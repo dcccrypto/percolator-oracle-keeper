@@ -22,7 +22,8 @@
  *   ADMIN_KEYPAIR_PATH — Oracle authority keypair
  *   PUSH_INTERVAL_MS  — Push interval (default: 3000)
  *   HEALTH_PORT       — HTTP health check port (default: 18810)
- *   HEALTH_BIND       — Bind address for health server (default: 127.0.0.1)
+ *   HEALTH_BIND       — Bind address for health server (default: 0.0.0.0 so platform
+ *                       health checks can reach it; set 127.0.0.1 for loopback-only)
  *   HEALTH_AUTH_TOKEN — Bearer token for health endpoint auth (optional but recommended)
  *   MAX_PRICE_MOVE_PCT — Circuit breaker % (default: 10)
  *   STALE_THRESHOLD_S  — Staleness alert threshold (default: 30)
@@ -183,8 +184,13 @@ const admin = loadAdminKeypair();
 
 // Pyth Hermes endpoint (free, no API key required)
 const HERMES_URL = process.env.HERMES_URL ?? "https://hermes.pyth.network";
-// Health endpoint security (from security hardening #616)
-const HEALTH_BIND = process.env.HEALTH_BIND ?? "127.0.0.1";
+// Health endpoint security (from security hardening #616).
+// #2: default to 0.0.0.0 — Railway's platform health check probes the container from
+// outside, so a 127.0.0.1 (loopback-only) bind is unreachable and the service is marked
+// unhealthy / fails to deploy. Binding all interfaces is the correct container default;
+// the endpoint is gated by HEALTH_AUTH_TOKEN when set. Override via HEALTH_BIND for
+// loopback-only / sidecar setups.
+const HEALTH_BIND = process.env.HEALTH_BIND ?? "0.0.0.0";
 const HEALTH_AUTH_TOKEN = process.env.HEALTH_AUTH_TOKEN ?? "";
 
 // Track markets where we're not the oracle authority (skip future attempts)
