@@ -248,6 +248,40 @@ const authorityVerified = new Set<string>();
 // otherwise the Solana runtime rejects with "Provided owner is not allowed" (0x10).
 const slabProgramId = new Map<string, PublicKey>();
 
+// #32: allowlist of program IDs whose slabs this keeper is permitted to sign for.
+// Populated at startup from deploy.programId + ADDITIONAL_PROGRAM_IDS env var.
+// A Supabase row that points at an attacker-owned program would make the keeper
+// sign transactions for that program; validating slabInfo.owner before parseConfig
+// prevents this. Access via isAllowedProgramId() below.
+const allowedProgramIds = new Set<string>();
+
+/**
+ * Check that a slab account's on-chain owner (slabInfo.owner) is in the
+ * EXPECTED_PROGRAM_IDS allowlist before trusting it for parseConfig or
+ * instruction building.  Must be called at ALL THREE fetch sites:
+ *   1. startup authority loop
+ *   2. pushAndCrank authority re-check
+ *   3. discovery loop authority check
+ *
+ * @param owner - the PublicKey from slabInfo.owner
+ * @param slabAddress - for logging
+ * @param label - human-readable market label for logging
+ * @returns true if allowed, false if the slab should be skipped
+ */
+function isAllowedProgramId(owner: PublicKey, slabAddress: string, label: string): boolean {
+  if (allowedProgramIds.size === 0) {
+    // Allowlist not yet populated (called before main() sets it up).
+    // This should not happen in production; block as a safety measure.
+    log(`🚨 [#32] ${label}: allowedProgramIds not initialised — blocking slab ${slabAddress.slice(0, 12)}...`);
+    return false;
+  }
+  if (!allowedProgramIds.has(owner.toBase58())) {
+    log(`🚨 [#32] ${label}: slab owned by UNEXPECTED program ${owner.toBase58()} — not in allowlist. Possible Supabase injection attack. Skipping.`);
+    return false;
+  }
+  return true;
+}
+
 /**
  * Validate critical environment variables at startup (HIGH-001 security fix)
  *
@@ -864,6 +898,11 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
       // deployment.json (e.g. old FwfB... vs current FxfD...).
       const slabInfo = await getAccountInfoWithTimeout(conn, new PublicKey(market.slab));
       if (!slabInfo) throw new Error(`Slab account not found: ${market.slab}`);
+      // #32: validate slab owner BEFORE parseConfig/trusting any account data
+      if (!isAllowedProgramId(slabInfo.owner, market.slab, market.label)) {
+        skippedMarkets.add(market.slab);
+        return;
+      }
       const slabData = new Uint8Array(slabInfo.data);
       const cfg = parseConfig(slabData);
       if (!cfg.oracleAuthority.equals(admin.publicKey)) {
@@ -1457,6 +1496,21 @@ async function main() {
     process.exit(1);
   }
 
+  // #32: Build the EXPECTED_PROGRAM_IDS allowlist.
+  // Always includes deploy.programId. ADDITIONAL_PROGRAM_IDS (comma-separated)
+  // lets operators allowlist additional program tiers (e.g. legacy small-tier).
+  allowedProgramIds.add(programId.toBase58());
+  const additionalIds = (process.env.ADDITIONAL_PROGRAM_IDS ?? "").split(",").map(s => s.trim()).filter(Boolean);
+  for (const id of additionalIds) {
+    try {
+      const pk = new PublicKey(id);
+      allowedProgramIds.add(pk.toBase58());
+    } catch {
+      console.error(`⚠️ [#32] Invalid ADDITIONAL_PROGRAM_IDS entry: "${id}" — ignoring`);
+    }
+  }
+  log(`[#32] Slab program allowlist (${allowedProgramIds.size}): ${[...allowedProgramIds].map(id => id.slice(0, 12) + "...").join(", ")}`);
+
   if (!Array.isArray(deploy.markets)) {
     deploy.markets = [];
   }
@@ -1483,6 +1537,11 @@ async function main() {
       // preventing "Provided owner is not allowed" for markets on different program tiers.
       const slabInfo = await getAccountInfoWithTimeout(conn, new PublicKey(m.slab));
       if (!slabInfo) throw new Error(`Slab account not found`);
+      // #32: validate slab owner BEFORE parseConfig/trusting any account data
+      if (!isAllowedProgramId(slabInfo.owner, m.slab, `STARTUP: ${m.label}`)) {
+        skippedMarkets.add(m.slab);
+        continue;
+      }
       const slabData = new Uint8Array(slabInfo.data);
       const cfg = parseConfig(slabData);
       if (!cfg.oracleAuthority.equals(admin.publicKey)) {
@@ -1582,6 +1641,11 @@ async function main() {
             try {
               const slabInfo = await getAccountInfoWithTimeout(conn, new PublicKey(m.slab));
               if (!slabInfo) throw new Error(`Slab account not found`);
+              // #32: validate slab owner BEFORE parseConfig/trusting any account data
+              if (!isAllowedProgramId(slabInfo.owner, m.slab, m.label)) {
+                skippedMarkets.add(m.slab);
+                continue;
+              }
               const slabData = new Uint8Array(slabInfo.data);
               const cfg = parseConfig(slabData);
               if (!cfg.oracleAuthority.equals(admin.publicKey)) {
