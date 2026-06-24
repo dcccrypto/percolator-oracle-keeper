@@ -322,13 +322,16 @@ function validateEnvironmentConfig(): void {
   }
 
   // Validate Supabase configuration (if enabled)
+  // #46: accept either SUPABASE_ANON_KEY (preferred for read-only) or SUPABASE_SERVICE_ROLE_KEY.
   const supabaseUrl = (process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL ?? "").trim();
-  const supabaseKey = (process.env.SUPABASE_SERVICE_ROLE_KEY ?? "").trim();
+  const supabaseAnonKey = (process.env.SUPABASE_ANON_KEY ?? "").trim();
+  const supabaseServiceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY ?? "").trim();
+  const supabaseEffectiveKey = supabaseAnonKey || supabaseServiceKey;
 
-  if (supabaseUrl && !supabaseKey) {
+  if (supabaseUrl && !supabaseEffectiveKey) {
     errors.push(
-      "SUPABASE_URL is configured but SUPABASE_SERVICE_ROLE_KEY is missing. " +
-      "Either disable Supabase (unset SUPABASE_URL) or provide a service role key.",
+      "SUPABASE_URL is configured but neither SUPABASE_ANON_KEY nor SUPABASE_SERVICE_ROLE_KEY is set. " +
+      "Either disable Supabase (unset SUPABASE_URL) or provide a read key.",
     );
   }
 
@@ -343,10 +346,10 @@ function validateEnvironmentConfig(): void {
     }
   }
 
-  if (supabaseUrl && supabaseKey && supabaseKey.length < 100) {
+  if (supabaseUrl && supabaseEffectiveKey && supabaseEffectiveKey.length < 100) {
     errors.push(
-      `SUPABASE_SERVICE_ROLE_KEY appears truncated (${supabaseKey.length} chars, expected 100+). ` +
-      "This usually indicates a copy-paste error.",
+      `Supabase key appears truncated (${supabaseEffectiveKey.length} chars, expected 100+). ` +
+      "This usually indicates a copy-paste error. Check SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY.",
     );
   }
 
@@ -384,9 +387,15 @@ function validateEnvironmentConfig(): void {
 // ── Supabase Auto-Discovery ─────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
+// #46: accept either the anon key or the service role key.
+// Prefer the anon key (SUPABASE_ANON_KEY) for read-only queries so the service
+// role key's write privileges aren't exposed to Supabase's REST layer.
+// Fall back to the service role key when no anon key is set, but emit a
+// startup warning so operators know to provision a dedicated read key.
+const SUPABASE_READ_KEY = process.env.SUPABASE_ANON_KEY || SUPABASE_SERVICE_KEY;
 const DISCOVERY_INTERVAL_MS = parsePositiveNumberEnv("DISCOVERY_INTERVAL_MS", 30000); // 30s
 
-const supabaseEnabled = !!(SUPABASE_URL && SUPABASE_SERVICE_KEY);
+const supabaseEnabled = !!(SUPABASE_URL && SUPABASE_READ_KEY);
 
 /** Lightweight Supabase REST query — no client library needed */
 async function supabaseQuery(table: string, params: string): Promise<any[] | null> {
@@ -396,8 +405,8 @@ async function supabaseQuery(table: string, params: string): Promise<any[] | nul
       `${SUPABASE_URL}/rest/v1/${table}?${params}`,
       {
         headers: {
-          apikey: SUPABASE_SERVICE_KEY,
-          Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+          apikey: SUPABASE_READ_KEY,
+          Authorization: `Bearer ${SUPABASE_READ_KEY}`,
         },
         signal: AbortSignal.timeout(5000),
       },
@@ -1459,6 +1468,10 @@ async function main() {
   let lastDiscoveryAt = 0;
   if (supabaseEnabled) {
     log(`Supabase auto-discovery enabled (interval: ${DISCOVERY_INTERVAL_MS}ms)`);
+    // #46: warn when using service role key without a dedicated anon key
+    if (!process.env.SUPABASE_ANON_KEY && SUPABASE_SERVICE_KEY) {
+      log("⚠️ [#46] SUPABASE_ANON_KEY not set — falling back to SUPABASE_SERVICE_ROLE_KEY for read queries. Provision a dedicated anon/read key to reduce exposure.");
+    }
     // Load mainnet CAs for existing markets from Supabase
     const caRows = await supabaseQuery(
       "markets",
@@ -1471,7 +1484,7 @@ async function main() {
       log(`Loaded ${caRows.length} mainnet CA mapping(s) from Supabase`);
     }
   } else {
-    log("⚠️ Supabase not configured — auto-discovery disabled (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)");
+    log("⚠️ Supabase not configured — auto-discovery disabled (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY)");
   }
 
   // Main push loop
