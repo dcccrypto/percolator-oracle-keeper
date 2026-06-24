@@ -987,6 +987,16 @@ let markets: MarketInfo[] = [];
 // detect when they're disabled and downgrade them back to admin oracle mode.
 const hyperpFromOracleTable = new Set<string>();
 
+/**
+ * Discovers HYPERP markets from the Supabase oracle_markets table.
+ *
+ * This keeps already-tracked slabs synchronized with oracle_markets by:
+ * - upgrading non-HYPERP markets to HYPERP mode when an override is enabled
+ * - refreshing dexPoolAddress when an existing HYPERP pool override changes
+ * - invalidating cached HYPERP pool metadata after pool updates
+ *
+ * @returns Newly discovered HYPERP markets that should be added to the keeper.
+ */
 async function discoverHyperpFromOracleTable(): Promise<MarketInfo[]> {
   if (!supabaseEnabled) return [];
   try {
