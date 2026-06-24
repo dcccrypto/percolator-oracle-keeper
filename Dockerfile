@@ -13,7 +13,7 @@ RUN groupadd -r keeper && useradd -r -g keeper -d /app keeper
 COPY package.json package-lock.json* ./
 
 # Install dependencies (includes tsx runtime)
-RUN npm install --omit=dev
+RUN npm ci --omit=dev
 
 # Copy source
 COPY src/ src/
@@ -27,7 +27,7 @@ EXPOSE 18810
 # Health check: /health returns 200 when all markets fresh, 503 when degraded
 # Use curl without -f so 503 doesn't fail the health check (service still running)
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=60s \
-  CMD curl -so /dev/null http://localhost:${HEALTH_PORT:-18810}/health || exit 1
+  CMD curl -sf -o /dev/null -H "Authorization: Bearer ${HEALTH_AUTH_TOKEN:-}" http://localhost:${HEALTH_PORT:-18810}/health || exit 1
 
 # Environment defaults (override via Railway service variables)
 ENV PUSH_INTERVAL_MS=3000
