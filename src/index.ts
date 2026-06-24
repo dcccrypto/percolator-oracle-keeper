@@ -43,6 +43,7 @@ import {
 } from "@percolator/sdk";
 import * as fs from "fs";
 import * as http from "http";
+import * as crypto from "crypto";
 
 // ── Config ──────────────────────────────────────────────────
 import { parsePositiveNumberEnv, requireProgramIdForSupabaseMode } from "./env-utils.ts";
@@ -1156,12 +1157,69 @@ const ALLOWED_POOL_PROGRAMS = new Set<string>([
 }
 
 // ── Health Check Server ─────────────────────────────────────
+
+// #35+#36: per-IP rate limit state.
+// Bounded to IP_RATE_LIMIT_MAP_MAX entries to prevent unbounded memory growth from
+// IP spoofing / scanning. When the map is full, the oldest entry is evicted.
+const IP_RATE_LIMIT_WINDOW_MS = 60_000;       // 1-minute sliding window
+const IP_RATE_LIMIT_MAX_REQS  = 60;            // max requests per window per IP
+const IP_RATE_LIMIT_MAP_MAX   = 4096;          // max IPs tracked simultaneously
+const ipRequestLog = new Map<string, number[]>();
+
+function isRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const windowStart = now - IP_RATE_LIMIT_WINDOW_MS;
+  let timestamps = ipRequestLog.get(ip) ?? [];
+  // Remove timestamps outside the window
+  timestamps = timestamps.filter(t => t >= windowStart);
+  if (timestamps.length >= IP_RATE_LIMIT_MAX_REQS) {
+    ipRequestLog.set(ip, timestamps);
+    return true;
+  }
+  timestamps.push(now);
+  // Evict oldest entry if map is full (bounded growth)
+  if (!ipRequestLog.has(ip) && ipRequestLog.size >= IP_RATE_LIMIT_MAP_MAX) {
+    const oldestKey = ipRequestLog.keys().next().value;
+    if (oldestKey !== undefined) ipRequestLog.delete(oldestKey);
+  }
+  ipRequestLog.set(ip, timestamps);
+  return false;
+}
+
+/**
+ * Timing-safe token comparison using crypto.timingSafeEqual.
+ * Length-normalises both buffers before comparison to prevent length-timing
+ * side-channel attacks (#35).
+ */
+function timingSafeTokenEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, "utf8");
+  const bufB = Buffer.from(b, "utf8");
+  // Pad the shorter buffer so both are the same length — this prevents a
+  // length mismatch from immediately revealing that the tokens differ.
+  const len = Math.max(bufA.length, bufB.length);
+  const padA = Buffer.alloc(len);
+  const padB = Buffer.alloc(len);
+  bufA.copy(padA);
+  bufB.copy(padB);
+  return crypto.timingSafeEqual(padA, padB) && bufA.length === bufB.length;
+}
+
 function startHealthServer() {
   const server = http.createServer((req, res) => {
+    // #35+#36: per-IP rate limit (prevents brute-force token guessing)
+    const clientIp = req.socket.remoteAddress ?? "unknown";
+    if (isRateLimited(clientIp)) {
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "60" });
+      res.end(JSON.stringify({ error: "too many requests" }));
+      return;
+    }
+
     // Auth guard: if HEALTH_AUTH_TOKEN is set, require Bearer token
+    // #35: timing-safe comparison to prevent timing side-channel token recovery
     if (HEALTH_AUTH_TOKEN) {
-      const auth = req.headers.authorization;
-      if (auth !== `Bearer ${HEALTH_AUTH_TOKEN}`) {
+      const auth = req.headers.authorization ?? "";
+      const provided = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+      if (!timingSafeTokenEqual(provided, HEALTH_AUTH_TOKEN)) {
         res.writeHead(401, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "unauthorized" }));
         return;
