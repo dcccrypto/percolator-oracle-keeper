@@ -906,14 +906,14 @@ function startHealthServer() {
       const now = Date.now();
       const uptimeS = Math.floor((now - startTime) / 1000);
       const markets: Record<string, any> = {};
+      const marketsBySlab: Record<string, unknown> = {};
       let healthy = true;
 
       for (const [slab, s] of stats) {
         const staleSec = s.lastPushAt ? Math.floor((now - s.lastPushAt) / 1000) : -1;
         const isStale = staleSec > STALE_THRESHOLD_S;
         if (isStale) healthy = false;
-        markets[slab] = {
-          symbol: s.symbol,
+        const marketHealth = {
           lastPrice: s.lastPrice,
           lastPushAgo: `${staleSec}s`,
           stale: isStale,
@@ -922,6 +922,11 @@ function startHealthServer() {
           totalErrors: s.totalErrors,
           consecutiveErrors: s.consecutiveErrors,
           circuitBreakerTrips: s.circuitBreakerTrips,
+        };
+        markets[s.symbol] = marketHealth;
+        marketsBySlab[slab] = {
+          symbol: s.symbol,
+          ...marketHealth,
         };
       }
 
@@ -939,6 +944,7 @@ function startHealthServer() {
           low: walletLow,
         },
         markets,
+        marketsBySlab,
       }, null, 2);
 
       res.writeHead(healthy ? 200 : 503, { "Content-Type": "application/json" });
