@@ -35,12 +35,13 @@ import {
   AccountInfo,
 } from "@solana/web3.js";
 import {
-  encodePushOraclePrice, encodeKeeperCrank, encodeUpdateHyperpMark,
-  ACCOUNTS_PUSH_ORACLE_PRICE, ACCOUNTS_KEEPER_CRANK,
-  buildAccountMetas, buildIx, WELL_KNOWN,
+  encodePushAuthMark, encodePushEwmaMark,
+  ACCOUNTS_PUSH_AUTH_MARK, ACCOUNTS_PUSH_EWMA_MARK,
+  buildAccountMetas, buildIx,
   parseConfig,
-  detectDexType, parseDexPool,
-} from "@percolator/sdk";
+  parseAssetOracleProfileV17,
+  V17_MARKET_GROUP_OFF, V17_MARKET_GROUP_LEN, V17_MARKET_ASSET_SLOT_LEN,
+} from "@percolatorct/sdk";
 import * as fs from "fs";
 import * as http from "http";
 import * as crypto from "crypto";
@@ -257,6 +258,48 @@ const authorityVerified = new Set<string>();
 // otherwise the Solana runtime rejects with "Provided owner is not allowed" (0x10).
 const slabProgramId = new Map<string, PublicKey>();
 
+/**
+ * v17 oracle mode numeric constants from v16_program.rs state module.
+ *
+ * Evidence (v16_program.rs lines 75-78):
+ *   pub const ORACLE_MODE_MANUAL: u8 = 0;
+ *   pub const ORACLE_MODE_HYBRID_AFTER_HOURS: u8 = 1;
+ *   pub const ORACLE_MODE_EWMA_MARK: u8 = 2;
+ *   pub const ORACLE_MODE_AUTH_MARK: u8 = 3;
+ */
+const V17_ORACLE_MODE_MANUAL           = 0;
+const V17_ORACLE_MODE_HYBRID           = 1;
+const V17_ORACLE_MODE_EWMA_MARK        = 2;
+const V17_ORACLE_MODE_AUTH_MARK        = 3;
+
+/**
+ * Byte offset of AssetOracleProfileV17 for asset_index N within a v17 market account.
+ *
+ * Layout (from v16_program.rs constants and SDK slab.ts):
+ *   HEADER_LEN (16) + WRAPPER_CONFIG_LEN (432) = V17_MARKET_GROUP_OFF (448)
+ *   + V17_MARKET_GROUP_LEN (758) = first asset slot start (1206)
+ *   + N * V17_MARKET_ASSET_SLOT_LEN (1797)
+ *
+ * The oracle profile is at byte 0 within each dynamic asset slot
+ * (dynamic_slot_offset returns MARKET_GROUP_OFF + slot_stride * N,
+ * and oracle_profile_range starts at that same offset).
+ *
+ * Evidence: v16_program.rs asset_oracle_profile_range + dynamic_slot_offset;
+ * SDK slab.ts V17_MARKET_GROUP_OFF=448, V17_MARKET_GROUP_LEN=758, V17_MARKET_ASSET_SLOT_LEN=1797.
+ */
+function v17OracleProfileOffset(assetIndex: number): number {
+  return V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN + assetIndex * V17_MARKET_ASSET_SLOT_LEN;
+}
+
+/**
+ * Cached v17 oracle mode per slab address (numeric value from AssetOracleProfileV17.oracleMode).
+ *
+ * Populated at startup and during the authority-check path. A null value means
+ * the mode has not been read yet or could not be parsed. When null, the push
+ * is skipped conservatively rather than guessing.
+ */
+const slabOracleMode = new Map<string, number>();
+
 // #32: allowlist of program IDs whose slabs this keeper is permitted to sign for.
 // Populated at startup from deploy.programId + ADDITIONAL_PROGRAM_IDS env var.
 // A Supabase row that points at an attacker-owned program would make the keeper
@@ -277,6 +320,42 @@ const allowedProgramIds = new Set<string>();
  * @param label - human-readable market label for logging
  * @returns true if allowed, false if the slab should be skipped
  */
+/**
+ * Read and cache the v17 oracle mode from the on-chain AssetOracleProfileV17
+ * at asset_index=0. Called any time we have fresh slab account data.
+ *
+ * Mode values from v16_program.rs (constants 75-78):
+ *   0 = MANUAL         — no push instruction; price driven by crank (skip push)
+ *   1 = HYBRID         — Pyth feeds read during crank; no separate push (skip push)
+ *   2 = EWMA_MARK      — authority pushes via PushEwmaMark (tag 36)
+ *   3 = AUTH_MARK      — authority pushes via PushAuthMark  (tag 63)
+ *
+ * If the profile cannot be parsed (short/malformed account), the cached value
+ * is NOT updated so the previous cached value (or absence) is preserved.
+ */
+function cacheV17OracleMode(slabAddress: string, slabData: Uint8Array): void {
+  try {
+    const profileOff = v17OracleProfileOffset(0);
+    if (slabData.length < profileOff + 1) {
+      // Account is too short for a v17 slab — could be a v12 slab on a wrong network.
+      // Do not update cache; existing value (if any) remains.
+      return;
+    }
+    const profile = parseAssetOracleProfileV17(slabData, profileOff);
+    const mode = profile.oracleMode;
+    if (mode !== V17_ORACLE_MODE_MANUAL && mode !== V17_ORACLE_MODE_HYBRID &&
+        mode !== V17_ORACLE_MODE_EWMA_MARK && mode !== V17_ORACLE_MODE_AUTH_MARK) {
+      // Unknown mode value — do not cache; conservative skip
+      log(`⚠️ [v17-oracle] slab ${slabAddress.slice(0, 12)}...: unknown oracle mode ${mode} — will skip push`);
+      return;
+    }
+    slabOracleMode.set(slabAddress, mode);
+  } catch {
+    // parseAssetOracleProfileV17 threw — account may be v12 or truncated.
+    // Do not cache; push will be skipped conservatively.
+  }
+}
+
 function isAllowedProgramId(owner: PublicKey, slabAddress: string, label: string): boolean {
   if (allowedProgramIds.size === 0) {
     // Allowlist not yet populated (called before main() sets it up).
@@ -907,22 +986,41 @@ function formatTransactionContext(error: any, tx?: any): string {
 }
 
 // ── Push + Crank ────────────────────────────────────────────
+//
+// v17 DESIGN NOTE:
+// In v17 the "crank" (PermissionlessCrank tag 5) requires a keeper-owned
+// portfolio account at slot [2]. The oracle-keeper does NOT provision portfolios.
+// The main keeper service (percolator-keeper) handles PermissionlessCrank Refresh
+// on its own cycle (~30 s). The oracle-keeper's job is now ONLY to push mark
+// prices to markets in EWMA_MARK or AUTH_MARK mode.
+//
+// The function is kept as "pushAndCrank" for historical naming; the crank half
+// is removed in v17. HYPERP / DEX-pool mark mode was also removed in v17 —
+// HYBRID_AFTER_HOURS (mode=1) reads Pyth feeds at crank time and needs no push.
+//
+// v17 oracle mode → push instruction mapping:
+//   MANUAL (0)       — NO push instruction (price driven by off-chain settlement). Skip.
+//   HYBRID (1)       — NO push instruction (Pyth feeds read at crank). Skip.
+//   EWMA_MARK (2)    — PushEwmaMark (tag 36). Authority signer + market writable.
+//   AUTH_MARK (3)    — PushAuthMark  (tag 63). Authority signer + market writable.
+// Evidence: v16_program.rs handle_push_ewma_mark (lines 11148-11224, checks
+//   profile_is_ewma_mark) and handle_push_auth_mark (lines 11224-11340, checks
+//   profile_is_auth_mark). Both have identical account layout:
+//   [0] authority (signer), [1] market (writable).
+//
+// The old "admin" Supabase oracle mode mapped to AUTH_MARK in v17.
+// The old "hyperp" Supabase oracle mode is now a skip (HYBRID reads Pyth at crank).
 async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<void> {
   const s = getOrCreateStats(market);
 
   // Skip markets explicitly blocked via ORACLE_KEEPER_BLOCKED_MARKETS env var
   if (ORACLE_KEEPER_BLOCKED_MARKETS.has(market.slab)) return;
 
-  // HYPERP markets use on-chain DEX pool oracle — route to dedicated crank
+  // v17: HYPERP mode is removed. The old updateHyperpMark path no longer exists.
+  // If a market is still labeled "hyperp" in Supabase, it is now either HYBRID
+  // (reads Pyth at crank — no push needed) or misconfigured. Skip and log once.
   if (market.oracleMode === "hyperp") {
-    try {
-      await updateHyperpMark(market, programId);
-    } catch (e) {
-      const msg = (e as Error).message?.slice(0, 120) ?? String(e);
-      log(`⚠️ ${market.label}: UpdateHyperpMark failed: ${msg}`);
-      s.totalErrors++;
-      s.consecutiveErrors++;
-    }
+    log(`ℹ️ ${market.label}: oracleMode="hyperp" — v17 DEX-pool mark crank removed. If this market is HYBRID_AFTER_HOURS it is cranked by the keeper service. Skipping oracle-keeper push.`);
     return;
   }
 
@@ -958,6 +1056,11 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
       if (!slabInfo.owner.equals(programId)) {
         log(`ℹ️ ${market.label}: slab owned by ${slabInfo.owner.toBase58().slice(0, 12)}... (differs from deployment.json programId ${programId.toBase58().slice(0, 12)}...) — will use slab owner`);
       }
+      // v17: read oracle mode from AssetOracleProfileV17 at asset_index=0 and cache it.
+      // The oracle mode determines which push instruction to use (EWMA_MARK → tag 36,
+      // AUTH_MARK → tag 63, MANUAL/HYBRID → no push instruction exists).
+      // Conservative: if we cannot parse the profile, we do NOT guess — skip push.
+      cacheV17OracleMode(market.slab, slabData);
       authorityVerified.add(market.slab);
       log(`✓ ${market.label}: oracle authority verified (${admin.publicKey.toBase58().slice(0, 12)}...)`);
     } catch (e) {
@@ -1081,7 +1184,6 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
   }
 
   const priceE6 = BigInt(Math.round(price * 1_000_000));
-  const timestamp = BigInt(Math.floor(Date.now() / 1000));
   const slab = new PublicKey(market.slab);
 
   // Use the slab's actual on-chain program owner, not the deployment.json
@@ -1089,19 +1191,84 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
   // created by a different program tier/version than the BTC-PERP markets.
   const effectiveProgramId = slabProgramId.get(market.slab) ?? programId;
 
-  const pushData = encodePushOraclePrice({ priceE6: priceE6.toString(), timestamp: timestamp.toString() });
-  const pushKeys = buildAccountMetas(ACCOUNTS_PUSH_ORACLE_PRICE, [admin.publicKey, slab]);
+  // v17: determine which push instruction to use based on the on-chain oracle mode.
+  // Evidence: v16_program.rs handle_push_ewma_mark (tag 36) checks profile_is_ewma_mark
+  //   → ORACLE_MODE_EWMA_MARK (2); handle_push_auth_mark (tag 63) checks profile_is_auth_mark
+  //   → ORACLE_MODE_AUTH_MARK (3). Both reject any other mode with Unauthorized.
+  //
+  // Account layout for BOTH push instructions (same for tag 36 and tag 63):
+  //   [0] oracle_authority  — signer (admin.publicKey)
+  //   [1] market            — writable (the slab)
+  //
+  // Wire format for both (19 bytes):
+  //   tag(u8) + asset_index(u16 LE) + now_slot(u64 LE) + mark_e6(u64 LE)
+  //   asset_index=0 for single-asset v17 markets (all current devnet markets).
+  //
+  // MANUAL (0) and HYBRID (1): no authority push instruction exists for these modes.
+  // Skip conservatively — pushing with the wrong tag would cause InvalidInstruction.
+  const oracleMode = slabOracleMode.get(market.slab);
+  if (oracleMode === undefined) {
+    // Mode not yet cached — this should not happen since authority check populates it,
+    // but guard conservatively. Skip without incrementing error counter.
+    log(`⚠️ ${market.label}: oracle mode not yet cached — skipping push tick (will resolve on next authority recheck)`);
+    return;
+  }
+  if (oracleMode === V17_ORACLE_MODE_MANUAL) {
+    // MANUAL: no push instruction. Market price is driven by administrative settlement.
+    // Skip silently — this is expected behaviour, not an error.
+    return;
+  }
+  if (oracleMode === V17_ORACLE_MODE_HYBRID) {
+    // HYBRID_AFTER_HOURS: oracle reads Pyth feeds at crank time. No push instruction.
+    // The main keeper service handles cranking. Skip silently.
+    return;
+  }
 
-  const crankData = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
-  const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
-    admin.publicKey, slab, WELL_KNOWN.clock, slab,
-  ]);
+  // Fetch current slot for the now_slot argument.
+  // The program calls authenticated_slot_or_fallback(now_slot) — passing 0 triggers
+  // a Clock::get() fallback inside the program, but passing the actual slot avoids
+  // that sysvar read and is strictly correct.
+  let nowSlot: bigint;
+  try {
+    nowSlot = BigInt(await conn.getSlot("processed"));
+  } catch {
+    // If getSlot fails, pass 0 to trigger the in-program Clock fallback.
+    nowSlot = 0n;
+  }
 
+  // Build the push instruction data and account keys.
+  // asset_index=0: v17 markets are multi-asset but all current devnet markets
+  // have a single asset at index 0.
+  let pushData: Uint8Array;
+  let pushKeys: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[];
+  let pushTag: string;
+
+  if (oracleMode === V17_ORACLE_MODE_EWMA_MARK) {
+    // PushEwmaMark (tag 36): EWMA exponential moving average oracle mode.
+    // The program applies a halflife-weighted EWMA update using the pushed mark_e6.
+    pushData = encodePushEwmaMark({ assetIndex: 0, nowSlot, markE6: priceE6 });
+    pushKeys = buildAccountMetas(ACCOUNTS_PUSH_EWMA_MARK, [admin.publicKey, slab]);
+    pushTag = "PushEwmaMark(36)";
+  } else if (oracleMode === V17_ORACLE_MODE_AUTH_MARK) {
+    // PushAuthMark (tag 63): direct authority-set oracle mode.
+    // The program stores mark_e6 directly with no smoothing.
+    pushData = encodePushAuthMark({ assetIndex: 0, nowSlot, markE6: priceE6 });
+    pushKeys = buildAccountMetas(ACCOUNTS_PUSH_AUTH_MARK, [admin.publicKey, slab]);
+    pushTag = "PushAuthMark(63)";
+  } else {
+    // Unrecognised mode value not caught by cacheV17OracleMode — never push.
+    log(`⚠️ ${market.label}: unrecognised oracle mode ${oracleMode} — skipping push (fund-safe: never push to unknown mode)`);
+    return;
+  }
+
+  // v17: oracle-keeper pushes the mark price only. PermissionlessCrank (tag 5)
+  // requires a keeper-owned portfolio account that this service does not provision.
+  // The main keeper service (percolator-keeper) runs PermissionlessCrank Refresh
+  // on its own cadence to accrue fees and funding.
   const tx = new Transaction().add(
-    ComputeBudgetProgram.setComputeUnitLimit({ units: 500_000 }),
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }),
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
     buildIx({ programId: effectiveProgramId, keys: pushKeys, data: pushData }),
-    buildIx({ programId: effectiveProgramId, keys: crankKeys, data: crankData }),
   );
   tx.feePayer = admin.publicKey;
   const { blockhash } = await conn.getLatestBlockhash("confirmed");
@@ -1141,7 +1308,7 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
   s.consecutiveErrors = 0;
   s.source = source;
 
-  log(`✅ ${market.label}: $${price.toFixed(2)} [${source}] → ${sig.slice(0, 12)}...`);
+  log(`✅ ${market.label}: $${price.toFixed(2)} [${source}] ${pushTag} → ${sig.slice(0, 12)}...`);
 }
 
 // ── HYPERP Oracle Cache ─────────────────────────────────────
@@ -1155,116 +1322,28 @@ interface HyperpPoolMeta {
 const hyperpPoolCache = new Map<string, HyperpPoolMeta>();
 
 /**
- * Crank UpdateHyperpMark for a market in HYPERP oracle mode.
+ * v17: UpdateHyperpMark is REMOVED. The v12 DEX-pool mark crank (old tag 34) is
+ * now ConfigureHybridOracle in v17, and no DEX-pool mark-push instruction exists.
  *
- * HYPERP markets read their index price from an on-chain DEX pool (PumpSwap,
- * Raydium CLMM, or Meteora DLMM) instead of a Pyth feed. UpdateHyperpMark
- * is permissionless — any fee payer works.
+ * Markets that were configured as "hyperp" in v12 are now expected to use one of:
+ *   - HYBRID_AFTER_HOURS (mode 1): Pyth/switchboard feeds read at PermissionlessCrank time.
+ *     No push instruction needed. The main keeper handles cranking.
+ *   - AUTH_MARK (mode 3): Authority pushes mark directly via PushAuthMark (tag 63).
+ *     The pushAndCrank function handles this path.
+ *   - EWMA_MARK (mode 2): Authority pushes new observation; mark is EWMA-smoothed.
  *
- * Without regular cranking the mark price goes stale (30–120 s observed
- * latency): each missed crank extends the EMA staleness window.
+ * This function is retained for compile-time safety (the HYPERP branch in pushAndCrank
+ * calls it early-return instead) but does nothing. All formerly-hyperp markets that
+ * were converted to HYBRID are automatically served by the keeper service's crank cycle.
+ *
+ * @deprecated v17: call removed. Retained as dead function for build hygiene.
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 async function updateHyperpMark(
-  market: MarketInfo,
-  programId: PublicKey,
+  _market: MarketInfo,
+  _programId: PublicKey,
 ): Promise<void> {
-  if (!market.dexPoolAddress) {
-    log(`⚠️ ${market.label}: HYPERP but no dex_pool_address — skipping UpdateHyperpMark`);
-    return;
-  }
-
-  const slab = new PublicKey(market.slab);
-  const effectiveProgramId = slabProgramId.get(market.slab) ?? programId;
-
-  // Resolve (and cache) pool meta + extra accounts
-const ALLOWED_POOL_PROGRAMS = new Set<string>([
-  "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", // PumpSwap
-  "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", // Raydium CLMM
-  "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo", // Meteora DLMM
-]);
-
-  let poolMeta = hyperpPoolCache.get(market.slab);
-  if (!poolMeta) {
-    const poolPk = new PublicKey(market.dexPoolAddress);
-    const poolInfo = await getAccountInfoWithTimeout(conn, poolPk);
-    if (!poolInfo) {
-      log(`⚠️ ${market.label}: DEX pool account not found: ${market.dexPoolAddress}`);
-      return;
-    }
-
-    // Security check: ensure the pool is owned by an allowed DEX program (HIGH-001)
-    if (!ALLOWED_POOL_PROGRAMS.has(poolInfo.owner.toBase58())) {
-      log(`⚠️ ${market.label}: pool owned by unknown program ${poolInfo.owner.toBase58()} — rejecting`);
-      return;
-    }
-
-    const extraAccounts: PublicKey[] = [];
-    // PumpSwap pools carry vault addresses in their account data layout
-    const dexType = detectDexType(poolInfo.owner);
-    if (dexType === "pumpswap") {
-      const parsed = parseDexPool(dexType, poolPk, Buffer.from(poolInfo.data));
-      if (parsed?.baseVault) extraAccounts.push(parsed.baseVault);
-      if (parsed?.quoteVault) extraAccounts.push(parsed.quoteVault);
-    }
-    poolMeta = { pool: poolPk, extraAccounts };
-    hyperpPoolCache.set(market.slab, poolMeta);
-    log(`ℹ️ ${market.label}: resolved DEX pool ${market.dexPoolAddress.slice(0, 12)}... (dex=${dexType}, extras=${extraAccounts.length})`);
-  }
-
-  const markData = encodeUpdateHyperpMark();
-  const markKeys = [
-    { pubkey: slab, isSigner: false, isWritable: true },
-    { pubkey: poolMeta.pool, isSigner: false, isWritable: false },
-    { pubkey: WELL_KNOWN.clock, isSigner: false, isWritable: false },
-    ...poolMeta.extraAccounts.map((pk) => ({ pubkey: pk, isSigner: false, isWritable: false })),
-  ];
-
-  const crankData = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
-  const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
-    admin.publicKey, slab, WELL_KNOWN.clock, slab,
-  ]);
-
-  const tx = new Transaction().add(
-    ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
-    buildIx({ programId: effectiveProgramId, keys: markKeys, data: markData }),
-    buildIx({ programId: effectiveProgramId, keys: crankKeys, data: crankData }),
-  );
-  tx.feePayer = admin.publicKey;
-  const { blockhash } = await conn.getLatestBlockhash("confirmed");
-  tx.recentBlockhash = blockhash;
-
-  let sig: string;
-  try {
-    sig = await sendAndConfirmTransaction(conn, tx, [admin], {
-      commitment: "confirmed",
-    });
-  } catch (e) {
-    // MEDIUM-004: Attach transaction details to error for better debugging
-    const err = e as any;
-    if (!err.txContext) {
-      err.txContext = formatTransactionContext(e, tx);
-    }
-    throw err;
-  }
-
-  // #37: verify the transaction actually landed before crediting
-  const included = await verifyTxInclusion(sig);
-  const s = getOrCreateStats(market);
-  if (!included) {
-    s.totalErrors++;
-    s.consecutiveErrors++;
-    log(`❌ ${market.label}: UpdateHyperpMark tx ${sig.slice(0, 12)}... confirmed but meta.err — not crediting push`);
-    return;
-  }
-
-  s.lastPushAt = Date.now();
-  s.lastPushSig = sig;
-  s.totalPushes++;
-  s.consecutiveErrors = 0;
-  s.source = "hyperp-dex";
-
-  log(`✅ ${market.label}: UpdateHyperpMark + KeeperCrank → ${sig.slice(0, 12)}...`);
+  // v17: DEX-pool mark push removed. This function is never called.
 }
 
 // ── Health Check Server ─────────────────────────────────────
@@ -1721,8 +1800,15 @@ async function main() {
         if (!slabInfo.owner.equals(programId)) {
           log(`ℹ️ STARTUP: ${m.label} — slab owned by ${slabInfo.owner.toBase58().slice(0, 12)}... (differs from deployment programId)`);
         }
+        cacheV17OracleMode(m.slab, slabData);
+        const mode = slabOracleMode.get(m.slab);
+        const modeStr = mode === V17_ORACLE_MODE_MANUAL ? "MANUAL" :
+          mode === V17_ORACLE_MODE_HYBRID ? "HYBRID" :
+          mode === V17_ORACLE_MODE_EWMA_MARK ? "EWMA_MARK" :
+          mode === V17_ORACLE_MODE_AUTH_MARK ? "AUTH_MARK" :
+          mode === undefined ? "UNKNOWN(parse-failed)" : `UNKNOWN(${mode})`;
         authorityVerified.add(m.slab);
-        log(`✅ STARTUP: ${m.label} — authority OK (${admin.publicKey.toBase58().slice(0, 12)}...)`);
+        log(`✅ STARTUP: ${m.label} — authority OK (${admin.publicKey.toBase58().slice(0, 12)}...) oracle_mode=${modeStr}`);
       }
     } catch (e) {
       log(`⚠️ STARTUP: ${m.label} — authority check failed: ${(e as Error).message?.slice(0, 80)}. Will retry during push loop.`);
@@ -1825,6 +1911,7 @@ async function main() {
                 if (!slabInfo.owner.equals(programId)) {
                   log(`ℹ️ ${m.label}: slab owned by ${slabInfo.owner.toBase58().slice(0, 12)}... (different program tier)`);
                 }
+                cacheV17OracleMode(m.slab, slabData);
                 authorityVerified.add(m.slab);
                 log(`✅ ${m.label}: authority OK`);
               }

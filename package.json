@@ -8,10 +8,10 @@
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "build": "tsc --noEmit",
-    "test": "node --import tsx/esm --test src/env-validation.test.ts src/circuit-breaker.test.ts src/security-fixes.test.ts"
+    "test": "node --import tsx/esm --test src/env-validation.test.ts src/circuit-breaker.test.ts src/security-fixes.test.ts src/v17-oracle-push.test.ts"
   },
   "dependencies": {
-    "@percolator/sdk": "github:dcccrypto/percolator-sdk#b6daec0de445e252bb28eb80891212d7c2a31659",
+    "@percolatorct/sdk": "github:dcccrypto/percolator-sdk#59441ff3",
     "@solana/web3.js": "1.98.4",
     "tsx": "4.19.1"
   },
