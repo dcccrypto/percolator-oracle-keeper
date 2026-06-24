@@ -44,7 +44,7 @@ import * as fs from "fs";
 import * as http from "http";
 
 // ── Config ──────────────────────────────────────────────────
-import { parsePositiveNumberEnv } from "./env-utils.ts";
+import { parsePositiveNumberEnv, requireProgramIdForSupabaseMode } from "./env-utils.ts";
 
 const PUSH_INTERVAL_MS    = parsePositiveNumberEnv("PUSH_INTERVAL_MS",    3000);
 const HEALTH_PORT         = parsePositiveNumberEnv("HEALTH_PORT",         18810);
@@ -1158,6 +1158,18 @@ async function main() {
     deployRaw = process.env.DEPLOYMENT_JSON;
   } else if (supabaseEnabled) {
     log("No deployment file — running in Supabase-only discovery mode");
+    // Guard: Supabase discovery cannot supply a program id from its market rows.
+    // The programId is needed as a fallback when building instructions for any
+    // market whose slab owner has not yet been cached.  Without it, the next
+    // line (`new PublicKey(deploy.programId)`) throws the opaque "_bn" error
+    // from inside @solana/web3.js, making the service crash after already
+    // claiming Supabase-only mode is active (issue #29).
+    try {
+      requireProgramIdForSupabaseMode(process.env.PROGRAM_ID);
+    } catch (e) {
+      console.error(`❌ ${(e as Error).message}`);
+      process.exit(1);
+    }
   } else {
     console.error("❌ Deployment info not found at", deployPath);
     console.error("   Run deploy-devnet-mm.ts first, set DEPLOYMENT_JSON env var, or set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY.");

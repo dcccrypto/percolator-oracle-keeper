@@ -24,3 +24,30 @@ export function parsePositiveNumberEnv(name: string, fallback: number): number {
   }
   return value;
 }
+
+/**
+ * Validate that PROGRAM_ID is set when the oracle keeper is running in
+ * Supabase-only discovery mode (no deployment file, no DEPLOYMENT_JSON).
+ *
+ * Supabase discovery surfaces slab addresses, oracle modes, and pool addresses
+ * but does NOT supply a program id.  The keeper uses `programId` as a fallback
+ * when building instructions before a slab's on-chain owner has been cached.
+ * Without it, `new PublicKey(undefined)` throws the opaque "_bn" error from
+ * inside @solana/web3.js — crashing the service after it has already logged
+ * that Supabase-only mode is active (issue #29).
+ *
+ * @param programIdEnv - value of process.env.PROGRAM_ID (pass explicitly so
+ *   the function is a pure helper that tests can drive without touching the
+ *   real process.env).
+ * @throws Error with a clear diagnostic message when the id is absent.
+ */
+export function requireProgramIdForSupabaseMode(
+  programIdEnv: string | undefined,
+): void {
+  if (!programIdEnv || programIdEnv.trim() === "") {
+    throw new Error(
+      "PROGRAM_ID is required for Supabase-only discovery mode (no deployment file present). " +
+      "Set PROGRAM_ID to your deployed program's public key, or provide a deployment file / DEPLOYMENT_JSON.",
+    );
+  }
+}

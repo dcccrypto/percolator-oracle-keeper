@@ -1,5 +1,9 @@
 /**
- * Unit tests for parsePositiveNumberEnv (bounty finding #4 fix).
+ * Unit tests for env-utils helpers.
+ *
+ * Covers:
+ *   - parsePositiveNumberEnv (bounty finding #4 fix)
+ *   - requireProgramIdForSupabaseMode (issue #29 fix)
  *
  * Run with: node --import tsx/esm --test src/env-validation.test.ts
  * Or via:   pnpm test
@@ -10,7 +14,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parsePositiveNumberEnv } from "./env-utils.ts";
+import { parsePositiveNumberEnv, requireProgramIdForSupabaseMode } from "./env-utils.ts";
 
 // ── helpers ──────────────────────────────────────────────────
 
@@ -153,6 +157,74 @@ describe("parsePositiveNumberEnv", () => {
       const movePct = Math.abs((newPrice - lastPrice) / lastPrice) * 100; // 5
       const accepted = !(movePct > threshold);
       assert.ok(accepted, `Expected 5% move to be accepted (movePct=${movePct}, threshold=${threshold})`);
+    });
+  });
+});
+
+// ── requireProgramIdForSupabaseMode (issue #29 fix) ──────────────────────────
+
+/**
+ * These tests assert the fix for issue #29:
+ *
+ * In Supabase-only discovery mode (no deployment file, no DEPLOYMENT_JSON),
+ * the keeper built a fallback deploy object using `process.env.PROGRAM_ID`.
+ * When `PROGRAM_ID` was unset, `new PublicKey(undefined)` crashed the service
+ * with the opaque "_bn" error from @solana/web3.js — AFTER logging that
+ * Supabase-only mode was active.
+ *
+ * The fix (Option A): fail fast with a clear error before claiming
+ * Supabase-only mode is available.  `requireProgramIdForSupabaseMode` is the
+ * pure, testable helper that performs this check.
+ */
+describe("requireProgramIdForSupabaseMode (issue #29)", () => {
+
+  describe("throws a clear error when PROGRAM_ID is absent", () => {
+    it("throws when programId is undefined (env var unset)", () => {
+      assert.throws(
+        () => requireProgramIdForSupabaseMode(undefined),
+        /PROGRAM_ID is required for Supabase-only discovery mode/,
+      );
+    });
+
+    it("throws when programId is empty string", () => {
+      assert.throws(
+        () => requireProgramIdForSupabaseMode(""),
+        /PROGRAM_ID is required for Supabase-only discovery mode/,
+      );
+    });
+
+    it("throws when programId is whitespace-only", () => {
+      assert.throws(
+        () => requireProgramIdForSupabaseMode("   "),
+        /PROGRAM_ID is required for Supabase-only discovery mode/,
+      );
+    });
+
+    it("error message mentions the deployment file / DEPLOYMENT_JSON alternatives", () => {
+      let caught: Error | undefined;
+      try {
+        requireProgramIdForSupabaseMode(undefined);
+      } catch (e) {
+        caught = e as Error;
+      }
+      assert.ok(caught, "Expected an error to be thrown");
+      assert.match(caught.message, /DEPLOYMENT_JSON/);
+    });
+  });
+
+  describe("does NOT throw when PROGRAM_ID is present", () => {
+    it("succeeds with a valid-looking base58 public key", () => {
+      // Does not validate the key format — that is @solana/web3.js's job.
+      // We only check that the guard does not block a non-empty value.
+      assert.doesNotThrow(() =>
+        requireProgramIdForSupabaseMode("FwfBtNNUUEjFnX6BqNJKdgxHXKiU5KmTJq5vCHY5tqc"),
+      );
+    });
+
+    it("succeeds with any non-empty string (format validation is downstream)", () => {
+      assert.doesNotThrow(() =>
+        requireProgramIdForSupabaseMode("some-program-id"),
+      );
     });
   });
 });
