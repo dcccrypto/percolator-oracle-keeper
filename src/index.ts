@@ -1016,6 +1016,56 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
     return;
   }
 
+  // #33: First-push cross-check.
+  // The sync circuit-breaker in circuit-breaker.ts unconditionally accepts any
+  // price when lastPrice===0 (every restart). An attacker who can influence the
+  // first price (e.g. flash a DexScreener/Jupiter pool just before restart) could
+  // re-baseline the keeper to a manipulated price.
+  //
+  // Mitigation: on the FIRST push for a market after start (lastPrice===0),
+  // require a secondary-source confirmation UNLESS the price came from a Pyth
+  // (Wormhole-attested) source, which is already multi-oracle-verified.
+  //
+  // The actual circuit-breaker (sync) runs after this async pre-check.
+  if (s.lastPrice === 0 && source !== "pyth") {
+    // Attempt a secondary source confirmation
+    let secondaryOk = false;
+    let secondaryPrice: number | null = null;
+    // Try Jupiter first (it's the fastest non-Pyth source)
+    const jupPrice = await fetchJupiterPrice(market.symbol);
+    if (jupPrice !== null) {
+      secondaryPrice = jupPrice;
+      const movePct = Math.abs((price - jupPrice) / jupPrice) * 100;
+      // Use DEXSCREENER_MAX_MOVE_PCT as the cross-check tolerance
+      if (movePct <= DEXSCREENER_MAX_MOVE_PCT) {
+        secondaryOk = true;
+      }
+    }
+    if (!secondaryOk) {
+      // Also try Pyth cache (may have been populated by this tick's batch fetch)
+      const pythEntry = getPythPrice(market.symbol);
+      if (pythEntry) {
+        const movePct = Math.abs((price - pythEntry.price) / pythEntry.price) * 100;
+        if (movePct <= DEXSCREENER_MAX_MOVE_PCT) {
+          secondaryOk = true;
+          secondaryPrice = pythEntry.price;
+        }
+      }
+    }
+    if (!secondaryOk) {
+      log(
+        `⚠️ [#33] ${market.label}: first push cross-check FAILED — ` +
+        `${source} price $${price.toFixed(4)} not confirmed by secondary source ` +
+        `(secondary=${ secondaryPrice !== null ? `$${secondaryPrice.toFixed(4)}` : "unavailable" }). ` +
+        `Holding until cross-check passes or a Pyth price becomes available.`,
+      );
+      s.totalErrors++;
+      s.consecutiveErrors++;
+      return;
+    }
+    log(`✓ [#33] ${market.label}: first push cross-check PASSED (${source} $${price.toFixed(4)} ≈ secondary $${secondaryPrice!.toFixed(4)})`);
+  }
+
   // Circuit breaker — use per-source bound for DexScreener (#34)
   if (!checkCircuitBreaker(s, price, result?.maxMovePct)) return;
 
