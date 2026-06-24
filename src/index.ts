@@ -701,12 +701,10 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
 
   const result = await getPrice(market.symbol, market.slab);
 
-  // Resolve price: live source preferred, fall back to last known price when all
-  // external sources return null or zero (e.g. devnet token with no DEX pool).
-  // Without a fallback the on-chain oracle stays at 0, the UI freshness check marks
-  // the market "unavailable", and trading is blocked even though a valid price exists
-  // from a previous push.  This is safe: the circuit breaker below will still reject
-  // moves > MAX_PRICE_MOVE_PCT, and s.lastPrice is only set after a successful push.
+  // Resolve price: live source preferred. A last-known fallback is only allowed
+  // while the previous successful push is still within the freshness threshold.
+  // This avoids re-publishing stale cached prices with fresh oracle timestamps when
+  // all live price sources fail.
   let price: number;
   let source: string;
 
@@ -716,6 +714,17 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
   } else if (s.lastPrice > 0) {
     // Devnet / no-pool fallback: use last successfully pushed price to keep oracle alive.
     // Logged clearly so ops know the market is running on cached data.
+    const lastKnownAgeSec = s.lastPushAt
+      ? Math.floor((Date.now() - s.lastPushAt) / 1000)
+      : Infinity;
+
+    if (lastKnownAgeSec > STALE_THRESHOLD_S) {
+      s.totalErrors++;
+      s.consecutiveErrors++;
+      log(`No fresh price available for ${market.symbol}; last-known price is stale (${lastKnownAgeSec}s), skipping push`);
+      return;
+    }
+
     price = s.lastPrice;
     source = "last-known";
     if (!result) {
