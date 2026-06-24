@@ -44,10 +44,12 @@ import * as fs from "fs";
 import * as http from "http";
 
 // ── Config ──────────────────────────────────────────────────
-const PUSH_INTERVAL_MS = Number(process.env.PUSH_INTERVAL_MS ?? "3000");
-const HEALTH_PORT = Number(process.env.HEALTH_PORT ?? "18810");
-const MAX_PRICE_MOVE_PCT = Number(process.env.MAX_PRICE_MOVE_PCT ?? "10");
-const STALE_THRESHOLD_S = Number(process.env.STALE_THRESHOLD_S ?? "30");
+import { parsePositiveNumberEnv } from "./env-utils.ts";
+
+const PUSH_INTERVAL_MS    = parsePositiveNumberEnv("PUSH_INTERVAL_MS",    3000);
+const HEALTH_PORT         = parsePositiveNumberEnv("HEALTH_PORT",         18810);
+const MAX_PRICE_MOVE_PCT  = parsePositiveNumberEnv("MAX_PRICE_MOVE_PCT",  10);
+const STALE_THRESHOLD_S   = parsePositiveNumberEnv("STALE_THRESHOLD_S",   30);
 /**
  * Blocked Markets - Markets that cannot be serviced by this oracle-keeper
  *
@@ -298,7 +300,7 @@ function validateEnvironmentConfig(): void {
 // ── Supabase Auto-Discovery ─────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
-const DISCOVERY_INTERVAL_MS = Number(process.env.DISCOVERY_INTERVAL_MS ?? "30000"); // 30s
+const DISCOVERY_INTERVAL_MS = parsePositiveNumberEnv("DISCOVERY_INTERVAL_MS", 30000); // 30s
 
 const supabaseEnabled = !!(SUPABASE_URL && SUPABASE_SERVICE_KEY);
 
@@ -520,13 +522,11 @@ let startTime = Date.now();
 // Devops audit 2026-03-14: wallet FF7KFfU5 exhausted twice in one day from
 // ~20+ markets per 3-second cycle. Guard prevents on-chain txn drain when
 // balance is low. Default: 0.05 SOL (50_000_000 lamports).
-const MIN_KEEPER_BALANCE_LAMPORTS = Number(
-  process.env.MIN_KEEPER_BALANCE_SOL
-    ? Math.round(parseFloat(process.env.MIN_KEEPER_BALANCE_SOL) * 1e9)
-    : 50_000_000,
-);
+const MIN_KEEPER_BALANCE_LAMPORTS = process.env.MIN_KEEPER_BALANCE_SOL
+  ? Math.round(parsePositiveNumberEnv("MIN_KEEPER_BALANCE_SOL", 0.05) * 1e9)
+  : 50_000_000;
 // Interval between balance refreshes (default: every 30 s = ~10 push cycles at 3s interval)
-const BALANCE_CHECK_INTERVAL_MS = Number(process.env.BALANCE_CHECK_INTERVAL_MS ?? "30000");
+const BALANCE_CHECK_INTERVAL_MS = parsePositiveNumberEnv("BALANCE_CHECK_INTERVAL_MS", 30000);
 let walletBalanceLamports: number | null = null;
 let lastBalanceCheckAt = 0;
 let walletLow = false;

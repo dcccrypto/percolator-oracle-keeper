@@ -8,7 +8,7 @@
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "build": "tsc --noEmit",
-    "test": "tsx src/index.ts --help 2>/dev/null || true"
+    "test": "node --import tsx/esm --test src/env-validation.test.ts"
   },
   "dependencies": {
     "@percolator/sdk": "github:dcccrypto/percolator-sdk",
