@@ -1024,13 +1024,20 @@ async function discoverHyperpFromOracleTable(): Promise<MarketInfo[]> {
       if (!row.enabled || !row.slab_address || !row.dex_pool_address) continue;
 
       if (knownSlabs.has(row.slab_address)) {
-        // Upgrade an already-tracked market from admin/pyth → hyperp
+        // Upgrade an already-tracked market from admin/pyth → hyperp, or refresh
+        // the pool override when oracle_markets changes dex_pool_address.
         const existing = markets.find(m => m.slab === row.slab_address);
-        if (existing && existing.oracleMode !== "hyperp") {
-          log(`🔄 ${existing.label}: oracle_markets override → hyperp (pool=${row.dex_pool_address.slice(0, 12)}...)`);
-          existing.oracleMode = "hyperp";
-          existing.dexPoolAddress = row.dex_pool_address;
-          hyperpPoolCache.delete(row.slab_address); // force re-fetch with new pool
+        if (existing) {
+          if (existing.oracleMode !== "hyperp") {
+            log(`🔄 ${existing.label}: oracle_markets override → hyperp (pool=${row.dex_pool_address.slice(0, 12)}...)`);
+            existing.oracleMode = "hyperp";
+            existing.dexPoolAddress = row.dex_pool_address;
+            hyperpPoolCache.delete(row.slab_address); // force re-fetch with new pool
+          } else if (existing.dexPoolAddress !== row.dex_pool_address) {
+            log(`🔄 ${existing.label}: oracle_markets pool updated ${existing.dexPoolAddress?.slice(0, 12) ?? "none"}... → ${row.dex_pool_address.slice(0, 12)}...`);
+            existing.dexPoolAddress = row.dex_pool_address;
+            hyperpPoolCache.delete(row.slab_address); // invalidate stale pool metadata
+          }
         }
         hyperpFromOracleTable.add(row.slab_address);
         continue;
