@@ -464,14 +464,27 @@ interface MarketStats {
   cbTripPrice: number;
   /** How many consecutive trips have occurred near cbTripPrice (issue #30). */
   cbConsecutiveTrips: number;
+  /** #34: consecutive push cycles where the price came only from a DexScreener source. */
+  consecutiveLowTrustCycles: number;
 }
 
 // ── Price Sources ───────────────────────────────────────────
+
+// #34: DexScreener is an unattested, single-source feed — apply a tighter
+// circuit-breaker bound than Pyth/Jupiter. Bounded <100 via the #44 helper.
+const DEXSCREENER_MAX_MOVE_PCT = parsePositiveNumberEnv("DEXSCREENER_MAX_MOVE_PCT", 5, 100);
+
+// #34: Alert after this many consecutive push cycles where only a DexScreener
+// source was available (low-trust alert).
+const DEXSCREENER_LOW_TRUST_ALERT_CYCLES = parsePositiveNumberEnv("DEXSCREENER_LOW_TRUST_ALERT_CYCLES", 5);
 
 type PriceResult = {
   price: number;
   source: string;
   freshAt: number;
+  /** Circuit-breaker max-move override for this source. When set, pushAndCrank
+   *  uses this value instead of the global MAX_PRICE_MOVE_PCT. */
+  maxMovePct?: number;
 };
 
 // Pyth Network feed IDs (hex, without 0x prefix) — universal across all chains
@@ -600,8 +613,10 @@ async function fetchJupiterPrice(symbol: string): Promise<number | null> {
   } catch { return null; }
 }
 
-/** DexScreener fallback for custom/exotic tokens */
-async function fetchDexScreenerPrice(symbol: string): Promise<number | null> {
+/** DexScreener fallback for custom/exotic tokens.
+ * Returns a PriceResult with the tighter DEXSCREENER_MAX_MOVE_PCT bound (#34).
+ */
+async function fetchDexScreenerPrice(symbol: string): Promise<PriceResult | null> {
   const mint = JUPITER_MINTS[symbol];
   if (!mint) return null;
   try {
@@ -613,7 +628,8 @@ async function fetchDexScreenerPrice(symbol: string): Promise<number | null> {
     const pair = json.pairs?.[0];
     if (!pair?.priceUsd) return null;
     const p = parseFloat(pair.priceUsd);
-    return isFinite(p) && p > 0 ? p : null;
+    if (!isFinite(p) || p <= 0) return null;
+    return { price: p, source: "dexscreener", freshAt: Date.now(), maxMovePct: DEXSCREENER_MAX_MOVE_PCT };
   } catch { return null; }
 }
 
@@ -662,9 +678,9 @@ async function getPrice(
   const jup = await fetchJupiterPrice(symbol);
   if (jup) return { price: jup, source: "jupiter", freshAt: Date.now() };
 
-  // Tertiary: DexScreener (broad coverage for exotic tokens)
+  // Tertiary: DexScreener (broad coverage for exotic tokens) — uses tighter bound (#34)
   const dex = await fetchDexScreenerPrice(symbol);
-  if (dex) return { price: dex, source: "dexscreener", freshAt: Date.now() };
+  if (dex) return dex;
 
   return null;
 }
@@ -711,6 +727,7 @@ function getOrCreateStats(market: MarketInfo): MarketStats {
       source: "",
       cbTripPrice: 0,
       cbConsecutiveTrips: 0,
+      consecutiveLowTrustCycles: 0,
     };
     stats.set(market.slab, s);
   }
@@ -722,10 +739,13 @@ function getOrCreateStats(market: MarketInfo): MarketStats {
  * Thin wrapper that binds the module-level config constants and log function
  * to the pure checkCircuitBreaker helper from ./circuit-breaker.ts.
  * See that module for full doc + issue #30 relocation-recovery semantics.
+ *
+ * #34: accepts an optional per-source maxMovePct override so DexScreener
+ * sources are held to the tighter DEXSCREENER_MAX_MOVE_PCT bound.
  */
-function checkCircuitBreaker(s: MarketStats, newPrice: number): boolean {
+function checkCircuitBreaker(s: MarketStats, newPrice: number, sourceMaxMovePct?: number): boolean {
   return _checkCircuitBreaker(s as CircuitBreakerState, newPrice, {
-    maxMovePct: MAX_PRICE_MOVE_PCT,
+    maxMovePct: sourceMaxMovePct ?? MAX_PRICE_MOVE_PCT,
     confirmTrips: CIRCUIT_BREAKER_CONFIRM_TRIPS,
     log,
   });
@@ -914,8 +934,19 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
     return;
   }
 
-  // Circuit breaker
-  if (!checkCircuitBreaker(s, price)) return;
+  // Circuit breaker — use per-source bound for DexScreener (#34)
+  if (!checkCircuitBreaker(s, price, result?.maxMovePct)) return;
+
+  // #34: track consecutive low-trust (DexScreener-only) cycles and alert
+  const isDexScreenerSource = source === "dexscreener" || source === "dexscreener-ca";
+  if (isDexScreenerSource) {
+    s.consecutiveLowTrustCycles++;
+    if (s.consecutiveLowTrustCycles >= DEXSCREENER_LOW_TRUST_ALERT_CYCLES) {
+      log(`⚠️ [#34] ${market.label}: ${s.consecutiveLowTrustCycles} consecutive DexScreener-only cycles — Pyth/Jupiter unavailable. Price trust is reduced.`);
+    }
+  } else {
+    s.consecutiveLowTrustCycles = 0;
+  }
 
   const priceE6 = BigInt(Math.round(price * 1_000_000));
   const timestamp = BigInt(Math.floor(Date.now() / 1000));
@@ -1338,7 +1369,7 @@ async function fetchPriceByCA(mainnetCA: string): Promise<PriceResult | null> {
     }
   } catch {}
 
-  // DexScreener fallback
+  // DexScreener fallback — tag with tighter bound (#34)
   try {
     const resp = await fetch(
       `https://api.dexscreener.com/latest/dex/tokens/${encoded}`,
@@ -1348,7 +1379,7 @@ async function fetchPriceByCA(mainnetCA: string): Promise<PriceResult | null> {
     const pair = json.pairs?.[0];
     if (pair?.priceUsd) {
       const p = parseFloat(pair.priceUsd);
-      if (isFinite(p) && p > 0) return { price: p, source: "dexscreener-ca", freshAt: Date.now() };
+      if (isFinite(p) && p > 0) return { price: p, source: "dexscreener-ca", freshAt: Date.now(), maxMovePct: DEXSCREENER_MAX_MOVE_PCT };
     }
   } catch {}
 
