@@ -46,11 +46,27 @@ import * as http from "http";
 
 // ── Config ──────────────────────────────────────────────────
 import { parsePositiveNumberEnv, requireProgramIdForSupabaseMode } from "./env-utils.ts";
+import { checkCircuitBreaker as _checkCircuitBreaker } from "./circuit-breaker.ts";
+import type { CircuitBreakerState } from "./circuit-breaker.ts";
 
 const PUSH_INTERVAL_MS    = parsePositiveNumberEnv("PUSH_INTERVAL_MS",    3000);
 const HEALTH_PORT         = parsePositiveNumberEnv("HEALTH_PORT",         18810);
 const MAX_PRICE_MOVE_PCT  = parsePositiveNumberEnv("MAX_PRICE_MOVE_PCT",  10);
 const STALE_THRESHOLD_S   = parsePositiveNumberEnv("STALE_THRESHOLD_S",   30);
+/**
+ * Number of consecutive circuit-breaker trips at a consistent new price level
+ * required before the breaker re-baselines to that level (issue #30 fix).
+ *
+ * A one-off spike is rejected every time (the next normal push resets the
+ * counter).  A genuine, sustained relocation — where the same approximate
+ * price level arrives on CIRCUIT_BREAKER_CONFIRM_TRIPS successive push cycles
+ * without itself varying by more than MAX_PRICE_MOVE_PCT from the first
+ * tripping price — is accepted and re-baselines lastPrice, un-wedging the
+ * market without a process restart.
+ *
+ * Set via env var CIRCUIT_BREAKER_CONFIRM_TRIPS (must be ≥ 1, default 3).
+ */
+const CIRCUIT_BREAKER_CONFIRM_TRIPS = parsePositiveNumberEnv("CIRCUIT_BREAKER_CONFIRM_TRIPS", 3);
 /**
  * Blocked Markets - Markets that cannot be serviced by this oracle-keeper
  *
@@ -421,6 +437,10 @@ interface MarketStats {
   consecutiveErrors: number;
   circuitBreakerTrips: number;
   source: string;           // last successful source
+  /** Price of the first trip in the current consecutive-trip run (issue #30). */
+  cbTripPrice: number;
+  /** How many consecutive trips have occurred near cbTripPrice (issue #30). */
+  cbConsecutiveTrips: number;
 }
 
 // ── Price Sources ───────────────────────────────────────────
@@ -651,6 +671,8 @@ function getOrCreateStats(market: MarketInfo): MarketStats {
       consecutiveErrors: 0,
       circuitBreakerTrips: 0,
       source: "",
+      cbTripPrice: 0,
+      cbConsecutiveTrips: 0,
     };
     stats.set(market.slab, s);
   }
@@ -658,15 +680,17 @@ function getOrCreateStats(market: MarketInfo): MarketStats {
 }
 
 // ── Circuit Breaker ─────────────────────────────────────────
-function checkCircuitBreaker(stats: MarketStats, newPrice: number): boolean {
-  if (stats.lastPrice === 0) return true; // First price, always accept
-  const movePct = Math.abs((newPrice - stats.lastPrice) / stats.lastPrice) * 100;
-  if (movePct > MAX_PRICE_MOVE_PCT) {
-    log(`🔴 ${stats.symbol}: Circuit breaker! ${stats.lastPrice.toFixed(2)} → ${newPrice.toFixed(2)} (${movePct.toFixed(1)}% > ${MAX_PRICE_MOVE_PCT}%)`);
-    stats.circuitBreakerTrips++;
-    return false;
-  }
-  return true;
+/**
+ * Thin wrapper that binds the module-level config constants and log function
+ * to the pure checkCircuitBreaker helper from ./circuit-breaker.ts.
+ * See that module for full doc + issue #30 relocation-recovery semantics.
+ */
+function checkCircuitBreaker(s: MarketStats, newPrice: number): boolean {
+  return _checkCircuitBreaker(s as CircuitBreakerState, newPrice, {
+    maxMovePct: MAX_PRICE_MOVE_PCT,
+    confirmTrips: CIRCUIT_BREAKER_CONFIRM_TRIPS,
+    log,
+  });
 }
 
 // ── Logging ─────────────────────────────────────────────────
@@ -1056,6 +1080,7 @@ function startHealthServer() {
           totalErrors: s.totalErrors,
           consecutiveErrors: s.consecutiveErrors,
           circuitBreakerTrips: s.circuitBreakerTrips,
+          cbConsecutiveTrips: s.cbConsecutiveTrips,
         };
         markets[s.symbol] = marketHealth;
         marketsBySlab[slab] = {
