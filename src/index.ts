@@ -113,7 +113,12 @@ for (const entry of envBlockedRaw) {
     new PublicKey(entry);
     validatedBlockedMarkets.push(entry);
   } catch (e) {
-    console.error(`[ERROR] Invalid blocked market address in ORACLE_KEEPER_BLOCKED_MARKETS: "${entry}" — ignoring`);
+    // #50: fail-fast — an invalid blocked-market address means the blocklist is
+    // misconfigured and a market that should be blocked might not be. Exit
+    // immediately so the operator is forced to fix the address before the
+    // keeper resumes signing transactions.
+    console.error(`[FATAL] Invalid blocked market address in ORACLE_KEEPER_BLOCKED_MARKETS: "${entry}" — fix the address or remove it, then restart.`);
+    process.exit(1);
   }
 }
 
