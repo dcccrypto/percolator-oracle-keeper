@@ -49,6 +49,15 @@ import { parsePositiveNumberEnv, requireProgramIdForSupabaseMode } from "./env-u
 import { checkCircuitBreaker as _checkCircuitBreaker } from "./circuit-breaker.ts";
 import type { CircuitBreakerState } from "./circuit-breaker.ts";
 
+// #31(a): Refuse to start with TLS verification disabled.
+// NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate validation for ALL
+// outbound connections — this allows MITM attacks on Hermes (price injection),
+// RPC, and DexScreener. Fail fast before any connections are made.
+if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
+  console.error("[FATAL] NODE_TLS_REJECT_UNAUTHORIZED=0 is set — this disables TLS certificate verification for all outbound connections and allows price injection via MITM. Remove this variable and restart.");
+  process.exit(1);
+}
+
 const PUSH_INTERVAL_MS    = parsePositiveNumberEnv("PUSH_INTERVAL_MS",    3000);
 const HEALTH_PORT         = parsePositiveNumberEnv("HEALTH_PORT",         18810);
 const MAX_PRICE_MOVE_PCT  = parsePositiveNumberEnv("MAX_PRICE_MOVE_PCT",  10, 100);
@@ -506,9 +515,14 @@ async function fetchPythPrices(symbols: string[]): Promise<void> {
   if (ids.length === 0) return;
 
   try {
+    // #31(b): Request with encoding=base64 so the response includes binary.data
+    // (the Wormhole VAA / guardian-attestation blob). Reject responses where the
+    // binary field is absent or empty — this is a presence check, not a full
+    // guardian-signature verification, but it ensures Hermes is returning real
+    // attested price data rather than a spoofed parsed-only response.
     const params = ids.map(id => `ids[]=${id}`).join("&");
     const resp = await fetch(
-      `${HERMES_URL}/v2/updates/price/latest?${params}&parsed=true`,
+      `${HERMES_URL}/v2/updates/price/latest?${params}&parsed=true&encoding=base64`,
       { signal: AbortSignal.timeout(5000) },
     );
     if (!resp.ok) {
@@ -516,11 +530,21 @@ async function fetchPythPrices(symbols: string[]): Promise<void> {
       return;
     }
     const json = (await resp.json()) as {
+      binary?: { encoding?: string; data?: string[] };
       parsed: Array<{
         id: string;
         price: { price: string; expo: number; publish_time: number };
       }>;
     };
+
+    // Reject the entire batch if the Wormhole VAA blob is absent or empty.
+    // This is a presence check — we do NOT verify guardian signatures here
+    // (that would require the full Wormhole verification stack). The intent is
+    // to ensure Hermes is returning attestation-backed data.
+    if (!json.binary?.data || json.binary.data.length === 0) {
+      log(`⚠️ Pyth Hermes: binary.data absent or empty — rejecting response (no Wormhole VAA present)`);
+      return;
+    }
 
     // Build reverse map: feedId → symbol
     const idToSymbol = new Map<string, string>();
