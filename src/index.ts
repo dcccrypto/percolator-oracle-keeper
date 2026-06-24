@@ -912,7 +912,8 @@ function startHealthServer() {
         const staleSec = s.lastPushAt ? Math.floor((now - s.lastPushAt) / 1000) : -1;
         const isStale = staleSec > STALE_THRESHOLD_S;
         if (isStale) healthy = false;
-        markets[s.symbol] = {
+        markets[slab] = {
+          symbol: s.symbol,
           lastPrice: s.lastPrice,
           lastPushAgo: `${staleSec}s`,
           stale: isStale,
