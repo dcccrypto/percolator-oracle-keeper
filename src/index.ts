@@ -479,8 +479,18 @@ async function fetchDexScreenerPrice(symbol: string): Promise<number | null> {
   } catch { return null; }
 }
 
-/** Fetch price with multi-source failover: Pyth → Jupiter → DexScreener → CA lookup */
+/** Fetch price with multi-source failover: CA lookup for mapped dynamic markets → Pyth → Jupiter → DexScreener */
 async function getPrice(symbol: string, slab?: string): Promise<{ price: number; source: string } | null> {
+  // Dynamic markets with a mainnet_ca mapping should use the CA as the
+  // authoritative asset identity before falling back to symbol-based sources.
+  if (slab) {
+    const ca = slabToMainnetCA.get(slab);
+    if (ca) {
+      const caPrice = await fetchPriceByCA(ca);
+      if (caPrice) return caPrice;
+    }
+  }
+
   // Primary: Pyth (decentralized oracle, fastest for supported tokens)
   const pyth = getPythPrice(symbol);
   if (pyth) return { price: pyth, source: "pyth" };
@@ -492,15 +502,6 @@ async function getPrice(symbol: string, slab?: string): Promise<{ price: number;
   // Tertiary: DexScreener (broad coverage for exotic tokens)
   const dex = await fetchDexScreenerPrice(symbol);
   if (dex) return { price: dex, source: "dexscreener" };
-
-  // Quaternary: Direct CA lookup for dynamic markets (PERC-465)
-  if (slab) {
-    const ca = slabToMainnetCA.get(slab);
-    if (ca) {
-      const caPrice = await fetchPriceByCA(ca);
-      if (caPrice) return caPrice;
-    }
-  }
 
   return null;
 }
