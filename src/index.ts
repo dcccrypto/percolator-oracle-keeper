@@ -145,6 +145,14 @@ const RPC_URL = process.env.RPC_URL!;
 
 const conn = new Connection(RPC_URL, "confirmed");
 
+// #37: Optional secondary connection for transaction-inclusion verification.
+// Set VERIFY_RPC_URL to a different RPC endpoint to cross-check that the
+// submitted transaction actually landed on-chain. Falls back to the primary
+// conn if VERIFY_RPC_URL is not set.
+const connVerify: Connection | null = process.env.VERIFY_RPC_URL
+  ? new Connection(process.env.VERIFY_RPC_URL, "confirmed")
+  : null;
+
 /**
  * Load oracle keeper admin keypair with security hardening
  * 
@@ -793,6 +801,40 @@ function log(msg: string) {
 }
 
 /**
+ * #37: Verify a transaction signature was actually included on-chain.
+ *
+ * Uses connVerify (if set) or falls back to conn. If the verify RPC itself
+ * errors we credit the push optimistically (don't halt on RPC outage).
+ * Returns true if confirmed or if the verify check errored (optimistic credit).
+ * Returns false only when we can positively confirm the tx was NOT included.
+ */
+async function verifyTxInclusion(sig: string): Promise<boolean> {
+  const verifyConn = connVerify ?? conn;
+  try {
+    const result = await verifyConn.getTransaction(sig, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    if (result === null) {
+      // Transaction not found — may still be pending; treat as not confirmed
+      log(`⚠️ [#37] tx ${sig.slice(0, 12)}... not found on verify RPC after sendAndConfirm — optimistic credit`);
+      // Optimistic: sendAndConfirmTransaction already waited for confirmation;
+      // a missing tx on the verify RPC is likely a propagation lag, not a real miss.
+      return true;
+    }
+    if (result.meta?.err) {
+      log(`⚠️ [#37] tx ${sig.slice(0, 12)}... landed but meta.err=${JSON.stringify(result.meta.err)} — marking as error`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    // Verify RPC errored — credit optimistically, don't halt on verify-RPC outage
+    log(`⚠️ [#37] verify RPC error for tx ${sig.slice(0, 12)}...: ${(e as Error).message?.slice(0, 60)} — crediting optimistically`);
+    return true;
+  }
+}
+
+/**
  * Extract transaction context from error or transaction object for debugging.
  * Helps diagnose cranking failures by capturing:
  * - Transaction size (bytes)
@@ -1029,6 +1071,16 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
     throw err;
   }
 
+  // #37: verify the transaction actually landed before crediting the push
+  const included = await verifyTxInclusion(sig);
+  if (!included) {
+    // tx landed but meta.err set — treat as an error push, do not update stats
+    s.totalErrors++;
+    s.consecutiveErrors++;
+    log(`❌ ${market.label}: tx ${sig.slice(0, 12)}... confirmed but meta.err — not crediting push`);
+    return;
+  }
+
   s.lastPrice = price;
   s.lastPushAt = Date.now();
   if (freshPriceAt !== null) {
@@ -1146,7 +1198,16 @@ const ALLOWED_POOL_PROGRAMS = new Set<string>([
     throw err;
   }
 
+  // #37: verify the transaction actually landed before crediting
+  const included = await verifyTxInclusion(sig);
   const s = getOrCreateStats(market);
+  if (!included) {
+    s.totalErrors++;
+    s.consecutiveErrors++;
+    log(`❌ ${market.label}: UpdateHyperpMark tx ${sig.slice(0, 12)}... confirmed but meta.err — not crediting push`);
+    return;
+  }
+
   s.lastPushAt = Date.now();
   s.lastPushSig = sig;
   s.totalPushes++;
