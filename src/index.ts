@@ -39,6 +39,8 @@ import {
   ACCOUNTS_PUSH_AUTH_MARK, ACCOUNTS_PUSH_EWMA_MARK,
   buildAccountMetas, buildIx,
   parseConfig,
+  parseWrapperConfigV17,
+  isV17Account,
   parseAssetOracleProfileV17,
   V17_MARKET_GROUP_OFF, V17_MARKET_GROUP_LEN, V17_MARKET_ASSET_SLOT_LEN,
 } from "@percolatorct/sdk";
@@ -368,6 +370,23 @@ function isAllowedProgramId(owner: PublicKey, slabAddress: string, label: string
     return false;
   }
   return true;
+}
+
+/**
+ * Parse oracle authority from slab data, routing v17 accounts through
+ * parseWrapperConfigV17 (reads .marketauth) and v12 accounts through
+ * parseConfig (reads .oracleAuthority).
+ *
+ * v17 accounts use magic 0x5045524356313600 (PERCV16\0). parseConfig throws
+ * "invalid slab magic" on v17 bytes, permanently blocking authority verification
+ * for any v17 market. isV17Account() detects the magic and routes to the
+ * correct parser instead.
+ */
+function parseOracleAuthorityFromSlab(slabData: Uint8Array): PublicKey {
+  if (isV17Account(slabData)) {
+    return parseWrapperConfigV17(slabData).marketauth;
+  }
+  return parseConfig(slabData).oracleAuthority;
 }
 
 /**
@@ -1045,9 +1064,9 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
         return;
       }
       const slabData = new Uint8Array(slabInfo.data);
-      const cfg = parseConfig(slabData);
-      if (!cfg.oracleAuthority.equals(admin.publicKey)) {
-        log(`🚨 ${market.label}: ORACLE AUTHORITY MISMATCH — slab has ${cfg.oracleAuthority.toBase58()}, keeper is signing as ${admin.publicKey.toBase58()}. Needs reinit. Skipping.`);
+      const slabOracleAuthority = parseOracleAuthorityFromSlab(slabData);
+      if (!slabOracleAuthority.equals(admin.publicKey)) {
+        log(`🚨 ${market.label}: ORACLE AUTHORITY MISMATCH — slab has ${slabOracleAuthority.toBase58()}, keeper is signing as ${admin.publicKey.toBase58()}. Needs reinit. Skipping.`);
         skippedMarkets.add(market.slab);
         return;
       }
@@ -1791,9 +1810,9 @@ async function main() {
         continue;
       }
       const slabData = new Uint8Array(slabInfo.data);
-      const cfg = parseConfig(slabData);
-      if (!cfg.oracleAuthority.equals(admin.publicKey)) {
-        log(`🚨 STARTUP: ${m.label} (${m.slab.slice(0, 12)}...) — authority MISMATCH. Slab: ${cfg.oracleAuthority.toBase58()} | Keeper: ${admin.publicKey.toBase58()} → SLAB NEEDS REINIT`);
+      const slabOracleAuthority = parseOracleAuthorityFromSlab(slabData);
+      if (!slabOracleAuthority.equals(admin.publicKey)) {
+        log(`🚨 STARTUP: ${m.label} (${m.slab.slice(0, 12)}...) — authority MISMATCH. Slab: ${slabOracleAuthority.toBase58()} | Keeper: ${admin.publicKey.toBase58()} → SLAB NEEDS REINIT`);
         skippedMarkets.add(m.slab);
       } else {
         slabProgramId.set(m.slab, slabInfo.owner);
@@ -1902,8 +1921,8 @@ async function main() {
                 continue;
               }
               const slabData = new Uint8Array(slabInfo.data);
-              const cfg = parseConfig(slabData);
-              if (!cfg.oracleAuthority.equals(admin.publicKey)) {
+              const slabOracleAuthority = parseOracleAuthorityFromSlab(slabData);
+              if (!slabOracleAuthority.equals(admin.publicKey)) {
                 log(`🚨 ${m.label}: authority MISMATCH — skipping`);
                 skippedMarkets.add(m.slab);
               } else {
