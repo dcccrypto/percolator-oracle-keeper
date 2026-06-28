@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "description": "Cross-cluster oracle keeper: devnet markets → mainnet pool price sources",
+  "markets": [
+    {
+      "label": "SOL/USDC — Raydium CLMM",
+      "marketAddress": "7VrvSC57aB9gdM8iymEDJtrgjE4RGZMPfkuxCR4sFcrj",
+      "poolAddress": "8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj",
+      "dexType": "raydium-clmm",
+      "assetIndex": 0,
+      "registeredAt": 1751126400000
+    },
+    {
+      "label": "SOL/USDC — Meteora DLMM",
+      "marketAddress": "C2yRmBio4yxF7MK2JiuVdWfNnz9MUJJdpg5Nwpt662Hn",
+      "poolAddress": "FoSDw2L5DmTuQTFe55gWPDXf88euaxAEKFre74CnvQbX",
+      "dexType": "meteora-dlmm",
+      "assetIndex": 0,
+      "registeredAt": 1751126400000
+    }
+  ]
+}
