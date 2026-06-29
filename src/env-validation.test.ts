@@ -14,7 +14,11 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parsePositiveNumberEnv, requireProgramIdForSupabaseMode } from "./env-utils.ts";
+import {
+  parsePositiveLamportsFromSolEnv,
+  parsePositiveNumberEnv,
+  requireProgramIdForSupabaseMode,
+} from "./env-utils.ts";
 
 // ── helpers ──────────────────────────────────────────────────
 
@@ -224,6 +228,119 @@ describe("requireProgramIdForSupabaseMode (issue #29)", () => {
     it("succeeds with any non-empty string (format validation is downstream)", () => {
       assert.doesNotThrow(() =>
         requireProgramIdForSupabaseMode("some-program-id"),
+      );
+    });
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════
+// #71 — MIN_KEEPER_BALANCE_SOL lamport conversion
+// ══════════════════════════════════════════════════════════════
+describe("#71 MIN_KEEPER_BALANCE_SOL lamport conversion", () => {
+  it("uses the 0.05 SOL fallback as 50,000,000 lamports when unset", () => {
+    withEnv("MIN_KEEPER_BALANCE_SOL", undefined, () => {
+      assert.equal(
+        parsePositiveLamportsFromSolEnv("MIN_KEEPER_BALANCE_SOL", 0.05),
+        50_000_000,
+      );
+    });
+  });
+
+  it("converts a normal SOL threshold into lamports", () => {
+    withEnv("MIN_KEEPER_BALANCE_SOL", "0.05", () => {
+      assert.equal(
+        parsePositiveLamportsFromSolEnv("MIN_KEEPER_BALANCE_SOL", 0.05),
+        50_000_000,
+      );
+    });
+  });
+
+  it("accepts the smallest positive whole-lamport SOL value", () => {
+    withEnv("MIN_KEEPER_BALANCE_SOL", "0.000000001", () => {
+      assert.equal(
+        parsePositiveLamportsFromSolEnv("MIN_KEEPER_BALANCE_SOL", 0.05),
+        1,
+      );
+    });
+  });
+
+  it("rejects a positive sub-lamport value that would round to zero", () => {
+    withEnv("MIN_KEEPER_BALANCE_SOL", "0.0000000004", () => {
+      assert.throws(
+        () => parsePositiveLamportsFromSolEnv("MIN_KEEPER_BALANCE_SOL", 0.05),
+        /must convert to at least 1 whole lamport/,
+      );
+    });
+  });
+
+  it("rejects zero values", () => {
+    withEnv("MIN_KEEPER_BALANCE_SOL", "0", () => {
+      assert.throws(
+        () => parsePositiveLamportsFromSolEnv("MIN_KEEPER_BALANCE_SOL", 0.05),
+        /must convert to at least 1 whole lamport/,
+      );
+    });
+  });
+
+  it("rejects negative, NaN, and Infinity values", () => {
+    for (const value of ["-1", "NaN", "Infinity"]) {
+      withEnv("MIN_KEEPER_BALANCE_SOL", value, () => {
+        assert.throws(
+          () => parsePositiveLamportsFromSolEnv("MIN_KEEPER_BALANCE_SOL", 0.05),
+          /finite positive decimal SOL amount/,
+        );
+      });
+    }
+  });
+
+  it("rejects values that convert to unsafe lamport integers", () => {
+    withEnv("MIN_KEEPER_BALANCE_SOL", "100000000000000000", () => {
+      assert.throws(
+        () => parsePositiveLamportsFromSolEnv("MIN_KEEPER_BALANCE_SOL", 0.05),
+        /unsafe lamport amount/,
+      );
+    });
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════
+// #71 — Fractional lamport hardening
+// ══════════════════════════════════════════════════════════════
+describe("#71 MIN_KEEPER_BALANCE_SOL fractional lamport hardening", () => {
+  it("rejects a fractional sub-lamport value that would round up to one lamport", () => {
+    withEnv("MIN_KEEPER_BALANCE_SOL", "0.0000000005", () => {
+      assert.throws(
+        () => parsePositiveLamportsFromSolEnv("MIN_KEEPER_BALANCE_SOL", 0.05),
+        /must convert to at least 1 whole lamport/,
+      );
+    });
+  });
+
+  it("rejects a fractional lamport value above one lamport instead of silently rounding", () => {
+    withEnv("MIN_KEEPER_BALANCE_SOL", "0.0000000014", () => {
+      assert.throws(
+        () => parsePositiveLamportsFromSolEnv("MIN_KEEPER_BALANCE_SOL", 0.05),
+        /fractional lamport amount/,
+      );
+    });
+  });
+
+  it("accepts whole lamport SOL values above one lamport", () => {
+    withEnv("MIN_KEEPER_BALANCE_SOL", "0.000000002", () => {
+      assert.equal(
+        parsePositiveLamportsFromSolEnv("MIN_KEEPER_BALANCE_SOL", 0.05),
+        2,
+      );
+    });
+  });
+
+  it("parses decimal SOL thresholds exactly without floating-point scaling", () => {
+    withEnv("MIN_KEEPER_BALANCE_SOL", "0.000000015", () => {
+      assert.equal(
+        parsePositiveLamportsFromSolEnv("MIN_KEEPER_BALANCE_SOL", 0.05),
+        15,
       );
     });
   });
