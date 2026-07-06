@@ -32,6 +32,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { loadRegistry } from "./cross-cluster/registry.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
+import { startRecoveryCrankLoop } from "./cross-cluster/recovery-cranker.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -77,6 +78,14 @@ const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "7000", 10);
 const CC_HEALTH_PORT = parseInt(process.env.CC_HEALTH_PORT ?? "3001", 10);
 const CC_HEALTH_BIND = process.env.CC_HEALTH_BIND ?? "0.0.0.0";
 
+// Recovery/maintenance crank loop — independent cadence from the oracle push.
+// See cross-cluster/recovery-cranker.ts for why this exists (keeps
+// asset.slot_last from drifting far enough behind the live slot to trip
+// EngineLockActive on risk-increasing trades). Defaults to on; set
+// CRANK_ENABLED=false to disable (e.g. for a read-only / dry-run deploy).
+const CRANK_ENABLED = process.env.CRANK_ENABLED !== "false";
+const CRANK_INTERVAL_MS = parseInt(process.env.CRANK_INTERVAL_MS ?? "20000", 10);
+
 const REGISTRY_PATH =
   process.env.REGISTRY_PATH ??
   path.resolve(__dirname, "..", "registry.json");
@@ -106,12 +115,29 @@ console.log(`  keeper:    ${keeper.publicKey.toBase58()}`);
 console.log(`  registry:  ${REGISTRY_PATH} (${registry.markets.length} markets)`);
 console.log(`  mode:      ${DRY_RUN ? "DRY-RUN (no on-chain writes)" : "LIVE"}`);
 console.log(`  interval:  ${CC_INTERVAL_MS}ms`);
+console.log(
+  `  cranker:   ${CRANK_ENABLED ? `every ${CRANK_INTERVAL_MS}ms` : "disabled (CRANK_ENABLED=false)"}`,
+);
 for (const m of registry.markets) {
   console.log(
     `  market:    ${m.label} | slab=${m.marketAddress.slice(0, 8)}… → pool=${m.poolAddress.slice(0, 8)}… (${m.dexType})`,
   );
 }
 console.log();
+
+// Recovery crank loop runs concurrently on its own interval — deliberately
+// NOT awaited, and deliberately never allowed to throw out of this scope, so
+// it can never delay or take down the oracle push loop below.
+if (CRANK_ENABLED) {
+  void startRecoveryCrankLoop(devnetConn, keeper, registry, {
+    intervalMs: CRANK_INTERVAL_MS,
+    dryRun: DRY_RUN,
+  }).catch((err) => {
+    console.error(
+      `[cranker] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  });
+}
 
 await startKeeperLoop(mainnetConn, devnetConn, keeper, registry, {
   intervalMs: CC_INTERVAL_MS,
