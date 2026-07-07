@@ -88,8 +88,15 @@ interface CrankMarketState {
   /** Cached LP-vault portfolio bound to this market (discovered via getProgramAccounts). */
   lpPortfolio: PublicKey | null;
   lastDiscoveryAttemptAt: number;
+  /** Cranks that PREFLIGHTED CLEAN and were submitted (real progress). */
   totalCranks: number;
+  /** Send/RPC failures (not on-chain reverts). */
   totalErrors: number;
+  /** On-chain reverts caught by preflight (EngineStale/EngineLockActive/etc). */
+  totalReverts: number;
+  /** Consecutive reverts since the last clean crank — the drift early-warning signal. */
+  consecutiveReverts: number;
+  lastRevertCode: number | null;
   lastCrankAt: number | null;
   lastSig: string | null;
   lastErrorMsg: string | null;
@@ -97,6 +104,50 @@ interface CrankMarketState {
 
 /** How often to retry LP-portfolio discovery for a market that doesn't have one yet. */
 const DISCOVERY_RETRY_MS = 5 * 60_000;
+
+/** Consecutive reverts on one market before we escalate to a loud ALERT log. */
+const REVERT_ALERT_THRESHOLD = 3;
+
+/** Log a full per-market health summary every N cycles so the loop is never silently "healthy". */
+const HEALTH_SUMMARY_EVERY_CYCLES = 30;
+
+/** Parse a Solana "custom program error: 0xNN" (or {"Custom":NN}) code out of an error/sim result. */
+function parseCustomErrorCode(errLike: unknown): number | null {
+  const text =
+    typeof errLike === "string"
+      ? errLike
+      : errLike instanceof Error
+        ? errLike.message
+        : JSON.stringify(errLike ?? "");
+  const hex = text.match(/custom program error: (0x[0-9a-fA-F]+)/);
+  if (hex) return parseInt(hex[1], 16);
+  const dec = text.match(/"Custom":\s*(\d+)/);
+  return dec ? parseInt(dec[1], 10) : null;
+}
+
+/**
+ * Run an RPC call with bounded exponential backoff on transient failures
+ * (429 rate-limit, fetch/network/5xx). Prevents a rate-limit blip from throwing
+ * an UNHANDLED rejection that crashes the whole keeper process — that was the
+ * 2026-07-06 crash (`keeper-new.log`: an un-retried 429 in a fire-and-forget
+ * send bubbled to Node's unhandledRejection and exited the process).
+ */
+async function withRpcRetry<T>(label: string, fn: () => Promise<T>, maxAttempts = 4): Promise<T> {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fn();
+    } catch (err) {
+      attempt++;
+      const msg = err instanceof Error ? err.message : String(err);
+      const transient = /429|rate.?limit|fetch failed|ETIMEDOUT|ECONNRESET|socket hang up|50[234]/i.test(msg);
+      if (!transient || attempt >= maxAttempts) throw err;
+      const backoff = Math.min(4_000, 250 * 2 ** (attempt - 1));
+      console.warn(`[cranker] ${label}: transient RPC error (attempt ${attempt}/${maxAttempts}) — ${msg.slice(0, 80)}; retry in ${backoff}ms`);
+      await new Promise((r) => setTimeout(r, backoff));
+    }
+  }
+}
 
 function readMatcherEnabled(data: Buffer): boolean {
   if (data.length < PORTFOLIO_MATCHER_CONFIG_LEN) return false;
@@ -184,7 +235,7 @@ async function crankOneMarket(
   }
 
   try {
-    const bh = await devnetConn.getLatestBlockhash("processed");
+    const bh = await withRpcRetry(label, () => devnetConn.getLatestBlockhash("processed"));
     const tx = new Transaction();
     tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT }));
     tx.add(ix);
@@ -192,17 +243,53 @@ async function crankOneMarket(
     tx.feePayer = keeper.publicKey;
     tx.sign(keeper);
 
-    // Fire-and-forget: same style as pushAuthMarkBatch — skip preflight, don't
-    // await confirmation. This is a maintenance crank, not a user-facing action;
-    // one dropped tx just means we try again next cycle.
-    const signature = await devnetConn.sendRawTransaction(tx.serialize(), {
-      skipPreflight: true,
-      maxRetries: 2,
-    });
+    // PREFLIGHT FIRST so a reverting crank is VISIBLE instead of being silently
+    // counted as a success. This is the 2026-07-06 root cause: the old path sent
+    // with skipPreflight:true fire-and-forget, so every EngineStale(19) /
+    // EngineLockActive(21) revert was counted as `totalCranks++` and the loop
+    // reported "healthy" while the markets drifted to an UNRECOVERABLE deep-stale
+    // state. A crank that would revert must NOT be sent — and must be alerted on.
+    // Legacy Transaction overload: it's already signed by the keeper with a fresh
+    // blockhash, so a plain simulate reflects exactly what a real send would do.
+    const sim = await withRpcRetry(label, () => devnetConn.simulateTransaction(tx));
+    if (sim.value.err) {
+      const code =
+        parseCustomErrorCode(sim.value.err) ?? parseCustomErrorCode(sim.value.logs?.join("\n"));
+      state.totalReverts++;
+      state.consecutiveReverts++;
+      state.lastRevertCode = code;
+      state.lastErrorMsg = `revert ${code != null ? `Custom(${code})` : JSON.stringify(sim.value.err)}`;
+      // 19=EngineStale, 21=EngineLockActive = the deep-stale signature. A fresh /
+      // lightly-stale market cranks CLEAN (only a rotting one reverts every cycle),
+      // so escalate loudly once it persists — that early warning is exactly what
+      // was missing when these 4 markets drifted past the point of recovery.
+      if (state.consecutiveReverts === 1 || state.consecutiveReverts % REVERT_ALERT_THRESHOLD === 0) {
+        const tag = state.consecutiveReverts >= REVERT_ALERT_THRESHOLD ? "[cranker][ALERT]" : "[cranker][REVERT]";
+        console.warn(
+          `${tag} ${label}: crank ${state.lastErrorMsg} (${state.consecutiveReverts}× consecutive). ` +
+            `Engine accrual is drifting toward an unrecoverable deep-stale state — investigate / re-seed if this persists.`,
+        );
+      }
+      return;
+    }
+
+    // Clean preflight → submit (skipPreflight because we just simulated). Still
+    // fire-and-forget on confirmation, like the push loop — a dropped tx just
+    // retries next cycle, but we now KNOW it would have executed.
+    const signature = await withRpcRetry(label, () =>
+      devnetConn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 }),
+    );
     state.totalCranks++;
     state.lastCrankAt = Date.now();
     state.lastSig = signature;
     state.lastErrorMsg = null;
+    if (state.consecutiveReverts > 0) {
+      console.log(
+        `[cranker] ${label}: RECOVERED — crank landed clean after ${state.consecutiveReverts} revert(s). sig=${signature.slice(0, 12)}…`,
+      );
+    }
+    state.consecutiveReverts = 0;
+    state.lastRevertCode = null;
   } catch (err) {
     state.totalErrors++;
     state.lastErrorMsg = err instanceof Error ? err.message : String(err);
@@ -234,6 +321,9 @@ export async function startRecoveryCrankLoop(
         lastDiscoveryAttemptAt: 0,
         totalCranks: 0,
         totalErrors: 0,
+        totalReverts: 0,
+        consecutiveReverts: 0,
+        lastRevertCode: null,
         lastCrankAt: null,
         lastSig: null,
         lastErrorMsg: null,
@@ -250,10 +340,31 @@ export async function startRecoveryCrankLoop(
   process.on("SIGINT", () => { stopping = true; });
   process.on("SIGTERM", () => { stopping = true; });
 
+  let cycleCount = 0;
   while (!stopping) {
     const cycleStart = Date.now();
     for (const m of registry.markets) {
-      const state = states.get(m.marketAddress)!;
+      // Lazily track markets registered AFTER boot (added live by the register-poll
+      // loop). The states Map was seeded only from the markets present at startup, so
+      // without this a newly-created market would hit `undefined` here and its crank
+      // would throw every cycle — it would never un-stale and stay untradeable.
+      let state = states.get(m.marketAddress);
+      if (!state) {
+        state = {
+          lpPortfolio: null,
+          lastDiscoveryAttemptAt: 0,
+          totalCranks: 0,
+          totalErrors: 0,
+          totalReverts: 0,
+          consecutiveReverts: 0,
+          lastRevertCode: null,
+          lastCrankAt: null,
+          lastSig: null,
+          lastErrorMsg: null,
+        };
+        states.set(m.marketAddress, state);
+        console.log(`[cranker] now tracking newly-registered market ${m.label} (${m.marketAddress.slice(0, 8)}…)`);
+      }
       try {
         await crankOneMarket(devnetConn, keeper, m.marketAddress, m.label, state, config.dryRun);
       } catch (err) {
@@ -261,6 +372,17 @@ export async function startRecoveryCrankLoop(
         // but never let an unexpected throw kill the whole loop.
         console.error(`[cranker] ${m.label}: unexpected error — ${err instanceof Error ? err.message : String(err)}`);
       }
+    }
+    cycleCount++;
+    if (cycleCount % HEALTH_SUMMARY_EVERY_CYCLES === 0) {
+      const summary = registry.markets
+        .map((m) => {
+          const st = states.get(m.marketAddress)!;
+          const flag = st.consecutiveReverts >= REVERT_ALERT_THRESHOLD ? "⚠STUCK" : st.consecutiveReverts > 0 ? "~drift" : "ok";
+          return `${m.label}=${flag}(ok:${st.totalCranks} rev:${st.totalReverts}${st.consecutiveReverts ? ` cons:${st.consecutiveReverts}` : ""}${st.lastRevertCode != null ? ` last:${st.lastRevertCode}` : ""})`;
+        })
+        .join("  ");
+      console.log(`[cranker][health] cycle ${cycleCount}: ${summary}`);
     }
     const elapsed = Date.now() - cycleStart;
     const remaining = config.intervalMs - elapsed;

@@ -36,6 +36,18 @@ export interface MarketEntry {
   assetIndex: number;
   /** Unix timestamp (ms) when this entry was registered. */
   registeredAt?: number;
+  /**
+   * Optional display symbol (e.g. "SOL/USDC"). Present on the pre-seeded entries in
+   * registry.json and on entries added by the playground registration-poll loop
+   * (register-poll.ts). Not read by the push/crank loops — display/logging only.
+   */
+  symbol?: string;
+  /**
+   * Optional collateral label or mint address, for display/logging only — not read
+   * by the push/crank loops. Pre-seeded entries use a short label ("SimUSDC");
+   * playground-registered entries carry the actual devnet collateral mint.
+   */
+  collateral?: string;
 }
 
 export interface Registry {

@@ -33,8 +33,26 @@ import { fileURLToPath } from "url";
 import { loadRegistry } from "./cross-cluster/registry.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { startRecoveryCrankLoop } from "./cross-cluster/recovery-cranker.ts";
+import { startRegisterPollLoop } from "./cross-cluster/register-poll.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ── Resilience guard (2026-07-06) ─────────────────────────────────────────────
+// A keeper is a long-running service; a transient RPC fault (e.g. a 429 rate
+// limit) must NEVER exit the process. The outage that bricked 4 markets began
+// with an un-retried 429 bubbling to an unhandledRejection that killed the
+// process — taking the recovery cranker down with it and letting engine accrual
+// drift past the point of recovery. Log loudly and stay up; individual RPC calls
+// are retried with backoff, and this is the last line of defense so a fault in
+// any loop can't take the whole keeper down.
+process.on("unhandledRejection", (reason) => {
+  console.error(
+    `[keeper][unhandledRejection] ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`,
+  );
+});
+process.on("uncaughtException", (err) => {
+  console.error(`[keeper][uncaughtException] ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+});
 
 // ── RPC endpoints ─────────────────────────────────────────────────────────────
 const MAINNET_RPC = process.env.MAINNET_RPC_URL;
@@ -85,6 +103,14 @@ const CC_HEALTH_BIND = process.env.CC_HEALTH_BIND ?? "0.0.0.0";
 // CRANK_ENABLED=false to disable (e.g. for a read-only / dry-run deploy).
 const CRANK_ENABLED = process.env.CRANK_ENABLED !== "false";
 const CRANK_INTERVAL_MS = parseInt(process.env.CRANK_INTERVAL_MS ?? "20000", 10);
+
+// Registration-poll loop — outbound poll of the Vercel-hosted playground registered-
+// markets blob, so markets created through the create-market wizard after this keeper
+// booted get added live. See cross-cluster/register-poll.ts for why this exists (the
+// keeper is NAT'd/outbound-only; the frontend can never reach it directly). Off unless
+// REGISTER_SOURCE_URL is set — nothing to poll without a source.
+const REGISTER_SOURCE_URL = process.env.REGISTER_SOURCE_URL;
+const REGISTER_POLL_INTERVAL_MS = parseInt(process.env.REGISTER_POLL_INTERVAL_MS ?? "30000", 10);
 
 const REGISTRY_PATH =
   process.env.REGISTRY_PATH ??
@@ -137,6 +163,25 @@ if (CRANK_ENABLED) {
       `[cranker] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
     );
   });
+}
+
+// Registration-poll loop — same "runs concurrently, never awaited, never allowed to
+// throw out of this scope" pattern as the recovery cranker above. Mutates `registry`
+// in place (addMarket + saveRegistry), and it's the SAME registry object passed to
+// startKeeperLoop/startRecoveryCrankLoop below, so a market added here is picked up
+// by both of those loops on their very next cycle.
+if (REGISTER_SOURCE_URL) {
+  void startRegisterPollLoop(registry, {
+    sourceUrl: REGISTER_SOURCE_URL,
+    registryPath: REGISTRY_PATH,
+    intervalMs: REGISTER_POLL_INTERVAL_MS,
+  }).catch((err) => {
+    console.error(
+      `[register-poll] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  });
+} else {
+  console.log("[register-poll] disabled (REGISTER_SOURCE_URL unset)");
 }
 
 await startKeeperLoop(mainnetConn, devnetConn, keeper, registry, {
