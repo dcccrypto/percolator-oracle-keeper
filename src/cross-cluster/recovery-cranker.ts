@@ -62,7 +62,7 @@ import {
   buildAccountMetas,
   PROGRAM_IDS_V17,
 } from "@percolatorct/sdk";
-import type { Registry } from "./registry.ts";
+import type { MarketEntry, Registry } from "./registry.ts";
 
 const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
 const COMPUTE_UNIT_LIMIT = 250_000;
@@ -85,8 +85,15 @@ export interface CrankLoopConfig {
 }
 
 interface CrankMarketState {
-  /** Cached LP-vault portfolio bound to this market (discovered via getProgramAccounts). */
+  /** Cached LP-vault portfolio bound to this market (from registry.json's seed, or discovered via getProgramAccounts). */
   lpPortfolio: PublicKey | null;
+  /**
+   * D5: once true, the registry's seeded `lpPortfolio` has been tried and
+   * rejected on-chain (e.g. AccountNotFound) — permanently fall through to
+   * real getProgramAccounts discovery for this market instead of retrying
+   * the same known-bad seeded address forever.
+   */
+  seedRejected: boolean;
   lastDiscoveryAttemptAt: number;
   /** Cranks that PREFLIGHTED CLEAN and were submitted (real progress). */
   totalCranks: number;
@@ -102,8 +109,33 @@ interface CrankMarketState {
   lastErrorMsg: string | null;
 }
 
-/** How often to retry LP-portfolio discovery for a market that doesn't have one yet. */
-const DISCOVERY_RETRY_MS = 5 * 60_000;
+function freshCrankMarketState(): CrankMarketState {
+  return {
+    lpPortfolio: null,
+    seedRejected: false,
+    lastDiscoveryAttemptAt: 0,
+    totalCranks: 0,
+    totalErrors: 0,
+    totalReverts: 0,
+    consecutiveReverts: 0,
+    lastRevertCode: null,
+    lastCrankAt: null,
+    lastSig: null,
+    lastErrorMsg: null,
+  };
+}
+
+/**
+ * How often to retry LP-portfolio discovery for a market with no seeded
+ * `lpPortfolio` (registered live via register-poll, or a seeded market whose
+ * seed was rejected — see `seedRejected` above).
+ *
+ * D5: was 5 * 60_000 (5 min) — LONGER than the ~190s engine accrue-staleness
+ * cliff, so a single transient discovery miss right after boot was enough to
+ * leave a market un-cranked long enough to die (root cause of the
+ * SOL/JUP/TRUMP deaths). 20s keeps every retry well inside the cliff.
+ */
+const DISCOVERY_RETRY_MS = 20_000;
 
 /** Consecutive reverts on one market before we escalate to a loud ALERT log. */
 const REVERT_ALERT_THRESHOLD = 3;
@@ -202,12 +234,28 @@ function buildCrankIx(owner: PublicKey, market: PublicKey, portfolio: PublicKey)
 async function crankOneMarket(
   devnetConn: Connection,
   keeper: Keypair,
-  marketAddress: string,
-  label: string,
+  entry: Pick<MarketEntry, "marketAddress" | "label" | "lpPortfolio">,
   state: CrankMarketState,
   dryRun: boolean,
 ): Promise<void> {
+  const marketAddress = entry.marketAddress;
+  const label = entry.label;
   const market = new PublicKey(marketAddress);
+
+  // ── D5: seeded fast path — use registry.json's known lpPortfolio directly,
+  // no getProgramAccounts discovery at all. This is what makes crank-on-boot
+  // (crankAllOnce, below) deterministic and fast for every seeded market.
+  if (!state.lpPortfolio && entry.lpPortfolio && !state.seedRejected) {
+    try {
+      state.lpPortfolio = new PublicKey(entry.lpPortfolio);
+      console.log(`[cranker] ${label}: using seeded LP portfolio ${state.lpPortfolio.toBase58()} (registry.json — no discovery needed)`);
+    } catch {
+      // Malformed registry data, not a runtime account problem — don't retry
+      // parsing garbage every cycle, fall through to real discovery once.
+      state.seedRejected = true;
+      console.warn(`[cranker] ${label}: registry lpPortfolio "${entry.lpPortfolio}" is not a valid pubkey — falling back to discovery`);
+    }
+  }
 
   if (!state.lpPortfolio) {
     const now = Date.now();
@@ -296,9 +344,80 @@ async function crankOneMarket(
     console.warn(`[cranker] ${label}: crank send failed — ${state.lastErrorMsg.slice(0, 160)}`);
     // A stale-account error (e.g. LP portfolio closed) is worth rediscovering next attempt.
     if (/AccountNotFound|could not find account/i.test(state.lastErrorMsg)) {
+      if (entry.lpPortfolio && state.lpPortfolio?.toBase58() === entry.lpPortfolio && !state.seedRejected) {
+        // The registry's SEEDED lpPortfolio doesn't exist on-chain — permanently
+        // stop retrying it and fall through to real discovery next cycle instead
+        // of spinning on the same known-bad address forever.
+        state.seedRejected = true;
+        console.warn(`[cranker][ALERT] ${label}: seeded LP portfolio ${entry.lpPortfolio} not found on-chain — falling back to discovery`);
+      }
       state.lpPortfolio = null;
     }
   }
+}
+
+/**
+ * D1: Deterministic crank-on-boot. Cranks every SEEDED market (one with a
+ * known `lpPortfolio` in registry.json) exactly once, using ONLY that seeded
+ * address — no getProgramAccounts discovery calls — so this resolves in a
+ * small, bounded number of RPC round-trips regardless of registry size.
+ *
+ * Call this AWAITED, before starting any of the recurring background loops.
+ * It guarantees every seeded market gets a real crank attempt within a few
+ * RPC calls of process boot, closing the exact gap that killed
+ * SOL/JUP/TRUMP: previously the very first crank for a market came from the
+ * recurring loop's own (fire-and-forget, un-awaited) first cycle, so a slow
+ * boot or one bad discovery round-trip in that first cycle could leave a
+ * market un-cranked with no guarantee of a fast retry.
+ *
+ * Markets with no seeded `lpPortfolio` (only ones registered live via
+ * register-poll, whose payload has no lpPortfolio field) are skipped here —
+ * they're picked up by startRecoveryCrankLoop's discovery fallback on its
+ * normal cadence.
+ */
+export async function crankAllOnce(
+  devnetConn: Connection,
+  keeper: Keypair,
+  registry: Registry,
+  dryRun: boolean,
+): Promise<void> {
+  const seeded = registry.markets.filter((m) => !!m.lpPortfolio);
+  if (seeded.length === 0) {
+    console.log("[cranker][boot] no seeded (lpPortfolio-known) markets in registry.json — skipping crank-on-boot");
+    return;
+  }
+  console.log(`[cranker][boot] cranking ${seeded.length} seeded market(s) once before starting the recurring loops…`);
+
+  const results = await Promise.allSettled(
+    seeded.map(async (m) => {
+      const state = freshCrankMarketState();
+      await crankOneMarket(devnetConn, keeper, m, state, dryRun);
+      return { market: m, state };
+    }),
+  );
+
+  let ok = 0;
+  let notClean = 0;
+  for (const r of results) {
+    if (r.status === "fulfilled") {
+      const { market, state } = r.value;
+      if (dryRun || state.lastSig) {
+        ok++;
+      } else {
+        notClean++;
+        if (state.lastErrorMsg) {
+          console.warn(`[cranker][boot] ${market.label}: not clean this attempt — ${state.lastErrorMsg}`);
+        }
+      }
+    } else {
+      notClean++;
+      console.error(`[cranker][boot] unexpected crank-on-boot failure: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`);
+    }
+  }
+  console.log(
+    `[cranker][boot] crank-on-boot complete: ${ok} clean, ${notClean} not-clean` +
+      `${notClean > 0 ? " (will keep retrying on the recurring crank loop)" : ""}.`,
+  );
 }
 
 /**
@@ -314,21 +433,7 @@ export async function startRecoveryCrankLoop(
   config: CrankLoopConfig,
 ): Promise<void> {
   const states = new Map<string, CrankMarketState>(
-    registry.markets.map((m) => [
-      m.marketAddress,
-      {
-        lpPortfolio: null,
-        lastDiscoveryAttemptAt: 0,
-        totalCranks: 0,
-        totalErrors: 0,
-        totalReverts: 0,
-        consecutiveReverts: 0,
-        lastRevertCode: null,
-        lastCrankAt: null,
-        lastSig: null,
-        lastErrorMsg: null,
-      } satisfies CrankMarketState,
-    ]),
+    registry.markets.map((m) => [m.marketAddress, freshCrankMarketState()]),
   );
 
   console.log(
@@ -343,36 +448,34 @@ export async function startRecoveryCrankLoop(
   let cycleCount = 0;
   while (!stopping) {
     const cycleStart = Date.now();
-    for (const m of registry.markets) {
-      // Lazily track markets registered AFTER boot (added live by the register-poll
-      // loop). The states Map was seeded only from the markets present at startup, so
-      // without this a newly-created market would hit `undefined` here and its crank
-      // would throw every cycle — it would never un-stale and stay untradeable.
-      let state = states.get(m.marketAddress);
-      if (!state) {
-        state = {
-          lpPortfolio: null,
-          lastDiscoveryAttemptAt: 0,
-          totalCranks: 0,
-          totalErrors: 0,
-          totalReverts: 0,
-          consecutiveReverts: 0,
-          lastRevertCode: null,
-          lastCrankAt: null,
-          lastSig: null,
-          lastErrorMsg: null,
-        };
-        states.set(m.marketAddress, state);
-        console.log(`[cranker] now tracking newly-registered market ${m.label} (${m.marketAddress.slice(0, 8)}…)`);
-      }
-      try {
-        await crankOneMarket(devnetConn, keeper, m.marketAddress, m.label, state, config.dryRun);
-      } catch (err) {
-        // Defense in depth: crankOneMarket already isolates errors per-market,
-        // but never let an unexpected throw kill the whole loop.
-        console.error(`[cranker] ${m.label}: unexpected error — ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+    // G8: crank every market in the cycle CONCURRENTLY instead of sequentially
+    // (was a `for...await` loop — N markets meant N sequential RPC round-trips
+    // per cycle, so cycle wall-time grew linearly with registry size). Each
+    // market's errors are already fully isolated inside crankOneMarket / the
+    // per-iteration try/catch below, so Promise.allSettled here is defense in
+    // depth, not a correctness requirement — it just keeps cycle time flat.
+    await Promise.allSettled(
+      registry.markets.map(async (m) => {
+        // Lazily track markets registered AFTER boot (added live by the register-poll
+        // loop, or hot-reloaded — see registry-reload.ts). The states Map was seeded
+        // only from the markets present at startup, so without this a newly-registered
+        // market would hit `undefined` here and its crank would throw every cycle — it
+        // would never un-stale and stay untradeable.
+        let state = states.get(m.marketAddress);
+        if (!state) {
+          state = freshCrankMarketState();
+          states.set(m.marketAddress, state);
+          console.log(`[cranker] now tracking newly-registered market ${m.label} (${m.marketAddress.slice(0, 8)}…)`);
+        }
+        try {
+          await crankOneMarket(devnetConn, keeper, m, state, config.dryRun);
+        } catch (err) {
+          // Defense in depth: crankOneMarket already isolates errors per-market,
+          // but never let an unexpected throw kill the whole loop.
+          console.error(`[cranker] ${m.label}: unexpected error — ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }),
+    );
     cycleCount++;
     if (cycleCount % HEALTH_SUMMARY_EVERY_CYCLES === 0) {
       const summary = registry.markets

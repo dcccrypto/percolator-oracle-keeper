@@ -34,6 +34,12 @@ export interface LoopConfig {
   healthBind: string;
   /** If true, build instructions and log them but do not send. */
   dryRun: boolean;
+  /**
+   * D2a: max milliseconds to wait for a single runCycle() before giving up
+   * on it and starting the next cycle anyway. Defaults to 10_000 if unset.
+   * See the `Promise.race` in the main loop below for why this exists.
+   */
+  cycleTimeoutMs?: number;
 }
 
 interface MarketStat {
@@ -56,6 +62,8 @@ interface LoopState {
   startedAt: number;
   lastCycleAt: number | null;
   cycleCount: number;
+  /** D2a: cycles that hit the cycleTimeoutMs watchdog (runCycle never resolved in time). */
+  timeoutCount: number;
   stats: Map<string, MarketStat>;
 }
 
@@ -92,6 +100,7 @@ function makeHealthHandler(state: LoopState, config: LoopConfig) {
       status: "ok",
       uptimeSec,
       cycleCount: state.cycleCount,
+      timeoutCount: state.timeoutCount,
       lastCycleAgo:
         state.lastCycleAt !== null
           ? `${Math.floor((Date.now() - state.lastCycleAt) / 1000)}s`
@@ -233,6 +242,32 @@ async function runCycle(
   }
 }
 
+// ── D2a: hang detection ───────────────────────────────────────────────────────
+
+const DEFAULT_CYCLE_TIMEOUT_MS = 10_000;
+
+/** Sentinel error thrown when a cycle is abandoned by the watchdog timeout. */
+class CycleTimeoutError extends Error {}
+
+/**
+ * Rejects after `ms` with a CycleTimeoutError. Racing this against runCycle()
+ * means a black-holed RPC socket (a request that never resolves and never
+ * rejects — the failure mode `withRpcRetry`/try-catch can't help with,
+ * because there's no error to catch) can no longer stall the main loop
+ * forever. This is best-effort: web3.js's Connection methods don't accept an
+ * AbortSignal, so the abandoned runCycle() call isn't actually cancelled —
+ * it keeps running in the background and its result (or error) is discarded
+ * when it eventually settles. What this DOES guarantee is that the loop's
+ * `lastCycleAt` keeps advancing and a new cycle gets a chance to run, so the
+ * keeper can't go fully silent because of one wedged RPC call. Full
+ * cancellation + an external process-level watchdog are D2b/D3 (deferred).
+ */
+function timeoutAfter(ms: number): Promise<never> {
+  return new Promise((_, reject) => {
+    setTimeout(() => reject(new CycleTimeoutError(`runCycle exceeded ${ms}ms`)), ms);
+  });
+}
+
 // ── Public entrypoint ─────────────────────────────────────────────────────────
 
 /**
@@ -248,11 +283,14 @@ export async function startKeeperLoop(
   registry: Registry,
   config: LoopConfig,
 ): Promise<void> {
+  const cycleTimeoutMs = config.cycleTimeoutMs ?? DEFAULT_CYCLE_TIMEOUT_MS;
+
   // Initialise per-market stats
   const state: LoopState = {
     startedAt: Date.now(),
     lastCycleAt: null,
     cycleCount: 0,
+    timeoutCount: 0,
     stats: new Map(
       registry.markets.map((m) => [
         m.marketAddress,
@@ -310,19 +348,26 @@ export async function startKeeperLoop(
     );
 
     try {
-      await runCycle(
-        mainnetConn,
-        devnetConn,
-        keeper,
-        registry,
-        decimalsCache,
-        state,
-        config,
-      );
+      // D2a: race the cycle against a timeout so a black-holed RPC call can't
+      // stall the loop silently forever — see timeoutAfter()'s doc comment
+      // for exactly what this does and does not guarantee.
+      await Promise.race([
+        runCycle(mainnetConn, devnetConn, keeper, registry, decimalsCache, state, config),
+        timeoutAfter(cycleTimeoutMs),
+      ]);
     } catch (err) {
-      console.error(
-        `[keeper] Unexpected cycle error: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      if (err instanceof CycleTimeoutError) {
+        state.timeoutCount++;
+        console.error(
+          `[keeper][ALERT] Cycle ${state.cycleCount} TIMED OUT after ${cycleTimeoutMs}ms — moving on to the` +
+            ` next cycle so the loop doesn't stall. (timeoutCount=${state.timeoutCount}; the abandoned` +
+            ` in-flight call may still complete in the background and will be discarded.)`,
+        );
+      } else {
+        console.error(
+          `[keeper] Unexpected cycle error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
 
     state.lastCycleAt = Date.now();

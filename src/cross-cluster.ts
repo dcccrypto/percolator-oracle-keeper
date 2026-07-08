@@ -21,7 +21,13 @@
  *   CC_INTERVAL_MS        push cycle interval ms  (default: 7000)
  *   CC_HEALTH_PORT        health server port      (default: 3001)
  *   CC_HEALTH_BIND        health server bind addr (default: 0.0.0.0)
+ *   CC_CYCLE_TIMEOUT_MS   D2a per-cycle hang-detection timeout (default: 10000)
  *   DRY_RUN               "true" for dry-run (no on-chain writes, default: false)
+ *   CRANK_ENABLED          "false" disables the recovery crank loop + crank-on-boot (default: true)
+ *   CRANK_INTERVAL_MS       recovery crank cycle interval ms (default: 20000)
+ *   REGISTER_SOURCE_URL     GET endpoint polled for wizard-registered markets (unset = disabled)
+ *   REGISTER_POLL_INTERVAL_MS  register-poll interval ms (default: 30000)
+ *   REGISTRY_RELOAD_INTERVAL_MS  G6 registry.json hot-reload interval ms (default: 15000)
  *
  * CLI flags:
  *   --dry-run             same as DRY_RUN=true
@@ -32,8 +38,9 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { loadRegistry } from "./cross-cluster/registry.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
-import { startRecoveryCrankLoop } from "./cross-cluster/recovery-cranker.ts";
+import { crankAllOnce, startRecoveryCrankLoop } from "./cross-cluster/recovery-cranker.ts";
 import { startRegisterPollLoop } from "./cross-cluster/register-poll.ts";
+import { startRegistryReloadLoop } from "./cross-cluster/registry-reload.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -95,6 +102,8 @@ const DRY_RUN =
 const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "7000", 10);
 const CC_HEALTH_PORT = parseInt(process.env.CC_HEALTH_PORT ?? "3001", 10);
 const CC_HEALTH_BIND = process.env.CC_HEALTH_BIND ?? "0.0.0.0";
+// D2a — see cross-cluster/keeper-loop.ts's hang-detection doc comment.
+const CC_CYCLE_TIMEOUT_MS = parseInt(process.env.CC_CYCLE_TIMEOUT_MS ?? "10000", 10);
 
 // Recovery/maintenance crank loop — independent cadence from the oracle push.
 // See cross-cluster/recovery-cranker.ts for why this exists (keeps
@@ -115,6 +124,10 @@ const REGISTER_POLL_INTERVAL_MS = parseInt(process.env.REGISTER_POLL_INTERVAL_MS
 const REGISTRY_PATH =
   process.env.REGISTRY_PATH ??
   path.resolve(__dirname, "..", "registry.json");
+
+// G6 — registry.json hot-reload, so a re-seed is picked up live without a
+// restart. See cross-cluster/registry-reload.ts for the full rationale.
+const REGISTRY_RELOAD_INTERVAL_MS = parseInt(process.env.REGISTRY_RELOAD_INTERVAL_MS ?? "15000", 10);
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
 const keeper = loadKeypair();
@@ -146,10 +159,35 @@ console.log(
 );
 for (const m of registry.markets) {
   console.log(
-    `  market:    ${m.label} | slab=${m.marketAddress.slice(0, 8)}… → pool=${m.poolAddress.slice(0, 8)}… (${m.dexType})`,
+    `  market:    ${m.label} | slab=${m.marketAddress.slice(0, 8)}… → pool=${m.poolAddress.slice(0, 8)}… (${m.dexType})${m.lpPortfolio ? ` | lp=${m.lpPortfolio.slice(0, 8)}…` : ""}`,
   );
 }
 console.log();
+
+// G9 — register-poll is what picks up markets created through the create-market
+// wizard AFTER this keeper booted. Silently running without it in live mode means
+// those markets never get priced/cranked and quietly die on arrival — loud enough
+// to be seen in logs/alerts, but not fatal (some deploys are intentionally
+// registry.json-only).
+if (!REGISTER_SOURCE_URL && !DRY_RUN) {
+  console.warn(
+    "[warn] REGISTER_SOURCE_URL is unset in LIVE mode — markets created through the" +
+      " create-market wizard after this keeper booted will NEVER be picked up" +
+      " (register-poll is disabled). Set REGISTER_SOURCE_URL (see .env.example) unless" +
+      " this registry.json-only deploy is intentional.",
+  );
+}
+
+// D1 — deterministic crank-on-boot. AWAITED (unlike every loop below, which is
+// deliberately fire-and-forget) so process boot does not complete — and the
+// recurring loops below do not start — until every seeded market has had a real
+// crank attempt. Uses ONLY registry.json's known lpPortfolio (no discovery), so
+// this resolves in a small, bounded number of RPC calls regardless of registry
+// size. See cross-cluster/recovery-cranker.ts's crankAllOnce() doc comment for
+// exactly why this closes the SOL/JUP/TRUMP boot-gap.
+if (CRANK_ENABLED) {
+  await crankAllOnce(devnetConn, keeper, registry, DRY_RUN);
+}
 
 // Recovery crank loop runs concurrently on its own interval — deliberately
 // NOT awaited, and deliberately never allowed to throw out of this scope, so
@@ -184,9 +222,24 @@ if (REGISTER_SOURCE_URL) {
   console.log("[register-poll] disabled (REGISTER_SOURCE_URL unset)");
 }
 
+// G6 — registry.json hot-reload. Same fire-and-forget pattern as the other
+// background loops. Critical ahead of the upcoming re-seed: without this, a
+// new registry.json on disk is invisible to a running keeper until restart —
+// and a restart right after a re-seed reintroduces exactly the kind of
+// boot-time gap D5/D1 exist to close.
+void startRegistryReloadLoop(registry, {
+  registryPath: REGISTRY_PATH,
+  intervalMs: REGISTRY_RELOAD_INTERVAL_MS,
+}).catch((err) => {
+  console.error(
+    `[registry-reload] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
+  );
+});
+
 await startKeeperLoop(mainnetConn, devnetConn, keeper, registry, {
   intervalMs: CC_INTERVAL_MS,
   healthPort: CC_HEALTH_PORT,
   healthBind: CC_HEALTH_BIND,
   dryRun: DRY_RUN,
+  cycleTimeoutMs: CC_CYCLE_TIMEOUT_MS,
 });

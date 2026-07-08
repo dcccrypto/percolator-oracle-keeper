@@ -48,6 +48,23 @@ export interface MarketEntry {
    * playground-registered entries carry the actual devnet collateral mint.
    */
   collateral?: string;
+  /**
+   * Optional pre-known LP-vault ("matcher-enabled") portfolio address for this
+   * market, seeded directly in registry.json for markets created via
+   * newmarkets.ts / launch-test-market.ts. When present, the recovery cranker
+   * (recovery-cranker.ts) uses it immediately and SKIPS the
+   * getProgramAccounts discovery scan entirely for this market.
+   *
+   * This closes the D5 boot-gap that caused the 2026-07 SOL/JUP/TRUMP market
+   * deaths: the old discovery-only path retried a failed lookup only every
+   * DISCOVERY_RETRY_MS (previously 5 minutes) — longer than the ~190s engine
+   * accrue-staleness cliff — so a single transient discovery miss right after
+   * boot was enough to leave a market un-cranked long enough to drift into a
+   * permanent EngineStale(19)/EngineLockActive(21) state. Markets registered
+   * live via the register-poll loop have no lpPortfolio in their payload, so
+   * they still fall back to discovery — just retried much faster now.
+   */
+  lpPortfolio?: string;
 }
 
 export interface Registry {
