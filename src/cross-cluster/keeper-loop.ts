@@ -20,8 +20,8 @@ import http from "http";
 import { Connection, Keypair } from "@solana/web3.js";
 import type { Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
-import { readPoolPriceE6 } from "./price-reader.ts";
-import { pushAuthMark } from "./auth-mark-pusher.ts";
+import { readAllPoolPricesE6 } from "./price-reader.ts";
+import { pushAuthMarkBatch, fetchOracleAuthority } from "./auth-mark-pusher.ts";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -107,6 +107,21 @@ function makeHealthHandler(state: LoopState, config: LoopConfig) {
 
 // ── Single cycle ──────────────────────────────────────────────────────────────
 
+// One-time oracle-authority check cache (keeper == oracle_authority?). A
+// batched tx is atomic, so we only ever include known-pushable markets.
+const authorityChecked = new Set<string>();
+const notPushable = new Set<string>();
+// Blockhash cache — a fresh one is valid ~60-90s; refetch every 15s so each
+// cycle doesn't pay a getLatestBlockhash round-trip.
+let cachedBlockhash: { blockhash: string; lastValidBlockHeight: number } | null = null;
+let cachedBlockhashAt = 0;
+
+/**
+ * FAST cycle: ONE getMultipleAccounts to read every mainnet DEX pool, ONE
+ * batched PushAuthMark tx for all pushable markets, fired WITHOUT awaiting
+ * confirmation. ~3 RPC calls per cycle (was ~25), so the on-chain AuthMark can
+ * refresh near per-slot. Price source is unchanged — the mainnet DEX pools.
+ */
 async function runCycle(
   mainnetConn: Connection,
   devnetConn: Connection,
@@ -116,12 +131,8 @@ async function runCycle(
   state: LoopState,
   config: LoopConfig,
 ): Promise<void> {
-  // Pool price cache for this cycle: avoid duplicate mainnet fetches when
-  // multiple markets share the same pool.
-  const poolPriceCache = new Map<string, bigint>();
-
+  // Ensure stat entries exist.
   for (const entry of registry.markets) {
-    // Ensure stat entry exists (handles hot-reload of registry if supported later)
     if (!state.stats.has(entry.marketAddress)) {
       state.stats.set(entry.marketAddress, {
         label: entry.label,
@@ -137,79 +148,87 @@ async function runCycle(
         authorityMismatch: false,
       });
     }
-    const stat = state.stats.get(entry.marketAddress)!;
+  }
 
-    // ── 1. Read pool price ─────────────────────────────────────────────────
-    let priceE6: bigint;
-    if (poolPriceCache.has(entry.poolAddress)) {
-      priceE6 = poolPriceCache.get(entry.poolAddress)!;
-    } else {
-      try {
-        const result = await readPoolPriceE6(mainnetConn, entry, decimalsCache);
-        if (result.skipped) {
-          console.log(
-            `[loop] ${entry.label}: pool skip — ${result.skipReason}`,
-          );
-          stat.totalErrors++;
-          stat.lastErrorMsg = result.skipReason ?? "pool skipped";
-          continue;
+  // ── 1. One-time oracle-authority check (only pushable markets go in a batch) ─
+  const unchecked = registry.markets.filter((m) => !authorityChecked.has(m.marketAddress));
+  if (unchecked.length > 0) {
+    await Promise.all(
+      unchecked.map(async (m) => {
+        const auth = await fetchOracleAuthority(devnetConn, m.marketAddress, m.assetIndex);
+        authorityChecked.add(m.marketAddress);
+        const ok = auth !== null && auth.equals(keeper.publicKey);
+        if (!ok) {
+          notPushable.add(m.marketAddress);
+          const s = state.stats.get(m.marketAddress)!;
+          s.authorityMismatch = true;
+          s.lastErrorMsg = "oracle_authority != keeper — market not pushable";
+          console.warn(`[loop] ${m.label}: not pushable (oracle_authority != keeper)`);
         }
-        priceE6 = result.priceE6;
-        poolPriceCache.set(entry.poolAddress, priceE6);
-        console.log(
-          `[loop] ${entry.label}: ${result.source}` +
-            ` priceE6=${priceE6} ($${(Number(priceE6) / 1e6).toFixed(4)})`,
-        );
-      } catch (err) {
-        const msg = (err instanceof Error ? err.message : String(err)).slice(
-          0,
-          140,
-        );
-        console.error(`[loop] ${entry.label}: pool read error — ${msg}`);
-        stat.totalErrors++;
-        stat.lastErrorMsg = msg;
-        continue;
+      }),
+    );
+  }
+
+  // ── 2. Read ALL pool prices in ONE getMultipleAccounts (DEX-pool source) ────
+  let prices: Map<string, bigint>;
+  try {
+    prices = await readAllPoolPricesE6(mainnetConn, registry.markets, decimalsCache);
+  } catch (err) {
+    const msg = (err instanceof Error ? err.message : String(err)).slice(0, 160);
+    console.error(`[loop] batch pool read error — ${msg}`);
+    return;
+  }
+
+  // ── 3. Build the pushable set for this cycle ────────────────────────────────
+  const pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }> = [];
+  for (const entry of registry.markets) {
+    if (notPushable.has(entry.marketAddress)) continue;
+    const priceE6 = prices.get(entry.poolAddress);
+    const stat = state.stats.get(entry.marketAddress)!;
+    if (priceE6 === undefined || priceE6 <= 0n) {
+      stat.totalErrors++;
+      stat.lastErrorMsg = "no pool price this cycle";
+      continue;
+    }
+    stat.lastPriceE6 = priceE6;
+    pushes.push({ marketAddress: entry.marketAddress, assetIndex: entry.assetIndex, priceE6 });
+  }
+  if (pushes.length === 0) return;
+
+  // ── 4. One slot + one (cached) blockhash for the whole batch ────────────────
+  const nowSlot = BigInt(await devnetConn.getSlot("processed"));
+  const now = Date.now();
+  if (!cachedBlockhash || now - cachedBlockhashAt > 15_000) {
+    cachedBlockhash = await devnetConn.getLatestBlockhash("processed");
+    cachedBlockhashAt = now;
+  }
+
+  // ── 5. One batched PushAuthMark tx, fire-and-forget ─────────────────────────
+  try {
+    const res = await pushAuthMarkBatch(devnetConn, keeper, pushes, nowSlot, cachedBlockhash, config.dryRun);
+    const stamp = Date.now();
+    for (const p of pushes) {
+      const stat = state.stats.get(p.marketAddress)!;
+      stat.authorityMismatch = false;
+      if (config.dryRun) {
+        stat.lastSig = "DRY_RUN";
+      } else if (res.pushed && res.signature) {
+        stat.totalPushes++;
+        stat.lastPushAt = stamp;
+        stat.lastSig = res.signature;
       }
     }
-
-    // ── 2. Push to devnet market ───────────────────────────────────────────
-    try {
-      const result = await pushAuthMark(
-        devnetConn,
-        keeper,
-        entry.marketAddress,
-        entry.assetIndex,
-        priceE6,
-        config.dryRun,
-      );
-
-      if (result.authorityMismatch) {
-        stat.authorityMismatch = true;
-        stat.lastErrorMsg = "oracle_authority != keeper — market not pushable";
-        continue;
-      }
-
-      stat.lastPriceE6 = priceE6;
-      stat.authorityMismatch = false;
-      stat.totalPushes++;
-      stat.lastPushAt = Date.now();
-
-      if (result.pushed && result.signature) {
-        stat.lastSig = result.signature;
-        console.log(
-          `[loop] ${entry.label}: sig=${result.signature.slice(0, 16)}…`,
-        );
-      } else if (result.dryRun) {
-        stat.lastSig = "DRY_RUN";
-      }
-    } catch (err) {
-      const msg = (err instanceof Error ? err.message : String(err)).slice(
-        0,
-        140,
-      );
-      console.error(`[loop] ${entry.label}: push error — ${msg}`);
-      stat.totalErrors++;
-      stat.lastErrorMsg = msg;
+    if (res.pushed && res.signature) {
+      console.log(`[loop] batched push × ${res.count}: sig=${res.signature.slice(0, 16)}…`);
+    }
+  } catch (err) {
+    const msg = (err instanceof Error ? err.message : String(err)).slice(0, 160);
+    console.error(`[loop] batch push error — ${msg}`);
+    if (/blockhash/i.test(msg)) cachedBlockhash = null; // force refresh next cycle
+    for (const p of pushes) {
+      const s = state.stats.get(p.marketAddress)!;
+      s.totalErrors++;
+      s.lastErrorMsg = msg;
     }
   }
 }

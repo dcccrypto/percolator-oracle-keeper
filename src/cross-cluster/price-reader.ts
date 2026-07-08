@@ -271,3 +271,55 @@ export async function readPoolPriceE6(
     skipReason: `unsupported dexType: ${String(entry.dexType)}`,
   };
 }
+
+/**
+ * FAST PATH: read ALL pool prices in a SINGLE getMultipleAccounts RPC call and
+ * compute each spot price locally. Same DEX-pool source as readPoolPriceE6 (no
+ * Pyth) — just collapses N sequential getAccountInfo calls into one, so the
+ * keeper can push far faster without hammering the RPC. Meteora mint-decimals
+ * are fetched once and cached (same as the single-read path); after the first
+ * cycle everything comes from the one batched read.
+ *
+ * Returns a map of poolAddress → priceE6 (only pools that produced a valid price).
+ */
+export async function readAllPoolPricesE6(
+  mainnetConn: Connection,
+  entries: Array<Pick<MarketEntry, "poolAddress" | "dexType" | "label">>,
+  decimalsCache: DecimalsCache,
+): Promise<Map<string, bigint>> {
+  const out = new Map<string, bigint>();
+  if (entries.length === 0) return out;
+  const pubkeys = entries.map((e) => new PublicKey(e.poolAddress));
+  const infos = await withRpcBackoff(() =>
+    mainnetConn.getMultipleAccountsInfo(pubkeys, "confirmed"),
+  );
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const info = infos[i];
+    if (!info || info.data.length === 0) continue;
+    if (detectDexType(info.owner) !== entry.dexType) continue;
+    const data = new Uint8Array(info.data);
+    try {
+      let priceE6 = 0n;
+      if (entry.dexType === "raydium-clmm") {
+        priceE6 = computeDexSpotPriceE6("raydium-clmm", data);
+      } else if (entry.dexType === "meteora-dlmm") {
+        if (!decimalsCache.has(entry.poolAddress)) {
+          const parsed = parseDexPool("meteora-dlmm", pubkeys[i], data);
+          const [base, quote] = await Promise.all([
+            withRpcBackoff(() => fetchMintDecimals(mainnetConn, parsed.baseMint)),
+            withRpcBackoff(() => fetchMintDecimals(mainnetConn, parsed.quoteMint)),
+          ]);
+          decimalsCache.set(entry.poolAddress, { base, quote });
+        }
+        priceE6 = computeDexSpotPriceE6("meteora-dlmm", data, undefined, decimalsCache.get(entry.poolAddress)!);
+      } else if (entry.dexType === "pumpswap") {
+        priceE6 = computeDexSpotPriceE6("pumpswap", data);
+      }
+      if (priceE6 > 0n) out.set(entry.poolAddress, priceE6);
+    } catch {
+      /* skip this pool for this cycle; next cycle retries */
+    }
+  }
+  return out;
+}

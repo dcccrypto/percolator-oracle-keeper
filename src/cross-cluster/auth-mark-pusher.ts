@@ -14,16 +14,32 @@
  *   Zero SOL consumed.
  *
  * Live mode:
- *   simulate=true first (fast fail for wrong authority / bad state),
- *   then simulate=false to confirm.
+ *   Simulate first via connection.simulateTransaction (fast fail for wrong authority
+ *   or bad state), then send via connection.sendTransaction + confirmTransaction.
+ *
+ * NOTE on module-identity fix:
+ *   The SDK (@percolatorct/sdk) has its own nested node_modules/@solana/web3.js.
+ *   Using the SDK's simulateOrSend / buildIx causes the Transaction object it
+ *   creates (SDK's Transaction class) to fail the `instanceof Transaction` check
+ *   inside connection.simulateTransaction (which uses the keeper's Transaction
+ *   class). This gives "Cannot read properties of undefined (reading
+ *   'numRequiredSignatures')". Fix: import Transaction / TransactionInstruction /
+ *   ComputeBudgetProgram directly from "@solana/web3.js" here — they resolve to
+ *   the keeper's own node_modules copy — and build/sign/send without going
+ *   through the SDK's simulateOrSend.
  */
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  Transaction,
+  TransactionInstruction,
+  ComputeBudgetProgram,
+} from "@solana/web3.js";
 import {
   encodePushAuthMark,
   ACCOUNTS_PUSH_AUTH_MARK,
   buildAccountMetas,
-  buildIx,
-  simulateOrSend,
   parseAssetOracleProfileV17,
   V17_MARKET_GROUP_OFF,
   V17_MARKET_GROUP_LEN,
@@ -32,6 +48,8 @@ import {
 } from "@percolatorct/sdk";
 
 const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
+
+const COMPUTE_UNIT_LIMIT = 200_000;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -88,6 +106,34 @@ export async function fetchOracleAuthority(
 // ── Push instruction ──────────────────────────────────────────────────────────
 
 /**
+ * Build a TransactionInstruction for PushAuthMark using the keeper's own
+ * @solana/web3.js TransactionInstruction (not the SDK's copy).
+ *
+ * The instruction encoding and account spec come from the SDK (pure data),
+ * but the TransactionInstruction class is from the keeper's web3.js so it
+ * is identity-compatible with keeper-owned Transaction objects.
+ */
+function buildPushAuthMarkIx(
+  oracleAuthority: PublicKey,
+  market: PublicKey,
+  assetIndex: number,
+  nowSlot: bigint,
+  priceE6: bigint,
+): TransactionInstruction {
+  const accountMetas = buildAccountMetas(ACCOUNTS_PUSH_AUTH_MARK, {
+    oracleAuthority,
+    market,
+  });
+  const data = encodePushAuthMark({ assetIndex, nowSlot, markE6: priceE6 });
+  return new TransactionInstruction({
+    programId: WRAPPER_PROGRAM_ID,
+    keys: accountMetas,
+    // TransactionInstruction accepts Buffer | Uint8Array at runtime.
+    data: data as unknown as Buffer,
+  });
+}
+
+/**
  * Push (or dry-run) a PushAuthMark instruction to a devnet market.
  *
  * The authority check is always performed — even in dry-run mode — because
@@ -133,15 +179,15 @@ export async function pushAuthMark(
     return { pushed: false, authorityMismatch: true, priceE6, nowSlot };
   }
 
-  // ── 3. Build instruction ─────────────────────────────────────────────────
-  const ix = buildIx({
-    programId: WRAPPER_PROGRAM_ID,
-    keys: buildAccountMetas(ACCOUNTS_PUSH_AUTH_MARK, {
-      oracleAuthority: keeper.publicKey,
-      market: new PublicKey(marketAddress),
-    }),
-    data: encodePushAuthMark({ assetIndex, nowSlot, markE6: priceE6 }),
-  });
+  // ── 3. Build instruction (using keeper's web3.js TransactionInstruction) ─
+  const marketPk = new PublicKey(marketAddress);
+  const ix = buildPushAuthMarkIx(
+    keeper.publicKey,
+    marketPk,
+    assetIndex,
+    nowSlot,
+    priceE6,
+  );
 
   // ── 4. Dry-run: log and return ───────────────────────────────────────────
   if (dryRun) {
@@ -154,35 +200,109 @@ export async function pushAuthMark(
     return { pushed: false, dryRun: true, priceE6, nowSlot };
   }
 
-  // ── 5. Live: simulate then send ──────────────────────────────────────────
-  const simResult = await simulateOrSend({
-    connection: devnetConn,
-    ix,
-    signers: [keeper],
-    simulate: true,
-    computeUnitLimit: 200_000,
+  // ── 5. Simulate first (fast-fail for wrong authority / bad state) ────────
+  const bh = await devnetConn.getLatestBlockhash("confirmed");
+
+  {
+    const simTx = new Transaction();
+    simTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT }));
+    simTx.add(ix);
+    simTx.recentBlockhash = bh.blockhash;
+    simTx.feePayer = keeper.publicKey;
+    simTx.sign(keeper);
+
+    // Pass the already-signed Transaction without re-supplying signers so the
+    // web3.js instanceof Transaction check succeeds (same module scope).
+    const simResult = await devnetConn.simulateTransaction(simTx);
+    if (simResult.value.err) {
+      const lastLogs = (simResult.value.logs ?? []).slice(-5).join(" | ");
+      throw new Error(
+        `PushAuthMark sim failed [${marketAddress.slice(0, 8)}…]:` +
+          ` ${JSON.stringify(simResult.value.err)} | logs: ${lastLogs}`,
+      );
+    }
+  }
+
+  // ── 6. Send ───────────────────────────────────────────────────────────────
+  const sendTx = new Transaction();
+  sendTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT }));
+  sendTx.add(ix);
+  sendTx.recentBlockhash = bh.blockhash;
+  sendTx.feePayer = keeper.publicKey;
+  sendTx.sign(keeper);
+
+  const signature = await devnetConn.sendRawTransaction(sendTx.serialize(), {
+    skipPreflight: false,
+    preflightCommitment: "confirmed",
   });
-  if (simResult.err) {
-    const lastLogs = (simResult.logs ?? []).slice(-5).join(" | ");
-    throw new Error(
-      `PushAuthMark sim failed [${marketAddress.slice(0, 8)}…]:` +
-        ` ${String(simResult.err)} | logs: ${lastLogs}`,
+
+  await devnetConn.confirmTransaction(
+    {
+      signature,
+      blockhash: bh.blockhash,
+      lastValidBlockHeight: bh.lastValidBlockHeight,
+    },
+    "confirmed",
+  );
+
+  return { pushed: true, signature, priceE6, nowSlot };
+}
+
+/**
+ * FAST PATH: push PushAuthMark for MANY markets in ONE devnet transaction, and
+ * do NOT wait for confirmation. One slot + one blockhash + one send per cycle
+ * (vs a simulate/send/confirm per market) — this is what lets the on-chain mark
+ * update near per-slot. The mark lands within a slot regardless of when we'd
+ * confirm, so awaiting confirmation only adds latency.
+ *
+ * A batched tx is ATOMIC: every market in `pushes` must be pushable
+ * (keeper == oracle_authority), so callers pass only markets that passed the
+ * one-time authority check — a single bad market can't fail the whole batch.
+ */
+export async function pushAuthMarkBatch(
+  devnetConn: Connection,
+  keeper: Keypair,
+  pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>,
+  nowSlot: bigint,
+  blockhash: { blockhash: string; lastValidBlockHeight: number },
+  dryRun: boolean,
+): Promise<{ pushed: boolean; signature?: string; count: number }> {
+  if (pushes.length === 0) return { pushed: false, count: 0 };
+
+  const tx = new Transaction();
+  tx.add(
+    ComputeBudgetProgram.setComputeUnitLimit({
+      units: Math.min(COMPUTE_UNIT_LIMIT * pushes.length, 1_200_000),
+    }),
+  );
+  for (const p of pushes) {
+    tx.add(
+      buildPushAuthMarkIx(
+        keeper.publicKey,
+        new PublicKey(p.marketAddress),
+        p.assetIndex,
+        nowSlot,
+        p.priceE6,
+      ),
     );
   }
 
-  const sendResult = await simulateOrSend({
-    connection: devnetConn,
-    ix,
-    signers: [keeper],
-    simulate: false,
-    commitment: "confirmed",
-    computeUnitLimit: 200_000,
-  });
-  if (sendResult.err) {
-    throw new Error(
-      `PushAuthMark send failed [${marketAddress.slice(0, 8)}…]: ${String(sendResult.err)}`,
+  if (dryRun) {
+    console.log(
+      `[DRY-RUN] batched PushAuthMark × ${pushes.length} @ slot ${nowSlot} ` +
+        `(${pushes.map((p) => `$${(Number(p.priceE6) / 1e6).toFixed(4)}`).join(", ")})`,
     );
+    return { pushed: false, count: pushes.length };
   }
 
-  return { pushed: true, signature: sendResult.signature!, priceE6, nowSlot };
+  tx.recentBlockhash = blockhash.blockhash;
+  tx.feePayer = keeper.publicKey;
+  tx.sign(keeper);
+
+  // Fire-and-forget: skip preflight sim, and do NOT await confirmation.
+  const signature = await devnetConn.sendRawTransaction(tx.serialize(), {
+    skipPreflight: true,
+    maxRetries: 2,
+  });
+  return { pushed: true, signature, count: pushes.length };
 }
