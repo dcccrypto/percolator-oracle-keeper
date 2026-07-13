@@ -259,16 +259,21 @@ export async function pushAuthMark(
  * (keeper == oracle_authority), so callers pass only markets that passed the
  * one-time authority check — a single bad market can't fail the whole batch.
  */
-export async function pushAuthMarkBatch(
-  devnetConn: Connection,
+/** Solana hard limit on a serialized transaction. */
+const MAX_TX_BYTES = 1232;
+/** Safety margin under MAX_TX_BYTES (signature/blockhash jitter). */
+const TX_SIZE_MARGIN = 32;
+
+/**
+ * Build one PushAuthMark tx for a slice of markets and return it with its
+ * serialized size, so the caller can size-check BEFORE sending.
+ */
+function buildPushTx(
   keeper: Keypair,
   pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>,
   nowSlot: bigint,
   blockhash: { blockhash: string; lastValidBlockHeight: number },
-  dryRun: boolean,
-): Promise<{ pushed: boolean; signature?: string; count: number }> {
-  if (pushes.length === 0) return { pushed: false, count: 0 };
-
+): { tx: Transaction; size: number } {
   const tx = new Transaction();
   tx.add(
     ComputeBudgetProgram.setComputeUnitLimit({
@@ -286,23 +291,116 @@ export async function pushAuthMarkBatch(
       ),
     );
   }
+  tx.recentBlockhash = blockhash.blockhash;
+  tx.feePayer = keeper.publicKey;
+  // web3.js's serialize() THROWS ("Transaction too large: N > 1232") instead of
+  // returning an oversized length, so a naive `.length` size probe crashes the
+  // very loop that is supposed to split the batch. Treat a throw as "does not
+  // fit" (Infinity) and let the caller close the chunk.
+  let size: number;
+  try {
+    size = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).length;
+  } catch {
+    size = Number.POSITIVE_INFINITY;
+  }
+  return { tx, size };
+}
+
+/**
+ * Split `pushes` into chunks that each serialize under the 1232-byte tx limit.
+ *
+ * OUTAGE 2026-07-13: this used to build ONE transaction containing EVERY
+ * registered market. At 18 markets it fit (1230B); the 19th and 20th
+ * registration pushed it to 1270B — over Solana's hard 1232-byte limit — so
+ * `sendRawTransaction` threw "Transaction too large: 1270 > 1232" on EVERY
+ * cycle. Because the batch was all-or-nothing, a single oversized batch froze
+ * the AuthMark for ALL markets simultaneously (every market's mark stuck at
+ * the same slot), and since the failure happened before submission, it left
+ * no on-chain trace at all. The keeper had no chunking and no size check, so
+ * it could never recover on its own — and it would break again at whatever
+ * market count the next registration crossed.
+ *
+ * Chunking on MEASURED serialized size (not a hard-coded market count) means
+ * the batch is now correct for any registry size, and for markets whose
+ * account lists differ in size.
+ */
+function chunkPushes(
+  keeper: Keypair,
+  pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>,
+  nowSlot: bigint,
+  blockhash: { blockhash: string; lastValidBlockHeight: number },
+): Array<Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>> {
+  const chunks: Array<Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>> = [];
+  let current: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }> = [];
+
+  for (const p of pushes) {
+    const candidate = [...current, p];
+    const { size } = buildPushTx(keeper, candidate, nowSlot, blockhash);
+    if (size <= MAX_TX_BYTES - TX_SIZE_MARGIN) {
+      current = candidate;
+      continue;
+    }
+    // Adding this market overflows the tx — close the current chunk.
+    if (current.length > 0) {
+      chunks.push(current);
+      current = [p];
+    } else {
+      // A single market that somehow doesn't fit on its own: push it alone and
+      // let the send surface the real error rather than silently dropping it.
+      chunks.push([p]);
+      current = [];
+    }
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+export async function pushAuthMarkBatch(
+  devnetConn: Connection,
+  keeper: Keypair,
+  pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>,
+  nowSlot: bigint,
+  blockhash: { blockhash: string; lastValidBlockHeight: number },
+  dryRun: boolean,
+): Promise<{ pushed: boolean; signature?: string; count: number }> {
+  if (pushes.length === 0) return { pushed: false, count: 0 };
+
+  const chunks = chunkPushes(keeper, pushes, nowSlot, blockhash);
 
   if (dryRun) {
     console.log(
-      `[DRY-RUN] batched PushAuthMark × ${pushes.length} @ slot ${nowSlot} ` +
+      `[DRY-RUN] PushAuthMark × ${pushes.length} in ${chunks.length} tx(s) @ slot ${nowSlot} ` +
         `(${pushes.map((p) => `$${(Number(p.priceE6) / 1e6).toFixed(4)}`).join(", ")})`,
     );
     return { pushed: false, count: pushes.length };
   }
 
-  tx.recentBlockhash = blockhash.blockhash;
-  tx.feePayer = keeper.publicKey;
-  tx.sign(keeper);
+  let firstSig: string | undefined;
+  let pushedCount = 0;
+  const errors: string[] = [];
 
-  // Fire-and-forget: skip preflight sim, and do NOT await confirmation.
-  const signature = await devnetConn.sendRawTransaction(tx.serialize(), {
-    skipPreflight: true,
-    maxRetries: 2,
-  });
-  return { pushed: true, signature, count: pushes.length };
+  for (const chunk of chunks) {
+    const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
+    tx.sign(keeper);
+    try {
+      // Fire-and-forget: skip preflight sim, and do NOT await confirmation.
+      const signature = await devnetConn.sendRawTransaction(tx.serialize(), {
+        skipPreflight: true,
+        maxRetries: 2,
+      });
+      firstSig ??= signature;
+      pushedCount += chunk.length;
+    } catch (err) {
+      // One oversized/failing chunk must NOT block the others — the old
+      // all-or-nothing batch is exactly what froze every market at once.
+      const msg = err instanceof Error ? err.message : String(err);
+      errors.push(`${chunk.length} market(s): ${msg.slice(0, 120)}`);
+    }
+  }
+
+  if (errors.length > 0) {
+    console.error(`[push] ${errors.length}/${chunks.length} chunk(s) failed — ${errors.join(" | ")}`);
+  }
+
+  return { pushed: pushedCount > 0, signature: firstSig, count: pushedCount };
 }

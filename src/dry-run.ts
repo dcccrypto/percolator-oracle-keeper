@@ -22,6 +22,7 @@ import { fileURLToPath } from "url";
 import { loadRegistry } from "./cross-cluster/registry.ts";
 import {
   readPoolPriceE6,
+  isSolUsdEntry,
   type DecimalsCache,
 } from "./cross-cluster/price-reader.ts";
 import type { DexType } from "./cross-cluster/registry.ts";
@@ -65,6 +66,11 @@ console.log(`Mainnet RPC : ${rpcDisplay}`);
 console.log(`Registry    : ${REGISTRY_PATH} (${registry.markets.length} markets)`);
 console.log();
 
+// SOL/USD reference price for the run — resolved from the first successful
+// SOL/USDC read (canonical or registry) and reused for every PumpSwap entry
+// after it, since PumpSwap pools quote in WSOL and need this to reach USD.
+let solPriceE6: bigint | undefined;
+
 // ── 1. Canonical pool verification ──────────────────────────────────────────
 console.log("── Canonical pool prices (always verified) ────────────────────────────");
 for (const pool of CANONICAL_POOLS) {
@@ -80,12 +86,18 @@ for (const pool of CANONICAL_POOLS) {
     } else {
       const usd = (Number(result.priceE6) / 1e6).toFixed(4);
       console.log(`OK  priceE6=${result.priceE6}  ($${usd})`);
+      if (solPriceE6 === undefined && isSolUsdEntry({ dexType: pool.dexType, label: pool.label, symbol: undefined })) {
+        solPriceE6 = result.priceE6;
+      }
     }
   } catch (e) {
     console.log(
       `ERROR: ${e instanceof Error ? e.message.slice(0, 100) : String(e)}`,
     );
   }
+}
+if (solPriceE6 !== undefined) {
+  console.log(`  [info] SOL/USD reference for this run: $${(Number(solPriceE6) / 1e6).toFixed(4)}`);
 }
 
 // ── 2. Registered market prices ──────────────────────────────────────────────
@@ -94,7 +106,7 @@ if (registry.markets.length > 0) {
   for (const entry of registry.markets) {
     process.stdout.write(`  ${entry.label} (${entry.dexType}) ... `);
     try {
-      const result = await readPoolPriceE6(mainnetConn, entry, decimalsCache);
+      const result = await readPoolPriceE6(mainnetConn, entry, decimalsCache, solPriceE6);
       if (result.skipped) {
         console.log(`SKIP: ${result.skipReason}`);
       } else {
@@ -106,6 +118,10 @@ if (registry.markets.length > 0) {
             ` assetIndex=${entry.assetIndex}` +
             ` priceE6=${result.priceE6} ($${usd})`,
         );
+        if (solPriceE6 === undefined && isSolUsdEntry(entry)) {
+          solPriceE6 = result.priceE6;
+          console.log(`    [info] SOL/USD reference now resolved: $${usd} (from this entry)`);
+        }
       }
     } catch (e) {
       console.log(
