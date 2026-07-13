@@ -164,8 +164,22 @@ async function runCycle(
   if (unchecked.length > 0) {
     await Promise.all(
       unchecked.map(async (m) => {
-        const auth = await fetchOracleAuthority(devnetConn, m.marketAddress, m.assetIndex);
+        let auth;
+        try {
+          auth = await fetchOracleAuthority(devnetConn, m.marketAddress, m.assetIndex);
+        } catch (err) {
+          // COULD NOT READ (RPC blip) — do NOT mark checked, do NOT blacklist.
+          // Leaving it unchecked means we retry on the next cycle. Previously a
+          // transient null here latched the market into `notPushable` FOREVER
+          // (the set is module-level and never cleared), so a single rate-limit
+          // burst at boot could take markets offline permanently while /health
+          // still reported "ok".
+          const s = state.stats.get(m.marketAddress)!;
+          s.lastErrorMsg = `authority check failed (will retry): ${(err instanceof Error ? err.message : String(err)).slice(0, 80)}`;
+          return;
+        }
         authorityChecked.add(m.marketAddress);
+        // Only a SUCCESSFULLY READ, genuinely different authority is permanent.
         const ok = auth !== null && auth.equals(keeper.publicKey);
         if (!ok) {
           notPushable.add(m.marketAddress);

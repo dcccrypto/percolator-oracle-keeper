@@ -27,6 +27,7 @@
  *   - Other errors: propagated to the caller (per-market isolation in the loop)
  */
 import { Connection, PublicKey } from "@solana/web3.js";
+import type { AccountInfo } from "@solana/web3.js";
 import {
   detectDexType,
   parseDexPool,
@@ -371,6 +372,38 @@ export async function readPoolPriceE6(
  *
  * Returns a map of poolAddress → priceE6 (only pools that produced a valid price).
  */
+
+/**
+ * Solana's `getMultipleAccounts` RPC hard-caps at 100 keys, and web3.js v1 does
+ * NOT chunk internally — it issues exactly one RPC call. Any call whose key
+ * array grows with the registry is therefore a dated cliff.
+ *
+ * This bit us once already (the 2026-07-13 outage was the same shape in the tx
+ * builder: an unbounded batch crossing a hard limit, failing before submission,
+ * invisible on-chain). Here the failure would have been WORSE than that one:
+ * the PumpSwap pass sends up to 4 keys per pool on a cold process (2 vaults +
+ * 2 mints until decimals are cached), so at 26 PumpSwap markets the FIRST cycle
+ * after every boot sends 104 keys, the RPC rejects it, readAllPoolPricesE6
+ * throws, keeper-loop returns the whole cycle — and because the decimals cache
+ * is only written after a SUCCESSFUL fetch, it never populates, so every
+ * subsequent cycle sends 104 keys again. That is a total, all-markets price
+ * freeze that a restart cannot clear. (Registry today: 15 PumpSwap markets.)
+ */
+const MAX_ACCOUNTS_PER_RPC = 100;
+
+async function getMultipleAccountsChunked(
+  conn: Connection,
+  keys: PublicKey[],
+): Promise<Array<AccountInfo<Buffer> | null>> {
+  const out: Array<AccountInfo<Buffer> | null> = [];
+  for (let i = 0; i < keys.length; i += MAX_ACCOUNTS_PER_RPC) {
+    const chunk = keys.slice(i, i + MAX_ACCOUNTS_PER_RPC);
+    const infos = await withRpcBackoff(() => conn.getMultipleAccountsInfo(chunk, "confirmed"));
+    out.push(...infos);
+  }
+  return out;
+}
+
 export async function readAllPoolPricesE6(
   mainnetConn: Connection,
   entries: Array<Pick<MarketEntry, "poolAddress" | "dexType" | "label" | "symbol">>,
@@ -378,10 +411,22 @@ export async function readAllPoolPricesE6(
 ): Promise<Map<string, bigint>> {
   const out = new Map<string, bigint>();
   if (entries.length === 0) return out;
-  const pubkeys = entries.map((e) => new PublicKey(e.poolAddress));
-  const infos = await withRpcBackoff(() =>
-    mainnetConn.getMultipleAccountsInfo(pubkeys, "confirmed"),
-  );
+  // eslint-disable-next-line no-param-reassign -- narrowed to the rows we can actually read
+  // A malformed poolAddress used to throw HERE, outside any per-entry guard —
+  // one bad registry row froze the price push for EVERY market. Skip the bad
+  // row instead; it simply gets "no pool price this cycle".
+  const valid: Array<{ entry: (typeof entries)[number]; pubkey: PublicKey }> = [];
+  for (const e of entries) {
+    try {
+      valid.push({ entry: e, pubkey: new PublicKey(e.poolAddress) });
+    } catch {
+      console.warn(`[price-reader] skipping ${e.label}: malformed poolAddress ${e.poolAddress}`);
+    }
+  }
+  entries = valid.map((v) => v.entry);
+  if (entries.length === 0) return out;
+  const pubkeys = valid.map((v) => v.pubkey);
+  const infos = await getMultipleAccountsChunked(mainnetConn, pubkeys);
 
   // ── Pass 1: raydium-clmm + meteora-dlmm, and resolve this cycle's SOL/USD ──
   let solPriceE6: bigint | undefined;
@@ -462,9 +507,7 @@ export async function readAllPoolPricesE6(
       return { baseVaultPos, quoteVaultPos, mintPos };
     });
 
-    const extraInfos = await withRpcBackoff(() =>
-      mainnetConn.getMultipleAccountsInfo(extraAddrs, "confirmed"),
-    );
+    const extraInfos = await getMultipleAccountsChunked(mainnetConn, extraAddrs);
 
     for (let c = 0; c < pumpswapCandidates.length; c++) {
       const { entry, poolData } = pumpswapCandidates[c];

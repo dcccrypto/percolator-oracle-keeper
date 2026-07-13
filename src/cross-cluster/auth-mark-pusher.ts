@@ -98,8 +98,14 @@ export async function fetchOracleAuthority(
     if (data.length < profileOff + 80) return null;
     const profile = parseAssetOracleProfileV17(data, profileOff);
     return profile.oracleAuthority;
-  } catch {
-    return null;
+  } catch (err) {
+    // A THROW means we could not READ the authority (RPC 429, socket hang-up,
+    // timeout) — NOT that the authority differs. The caller used to treat both
+    // as "permanently not pushable", so one rate-limit burst at boot (when
+    // every market is checked at once) could silently latch markets out of the
+    // push set for the entire process lifetime, with /health still green.
+    // Rethrow so the caller can retry this market on a later cycle.
+    throw err instanceof Error ? err : new Error(String(err));
   }
 }
 
