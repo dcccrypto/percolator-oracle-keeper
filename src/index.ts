@@ -42,7 +42,7 @@ import {
   parseWrapperConfigV17,
   isV17Account,
   parseAssetOracleProfileV17,
-  V17_MARKET_GROUP_OFF, V17_MARKET_GROUP_LEN, V17_MARKET_ASSET_SLOT_LEN,
+  V17_MARKET_GROUP_LEN, V17_MARKET_ASSET_SLOT_LEN,
 } from "@percolatorct/sdk";
 import * as fs from "fs";
 import * as http from "http";
@@ -52,6 +52,7 @@ import * as crypto from "crypto";
 import { parsePositiveNumberEnv, requireProgramIdForSupabaseMode } from "./env-utils.ts";
 import { checkCircuitBreaker as _checkCircuitBreaker } from "./circuit-breaker.ts";
 import type { CircuitBreakerState } from "./circuit-breaker.ts";
+import { selectMarketGroupOffset } from "./wrapper-market-group-offset.ts";
 
 // #31(a): Refuse to start with TLS verification disabled.
 // NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate validation for ALL
@@ -275,22 +276,36 @@ const V17_ORACLE_MODE_EWMA_MARK        = 2;
 const V17_ORACLE_MODE_AUTH_MARK        = 3;
 
 /**
- * Byte offset of AssetOracleProfileV17 for asset_index N within a v17 market account.
+ * Byte offset of AssetOracleProfileV17 for asset_index N within a wrapper market
+ * account, or null if the offset cannot be safely computed for this account.
  *
  * Layout (from v16_program.rs constants and SDK slab.ts):
- *   HEADER_LEN (16) + WRAPPER_CONFIG_LEN (432) = V17_MARKET_GROUP_OFF (448)
- *   + V17_MARKET_GROUP_LEN (758) = first asset slot start (1206)
+ *   HEADER_LEN (16) + WRAPPER_CONFIG_LEN = MARKET_GROUP_OFF
+ *   + V17_MARKET_GROUP_LEN (758) = first asset slot start
  *   + N * V17_MARKET_ASSET_SLOT_LEN (1797)
  *
  * The oracle profile is at byte 0 within each dynamic asset slot
  * (dynamic_slot_offset returns MARKET_GROUP_OFF + slot_stride * N,
  * and oracle_profile_range starts at that same offset).
  *
+ * SECURITY (review 3 must-fix, same class of bug as cross-cluster/auth-mark-pusher.ts):
+ * MARKET_GROUP_OFF is CONFIG-RELATIVE, not fixed — it moved 448 -> 512 when
+ * the protocol-fee program change grew WrapperConfigV16 432 -> 496 bytes and
+ * bumped the header VERSION 16 -> 17 in the same commit. Computing this
+ * offset unconditionally from the VERSION-17 constant would silently decode
+ * the wrong bytes as the oracle profile on any VERSION-16 account still
+ * present during a mixed-fleet window. `slabData`'s own header magic +
+ * VERSION are read via the shared `selectMarketGroupOffset` helper (also
+ * used by cross-cluster/auth-mark-pusher.ts) to select the correct
+ * MARKET_GROUP_OFF — never guessed.
+ *
  * Evidence: v16_program.rs asset_oracle_profile_range + dynamic_slot_offset;
- * SDK slab.ts V17_MARKET_GROUP_OFF=448, V17_MARKET_GROUP_LEN=758, V17_MARKET_ASSET_SLOT_LEN=1797.
+ * SDK slab.ts V17_MARKET_GROUP_LEN=758, V17_MARKET_ASSET_SLOT_LEN=1797.
  */
-function v17OracleProfileOffset(assetIndex: number): number {
-  return V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN + assetIndex * V17_MARKET_ASSET_SLOT_LEN;
+function v17OracleProfileOffset(slabData: Uint8Array, assetIndex: number): number | null {
+  const groupOffResult = selectMarketGroupOffset(slabData);
+  if (!groupOffResult.ok) return null;
+  return groupOffResult.marketGroupOff + V17_MARKET_GROUP_LEN + assetIndex * V17_MARKET_ASSET_SLOT_LEN;
 }
 
 /**
@@ -337,7 +352,14 @@ const allowedProgramIds = new Set<string>();
  */
 function cacheV17OracleMode(slabAddress: string, slabData: Uint8Array): void {
   try {
-    const profileOff = v17OracleProfileOffset(0);
+    const profileOff = v17OracleProfileOffset(slabData, 0);
+    if (profileOff === null) {
+      // Could not resolve a version-correct MARKET_GROUP_OFF for this account
+      // (bad magic, too short, or an unrecognized wrapper VERSION — see
+      // selectMarketGroupOffset). Conservative: do not update the cache with a
+      // guessed offset; existing value (if any) remains and push is skipped.
+      return;
+    }
     if (slabData.length < profileOff + 1) {
       // Account is too short for a v17 slab — could be a v12 slab on a wrong network.
       // Do not update cache; existing value (if any) remains.

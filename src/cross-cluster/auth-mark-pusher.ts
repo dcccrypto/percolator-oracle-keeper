@@ -41,14 +41,12 @@ import {
   ACCOUNTS_PUSH_AUTH_MARK,
   buildAccountMetas,
   parseAssetOracleProfileV17,
-  V17_MARKET_GROUP_OFF,
   V17_MARKET_GROUP_LEN,
   V17_MARKET_ASSET_SLOT_LEN,
   V17_ASSET_ORACLE_PROFILE_LEN,
-  V17_MAGIC,
-  V17_EXPECTED_VERSION,
   PROGRAM_IDS_V17,
 } from "@percolatorct/sdk";
+import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
 
 const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
 
@@ -73,27 +71,10 @@ const COMPUTE_UNIT_LIMIT = 200_000;
 // keeper should never present a wrong-but-plausible authority as ground truth.
 //
 // Fix: read the account's own header VERSION byte and select the matching
-// MARKET_GROUP_OFF from a small local table. V17_MARKET_GROUP_LEN and
-// V17_MARKET_ASSET_SLOT_LEN are unchanged between VERSION 16 and 17 (per the SDK:
-// "the header/asset-slot structs themselves are unchanged" — only
-// MARKET_GROUP_OFF shifted), so only the group offset needs a version branch.
-// The SDK does not export a V16-specific constant, so it is derived here as
-// V17_MARKET_GROUP_OFF - 64 (= HEADER_LEN(16) + pre-protocol-fee
-// WRAPPER_CONFIG_LEN(432) = 448) with this comment as the paper trail. On an
-// unrecognized VERSION, fail loud — warn and return null (skip push) rather than
-// guess an offset this file was never verified against.
-const HEADER_MAGIC_OFF = 0;
-const HEADER_VERSION_OFF = 8; // u16 LE, right after the 8-byte magic
-/** Pre-protocol-fee MARKET_GROUP_OFF (VERSION 16): HEADER_LEN(16) + WRAPPER_CONFIG_LEN(432). */
-const V16_MARKET_GROUP_OFF = V17_MARKET_GROUP_OFF - 64; // = 448
-/** Pre-protocol-fee wrapper account VERSION (percolator-prog v16_program.rs, parent of 626fb617). */
-const VERSION_16 = 16;
-
-/** Versions this keeper knows how to decode, mapped to their MARKET_GROUP_OFF. */
-const MARKET_GROUP_OFF_BY_VERSION: Record<number, number> = {
-  [VERSION_16]: V16_MARKET_GROUP_OFF,
-  [V17_EXPECTED_VERSION]: V17_MARKET_GROUP_OFF,
-};
+// MARKET_GROUP_OFF via the shared `selectMarketGroupOffset` helper (also used
+// by src/index.ts's oracle-mode read path, so the version table lives in one
+// place). On an unrecognized VERSION, fail loud — warn and return null (skip
+// push) rather than guess an offset this file was never verified against.
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -136,41 +117,36 @@ export async function fetchOracleAuthority(
     const data = new Uint8Array(info.data);
 
     // ── VERSION gate (security review 3 must-fix) ────────────────────────────
-    // See the MARKET_GROUP_OFF_BY_VERSION comment above buildPushAuthMarkIx's
-    // imports for the full root cause. Refuse to decode with a guessed offset:
-    // check magic + read the header's own VERSION byte and select the
-    // MARKET_GROUP_OFF that actually applies to THIS account.
-    if (data.length < HEADER_VERSION_OFF + 2) return null;
-    const magic = new DataView(data.buffer, data.byteOffset, data.byteLength).getBigUint64(
-      HEADER_MAGIC_OFF,
-      true,
-    );
-    if (magic !== V17_MAGIC) {
-      console.warn(
-        `[pusher] ${marketAddress.slice(0, 8)}… bad account magic 0x${magic.toString(16)} — ` +
-          `refusing to read a stale/guessed offset`,
-      );
-      return null;
-    }
-    const version = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint16(
-      HEADER_VERSION_OFF,
-      true,
-    );
-    const marketGroupOff = MARKET_GROUP_OFF_BY_VERSION[version];
-    if (marketGroupOff === undefined) {
-      // FAIL LOUD, not silently-plausible: an unrecognized VERSION means the
-      // on-chain layout changed again and this file's offsets need updating.
-      // Do NOT fall back to guessing an offset from an unverified version.
-      console.warn(
-        `[pusher] ${marketAddress.slice(0, 8)}… unrecognized account VERSION=${version} — ` +
-          `oracle_authority offset unknown for this layout, skipping ` +
-          `(update MARKET_GROUP_OFF_BY_VERSION in auth-mark-pusher.ts)`,
-      );
-      return null;
+    // Refuse to decode with a guessed offset: check magic + read the header's
+    // own VERSION byte and select the MARKET_GROUP_OFF that actually applies
+    // to THIS account (see shared helper module for the full root cause).
+    const groupOffResult = selectMarketGroupOffset(data);
+    if (!groupOffResult.ok) {
+      switch (groupOffResult.reason) {
+        case "too-short":
+          return null;
+        case "bad-magic":
+          console.warn(
+            `[pusher] ${marketAddress.slice(0, 8)}… bad account magic ` +
+              `0x${groupOffResult.magic.toString(16)} — refusing to read a stale/guessed offset`,
+          );
+          return null;
+        case "unrecognized-version":
+          // FAIL LOUD, not silently-plausible: an unrecognized VERSION means
+          // the on-chain layout changed again and this file's offsets need
+          // updating. Do NOT fall back to guessing an offset from an
+          // unverified version.
+          console.warn(
+            `[pusher] ${marketAddress.slice(0, 8)}… unrecognized account VERSION=` +
+              `${groupOffResult.version} — oracle_authority offset unknown for this layout, ` +
+              `skipping (update MARKET_GROUP_OFF_BY_VERSION in wrapper-market-group-offset.ts)`,
+          );
+          return null;
+      }
     }
 
     const profileOff =
-      marketGroupOff +
+      groupOffResult.marketGroupOff +
       V17_MARKET_GROUP_LEN +
       assetIndex * V17_MARKET_ASSET_SLOT_LEN;
     // parseAssetOracleProfileV17 requires V17_ASSET_ORACLE_PROFILE_LEN (400)

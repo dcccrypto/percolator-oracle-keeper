@@ -284,7 +284,7 @@ describe("PushAuthMark (tag 63) wire format", () => {
 // ══════════════════════════════════════════════════════════════
 //
 // Evidence from v16_program.rs:
-//   HEADER_LEN=16, WRAPPER_CONFIG_LEN=432 → MARKET_GROUP_OFF=448
+//   HEADER_LEN=16, WRAPPER_CONFIG_LEN=496 (post-protocol-fee, VERSION 17) → MARKET_GROUP_OFF=512
 //   MARKET_GROUP_LEN = size_of::<MarketGroupV16HeaderAccount>() = 758 (SDK: V17_MARKET_GROUP_LEN)
 //   MARKET_ASSET_SLOT_LEN = size_of::<Market<[u8;512]>>() = 1797 (SDK: V17_MARKET_ASSET_SLOT_LEN)
 //   ASSET_ORACLE_PROFILE_LEN = 400 (at offset 0 within each dynamic slot)
@@ -292,28 +292,40 @@ describe("PushAuthMark (tag 63) wire format", () => {
 // oracle_profile_range(asset_index) = dynamic_slot_offset(asset_index) .. start+400
 // dynamic_slot_offset(0) = MARKET_GROUP_OFF + first slot in MarketGroupV16HeaderAccount
 //
-// SDK slab.ts exports V17_MARKET_GROUP_OFF=448, V17_MARKET_GROUP_LEN=758,
+// SDK slab.ts exports V17_MARKET_GROUP_OFF=512, V17_MARKET_GROUP_LEN=758,
 //   V17_MARKET_ASSET_SLOT_LEN=1797, V17_ASSET_ORACLE_PROFILE_LEN=400.
+//
+// NOTE (security review 3 follow-up, 2026-07-15): V17_MARKET_GROUP_OFF used to be
+// 448 (WRAPPER_CONFIG_LEN=432, pre-protocol-fee / VERSION 16). The protocol-fee
+// program change (percolator-prog@626fb617) grew WRAPPER_CONFIG_LEN 432 -> 496
+// and bumped the header VERSION 16 -> 17 in the same commit, moving
+// MARKET_GROUP_OFF 448 -> 512 and every downstream offset in this describe block
+// by the same +64. These literals were stale until this fix — they asserted the
+// pre-protocol-fee (448-based) values against the SDK's current (512-based)
+// V17_MARKET_GROUP_OFF export and failed. Bumped to match; see
+// src/wrapper-market-group-offset.ts for the version-gated offset selection that
+// production code (index.ts, cross-cluster/auth-mark-pusher.ts) now uses instead
+// of assuming VERSION 17 unconditionally.
 
 describe("v17 AssetOracleProfile byte offset", () => {
-  it("asset_index=0 profile starts at 1206 (=448+758+0)", () => {
+  it("asset_index=0 profile starts at 1270 (=512+758+0)", () => {
     const off = v17OracleProfileOffset(0);
     assert.equal(off, V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN,
-      "First asset profile at MARKET_GROUP_OFF + MARKET_GROUP_LEN = 448 + 758 = 1206");
-    assert.equal(off, 1206);
+      "First asset profile at MARKET_GROUP_OFF + MARKET_GROUP_LEN = 512 + 758 = 1270");
+    assert.equal(off, 1270);
   });
 
-  it("asset_index=1 profile starts at 3003 (=1206+1797)", () => {
+  it("asset_index=1 profile starts at 3067 (=1270+1797)", () => {
     const off = v17OracleProfileOffset(1);
-    assert.equal(off, 1206 + V17_MARKET_ASSET_SLOT_LEN);
-    assert.equal(off, 3003);
+    assert.equal(off, 1270 + V17_MARKET_ASSET_SLOT_LEN);
+    assert.equal(off, 3067);
   });
 
-  it("asset_index=N profile starts at 1206 + N*1797", () => {
+  it("asset_index=N profile starts at 1270 + N*1797", () => {
     for (const n of [0, 1, 2, 5, 10]) {
       assert.equal(
         v17OracleProfileOffset(n),
-        1206 + n * 1797,
+        1270 + n * 1797,
         `Profile offset for asset_index=${n}`,
       );
     }
