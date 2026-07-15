@@ -44,12 +44,56 @@ import {
   V17_MARKET_GROUP_OFF,
   V17_MARKET_GROUP_LEN,
   V17_MARKET_ASSET_SLOT_LEN,
+  V17_ASSET_ORACLE_PROFILE_LEN,
+  V17_MAGIC,
+  V17_EXPECTED_VERSION,
   PROGRAM_IDS_V17,
 } from "@percolatorct/sdk";
 
 const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
 
 const COMPUTE_UNIT_LIMIT = 200_000;
+
+// ── VERSION-gated market-group offset (security review 3 must-fix) ────────────
+//
+// The wrapper's account header is [magic:8][version:2 LE][kind:1][pad:1][reserved:4]
+// (V17_HEADER_LEN = 16), and MARKET_GROUP_OFF = HEADER_LEN + WRAPPER_CONFIG_LEN is
+// CONFIG-RELATIVE, not a fixed constant across program versions. The protocol-fee
+// program change (percolator-prog@626fb617) grew WrapperConfigV16 432 -> 496 bytes
+// and bumped the header's VERSION field 16 -> 17 in the SAME commit, so
+// MARKET_GROUP_OFF moves 448 -> 512 and every asset-profile slot (including the
+// oracle_authority field this file reads) shifts by the same +64 downstream.
+//
+// During the mixed-fleet window — some devnet markets re-seeded at VERSION 17,
+// others still VERSION 16 — computing profileOff with the V17 offset
+// UNCONDITIONALLY decodes 64 bytes into the wrong struct on any VERSION-16
+// account: still in-bounds (passes the length check), still parses as a
+// plausible-looking pubkey, but it is NOT oracle_authority. The on-chain
+// PushAuthMark signer check backstops this (worst case: a skipped push), but the
+// keeper should never present a wrong-but-plausible authority as ground truth.
+//
+// Fix: read the account's own header VERSION byte and select the matching
+// MARKET_GROUP_OFF from a small local table. V17_MARKET_GROUP_LEN and
+// V17_MARKET_ASSET_SLOT_LEN are unchanged between VERSION 16 and 17 (per the SDK:
+// "the header/asset-slot structs themselves are unchanged" — only
+// MARKET_GROUP_OFF shifted), so only the group offset needs a version branch.
+// The SDK does not export a V16-specific constant, so it is derived here as
+// V17_MARKET_GROUP_OFF - 64 (= HEADER_LEN(16) + pre-protocol-fee
+// WRAPPER_CONFIG_LEN(432) = 448) with this comment as the paper trail. On an
+// unrecognized VERSION, fail loud — warn and return null (skip push) rather than
+// guess an offset this file was never verified against.
+const HEADER_MAGIC_OFF = 0;
+const HEADER_VERSION_OFF = 8; // u16 LE, right after the 8-byte magic
+/** Pre-protocol-fee MARKET_GROUP_OFF (VERSION 16): HEADER_LEN(16) + WRAPPER_CONFIG_LEN(432). */
+const V16_MARKET_GROUP_OFF = V17_MARKET_GROUP_OFF - 64; // = 448
+/** Pre-protocol-fee wrapper account VERSION (percolator-prog v16_program.rs, parent of 626fb617). */
+const VERSION_16 = 16;
+
+/** Versions this keeper knows how to decode, mapped to their MARKET_GROUP_OFF. */
+const MARKET_GROUP_OFF_BY_VERSION: Record<number, number> = {
+  [VERSION_16]: V16_MARKET_GROUP_OFF,
+  [V17_EXPECTED_VERSION]: V17_MARKET_GROUP_OFF,
+};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -90,12 +134,52 @@ export async function fetchOracleAuthority(
     const info = await devnetConn.getAccountInfo(pk, "confirmed");
     if (!info) return null;
     const data = new Uint8Array(info.data);
+
+    // ── VERSION gate (security review 3 must-fix) ────────────────────────────
+    // See the MARKET_GROUP_OFF_BY_VERSION comment above buildPushAuthMarkIx's
+    // imports for the full root cause. Refuse to decode with a guessed offset:
+    // check magic + read the header's own VERSION byte and select the
+    // MARKET_GROUP_OFF that actually applies to THIS account.
+    if (data.length < HEADER_VERSION_OFF + 2) return null;
+    const magic = new DataView(data.buffer, data.byteOffset, data.byteLength).getBigUint64(
+      HEADER_MAGIC_OFF,
+      true,
+    );
+    if (magic !== V17_MAGIC) {
+      console.warn(
+        `[pusher] ${marketAddress.slice(0, 8)}… bad account magic 0x${magic.toString(16)} — ` +
+          `refusing to read a stale/guessed offset`,
+      );
+      return null;
+    }
+    const version = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint16(
+      HEADER_VERSION_OFF,
+      true,
+    );
+    const marketGroupOff = MARKET_GROUP_OFF_BY_VERSION[version];
+    if (marketGroupOff === undefined) {
+      // FAIL LOUD, not silently-plausible: an unrecognized VERSION means the
+      // on-chain layout changed again and this file's offsets need updating.
+      // Do NOT fall back to guessing an offset from an unverified version.
+      console.warn(
+        `[pusher] ${marketAddress.slice(0, 8)}… unrecognized account VERSION=${version} — ` +
+          `oracle_authority offset unknown for this layout, skipping ` +
+          `(update MARKET_GROUP_OFF_BY_VERSION in auth-mark-pusher.ts)`,
+      );
+      return null;
+    }
+
     const profileOff =
-      V17_MARKET_GROUP_OFF +
+      marketGroupOff +
       V17_MARKET_GROUP_LEN +
       assetIndex * V17_MARKET_ASSET_SLOT_LEN;
-    // parseAssetOracleProfileV17 needs at least 80 bytes after profileOff
-    if (data.length < profileOff + 80) return null;
+    // parseAssetOracleProfileV17 requires V17_ASSET_ORACLE_PROFILE_LEN (400)
+    // bytes after profileOff — check up front so a too-short buffer returns
+    // null (skip) instead of throwing inside the parse call. The v17-only
+    // trailing asset_admin field (offset 368-399) is read-but-unused here on
+    // VERSION-16 accounts; only oracleAuthority (offset 120-152, unchanged
+    // across VERSION 16/17 per the SDK) is consumed by this function.
+    if (data.length < profileOff + V17_ASSET_ORACLE_PROFILE_LEN) return null;
     const profile = parseAssetOracleProfileV17(data, profileOff);
     return profile.oracleAuthority;
   } catch (err) {
