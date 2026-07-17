@@ -210,18 +210,22 @@ async function findLpPortfolio(
   return null;
 }
 
-function buildCrankIx(owner: PublicKey, market: PublicKey, portfolio: PublicKey): TransactionInstruction {
+// Exported for testing (see recovery-cranker.test.ts): pins the exact
+// PermissionlessCrank wire format this loop sends on every cycle.
+export function buildCrankIx(owner: PublicKey, market: PublicKey, portfolio: PublicKey): TransactionInstruction {
   const accountMetas = buildAccountMetas(ACCOUNTS_PERMISSIONLESS_CRANK_BASE, {
     owner,
     market,
     portfolio,
   });
   const data = encodePermissionlessCrank({
+    // W3 (upstream wrapper #206): wire no longer accepts closeQ/feeBps —
+    // liquidation size/fee are engine-selected. Refresh (action=0) never
+    // used these fields for real work anyway; removed to match the new
+    // 29-byte layout (was 53 bytes pre-W3).
     action: CrankAction.FeeSweep, // 0 = Refresh (the only recovery-relevant action the wrapper exposes permissionlessly)
     assetIndex: 0,
     nowSlot: 0n, // program authenticates against Clock::get() regardless of this value
-    closeQ: 0n,
-    feeBps: 0n,
     recoveryReason: 0, // any nonzero value is rejected by the wrapper (InvalidInstruction) — must stay 0
   });
   return new TransactionInstruction({

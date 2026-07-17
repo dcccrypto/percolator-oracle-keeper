@@ -8,7 +8,7 @@
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "build": "tsc --noEmit",
-    "test": "node --import tsx/esm --test src/env-validation.test.ts src/circuit-breaker.test.ts src/security-fixes.test.ts src/v17-oracle-push.test.ts",
+    "test": "node --import tsx/esm --test src/env-validation.test.ts src/circuit-breaker.test.ts src/security-fixes.test.ts src/v17-oracle-push.test.ts src/cross-cluster/recovery-cranker.test.ts",
     "cross-cluster": "tsx src/cross-cluster.ts",
     "cross-cluster:dry-run": "tsx src/dry-run.ts",
     "cross-cluster:live": "tsx src/cross-cluster.ts"
