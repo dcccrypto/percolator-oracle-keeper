@@ -23,6 +23,13 @@ const OWNER = PublicKey.unique();
 const MARKET = PublicKey.unique();
 const PORTFOLIO = PublicKey.unique();
 
+// Fresh devnet triple — deployed + upgraded 2026-07-17, hash-verified on-chain.
+const FRESH_WRAPPER = "DhSkE7uTb8HBUYYWF1xkxMYBGtLYJEoDq1tfBD7SnHcj";
+
+// Superseded 2026-06-26 wrapper — still live on devnet with ~152 existing
+// markets, but no longer the SDK default. buildCrankIx must NOT target it.
+const OLD_WRAPPER = "69VUZ7a2BeXBTpRRManLamF5UWTaNR9B1hy5Se3cdXy9";
+
 describe("buildCrankIx — PermissionlessCrank W3 wire format", () => {
   it("produces exactly 29 bytes (post-W3; pre-W3 was 53)", () => {
     const ix = buildCrankIx(OWNER, MARKET, PORTFOLIO);
@@ -49,6 +56,22 @@ describe("buildCrankIx — PermissionlessCrank W3 wire format", () => {
   it("targets the v17 wrapper program", () => {
     const ix = buildCrankIx(OWNER, MARKET, PORTFOLIO);
     assert.equal(ix.programId.toBase58(), PROGRAM_IDS_V17.percolator);
+  });
+
+  // 2026-07-17 fresh devnet triple cutover: the assertion above re-imports
+  // PROGRAM_IDS_V17 from the same SDK module buildCrankIx reads from, so it
+  // is a vacuous self-check — it would pass no matter which program the SDK
+  // currently points at. These two pin the LITERAL addresses instead, so a
+  // silent SDK regression back to (or drift away from) the fresh wrapper is
+  // caught here independent of PROGRAM_IDS_V17's current contents.
+  it("targets the fresh devnet wrapper (literal pin, 2026-07-17 cutover)", () => {
+    const ix = buildCrankIx(OWNER, MARKET, PORTFOLIO);
+    assert.equal(ix.programId.toBase58(), FRESH_WRAPPER);
+  });
+
+  it("does NOT target the superseded 2026-06-26 wrapper", () => {
+    const ix = buildCrankIx(OWNER, MARKET, PORTFOLIO);
+    assert.notEqual(ix.programId.toBase58(), OLD_WRAPPER);
   });
 
   it("account order is [owner(signer,writable), market(writable), portfolio(writable)]", () => {

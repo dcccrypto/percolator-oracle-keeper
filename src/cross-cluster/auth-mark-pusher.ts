@@ -48,7 +48,18 @@ import {
 } from "@percolatorct/sdk";
 import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
 
-const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
+/**
+ * Wrapper program the auth-mark-pusher targets for PushAuthMark. Sourced
+ * directly from the SDK's PROGRAM_IDS_V17 constant (2026-07-17 fresh devnet
+ * triple cutover) rather than an env var — see auth-mark-pusher.test.ts for
+ * a literal-pinned regression guard against silent drift back to the
+ * superseded 2026-06-26 wrapper (69VUZ7a2...).
+ *
+ * Exported (not just module-private) so tests can assert on it directly
+ * instead of only re-importing the same SDK constant this file reads from,
+ * which would be a vacuous self-check.
+ */
+export const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
 
 const COMPUTE_UNIT_LIMIT = 200_000;
 
