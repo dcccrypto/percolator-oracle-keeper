@@ -337,6 +337,28 @@ export async function pushAuthMark(
  * one-time authority check — a single bad market can't fail the whole batch.
  */
 /** Solana hard limit on a serialized transaction. */
+/**
+ * Markets whose PushAuthMark reverted in preflight, and for how long to skip
+ * them. A market only enters quarantine after repeated reverts, so a transient
+ * blip does not silence a healthy market; it leaves automatically when the
+ * timer lapses and its next push preflights clean.
+ *
+ * Purpose: keep ONE bad market from freezing everyone else's price. The atomic
+ * batch means a single ineligible market reverts the whole chunk, and the
+ * 2026-07-23 owner filter does not catch this case (a broken market owned by
+ * the CURRENT wrapper still passes it).
+ */
+const quarantinedUntil = new Map<string, number>();
+const quarantineStrikes = new Map<string, number>();
+const QUARANTINE_AFTER_STRIKES = 3;
+const QUARANTINE_MS = 10 * 60_000;
+
+/** Exported for the health log + tests. */
+export function getQuarantinedMarkets(): string[] {
+  const now = Date.now();
+  return [...quarantinedUntil.entries()].filter(([, t]) => t > now).map(([m]) => m);
+}
+
 const MAX_TX_BYTES = 1232;
 /** Safety margin under MAX_TX_BYTES (signature/blockhash jitter). */
 const TX_SIZE_MARGIN = 32;
@@ -439,45 +461,157 @@ export async function pushAuthMarkBatch(
   nowSlot: bigint,
   blockhash: { blockhash: string; lastValidBlockHeight: number },
   dryRun: boolean,
-): Promise<{ pushed: boolean; signature?: string; count: number }> {
-  if (pushes.length === 0) return { pushed: false, count: 0 };
+): Promise<{
+  pushed: boolean;
+  signature?: string;
+  count: number;
+  /** Markets whose push actually went out — NOT the whole input batch. */
+  pushedMarkets: string[];
+  /** Markets dropped this cycle (reverted in preflight, or quarantined). */
+  skippedMarkets: string[];
+}> {
+  if (pushes.length === 0) {
+    return { pushed: false, count: 0, pushedMarkets: [], skippedMarkets: [] };
+  }
 
-  const chunks = chunkPushes(keeper, pushes, nowSlot, blockhash);
+  // Drop markets currently quarantined for repeated reverts, so they cannot be
+  // batched with healthy ones and freeze their prices. They re-enter
+  // automatically when the timer lapses.
+  const now = Date.now();
+  const eligible = pushes.filter((p) => {
+    const until = quarantinedUntil.get(p.marketAddress);
+    if (until === undefined) return true;
+    if (until > now) return false;
+    quarantinedUntil.delete(p.marketAddress);
+    quarantineStrikes.delete(p.marketAddress);
+    console.log(`[push] ${p.marketAddress.slice(0, 8)}… leaving quarantine — will retry`);
+    return true;
+  });
+  const skipped = pushes.length - eligible.length;
+  if (skipped > 0) {
+    console.warn(`[push] skipping ${skipped} quarantined market(s): ${getQuarantinedMarkets().map((m) => m.slice(0, 8) + "…").join(", ")}`);
+  }
+  if (eligible.length === 0) {
+    return { pushed: false, count: 0, pushedMarkets: [], skippedMarkets: pushes.map((p) => p.marketAddress) };
+  }
+
+  const chunks = chunkPushes(keeper, eligible, nowSlot, blockhash);
 
   if (dryRun) {
     console.log(
-      `[DRY-RUN] PushAuthMark × ${pushes.length} in ${chunks.length} tx(s) @ slot ${nowSlot} ` +
-        `(${pushes.map((p) => `$${(Number(p.priceE6) / 1e6).toFixed(4)}`).join(", ")})`,
+      `[DRY-RUN] PushAuthMark × ${eligible.length} in ${chunks.length} tx(s) @ slot ${nowSlot} ` +
+        `(${eligible.map((p) => `$${(Number(p.priceE6) / 1e6).toFixed(4)}`).join(", ")})`,
     );
-    return { pushed: false, count: pushes.length };
+    return {
+      pushed: false,
+      count: eligible.length,
+      pushedMarkets: eligible.map((p) => p.marketAddress),
+      skippedMarkets: [],
+    };
   }
 
   let firstSig: string | undefined;
-  let pushedCount = 0;
+  const pushedMarkets: string[] = [];
   const errors: string[] = [];
 
-  for (const chunk of chunks) {
+  /**
+   * Send one chunk, preflighting first so an ON-CHAIN revert is visible.
+   *
+   * Returns the markets that a revert proves cannot be pushed right now, so the
+   * caller can isolate them. An empty array means the chunk went out clean.
+   */
+  const sendChunk = async (
+    chunk: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>,
+  ): Promise<Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>> => {
     const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
     tx.sign(keeper);
+
+    // PREFLIGHT (2026-07-27). This used to send with skipPreflight:true and
+    // never await confirmation, so a chunk that REVERTED on-chain was counted
+    // as pushed — the phantom-success problem. Worse, PushAuthMark reverts for
+    // the whole atomic batch if ANY market in it is ineligible
+    // (`group.header.mode != 0` -> EngineLockActive, a slot regression ->
+    // EngineStale, or a junk slab -> Unauthorized). Reproduced: [good] and
+    // [good, good] both land, but [good, junk] reverts entirely, so one bad
+    // market silently freezes the price for every market batched with it. That
+    // is the 2026-07-13 outage shape, and the owner-filter added afterwards
+    // does not cover it (the junk market is owned by the CURRENT wrapper).
+    let simErr: unknown = null;
     try {
-      // Fire-and-forget: skip preflight sim, and do NOT await confirmation.
+      const sim = await devnetConn.simulateTransaction(tx);
+      simErr = sim.value.err;
+    } catch (err) {
+      // A simulate that cannot even run (RPC hiccup) must not drop the push —
+      // fall through and send, which is the old behaviour.
+      simErr = null;
+    }
+
+    if (simErr) {
+      // Chunk would revert. If it is a single market we know exactly who is at
+      // fault; otherwise tell the caller to isolate.
+      if (chunk.length === 1) {
+        const bad = chunk[0];
+        const strikes = (quarantineStrikes.get(bad.marketAddress) ?? 0) + 1;
+        quarantineStrikes.set(bad.marketAddress, strikes);
+        if (strikes >= QUARANTINE_AFTER_STRIKES) {
+          quarantinedUntil.set(bad.marketAddress, Date.now() + QUARANTINE_MS);
+          console.error(
+            `[push][QUARANTINE] ${bad.marketAddress.slice(0, 8)}… reverted ${strikes}× ` +
+              `(${JSON.stringify(simErr).slice(0, 80)}) — skipping it for ${QUARANTINE_MS / 60_000}min ` +
+              `so it cannot freeze the other markets' prices. Investigate: is it Live (mode 0)?`,
+          );
+        }
+        errors.push(`${bad.marketAddress.slice(0, 8)}…: ${JSON.stringify(simErr).slice(0, 80)}`);
+        return chunk;
+      }
+      return chunk; // caller re-sends these one at a time
+    }
+
+    // Clean preflight → submit. Still fire-and-forget on confirmation (a dropped
+    // tx just retries next cycle) but we now KNOW it would have executed.
+    try {
       const signature = await devnetConn.sendRawTransaction(tx.serialize(), {
         skipPreflight: true,
         maxRetries: 2,
       });
       firstSig ??= signature;
-      pushedCount += chunk.length;
+      for (const p of chunk) pushedMarkets.push(p.marketAddress);
+      // A clean push clears any accumulated strikes.
+      for (const p of chunk) quarantineStrikes.delete(p.marketAddress);
     } catch (err) {
-      // One oversized/failing chunk must NOT block the others — the old
-      // all-or-nothing batch is exactly what froze every market at once.
       const msg = err instanceof Error ? err.message : String(err);
       errors.push(`${chunk.length} market(s): ${msg.slice(0, 120)}`);
+    }
+    return [];
+  };
+
+  for (const chunk of chunks) {
+    const failed = await sendChunk(chunk);
+    if (failed.length > 1) {
+      // ISOLATE: the batch reverted, but most of these markets are fine. Send
+      // them individually so the healthy ones still get their price and the
+      // offender is identified by name instead of taking the chunk down with it.
+      console.warn(
+        `[push] chunk of ${failed.length} reverted in preflight — retrying individually to isolate the bad market`,
+      );
+      for (const single of failed) {
+        await sendChunk([single]);
+      }
     }
   }
 
   if (errors.length > 0) {
-    console.error(`[push] ${errors.length}/${chunks.length} chunk(s) failed — ${errors.join(" | ")}`);
+    console.error(`[push] ${errors.length} push(es) failed — ${errors.join(" | ")}`);
   }
 
-  return { pushed: pushedCount > 0, signature: firstSig, count: pushedCount };
+  const pushedSet = new Set(pushedMarkets);
+  return {
+    pushed: pushedMarkets.length > 0,
+    signature: firstSig,
+    count: pushedMarkets.length,
+    pushedMarkets,
+    // Everything asked for that did NOT go out — quarantined or reverting. The
+    // caller must not stamp these as freshly pushed (that was the /health lie).
+    skippedMarkets: pushes.map((p) => p.marketAddress).filter((m) => !pushedSet.has(m)),
+  };
 }

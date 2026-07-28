@@ -21,7 +21,7 @@ import { Connection, Keypair } from "@solana/web3.js";
 import type { Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
 import { readAllPoolPricesE6 } from "./price-reader.ts";
-import { pushAuthMarkBatch, fetchOracleAuthority } from "./auth-mark-pusher.ts";
+import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets } from "./auth-mark-pusher.ts";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -96,8 +96,21 @@ function makeHealthHandler(state: LoopState, config: LoopConfig) {
         lastError: stat.lastErrorMsg,
       };
     }
+    // A quarantined market reverted its push 3 cycles running, so the pusher
+    // stopped batching it to keep it from freezing everyone else's price.
+    //
+    // Reported in the BODY, deliberately still HTTP 200: railway.toml
+    // health-gates deploys on this path and the Dockerfile HEALTHCHECK runs
+    // `curl -sf`, which fails on 5xx. A 503 here would restart the keeper — and
+    // since quarantine is in-memory, the restart clears it, the bad market gets
+    // re-batched, takes 3 strikes, and 503s again: a restart loop that breaks
+    // pricing for every market to report a problem with one. The service is
+    // genuinely healthy in this state (it is doing exactly what it should);
+    // it is the MARKET that is degraded, so alert on the field, not the code.
+    const quarantinedMarkets = getQuarantinedMarkets();
     const payload = JSON.stringify({
-      status: "ok",
+      status: quarantinedMarkets.length > 0 ? "degraded-markets" : "ok",
+      quarantinedMarkets,
       uptimeSec,
       cycleCount: state.cycleCount,
       timeoutCount: state.timeoutCount,
@@ -230,19 +243,34 @@ async function runCycle(
   try {
     const res = await pushAuthMarkBatch(devnetConn, keeper, pushes, nowSlot, cachedBlockhash, config.dryRun);
     const stamp = Date.now();
+    // Record PER MARKET, not per batch. This loop used to stamp every market in
+    // `pushes` as freshly pushed whenever the batch reported success — so a
+    // market that was dropped (reverting or quarantined) still showed a fresh
+    // lastPushAt and a rising totalPushes on /health. That made a frozen price
+    // look healthy, which is how a stuck market goes unnoticed for days.
+    const pushedSet = new Set(res.pushedMarkets);
     for (const p of pushes) {
       const stat = state.stats.get(p.marketAddress)!;
       stat.authorityMismatch = false;
       if (config.dryRun) {
         stat.lastSig = "DRY_RUN";
-      } else if (res.pushed && res.signature) {
+      } else if (pushedSet.has(p.marketAddress) && res.signature) {
         stat.totalPushes++;
         stat.lastPushAt = stamp;
         stat.lastSig = res.signature;
+      } else {
+        stat.totalErrors++;
+        stat.lastErrorMsg = "dropped from batch (reverted in preflight or quarantined)";
       }
     }
     if (res.pushed && res.signature) {
       console.log(`[loop] batched push × ${res.count}: sig=${res.signature.slice(0, 16)}…`);
+    }
+    if (res.skippedMarkets.length > 0) {
+      console.warn(
+        `[loop] ${res.skippedMarkets.length} market(s) NOT priced this cycle: ` +
+          res.skippedMarkets.map((m) => m.slice(0, 8) + "…").join(", "),
+      );
     }
   } catch (err) {
     const msg = (err instanceof Error ? err.message : String(err)).slice(0, 160);
