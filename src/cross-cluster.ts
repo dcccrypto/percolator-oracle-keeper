@@ -39,8 +39,10 @@ import { fileURLToPath } from "url";
 import { loadRegistry } from "./cross-cluster/registry.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { crankAllOnce, startRecoveryCrankLoop } from "./cross-cluster/recovery-cranker.ts";
+import { startLpFeeCrankLoop } from "./cross-cluster/lp-fee-cranker.ts";
 import { startRegisterPollLoop } from "./cross-cluster/register-poll.ts";
 import { startRegistryReloadLoop } from "./cross-cluster/registry-reload.ts";
+import { WRAPPER_PROGRAM_ID } from "./cross-cluster/auth-mark-pusher.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -112,6 +114,11 @@ const CC_CYCLE_TIMEOUT_MS = parseInt(process.env.CC_CYCLE_TIMEOUT_MS ?? "10000",
 // CRANK_ENABLED=false to disable (e.g. for a read-only / dry-run deploy).
 const CRANK_ENABLED = process.env.CRANK_ENABLED !== "false";
 const CRANK_INTERVAL_MS = parseInt(process.env.CRANK_INTERVAL_MS ?? "20000", 10);
+// LP_FEE_CRANK_ENABLED=false to disable. 200s by default: fee distribution is not
+// latency-sensitive (it only moves already-accrued atoms into the vault), and a
+// market with no LP depositors costs no transaction at all.
+const LP_FEE_CRANK_ENABLED = process.env.LP_FEE_CRANK_ENABLED !== "false";
+const LP_FEE_CRANK_INTERVAL_MS = parseInt(process.env.LP_FEE_CRANK_INTERVAL_MS ?? "200000", 10);
 
 // Registration-poll loop — outbound poll of the Vercel-hosted playground registered-
 // markets blob, so markets created through the create-market wizard after this keeper
@@ -156,6 +163,7 @@ console.log(`  mode:      ${DRY_RUN ? "DRY-RUN (no on-chain writes)" : "LIVE"}`)
 console.log(`  interval:  ${CC_INTERVAL_MS}ms`);
 console.log(
   `  cranker:   ${CRANK_ENABLED ? `every ${CRANK_INTERVAL_MS}ms` : "disabled (CRANK_ENABLED=false)"}`,
+  `  lp-fee:    ${LP_FEE_CRANK_ENABLED ? `every ${LP_FEE_CRANK_INTERVAL_MS}ms` : "disabled (LP_FEE_CRANK_ENABLED=false)"}`,
 );
 for (const m of registry.markets) {
   console.log(
@@ -203,6 +211,23 @@ if (CRANK_ENABLED) {
   });
 }
 
+// LP-fee distribution loop. Same "concurrent, never awaited, never throws out of
+// scope" pattern. Without this, `lp_fee_accrued_atoms` grows on the slab forever
+// and LP depositors see 0% APY no matter how much the market trades — the fee
+// split is correct, but nothing ever moves the LP's share into the vault.
+// Runs 10x slower than the recovery crank: distribution is not latency-sensitive,
+// and a market with no LP depositors is skipped locally without a transaction.
+if (LP_FEE_CRANK_ENABLED) {
+  void startLpFeeCrankLoop(devnetConn, keeper, registry, {
+    intervalMs: LP_FEE_CRANK_INTERVAL_MS,
+    dryRun: DRY_RUN,
+  }).catch((err) => {
+    console.error(
+      `[lp-fee] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  });
+}
+
 // Registration-poll loop — same "runs concurrently, never awaited, never allowed to
 // throw out of this scope" pattern as the recovery cranker above. Mutates `registry`
 // in place (addMarket + saveRegistry), and it's the SAME registry object passed to
@@ -213,6 +238,11 @@ if (REGISTER_SOURCE_URL) {
     sourceUrl: REGISTER_SOURCE_URL,
     registryPath: REGISTRY_PATH,
     intervalMs: REGISTER_POLL_INTERVAL_MS,
+    // Owner filter: only admit markets owned by the current wrapper (WRAPPER_PROGRAM_ID
+    // = PROGRAM_IDS_V17.percolator). Keeps retired-wrapper blob entries out of the
+    // atomic push batch (they revert it with IncorrectProgramId).
+    connection: devnetConn,
+    expectedOwner: WRAPPER_PROGRAM_ID,
   }).catch((err) => {
     console.error(
       `[register-poll] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
