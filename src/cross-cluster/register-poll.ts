@@ -21,7 +21,7 @@
  * startRegisterPollLoop(...).catch(...)` as a last line of defense, same as the
  * recovery-cranker).
  */
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, type Connection } from "@solana/web3.js";
 import { addMarket, saveRegistry } from "./registry.ts";
 import type { Registry, MarketEntry, DexType } from "./registry.ts";
 
@@ -41,6 +41,18 @@ export interface RegisterPollConfig {
   registryPath: string;
   /** Milliseconds between polls (default 30_000). */
   intervalMs?: number;
+  /**
+   * Devnet connection for the on-chain owner filter. If both `connection` and
+   * `expectedOwner` are set, a market is only admitted when its on-chain owner
+   * equals `expectedOwner`. Omit both to disable the filter (legacy behavior).
+   */
+  connection?: Connection;
+  /**
+   * Only admit markets whose on-chain owner == this program (the current wrapper).
+   * The blob store still holds retired-wrapper markets; admitting one poisons the
+   * atomic PushAuthMark batch with IncorrectProgramId (the whole batch reverts).
+   */
+  expectedOwner?: PublicKey;
 }
 
 /** Loosely-typed shape of one entry from GET /api/playground/registered-markets. */
@@ -150,6 +162,38 @@ async function pollOnce(registry: Registry, config: RegisterPollConfig): Promise
           `${JSON.stringify(raw).slice(0, 200)}`,
       );
       continue;
+    }
+
+    // Owner filter (2026-07-23): only admit markets owned by the current wrapper.
+    // The blob store still lists retired-wrapper markets; one of those in the push
+    // batch reverts the whole atomic tx with IncorrectProgramId. On RPC failure or
+    // not-yet-found, skip this cycle (retried on the next poll) rather than admit.
+    if (config.connection && config.expectedOwner) {
+      let owner: PublicKey | null = null;
+      try {
+        const info = await config.connection.getAccountInfo(new PublicKey(marketAddress));
+        owner = info?.owner ?? null;
+      } catch (err) {
+        console.warn(
+          `[register-poll] owner check failed for ${marketAddress.slice(0, 8)}… — skipping this cycle: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+        continue;
+      }
+      if (!owner) {
+        console.warn(`[register-poll] ${marketAddress.slice(0, 8)}… not found on-chain — skipping`);
+        continue;
+      }
+      if (!owner.equals(config.expectedOwner)) {
+        console.log(
+          `[register-poll] skipping ${marketAddress.slice(0, 8)}… — owner ${owner
+            .toBase58()
+            .slice(0, 8)}… != current wrapper ${config.expectedOwner
+            .toBase58()
+            .slice(0, 8)}… (retired-wrapper market)`,
+        );
+        continue;
+      }
     }
 
     const full = addMarket(registry, entry);

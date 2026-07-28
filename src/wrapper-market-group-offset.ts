@@ -38,11 +38,16 @@ export const VERSION_16 = 16;
 export const VERSION_17 = V17_EXPECTED_VERSION;
 
 /**
- * Pre-protocol-fee MARKET_GROUP_OFF (VERSION 16): HEADER_LEN(16) + WRAPPER_CONFIG_LEN(432).
- * The SDK does not export a V16-specific constant, so it is derived here as
- * V17_MARKET_GROUP_OFF - 64, with this comment as the paper trail.
+ * Pre-protocol-fee MARKET_GROUP_OFF (VERSION 16): HEADER_LEN(16) + WRAPPER_CONFIG_LEN_V16(432) = 448.
+ *
+ * ⚠ MUST be pinned, NOT derived from V17_MARKET_GROUP_OFF. The v17 config grew
+ * in TWO steps: protocol-fee 432->496 (+64) AND fee-split 496->576 (+80), so
+ * V17_MARKET_GROUP_OFF is now 592 and the v17->v16 delta is 144, not 64. The old
+ * `V17_MARKET_GROUP_OFF - 64` derivation silently became 528 (wrong) the moment
+ * the SDK was refreshed to the 576-byte fee-split layout — which would misread
+ * every VERSION-16 account by 80 bytes. v16's config is genuinely 432, so pin it.
  */
-export const V16_MARKET_GROUP_OFF = V17_MARKET_GROUP_OFF - 64; // = 448
+export const V16_MARKET_GROUP_OFF = 448; // HEADER_LEN(16) + WRAPPER_CONFIG_LEN_V16(432)
 
 /**
  * Versions this keeper knows how to decode, mapped to their MARKET_GROUP_OFF.

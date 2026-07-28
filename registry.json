@@ -1,86 +1,55 @@
 {
   "version": 1,
-  "description": "Cross-cluster oracle keeper: devnet markets → mainnet pool price sources (new consistent markets 2026-07-01)",
+  "description": "v17 devnet 2.0 — new wrapper DhSkE7u ONLY. Old-wrapper markets removed 2026-07-23 (they caused atomic IncorrectProgramId batch reverts). register-poll temporarily off during verification.",
   "markets": [
     {
       "label": "SOL/USDC — raydium-clmm",
-      "marketAddress": "9NqrXtHxgkYKWERxuC3rQ5q3LABc8iDgJBoZPqCbf2Cy",
+      "marketAddress": "BPgSUbDsxZ9bkauWgd6eQ8oLHVx6pSsvfAjPGsS2Sso8",
       "poolAddress": "8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj",
       "dexType": "raydium-clmm",
       "assetIndex": 0,
-      "registeredAt": 1782934428779,
       "symbol": "SOL/USDC",
-      "collateral": "SimUSDC",
-      "lpPortfolio": "Htk8TL52WswewGHvit87yA6w9Riiq3wjA1F8bcQ5qSsY",
-      "matcherCtx": "5rVtdTqC7YzvdaybQu9y3yGdCbFC5QkYDWeQU3Ejizxr",
-      "stakePool": "AsrzyX1JSKcSqrVFRDjiWiVFhNwr4Hd8XuUAJbDhZ9qk",
-      "lpVaultRegistry": "HpcoqCCwzKr1bC8o52U3JpqHy5rGveFYmXwBGzForUaT"
+      "collateral": "USDC"
     },
     {
-      "label": "BONK/USDC — raydium-clmm",
-      "marketAddress": "EC5jrkpRkPG47ZCXH6GDUCLYK9Yfszv9Bv1LVsvgcZH7",
-      "poolAddress": "3UwfrdLTpAjxTRni1boc5HUWe6hzc4HgE5yLdvEp2Noc",
-      "dexType": "raydium-clmm",
+      "label": "Percolator/USDC — pumpswap",
+      "marketAddress": "7FBXdrm1vQ4ktQJjMwurq4cAHkVB1gKoZ7Hx3CAQv6P4",
+      "poolAddress": "Ebs3mXAzqZfzHfsdinTNw7gPy4uNyEAywcCiJxzLRrBW",
+      "dexType": "pumpswap",
       "assetIndex": 0,
-      "registeredAt": 1782934428779,
-      "symbol": "BONK/USDC",
-      "collateral": "SimUSDC",
-      "lpPortfolio": "CqUyAcj61v1buy8yRYs5Bc36SSZ6sj3wayVS6rgYDyBQ",
-      "matcherCtx": "3FEXcEfjraGHe5HDvST8WfTWVdDPMYuYgU5Le7abHjqt",
-      "stakePool": "2kETeciqCCiV9tygVkcr9F14qsxu6heGNh5rWse17PYo",
-      "lpVaultRegistry": "E3JoDaczEif2fbdtp6iTzqgNHKF7LmWpyi4CmWtgJRmv"
+      "symbol": "Percolator",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "registeredAt": 1784804759462
     },
     {
-      "label": "JUP/USDC — meteora-dlmm",
-      "marketAddress": "CBcVebWVTxqbh75PW12nN9uvZBHDrkPf1UL92ja3hzK2",
-      "poolAddress": "HfgjZDmexhFVD28Vkb1NbQwWeXP3uDcVTLPjSGHmRHhL",
-      "dexType": "meteora-dlmm",
+      "label": "Jimothy/USDC — pumpswap",
+      "marketAddress": "gHey79gB1xGQyXne8yEHoKmGi6jrEVigLwxSXQrYkD3",
+      "poolAddress": "5PGhKctym6odbHGo2tKMST2AjmJsb2uZBQrKkn4ZuFT5",
+      "dexType": "pumpswap",
       "assetIndex": 0,
-      "registeredAt": 1782934428779,
-      "symbol": "JUP/USDC",
-      "collateral": "SimUSDC",
-      "lpPortfolio": "AAuQLbUwDVBvevrFMa7YKY4LLvrsuXvWztJ5H9sCwsQp",
-      "matcherCtx": "CCgXAkCa2NCx29jfqW2dKNzSuscQganjrdHSFFpJZjzj",
-      "stakePool": "9XCVnhfkbrNgtaavATy3iHmw1J45Qk8mVNEAGsedjBS7",
-      "lpVaultRegistry": "CvVaWKKe6SJut3pumbhZLuAKdB72jMtEVvJ26jLspVFh"
+      "symbol": "Jimothy",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "registeredAt": 1784942942893
     },
     {
-      "label": "TRUMP/USDC — meteora-dlmm",
-      "marketAddress": "AXU3BPEB3GjEfCJirYejtiqSkAqDvrTtaDqcvjvhPoqb",
-      "poolAddress": "9d9mb8kooFfaD3SctgZtkxQypkshx6ezhbKio89ixyy2",
-      "dexType": "meteora-dlmm",
+      "label": "TROLL/USDC — pumpswap",
+      "marketAddress": "8SHhSKuY9cun15Y2Q9p9SNEV86zzSWbeP4e59xLAv99h",
+      "poolAddress": "4w2cysotX6czaUGmmWg13hDpY4QEMG2CzeKYEQyK9Ama",
+      "dexType": "pumpswap",
       "assetIndex": 0,
-      "registeredAt": 1782934428779,
-      "symbol": "TRUMP/USDC",
-      "collateral": "SimUSDC",
-      "lpPortfolio": "32349hkMm4GAPAFZPCiDf3cewrS2cnYuqRP1dWkYHNc5",
-      "matcherCtx": "2dhrjZwhTPYLQ1r1xeVJ6SMjB1DhY7SQVqy9Xx4cJhx1",
-      "stakePool": "GWE7vT6Ae3bsWfC3cyxNDJ84GUhknykv3HsszcyDSiSF",
-      "lpVaultRegistry": "4bQA59fz5LwPjgvJAnWbFW1XPncXQweSf58Zw4k2s5FS"
+      "symbol": "TROLL",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "registeredAt": 1785084432523
     },
     {
-      "label": "PENGU/USDC — meteora-dlmm",
-      "marketAddress": "6fXCu33Wrhwtsd2srFGJt8xMV2GB16DYM5Bn9s12ShZH",
-      "poolAddress": "DdMA1cHcHEqYfttc1z1sJEY978CcU1pyjNuTWTNmdvzU",
-      "dexType": "meteora-dlmm",
-      "assetIndex": 0,
-      "registeredAt": 1782934428779,
-      "symbol": "PENGU/USDC",
-      "collateral": "SimUSDC",
-      "lpPortfolio": "FnjrPShR1z5y23EcDWSSrP3DRwUecMr261AmcjJrSCVr",
-      "matcherCtx": "FoPthGNxmXat2ejjyyrRX6NXcG4zyZBPrDqF8Ffn5S3x",
-      "stakePool": "4G23qvQFo3qPZTZBcKkwNYKbVnuAHveyiNxDmRFHY8zM",
-      "lpVaultRegistry": "26UywThatZubhV69SPpZVfZG5pemVEaYf4xCn5C3FHfR"
-    },
-    {
-      "label": "ANSEM/USDC - PumpSwap",
-      "marketAddress": "7mzqfnuAhANvDV8PiqJBG3jehyv3rPrCMr9V6j2bCHPV",
+      "label": "ANSEM/USDC — pumpswap",
+      "marketAddress": "CseeeuKKbgNU38VRukG38mTdcPJ4KWci5GmFikEtp1X5",
       "poolAddress": "FnzKY6x7entQ1eR3D225dQyT7ybfka4PskBMQhb8L3CC",
       "dexType": "pumpswap",
       "assetIndex": 0,
       "symbol": "ANSEM",
       "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
-      "registeredAt": 1783522454905
+      "registeredAt": 1785084582429
     }
   ]
 }

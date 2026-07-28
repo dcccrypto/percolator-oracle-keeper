@@ -1,6 +1,12 @@
 node_modules/
 dist/
 .env
+# `.env` alone does NOT match rotated copies like `.env.bak.1783375948`, which
+# hold the same RPC keys and keypair paths. Without this, a `git add -A` commits
+# a live secrets backup.
+.env*
+!.env.example
+logs/
 *.json
 !package-lock.json
 !package.json
