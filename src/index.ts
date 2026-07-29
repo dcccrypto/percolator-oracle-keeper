@@ -55,6 +55,7 @@ import type { CircuitBreakerState } from "./circuit-breaker.ts";
 import { selectMarketGroupOffset } from "./wrapper-market-group-offset.ts";
 import {
   applyMainnetCaSnapshot,
+  normalizeSolanaAddress,
   reconcileMainnetCaMappings,
 } from "./mainnet-ca-registry.ts";
 import {
@@ -68,6 +69,9 @@ import {
 import type {
   FirstPushPriceReaders,
 } from "./oracle-price-policy.ts";
+import {
+  collectCompletePostgrestSnapshot,
+} from "./supabase-pagination.ts";
 
 // #31(a): Refuse to start with TLS verification disabled.
 // NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate validation for ALL
@@ -589,29 +593,157 @@ const DISCOVERY_INTERVAL_MS = parsePositiveNumberEnv("DISCOVERY_INTERVAL_MS", 30
 
 const supabaseEnabled = !!(SUPABASE_URL && SUPABASE_READ_KEY);
 
-/** Lightweight Supabase REST query — no client library needed */
-async function supabaseQuery(table: string, params: string): Promise<any[] | null> {
+/**
+ * Execute one authenticated Supabase/PostgREST request.
+ *
+ * Returns null for disabled configuration, transport failures, timeouts, and
+ * non-success HTTP responses.
+ */
+async function supabaseRequest(
+  table: string,
+  params: string,
+  extraHeaders: Readonly<Record<string, string>> = {},
+): Promise<Response | null> {
   if (!supabaseEnabled) return null;
+
   try {
-    const resp = await fetch(
+    const response = await fetch(
       `${SUPABASE_URL}/rest/v1/${table}?${params}`,
       {
         headers: {
           apikey: SUPABASE_READ_KEY,
           Authorization: `Bearer ${SUPABASE_READ_KEY}`,
+          ...extraHeaders,
         },
         signal: AbortSignal.timeout(5000),
       },
     );
-    if (!resp.ok) {
-      log(`⚠️ Supabase query to ${table} failed with HTTP status ${resp.status}`);
+
+    if (!response.ok) {
+      log(
+        `⚠️ Supabase query to ${table} failed with HTTP status ` +
+          `${response.status}`,
+      );
+
       return null;
     }
-    return await resp.json();
-  } catch (e) {
-    log(`⚠️ Supabase query to ${table} failed: ${(e as Error).message}`);
+
+    return response;
+  } catch (error) {
+    log(
+      `⚠️ Supabase query to ${table} failed: ` +
+        `${(error as Error).message}`,
+    );
+
     return null;
   }
+}
+
+/**
+ * Execute a lightweight single-page Supabase REST query.
+ *
+ * This remains suitable for non-authoritative discovery reads. Authoritative
+ * CA replacement uses fetchMainnetCaRows(), which verifies all pages.
+ */
+async function supabaseQuery(
+  table: string,
+  params: string,
+): Promise<any[] | null> {
+  const response = await supabaseRequest(
+    table,
+    params,
+  );
+
+  if (!response) return null;
+
+  try {
+    const data: unknown = await response.json();
+
+    if (!Array.isArray(data)) {
+      log(
+        `⚠️ Supabase query to ${table} returned a non-array payload`,
+      );
+
+      return null;
+    }
+
+    return data;
+  } catch (error) {
+    log(
+      `⚠️ Supabase query to ${table} returned invalid JSON: ` +
+        `${(error as Error).message}`,
+    );
+
+    return null;
+  }
+}
+
+const MAINNET_CA_SNAPSHOT_PARAMS =
+  "select=slab_address,mainnet_ca" +
+  "&mainnet_ca=not.is.null" +
+  "&order=slab_address.asc";
+
+const MAINNET_CA_SNAPSHOT_PAGE_SIZE = 1_000;
+
+/**
+ * Fetch a complete, count-verified mainnet CA snapshot.
+ *
+ * Every page requests Prefer: count=exact and is validated against the
+ * PostgREST Content-Range response. Missing, inconsistent, or incomplete range
+ * information fails closed and causes the previous CA snapshot to be retained.
+ */
+async function fetchMainnetCaRows(): Promise<unknown[] | null> {
+  const rows =
+    await collectCompletePostgrestSnapshot<unknown>(
+      async (start, end) => {
+        const response = await supabaseRequest(
+          "markets",
+          MAINNET_CA_SNAPSHOT_PARAMS,
+          {
+            Range: `${start}-${end}`,
+            "Range-Unit": "items",
+            Prefer: "count=exact",
+          },
+        );
+
+        if (!response) return null;
+
+        try {
+          const data: unknown = await response.json();
+
+          if (!Array.isArray(data)) {
+            log(
+              "⚠️ Mainnet CA snapshot returned a non-array payload",
+            );
+
+            return null;
+          }
+
+          return {
+            rows: data,
+            contentRange:
+              response.headers.get("content-range"),
+          };
+        } catch (error) {
+          log(
+            `⚠️ Mainnet CA snapshot returned invalid JSON: ` +
+              `${(error as Error).message}`,
+          );
+
+          return null;
+        }
+      },
+      MAINNET_CA_SNAPSHOT_PAGE_SIZE,
+    );
+
+  if (rows === null) {
+    log(
+      "⚠️ Mainnet CA snapshot was incomplete or unverifiable — " +
+        "preserving the last known-good mapping",
+    );
+  }
+
+  return rows;
 }
 
 // ── Types ───────────────────────────────────────────────────
@@ -1764,22 +1896,6 @@ async function discoverNewMarkets(): Promise<MarketInfo[]> {
  * since they may not be in PYTH_FEED_IDS or JUPITER_MINTS.
  * This fetches price directly using the mainnet CA via Jupiter Lite API.
  */
-function normalizeMainnetCaForLookup(
-  mainnetCa: string,
-): string | null {
-  const normalized = mainnetCa.trim();
-
-  if (
-    !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(
-      normalized,
-    )
-  ) {
-    return null;
-  }
-
-  return normalized;
-}
-
 /**
  * Jupiter-only CA reader.
  *
@@ -1790,7 +1906,7 @@ async function fetchJupiterPriceByCA(
   mainnetCa: string,
 ): Promise<number | null> {
   const normalized =
-    normalizeMainnetCaForLookup(mainnetCa);
+    normalizeSolanaAddress(mainnetCa);
 
   if (!normalized) return null;
 
@@ -1826,7 +1942,7 @@ async function fetchDexScreenerPriceByCA(
   mainnetCa: string,
 ): Promise<number | null> {
   const normalized =
-    normalizeMainnetCaForLookup(mainnetCa);
+    normalizeSolanaAddress(mainnetCa);
 
   if (!normalized) return null;
 
@@ -1944,6 +2060,17 @@ function reconcileMainnetCaSnapshot(
     );
 
     return;
+  }
+
+  if (
+    slabToMainnetCA.size > 0 &&
+    result.next.size === 0
+  ) {
+    log(
+      `🚨 [#57] ${context}: authoritative mainnet CA snapshot is empty — ` +
+        `removing all ${slabToMainnetCA.size} active mapping(s). ` +
+        `Verify Supabase RLS, permissions, and filters if this was unexpected.`,
+    );
   }
 
   const identityChangedSlabs = new Set<string>([
@@ -2175,10 +2302,7 @@ async function main() {
       log("⚠️ [#46] SUPABASE_ANON_KEY not set — falling back to SUPABASE_SERVICE_ROLE_KEY for read queries. Provision a dedicated anon/read key to reduce exposure.");
     }
     // Load and atomically reconcile the authoritative mainnet CA snapshot.
-    const caRows = await supabaseQuery(
-      "markets",
-      "select=slab_address,mainnet_ca&mainnet_ca=not.is.null",
-    );
+    const caRows = await fetchMainnetCaRows();
     reconcileMainnetCaSnapshot(caRows, "startup");
   } else {
     log("⚠️ Supabase not configured — auto-discovery disabled (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY)");
@@ -2193,10 +2317,7 @@ async function main() {
       try {
         // Refresh the complete CA snapshot. Successful empty snapshots remove
         // stale mappings; query failures preserve the last known-good state.
-        const caData = await supabaseQuery(
-          "markets",
-          "select=slab_address,mainnet_ca&mainnet_ca=not.is.null",
-        );
+        const caData = await fetchMainnetCaRows();
         reconcileMainnetCaSnapshot(caData, "discovery refresh");
 
         // Also check the oracle_markets override table (HYPERP explicit registrations)

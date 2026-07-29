@@ -100,6 +100,46 @@ describe("mainnet CA snapshot reconciliation", () => {
     assert.deepEqual([...result.next], [[SLAB_A, CA_A]]);
   });
 
+  it("accepts benign duplicate rows with the same normalized identity", () => {
+    const result = reconcileMainnetCaMappings(
+      new Map(),
+      [
+        {
+          slab_address: SLAB_B,
+          mainnet_ca: CA_B,
+        },
+        {
+          slab_address: SLAB_B,
+          mainnet_ca: CA_B,
+        },
+      ],
+    );
+
+    assert.equal(result.applied, true);
+    assert.deepEqual(
+      [...result.next],
+      [[SLAB_B, CA_B]],
+    );
+  });
+
+  it("trims whitespace before reconciling addresses", () => {
+    const result = reconcileMainnetCaMappings(
+      new Map(),
+      [
+        {
+          slab_address: `  ${SLAB_B}  `,
+          mainnet_ca: `\n${CA_B}\t`,
+        },
+      ],
+    );
+
+    assert.equal(result.applied, true);
+    assert.deepEqual(
+      [...result.next],
+      [[SLAB_B, CA_B]],
+    );
+  });
+
   it("rejects conflicting duplicate identities for the same slab", () => {
     const current = new Map([[SLAB_A, CA_A]]);
 

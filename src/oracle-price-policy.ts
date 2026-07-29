@@ -1,4 +1,6 @@
-const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+import {
+  normalizeSolanaAddress,
+} from "./mainnet-ca-registry.ts";
 
 export type PricingIdentityKind =
   | "static-symbol"
@@ -68,8 +70,11 @@ export function resolvePricingIdentity(
   if (market.isDynamic === true) {
     if (!market.slab) return null;
 
-    const mainnetCa = slabToMainnetCa.get(market.slab);
-    if (!mainnetCa || !SOLANA_ADDRESS_RE.test(mainnetCa)) {
+    const mainnetCa = normalizeSolanaAddress(
+      slabToMainnetCa.get(market.slab),
+    );
+
+    if (!mainnetCa) {
       return null;
     }
 
@@ -90,6 +95,9 @@ export function resolvePricingIdentity(
   };
 }
 
+/**
+ * Return true only for an attested Pyth price on a static-symbol identity.
+ */
 export function isStaticPythFirstPushExempt(
   identityKind: PricingIdentityKind,
   source: string,
@@ -149,7 +157,14 @@ export async function fetchIndependentFirstPushSecondary(
   const reader = readers[secondarySource];
   if (!reader) return null;
 
-  const price = await reader(identity.key);
+  let price: number | null;
+
+  try {
+    price = await reader(identity.key);
+  } catch {
+    return null;
+  }
+
   if (!isValidPrice(price)) return null;
 
   return {
@@ -158,6 +173,9 @@ export async function fetchIndependentFirstPushSecondary(
   };
 }
 
+/**
+ * Validate that a provider price is finite, positive, and available.
+ */
 function isValidPrice(value: number | null): value is number {
   return (
     value !== null &&

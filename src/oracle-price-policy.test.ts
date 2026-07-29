@@ -37,6 +37,28 @@ describe("price identity routing", () => {
     );
   });
 
+  it("normalizes whitespace around a mapped dynamic CA", () => {
+    const mappings = new Map([
+      [SLAB, `  ${MAINNET_CA}\n`],
+    ]);
+
+    assert.deepEqual(
+      resolvePricingIdentity(
+        {
+          symbol: "IGNORED",
+          slab: SLAB,
+          isDynamic: true,
+        },
+        mappings,
+        STATIC_SYMBOLS,
+      ),
+      {
+        kind: "dynamic-ca",
+        key: MAINNET_CA,
+      },
+    );
+  });
+
   it("fails closed when a dynamic market has no CA mapping", () => {
     assert.equal(
       resolvePricingIdentity(
@@ -329,6 +351,24 @@ describe("independent secondary reader orchestration", () => {
     assert.equal(jupiterCaCalls, 0);
     assert.equal(dexScreenerCaCalls, 1);
     assert.equal(receivedIdentity, MAINNET_CA);
+  });
+
+  it("fails closed when the selected independent reader rejects", async () => {
+    const result =
+      await fetchIndependentFirstPushSecondary(
+        {
+          kind: "static-symbol",
+          key: "SOL",
+        },
+        "jupiter",
+        {
+          dexscreener: async () => {
+            throw new Error("provider failure");
+          },
+        },
+      );
+
+    assert.equal(result, null);
   });
 
   it("fails closed when the required independent reader is unavailable", async () => {

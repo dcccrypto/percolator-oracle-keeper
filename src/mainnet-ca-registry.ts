@@ -26,6 +26,9 @@ export interface MainnetCaReconcileResult {
   reason?: MainnetCaSnapshotRejectReason;
 }
 
+/**
+ * Create an empty reconciliation diff.
+ */
 function emptyDiff(): {
   added: Set<string>;
   changed: Set<string>;
@@ -38,6 +41,9 @@ function emptyDiff(): {
   };
 }
 
+/**
+ * Build a rejected reconciliation result that preserves current state.
+ */
 function preserveCurrent(
   current: ReadonlyMap<string, string>,
   reason: MainnetCaSnapshotRejectReason,
@@ -52,10 +58,19 @@ function preserveCurrent(
   };
 }
 
+/**
+ * Narrow an unknown Supabase row to a non-null record.
+ */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+/**
+ * Trim and validate a base58-formatted Solana address.
+ *
+ * This is the single normalization rule used by registry ingestion, pricing
+ * identity resolution, and provider URL construction.
+ */
 export function normalizeSolanaAddress(value: unknown): string | null {
   if (typeof value !== "string") return null;
 
