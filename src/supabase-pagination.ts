@@ -149,13 +149,13 @@ export async function collectCompletePostgrestSnapshot<T>(
       return null;
     }
 
-    if (
-      collected.length + page.rows.length >
-      range.total
-    ) {
-      return null;
-    }
-
+    // At this point:
+    //
+    // - range.start equals the next expected offset
+    // - the response row count equals the declared range length
+    // - parsePostgrestContentRange() guarantees range.end < range.total
+    //
+    // Therefore appending this page cannot exceed the declared total.
     collected.push(...page.rows);
 
     if (range.end === range.total - 1) {

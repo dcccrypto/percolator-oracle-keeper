@@ -129,6 +129,59 @@ describe("complete PostgREST snapshot collection", () => {
     assert.equal(result, null);
   });
 
+  it("rejects invalid page sizes before requesting a page", async () => {
+    let fetchCalls = 0;
+
+    await assert.rejects(
+      () =>
+        collectCompletePostgrestSnapshot(
+          async () => {
+            fetchCalls++;
+            return {
+              rows: [],
+              contentRange: "*/0",
+            };
+          },
+          0,
+        ),
+      {
+        name: "RangeError",
+        message:
+          "pageSize must be a positive safe integer",
+      },
+    );
+
+    assert.equal(fetchCalls, 0);
+  });
+
+  it("rejects a page whose range starts at an unexpected offset", async () => {
+    const result =
+      await collectCompletePostgrestSnapshot(
+        async () => ({
+          rows: ["unexpected"],
+          contentRange: "1-1/2",
+        }),
+      );
+
+    assert.equal(result, null);
+  });
+
+  it("returns an authoritative empty snapshot through the collector", async () => {
+    const result =
+      await collectCompletePostgrestSnapshot(
+        async (start) => {
+          assert.equal(start, 0);
+
+          return {
+            rows: [],
+            contentRange: "*/0",
+          };
+        },
+      );
+
+    assert.deepEqual(result, []);
+  });
+
   it("fails closed when a page reader rejects", async () => {
     const result =
       await collectCompletePostgrestSnapshot(
