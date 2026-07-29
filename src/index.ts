@@ -53,6 +53,21 @@ import { parsePositiveNumberEnv, requireProgramIdForSupabaseMode } from "./env-u
 import { checkCircuitBreaker as _checkCircuitBreaker } from "./circuit-breaker.ts";
 import type { CircuitBreakerState } from "./circuit-breaker.ts";
 import { selectMarketGroupOffset } from "./wrapper-market-group-offset.ts";
+import {
+  applyMainnetCaSnapshot,
+  reconcileMainnetCaMappings,
+} from "./mainnet-ca-registry.ts";
+import {
+  fetchIndependentFirstPushSecondary,
+  isStaticPythFirstPushExempt,
+  resetPriceBaselineForIdentityChange,
+  resolvePricingIdentity,
+  shouldInvalidatePriceBaselineForMainnetCaChange,
+  validateFirstPushSecondary,
+} from "./oracle-price-policy.ts";
+import type {
+  FirstPushPriceReaders,
+} from "./oracle-price-policy.ts";
 
 // #31(a): Refuse to start with TLS verification disabled.
 // NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate validation for ALL
@@ -796,56 +811,92 @@ async function fetchDexScreenerPrice(symbol: string): Promise<PriceResult | null
   } catch { return null; }
 }
 
-/** Fetch price with multi-source failover: CA lookup for mapped dynamic markets → Pyth → Jupiter → DexScreener */
-const ALLOWED_STATIC_SYMBOLS = new Set<string>(Object.keys(PYTH_FEED_IDS).concat(Object.keys(JUPITER_MINTS)));
+/**
+ * Explicitly allowlisted static symbols.
+ *
+ * Dynamic markets never use this list; they resolve exclusively through their
+ * authoritative slab -> mainnet_ca mapping.
+ */
+const ALLOWED_STATIC_SYMBOLS = new Set<string>(
+  Object.keys(PYTH_FEED_IDS).concat(
+    Object.keys(JUPITER_MINTS),
+  ),
+);
 
-/** Fetch price with multi-source failover: CA lookup for mapped dynamic markets → Pyth → Jupiter → DexScreener */
+/**
+ * Fetch a live price after resolving the market's authoritative identity.
+ *
+ * Routing is intentionally disjoint:
+ *
+ * - dynamic market -> mainnet CA only
+ * - static market  -> allowlisted symbol only
+ *
+ * A stale slabToMainnetCA entry can therefore never redirect a static market
+ * to a different asset.
+ */
 async function getPrice(
   symbol: string,
   slab?: string,
   isDynamic?: boolean,
 ): Promise<PriceResult | null> {
-  // If the market is dynamic, bypass symbol-based lookups completely to prevent oracle confusion. (HIGH-004)
-  // Dynamic markets must resolve strictly through their contract address (mainnet_ca).
-  if (isDynamic) {
-    if (slab) {
-      const ca = slabToMainnetCA.get(slab);
-      if (ca) {
-        return fetchPriceByCA(ca);
-      }
+  const identity = resolvePricingIdentity(
+    {
+      symbol,
+      slab,
+      isDynamic,
+    },
+    slabToMainnetCA,
+    ALLOWED_STATIC_SYMBOLS,
+  );
+
+  if (!identity) {
+    if (isDynamic === true) {
+      log(
+        `⚠️ [#59] getPrice: dynamic market ` +
+          `${slab?.slice(0, 12) ?? "<missing-slab>"}... ` +
+          `has no valid mainnet CA mapping — refusing symbol fallback`,
+      );
+    } else {
+      log(
+        `⚠️ [#59] getPrice: rejected unknown static symbol lookup ` +
+          `for "${symbol}"`,
+      );
     }
+
     return null;
   }
 
-  // Non-dynamic: CA-first routing for markets with a known mainnet_ca mapping.
-  // This ensures symbol→wrong-asset confusion is avoided even for non-isDynamic markets.
-  if (slab) {
-    const ca = slabToMainnetCA.get(slab);
-    if (ca) {
-      const caPrice = await fetchPriceByCA(ca);
-      if (caPrice) return caPrice;
-    }
+  if (identity.kind === "dynamic-ca") {
+    return fetchPriceByCA(identity.key);
   }
 
-  // Security hardening: Restrict static symbols to a known safe allowlist to prevent confusion (HIGH-004)
-  if (!ALLOWED_STATIC_SYMBOLS.has(symbol)) {
-    log(`⚠️ getPrice: rejected unknown static symbol lookup for "${symbol}"`);
-    return null;
+  const staticSymbol = identity.key;
+
+  // Primary: Pyth.
+  const pyth = getPythPrice(staticSymbol);
+  if (pyth) {
+    return {
+      price: pyth.price,
+      source: "pyth",
+      freshAt: pyth.freshAt,
+    };
   }
 
-  // Primary: Pyth (decentralized oracle, fastest for supported tokens)
-  const pyth = getPythPrice(symbol);
-  if (pyth) return { price: pyth.price, source: "pyth", freshAt: pyth.freshAt };
+  // Secondary: Jupiter symbol/mint lookup.
+  const jupiterPrice = await fetchJupiterPrice(
+    staticSymbol,
+  );
 
-  // Secondary: Jupiter (Solana DEX aggregator, uses mint addresses)
-  const jup = await fetchJupiterPrice(symbol);
-  if (jup) return { price: jup, source: "jupiter", freshAt: Date.now() };
+  if (jupiterPrice) {
+    return {
+      price: jupiterPrice,
+      source: "jupiter",
+      freshAt: Date.now(),
+    };
+  }
 
-  // Tertiary: DexScreener (broad coverage for exotic tokens) — uses tighter bound (#34)
-  const dex = await fetchDexScreenerPrice(symbol);
-  if (dex) return dex;
-
-  return null;
+  // Tertiary: DexScreener symbol/mint lookup.
+  return fetchDexScreenerPrice(staticSymbol);
 }
 
 /**
@@ -1160,54 +1211,88 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
     return;
   }
 
-  // #33: First-push cross-check.
-  // The sync circuit-breaker in circuit-breaker.ts unconditionally accepts any
-  // price when lastPrice===0 (every restart). An attacker who can influence the
-  // first price (e.g. flash a DexScreener/Jupiter pool just before restart) could
-  // re-baseline the keeper to a manipulated price.
+  // #33 / #55 / #58: first-push independent-source validation.
   //
-  // Mitigation: on the FIRST push for a market after start (lastPrice===0),
-  // require a secondary-source confirmation UNLESS the price came from a Pyth
-  // (Wormhole-attested) source, which is already multi-oracle-verified.
+  // Static Pyth prices remain exempt because they are already oracle-attested.
+  // Every other first price must be confirmed by:
   //
-  // The actual circuit-breaker (sync) runs after this async pre-check.
-  if (s.lastPrice === 0 && source !== "pyth") {
-    // Attempt a secondary source confirmation
-    let secondaryOk = false;
-    let secondaryPrice: number | null = null;
-    // Try Jupiter first (it's the fastest non-Pyth source)
-    const jupPrice = await fetchJupiterPrice(market.symbol);
-    if (jupPrice !== null) {
-      secondaryPrice = jupPrice;
-      const movePct = Math.abs((price - jupPrice) / jupPrice) * 100;
-      // Use DEXSCREENER_MAX_MOVE_PCT as the cross-check tolerance
-      if (movePct <= DEXSCREENER_MAX_MOVE_PCT) {
-        secondaryOk = true;
-      }
-    }
-    if (!secondaryOk) {
-      // Also try Pyth cache (may have been populated by this tick's batch fetch)
-      const pythEntry = getPythPrice(market.symbol);
-      if (pythEntry) {
-        const movePct = Math.abs((price - pythEntry.price) / pythEntry.price) * 100;
-        if (movePct <= DEXSCREENER_MAX_MOVE_PCT) {
-          secondaryOk = true;
-          secondaryPrice = pythEntry.price;
-        }
-      }
-    }
-    if (!secondaryOk) {
+  // - the same authoritative asset identity
+  // - a different provider
+  // - a price within the configured tolerance
+  //
+  // Dynamic markets use mainnet_ca, never market.symbol.
+  if (s.lastPrice === 0) {
+    const identity = resolvePricingIdentity(
+      {
+        symbol: market.symbol,
+        slab: market.slab,
+        isDynamic: market.isDynamic,
+      },
+      slabToMainnetCA,
+      ALLOWED_STATIC_SYMBOLS,
+    );
+
+    if (!identity) {
       log(
-        `⚠️ [#33] ${market.label}: first push cross-check FAILED — ` +
-        `${source} price $${price.toFixed(4)} not confirmed by secondary source ` +
-        `(secondary=${ secondaryPrice !== null ? `$${secondaryPrice.toFixed(4)}` : "unavailable" }). ` +
-        `Holding until cross-check passes or a Pyth price becomes available.`,
+        `⚠️ [#55/#58] ${market.label}: ` +
+          `cannot resolve authoritative identity for first-push validation — ` +
+          `refusing to establish an oracle baseline`,
       );
+
       s.totalErrors++;
       s.consecutiveErrors++;
       return;
     }
-    log(`✓ [#33] ${market.label}: first push cross-check PASSED (${source} $${price.toFixed(4)} ≈ secondary $${secondaryPrice!.toFixed(4)})`);
+
+    if (
+      !isStaticPythFirstPushExempt(
+        identity.kind,
+        source,
+      )
+    ) {
+      const secondary =
+        await fetchIndependentFirstPushSecondary(
+          identity,
+          source,
+          FIRST_PUSH_PRICE_READERS,
+        );
+
+      const secondaryOk =
+        secondary !== null &&
+        validateFirstPushSecondary(
+          identity.kind,
+          source,
+          secondary.source,
+          price,
+          secondary.price,
+          DEXSCREENER_MAX_MOVE_PCT,
+        );
+
+      if (!secondaryOk) {
+        const secondaryDescription = secondary
+          ? `${secondary.source} $${secondary.price.toFixed(4)}`
+          : "independent source unavailable";
+
+        log(
+          `⚠️ [#55/#58] ${market.label}: first push cross-check FAILED — ` +
+            `primary=${source} $${price.toFixed(4)}, ` +
+            `identity=${identity.kind}:${identity.key.slice(0, 12)}..., ` +
+            `secondary=${secondaryDescription}. ` +
+            `Refusing to establish an unconfirmed baseline.`,
+        );
+
+        s.totalErrors++;
+        s.consecutiveErrors++;
+        return;
+      }
+
+      log(
+        `✓ [#55/#58] ${market.label}: first push cross-check PASSED — ` +
+          `${source} $${price.toFixed(4)} confirmed by ` +
+          `${secondary.source} $${secondary.price.toFixed(4)} ` +
+          `using ${identity.kind}`,
+      );
+    }
   }
 
   // Circuit breaker — use per-source bound for DexScreener (#34)
@@ -1679,43 +1764,245 @@ async function discoverNewMarkets(): Promise<MarketInfo[]> {
  * since they may not be in PYTH_FEED_IDS or JUPITER_MINTS.
  * This fetches price directly using the mainnet CA via Jupiter Lite API.
  */
-async function fetchPriceByCA(mainnetCA: string): Promise<PriceResult | null> {
-  // Validate as base58 Solana address before using in external URLs (#783, #784)
-  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mainnetCA)) return null;
-  const encoded = encodeURIComponent(mainnetCA);
+function normalizeMainnetCaForLookup(
+  mainnetCa: string,
+): string | null {
+  const normalized = mainnetCa.trim();
+
+  if (
+    !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(
+      normalized,
+    )
+  ) {
+    return null;
+  }
+
+  return normalized;
+}
+
+/**
+ * Jupiter-only CA reader.
+ *
+ * This must stay separate from the fallback wrapper so first-push validation
+ * can prove that Jupiter was not used as both primary and secondary.
+ */
+async function fetchJupiterPriceByCA(
+  mainnetCa: string,
+): Promise<number | null> {
+  const normalized =
+    normalizeMainnetCaForLookup(mainnetCa);
+
+  if (!normalized) return null;
+
+  const encoded = encodeURIComponent(normalized);
 
   try {
-    const resp = await fetch(
+    const response = await fetch(
       `https://api.jup.ag/price/v2?ids=${encoded}`,
-      { signal: AbortSignal.timeout(4000) },
+      {
+        signal: AbortSignal.timeout(4000),
+      },
     );
-    const json = (await resp.json()) as any;
-    const data = json.data?.[mainnetCA];
-    if (data?.price) {
-      const p = parseFloat(data.price);
-      if (isFinite(p) && p > 0) return { price: p, source: "jupiter-ca", freshAt: Date.now() };
-    }
-  } catch {}
 
-  // DexScreener fallback — tag with tighter bound (#34)
+    const json = (await response.json()) as any;
+    const value = json.data?.[normalized]?.price;
+
+    if (!value) return null;
+
+    const price = Number.parseFloat(value);
+
+    return Number.isFinite(price) && price > 0
+      ? price
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * DexScreener-only CA reader.
+ */
+async function fetchDexScreenerPriceByCA(
+  mainnetCa: string,
+): Promise<number | null> {
+  const normalized =
+    normalizeMainnetCaForLookup(mainnetCa);
+
+  if (!normalized) return null;
+
+  const encoded = encodeURIComponent(normalized);
+
   try {
-    const resp = await fetch(
+    const response = await fetch(
       `https://api.dexscreener.com/latest/dex/tokens/${encoded}`,
-      { signal: AbortSignal.timeout(4000) },
+      {
+        signal: AbortSignal.timeout(4000),
+      },
     );
-    const json = (await resp.json()) as any;
-    const pair = json.pairs?.[0];
-    if (pair?.priceUsd) {
-      const p = parseFloat(pair.priceUsd);
-      if (isFinite(p) && p > 0) return { price: p, source: "dexscreener-ca", freshAt: Date.now(), maxMovePct: DEXSCREENER_MAX_MOVE_PCT };
-    }
-  } catch {}
+
+    const json = (await response.json()) as any;
+    const value = json.pairs?.[0]?.priceUsd;
+
+    if (!value) return null;
+
+    const price = Number.parseFloat(value);
+
+    return Number.isFinite(price) && price > 0
+      ? price
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Normal dynamic-market failover.
+ *
+ * First-push confirmation does not call this wrapper because it must select
+ * exactly one independent provider rather than silently falling back to the
+ * provider that supplied the primary price.
+ */
+async function fetchPriceByCA(
+  mainnetCa: string,
+): Promise<PriceResult | null> {
+  const jupiterPrice =
+    await fetchJupiterPriceByCA(mainnetCa);
+
+  if (jupiterPrice !== null) {
+    return {
+      price: jupiterPrice,
+      source: "jupiter-ca",
+      freshAt: Date.now(),
+    };
+  }
+
+  const dexScreenerPrice =
+    await fetchDexScreenerPriceByCA(mainnetCa);
+
+  if (dexScreenerPrice !== null) {
+    return {
+      price: dexScreenerPrice,
+      source: "dexscreener-ca",
+      freshAt: Date.now(),
+      maxMovePct: DEXSCREENER_MAX_MOVE_PCT,
+    };
+  }
 
   return null;
 }
 
+/**
+ * Explicit provider readers used by first-push confirmation.
+ *
+ * The policy module selects which single reader is allowed. Readers for the
+ * primary provider are never called.
+ */
+const FIRST_PUSH_PRICE_READERS: FirstPushPriceReaders = {
+  jupiter: fetchJupiterPrice,
+
+  dexscreener: async (symbol) => {
+    const result =
+      await fetchDexScreenerPrice(symbol);
+
+    return result?.price ?? null;
+  },
+
+  "jupiter-ca": fetchJupiterPriceByCA,
+
+  "dexscreener-ca":
+    fetchDexScreenerPriceByCA,
+};
+
+
 // Map slab address → mainnet CA for dynamic markets
 const slabToMainnetCA = new Map<string, string>();
+
+/**
+ * Apply a complete Supabase mainnet_ca snapshot.
+ *
+ * Query failure preserves the last known-good mapping. A valid successful
+ * snapshot is applied atomically, including removals. When a slab's CA changes
+ * or is removed, cached price and circuit-breaker state from the previous asset
+ * identity is cleared before the new snapshot becomes active.
+ */
+function reconcileMainnetCaSnapshot(
+  rows: readonly unknown[] | null,
+  context: string,
+): void {
+  const result = reconcileMainnetCaMappings(
+    slabToMainnetCA,
+    rows,
+  );
+
+  if (!result.applied) {
+    const reason = result.reason ?? "unknown";
+
+    log(
+      `⚠️ [#57] ${context}: mainnet CA snapshot rejected ` +
+        `(reason=${reason}, invalidRows=${result.invalidRows}) — ` +
+        `preserving ${slabToMainnetCA.size} last-known-good mapping(s)`,
+    );
+
+    return;
+  }
+
+  const identityChangedSlabs = new Set<string>([
+    ...result.changed,
+    ...result.removed,
+  ]);
+
+  for (const slab of identityChangedSlabs) {
+    const market = markets.find(
+      (candidate) => candidate.slab === slab,
+    );
+
+    const changeType = result.changed.has(slab)
+      ? "changed"
+      : "removed";
+
+    if (
+      market &&
+      shouldInvalidatePriceBaselineForMainnetCaChange(
+        market.isDynamic,
+      )
+    ) {
+      const state = stats.get(slab);
+
+      if (state) {
+        resetPriceBaselineForIdentityChange(state);
+      }
+
+      log(
+        `⚠️ [#57] ${context}: ` +
+          `${market.label} mainnet CA ${changeType} — ` +
+          `cleared dynamic-market price and circuit-breaker baseline`,
+      );
+
+      continue;
+    }
+
+    if (market) {
+      log(
+        `ℹ️ [#59] ${context}: ` +
+          `${market.label} is static — mainnet CA ${changeType}, ` +
+          `but its symbol-based price baseline was preserved`,
+      );
+    }
+  }
+
+  applyMainnetCaSnapshot(
+    slabToMainnetCA,
+    result,
+  );
+
+  log(
+    `✓ [#57] ${context}: mainnet CA snapshot reconciled — ` +
+      `${slabToMainnetCA.size} active, ` +
+      `added=${result.added.size}, ` +
+      `changed=${result.changed.size}, ` +
+      `removed=${result.removed.size}`,
+  );
+}
 
 // ── Main Loop ───────────────────────────────────────────────
 async function main() {
@@ -1887,17 +2174,12 @@ async function main() {
     if (!process.env.SUPABASE_ANON_KEY && SUPABASE_SERVICE_KEY) {
       log("⚠️ [#46] SUPABASE_ANON_KEY not set — falling back to SUPABASE_SERVICE_ROLE_KEY for read queries. Provision a dedicated anon/read key to reduce exposure.");
     }
-    // Load mainnet CAs for existing markets from Supabase
+    // Load and atomically reconcile the authoritative mainnet CA snapshot.
     const caRows = await supabaseQuery(
       "markets",
       "select=slab_address,mainnet_ca&mainnet_ca=not.is.null",
     );
-    if (caRows) {
-      for (const row of caRows) {
-        slabToMainnetCA.set(row.slab_address, row.mainnet_ca);
-      }
-      log(`Loaded ${caRows.length} mainnet CA mapping(s) from Supabase`);
-    }
+    reconcileMainnetCaSnapshot(caRows, "startup");
   } else {
     log("⚠️ Supabase not configured — auto-discovery disabled (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY)");
   }
@@ -1909,16 +2191,13 @@ async function main() {
     if (supabaseEnabled && now - lastDiscoveryAt > DISCOVERY_INTERVAL_MS) {
       lastDiscoveryAt = now;
       try {
-        // Refresh mainnet CA mappings
+        // Refresh the complete CA snapshot. Successful empty snapshots remove
+        // stale mappings; query failures preserve the last known-good state.
         const caData = await supabaseQuery(
           "markets",
           "select=slab_address,mainnet_ca&mainnet_ca=not.is.null",
         );
-        if (caData) {
-          for (const row of caData) {
-            slabToMainnetCA.set(row.slab_address, row.mainnet_ca);
-          }
-        }
+        reconcileMainnetCaSnapshot(caData, "discovery refresh");
 
         // Also check the oracle_markets override table (HYPERP explicit registrations)
         const oracleTableMarkets = await discoverHyperpFromOracleTable();
