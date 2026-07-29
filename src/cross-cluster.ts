@@ -40,7 +40,8 @@ import { loadRegistry } from "./cross-cluster/registry.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { crankAllOnce, startRecoveryCrankLoop } from "./cross-cluster/recovery-cranker.ts";
 import { startLpFeeCrankLoop } from "./cross-cluster/lp-fee-cranker.ts";
-import { startRegisterPollLoop } from "./cross-cluster/register-poll.ts";
+import { startRegisterPollLoop, pollOnce } from "./cross-cluster/register-poll.ts";
+import { startRegistrationStream, type RegistrationStream } from "./cross-cluster/registration-stream.ts";
 import { startRegistryReloadLoop } from "./cross-cluster/registry-reload.ts";
 import { WRAPPER_PROGRAM_ID } from "./cross-cluster/auth-mark-pusher.ts";
 
@@ -126,13 +127,19 @@ const LP_FEE_CRANK_INTERVAL_MS = parseInt(process.env.LP_FEE_CRANK_INTERVAL_MS ?
 // keeper is NAT'd/outbound-only; the frontend can never reach it directly). Off unless
 // REGISTER_SOURCE_URL is set — nothing to poll without a source.
 const REGISTER_SOURCE_URL = process.env.REGISTER_SOURCE_URL;
-// 3s, not 30s. A market the user just created has to start being priced
-// immediately — at 30s the markets page showed it live while the keeper had not
-// yet heard of it, so its price sat at the seed value for up to half a minute.
-// The endpoint is a no-store liveness feed backed by one indexed select, so
-// polling it every 3s is cheap; the old interval was sized for a cached
-// Blob-only read.
-const REGISTER_POLL_INTERVAL_MS = parseInt(process.env.REGISTER_POLL_INTERVAL_MS ?? "3000", 10);
+
+// Supabase Realtime credentials for push registration. Anon key only: `markets`
+// has RLS with a public_read SELECT policy and Realtime enforces RLS per
+// subscriber, so this exposes nothing GET /api/markets does not already serve.
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+let registrationStream: RegistrationStream | null = null;
+// This is the SAFETY NET, not the fast path. Supabase Realtime (see
+// registration-stream.ts) triggers a poll the instant a `markets` row changes,
+// so a new market is picked up in ~ms. This loop exists for when that socket is
+// down, throttled, or Realtime is unavailable — registration still converges,
+// just slower. 30s is fine for that role; it does not gate launch latency.
+const REGISTER_POLL_INTERVAL_MS = parseInt(process.env.REGISTER_POLL_INTERVAL_MS ?? "30000", 10);
 
 const REGISTRY_PATH =
   process.env.REGISTRY_PATH ??
@@ -258,7 +265,7 @@ if (LP_FEE_CRANK_ENABLED) {
 // startKeeperLoop/startRecoveryCrankLoop below, so a market added here is picked up
 // by both of those loops on their very next cycle.
 if (REGISTER_SOURCE_URL) {
-  void startRegisterPollLoop(registry, {
+  const registerPollConfig = {
     sourceUrl: REGISTER_SOURCE_URL,
     registryPath: REGISTRY_PATH,
     intervalMs: REGISTER_POLL_INTERVAL_MS,
@@ -267,7 +274,35 @@ if (REGISTER_SOURCE_URL) {
     // atomic push batch (they revert it with IncorrectProgramId).
     connection: devnetConn,
     expectedOwner: WRAPPER_PROGRAM_ID,
-  }).catch((err) => {
+  };
+
+  // Push path: Supabase Realtime tells us the instant a `markets` row changes,
+  // so a market the user just created is picked up in ~ms rather than waiting
+  // for the next tick. It TRIGGERS the poll rather than replacing it — one code
+  // path still admits a market, and if the socket drops the loop below covers
+  // it. See cross-cluster/registration-stream.ts.
+  if (SUPABASE_URL && SUPABASE_ANON_KEY) {
+    registrationStream = startRegistrationStream({
+      supabaseUrl: SUPABASE_URL,
+      supabaseAnonKey: SUPABASE_ANON_KEY,
+      onChange: () => {
+        void pollOnce(registry, registerPollConfig).catch((err) => {
+          console.warn(
+            `[registration-stream] triggered poll failed (periodic poll unaffected): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+      },
+    });
+  } else {
+    console.warn(
+      "[registration-stream] SUPABASE_URL/SUPABASE_ANON_KEY unset — push registration" +
+        " disabled, falling back to the periodic poll alone.",
+    );
+  }
+
+  void startRegisterPollLoop(registry, registerPollConfig).catch((err) => {
     console.error(
       `[register-poll] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
     );

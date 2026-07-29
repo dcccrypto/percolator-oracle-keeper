@@ -121,7 +121,12 @@ function toMarketEntry(remote: RemoteMarket): Omit<MarketEntry, "registeredAt"> 
  *
  * Returns the number of markets added this cycle.
  */
-async function pollOnce(registry: Registry, config: RegisterPollConfig): Promise<number> {
+/**
+ * One registration poll. Exported so the Realtime stream can trigger a poll the
+ * instant a market row changes (see registration-stream.ts) — the stream is the
+ * wake-up, this stays the single path that actually admits a market.
+ */
+export async function pollOnce(registry: Registry, config: RegisterPollConfig): Promise<number> {
   let payload: unknown;
   try {
     const resp = await fetch(config.sourceUrl, {
