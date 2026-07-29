@@ -1,55 +1,5 @@
 {
   "version": 1,
-  "description": "v17 devnet 2.0 — new wrapper DhSkE7u ONLY. Old-wrapper markets removed 2026-07-23 (they caused atomic IncorrectProgramId batch reverts). register-poll temporarily off during verification.",
-  "markets": [
-    {
-      "label": "SOL/USDC — raydium-clmm",
-      "marketAddress": "BPgSUbDsxZ9bkauWgd6eQ8oLHVx6pSsvfAjPGsS2Sso8",
-      "poolAddress": "8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj",
-      "dexType": "raydium-clmm",
-      "assetIndex": 0,
-      "symbol": "SOL/USDC",
-      "collateral": "USDC"
-    },
-    {
-      "label": "Percolator/USDC — pumpswap",
-      "marketAddress": "7FBXdrm1vQ4ktQJjMwurq4cAHkVB1gKoZ7Hx3CAQv6P4",
-      "poolAddress": "Ebs3mXAzqZfzHfsdinTNw7gPy4uNyEAywcCiJxzLRrBW",
-      "dexType": "pumpswap",
-      "assetIndex": 0,
-      "symbol": "Percolator",
-      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
-      "registeredAt": 1784804759462
-    },
-    {
-      "label": "Jimothy/USDC — pumpswap",
-      "marketAddress": "gHey79gB1xGQyXne8yEHoKmGi6jrEVigLwxSXQrYkD3",
-      "poolAddress": "5PGhKctym6odbHGo2tKMST2AjmJsb2uZBQrKkn4ZuFT5",
-      "dexType": "pumpswap",
-      "assetIndex": 0,
-      "symbol": "Jimothy",
-      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
-      "registeredAt": 1784942942893
-    },
-    {
-      "label": "TROLL/USDC — pumpswap",
-      "marketAddress": "8SHhSKuY9cun15Y2Q9p9SNEV86zzSWbeP4e59xLAv99h",
-      "poolAddress": "4w2cysotX6czaUGmmWg13hDpY4QEMG2CzeKYEQyK9Ama",
-      "dexType": "pumpswap",
-      "assetIndex": 0,
-      "symbol": "TROLL",
-      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
-      "registeredAt": 1785084432523
-    },
-    {
-      "label": "ANSEM/USDC — pumpswap",
-      "marketAddress": "CseeeuKKbgNU38VRukG38mTdcPJ4KWci5GmFikEtp1X5",
-      "poolAddress": "FnzKY6x7entQ1eR3D225dQyT7ybfka4PskBMQhb8L3CC",
-      "dexType": "pumpswap",
-      "assetIndex": 0,
-      "symbol": "ANSEM",
-      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
-      "registeredAt": 1785084582429
-    }
-  ]
+  "description": "v17 devnet 2.0 \u2014 new wrapper DhSkE7u ONLY. Old-wrapper markets removed 2026-07-23 (they caused atomic IncorrectProgramId batch reverts). register-poll temporarily off during verification.",
+  "markets": []
 }

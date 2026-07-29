@@ -145,11 +145,29 @@ if (registry.markets.length === 0) {
     "[warn] Registry is empty — no markets to push to." +
       " Register markets via addMarket() or by populating registry.json.",
   );
-  if (!DRY_RUN) {
+  // An empty registry is only fatal when there is no way to become non-empty.
+  //
+  // This exit predates the registration-poll loop, when registry.json was the
+  // only source and empty genuinely meant "nothing to do, ever". With
+  // REGISTER_SOURCE_URL set there IS something to do: wait for the frontend to
+  // publish a market and pick it up on the next poll.
+  //
+  // Exiting here made retiring every market a trap — the board is cleared, the
+  // keeper dies, and the next market launched is never priced because nothing
+  // is alive to poll for it. Starting empty and filling from the poll is the
+  // normal cold-start path now, not an error.
+  if (!DRY_RUN && !REGISTER_SOURCE_URL) {
     console.error(
-      "[fatal] Nothing to do in live mode with an empty registry. Exiting.",
+      "[fatal] Nothing to do in live mode with an empty registry and no" +
+        " REGISTER_SOURCE_URL to poll. Exiting.",
     );
     process.exit(1);
+  }
+  if (REGISTER_SOURCE_URL) {
+    console.warn(
+      `[warn] Starting with an empty registry — waiting for markets from ${REGISTER_SOURCE_URL}` +
+        ` (poll every ${REGISTER_POLL_INTERVAL_MS}ms).`,
+    );
   }
 }
 
