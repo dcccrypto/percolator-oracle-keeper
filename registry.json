@@ -1,5 +1,16 @@
 {
   "version": 1,
-  "description": "v17 devnet 2.0 \u2014 new wrapper DhSkE7u ONLY. Old-wrapper markets removed 2026-07-23 (they caused atomic IncorrectProgramId batch reverts). register-poll temporarily off during verification.",
-  "markets": []
+  "description": "v17 devnet 2.0 — new wrapper DhSkE7u ONLY. Old-wrapper markets removed 2026-07-23 (they caused atomic IncorrectProgramId batch reverts). register-poll temporarily off during verification.",
+  "markets": [
+    {
+      "label": "FRANK/USDC — pumpswap",
+      "marketAddress": "H9ey1RBnVoBBit2o7EUCPZWJLMNtQpuA6QiqGmM95ZJ4",
+      "poolAddress": "Bm7uQqEanV8xnLBci1XKQipzxugZTC4vQFsQVc3Zoomk",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "FRANK",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "registeredAt": 1785332289097
+    }
+  ]
 }

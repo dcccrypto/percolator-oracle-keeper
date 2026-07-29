@@ -208,7 +208,14 @@ async function runCycle(
   // ── 2. Read ALL pool prices in ONE getMultipleAccounts (DEX-pool source) ────
   let prices: Map<string, bigint>;
   try {
-    prices = await readAllPoolPricesE6(mainnetConn, registry.markets, decimalsCache);
+    prices = await readAllPoolPricesE6(
+      mainnetConn,
+      registry.markets,
+      decimalsCache,
+      // SOL/USD reference for WSOL-quoted (pumpswap) pools when no SOL/USDC
+      // market is registered — see the param's doc comment.
+      process.env.SOL_USD_REFERENCE_POOL,
+    );
   } catch (err) {
     const msg = (err instanceof Error ? err.message : String(err)).slice(0, 160);
     console.error(`[loop] batch pool read error — ${msg}`);

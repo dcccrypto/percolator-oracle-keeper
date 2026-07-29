@@ -408,6 +408,21 @@ export async function readAllPoolPricesE6(
   mainnetConn: Connection,
   entries: Array<Pick<MarketEntry, "poolAddress" | "dexType" | "label" | "symbol">>,
   decimalsCache: DecimalsCache,
+  /**
+   * Mainnet raydium-clmm SOL/USDC pool used as the SOL/USD reference when no
+   * registry entry provides one.
+   *
+   * PumpSwap pools quote in WSOL, so every pumpswap market needs a SOL/USD rate
+   * to convert into USD. That rate came ONLY from a registry entry matching
+   * isSolUsdEntry — i.e. from a SOL/USDC market happening to be registered. The
+   * anchor is a price SOURCE, but it was modelled as a MARKET, so retiring the
+   * SOL/USDC market silently made every pumpswap market unpriceable: they all
+   * reported "no pool price this cycle" with nothing obviously wrong.
+   *
+   * Supplying this decouples the two. Read only when pass 1 produced no rate, so
+   * a registered SOL/USDC market still wins and this costs nothing when present.
+   */
+  solUsdReferencePool?: string,
 ): Promise<Map<string, bigint>> {
   const out = new Map<string, bigint>();
   if (entries.length === 0) return out;
@@ -486,6 +501,24 @@ export async function readAllPoolPricesE6(
       }
     } catch {
       /* skip this pool for this cycle; next cycle retries */
+    }
+  }
+
+  // No SOL/USD from the registry this cycle — fall back to the reference pool.
+  // Without this every WSOL-quoted (pumpswap) market is skipped.
+  if (solPriceE6 === undefined && solUsdReferencePool) {
+    try {
+      const refPk = new PublicKey(solUsdReferencePool);
+      const refInfo = await withRpcBackoff(() => mainnetConn.getAccountInfo(refPk, "confirmed"));
+      if (refInfo?.data) {
+        const refDex = detectDexType(refInfo.owner);
+        if (refDex === "raydium-clmm") {
+          const refPrice = computeDexSpotPriceE6("raydium-clmm", new Uint8Array(refInfo.data));
+          if (refPrice > 0n) solPriceE6 = refPrice;
+        }
+      }
+    } catch {
+      // Reference unavailable — pumpswap entries skip this cycle, as before.
     }
   }
 
