@@ -126,7 +126,13 @@ const LP_FEE_CRANK_INTERVAL_MS = parseInt(process.env.LP_FEE_CRANK_INTERVAL_MS ?
 // keeper is NAT'd/outbound-only; the frontend can never reach it directly). Off unless
 // REGISTER_SOURCE_URL is set — nothing to poll without a source.
 const REGISTER_SOURCE_URL = process.env.REGISTER_SOURCE_URL;
-const REGISTER_POLL_INTERVAL_MS = parseInt(process.env.REGISTER_POLL_INTERVAL_MS ?? "30000", 10);
+// 3s, not 30s. A market the user just created has to start being priced
+// immediately — at 30s the markets page showed it live while the keeper had not
+// yet heard of it, so its price sat at the seed value for up to half a minute.
+// The endpoint is a no-store liveness feed backed by one indexed select, so
+// polling it every 3s is cheap; the old interval was sized for a cached
+// Blob-only read.
+const REGISTER_POLL_INTERVAL_MS = parseInt(process.env.REGISTER_POLL_INTERVAL_MS ?? "3000", 10);
 
 const REGISTRY_PATH =
   process.env.REGISTRY_PATH ??
