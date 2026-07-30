@@ -282,7 +282,8 @@ export async function startRegisterPollLoop(
 ): Promise<void> {
   const intervalMs = config.intervalMs ?? DEFAULT_INTERVAL_MS;
   console.log(
-    `[register-poll] starting: source=${config.sourceUrl} interval=${intervalMs}ms registry=${config.registryPath}`,
+    `[register-poll] starting: source=supabase(markets.keeper_status=active) ` +
+      `interval=${intervalMs}ms registry=${config.registryPath} absenceThreshold=${ABSENCE_THRESHOLD}`,
   );
 
   let stopping = false;
