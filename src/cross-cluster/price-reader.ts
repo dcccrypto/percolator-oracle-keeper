@@ -110,7 +110,7 @@ const USD_STABLE_MINTS: ReadonlySet<string> = new Set([
  * (WSOL=mint0, USDC=mint1 -> USDC per SOL = a real USD price), which every
  * pumpswap and WSOL-quoted-Meteora conversion depends on.
  */
-function raydiumPriceIsNotUsd(quoteMint: PublicKey): boolean {
+export function raydiumPriceIsNotUsd(quoteMint: PublicKey): boolean {
   return !USD_STABLE_MINTS.has(quoteMint.toBase58());
 }
 

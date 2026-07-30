@@ -13,7 +13,8 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { meteoraWsolPriceToUsdE6 } from "./price-reader.ts";
+import { PublicKey } from "@solana/web3.js";
+import { meteoraWsolPriceToUsdE6, raydiumPriceIsNotUsd } from "./price-reader.ts";
 import { computeDexSpotPriceE6 } from "@percolatorct/sdk";
 
 /**
@@ -101,29 +102,29 @@ describe("meteoraWsolPriceToUsdE6", () => {
  * the block can't silently take the SOL/USD reference down with it.
  */
 describe("raydium-clmm USD gate", () => {
-  const WSOL = "So11111111111111111111111111111111111111112";
-  const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-  const USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
-  const FAUCI = "3VFnDoACa991DYe987w354sbvmhqjjzC4Z31SoZepump";
-
-  // Mirrors the module-private predicate: publishable iff mint1 is a USD stable.
-  const stables = new Set([USDC, USDT]);
-  const blocked = (quoteMint: string) => !stables.has(quoteMint);
+  // Exercises the REAL predicate. An earlier version of this block defined its
+  // own `blocked()` mirror of the rule and never imported the module under
+  // test — deleting raydiumPriceIsNotUsd outright would have left it green.
+  const WSOL = new PublicKey("So11111111111111111111111111111111111111112");
+  const USDC = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+  const USDT = new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB");
+  const FAUCI = new PublicKey("3VFnDoACa991DYe987w354sbvmhqjjzC4Z31SoZepump");
 
   it("keeps the SOL/USD reference pool publishable (mint1 = USDC)", () => {
     // 8sLbNZoA…: mint0 = WSOL, mint1 = USDC -> price is USDC per SOL = USD.
-    assert.equal(blocked(USDC), false);
-  });
-
-  it("blocks a SOL-quoted pool (mint1 = WSOL -> price is SOL per token)", () => {
-    assert.equal(blocked(WSOL), true);
-  });
-
-  it("blocks a pool quoted in an arbitrary token", () => {
-    assert.equal(blocked(FAUCI), true);
+    // Every pumpswap and WSOL-Meteora conversion depends on this pool.
+    assert.equal(raydiumPriceIsNotUsd(USDC), false);
   });
 
   it("allows USDT-quoted pools too", () => {
-    assert.equal(blocked(USDT), false);
+    assert.equal(raydiumPriceIsNotUsd(USDT), false);
+  });
+
+  it("blocks a SOL-quoted pool — the price is SOL per token, not USD", () => {
+    assert.equal(raydiumPriceIsNotUsd(WSOL), true);
+  });
+
+  it("blocks a pool quoted in an arbitrary token", () => {
+    assert.equal(raydiumPriceIsNotUsd(FAUCI), true);
   });
 });
