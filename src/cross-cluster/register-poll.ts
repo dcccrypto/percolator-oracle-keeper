@@ -122,6 +122,63 @@ function toMarketEntry(remote: RemoteMarket): Omit<MarketEntry, "registeredAt"> 
  * Returns the number of markets added this cycle.
  */
 /**
+ * Consecutive successful queries a market must be ABSENT from before it is
+ * dropped. One odd-but-successful result must not be able to retire the board.
+ */
+export const ABSENCE_THRESHOLD = 3;
+
+/**
+ * Reconcile the local registry against the desired set.
+ *
+ * WHY: this function used to not exist, and registration was append-only. A
+ * market removed upstream kept being priced from the local copy forever —
+ * observed 2026-07-29, the feed served 1 market while registry.json held 3 and
+ * all 3 were pushed every ~7s, two of them blocklisted in both repos. Retiring
+ * a market required hand-editing registry.json on the keeper host.
+ *
+ * `desired` is authoritative. CALLERS MUST NOT pass the result of a FAILED
+ * query — see fetchActiveMarkets' null contract. An empty `desired` from a
+ * SUCCESSFUL query legitimately means "retire everything", and this will do
+ * exactly that, which is why the absence threshold exists as a second guard.
+ *
+ * Pure and synchronous so the dangerous half of the loop is directly testable.
+ */
+export function reconcileMarkets(
+  registry: Pick<Registry, "markets">,
+  desired: readonly MarketEntry[],
+  absences: Map<string, number>,
+  threshold: number = ABSENCE_THRESHOLD,
+): { added: string[]; removed: string[] } {
+  const desiredByAddr = new Map(desired.map((m) => [m.marketAddress, m]));
+  const added: string[] = [];
+  const removed: string[] = [];
+
+  for (const [addr, entry] of desiredByAddr) {
+    // Present this cycle — any accumulated absence is stale.
+    absences.delete(addr);
+    if (!registry.markets.some((m) => m.marketAddress === addr)) {
+      registry.markets.push(entry);
+      added.push(addr);
+    }
+  }
+
+  for (const local of [...registry.markets]) {
+    if (desiredByAddr.has(local.marketAddress)) continue;
+    const n = (absences.get(local.marketAddress) ?? 0) + 1;
+    absences.set(local.marketAddress, n);
+    if (n >= threshold) {
+      registry.markets = registry.markets.filter(
+        (m) => m.marketAddress !== local.marketAddress,
+      );
+      absences.delete(local.marketAddress);
+      removed.push(local.marketAddress);
+    }
+  }
+
+  return { added, removed };
+}
+
+/**
  * One registration poll. Exported so the Realtime stream can trigger a poll the
  * instant a market row changes (see registration-stream.ts) — the stream is the
  * wake-up, this stays the single path that actually admits a market.
