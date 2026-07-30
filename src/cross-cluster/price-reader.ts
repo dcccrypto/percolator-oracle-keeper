@@ -60,6 +60,73 @@ export function isSolUsdEntry(entry: Pick<MarketEntry, "dexType" | "label" | "sy
   return label.startsWith("SOL/USDC") || label.startsWith("SOL/USDT");
 }
 
+/**
+ * USD price (e6) of a WSOL-quoted Meteora DLMM pool.
+ *
+ * WHY THIS EXISTS: `computeDexSpotPriceE6` returns the price in the pool's
+ * QUOTE asset. For a TOKEN/USDC pool that is already USD, but for a TOKEN/SOL
+ * pool it is a price in SOL. The SDK applies the WSOL->USD conversion for
+ * `pumpswap` ONLY (see its `solPriceE6` param docs) — Meteora had no such
+ * path, so every WSOL-quoted Meteora market published a SOL-denominated price
+ * mislabeled as USD, low by the whole SOL/USD rate (~80x).
+ *
+ * Real impact (devnet, 2026-07-29): market 5sDvEs2… (Fauci, meteora-dlmm,
+ * WSOL-quoted) published $0.000011 while the token traded at $0.000943. The
+ * LP guardrails written at creation are a fixed TOKEN count, so an 80x-low
+ * price shrank that market's per-trade cap from $1,000 to $9.57 and every
+ * trade above it failed with a bare `InvalidAccountData`.
+ *
+ * PRECISION: the naive fix — multiply the e6 SOL price by solPriceE6 — is
+ * badly lossy for cheap tokens. Fauci's SOL price is 0.00001286, which is
+ * just `12` in e6; converting from that quantized integer lands 5-8% off.
+ * Meteora's price scales as `10^(baseDecimals - quoteDecimals)` (see the SDK's
+ * computeMeteoraDlmmPriceE6), so asking for 6 EXTRA base decimals returns the
+ * same price at e12 instead of e6. Converting from e12 reproduces $0.000943
+ * exactly. We inflate `base` rather than deflating `quote` so the argument can
+ * never go negative for a low-decimal quote mint.
+ */
+/**
+ * Mainnet USD-stable mints. A pool is USD-denominated only when its QUOTE side
+ * is one of these.
+ */
+const USD_STABLE_MINTS: ReadonlySet<string> = new Set([
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
+]);
+
+/**
+ * True when a raydium-clmm pool's price cannot be trusted as USD.
+ *
+ * `computeRaydiumClmmPriceE6` returns "mint1 per mint0", and Raydium CLMM
+ * orders those two mints by PUBKEY rather than by meaning. So for a token
+ * paired against SOL, WSOL lands on either side depending on the other token's
+ * address: when WSOL is mint0 the price reads token-per-SOL, when WSOL is
+ * mint1 it reads SOL-per-token. One needs a multiply by SOL/USD, the other an
+ * invert — and publishing either convention for both would be ~80x wrong half
+ * the time. Until the conversion handles both orientations, only pools whose
+ * QUOTE (mint1) is a USD stable are published.
+ *
+ * This deliberately still allows the registry's SOL/USD reference pool
+ * (WSOL=mint0, USDC=mint1 -> USDC per SOL = a real USD price), which every
+ * pumpswap and WSOL-quoted-Meteora conversion depends on.
+ */
+function raydiumPriceIsNotUsd(quoteMint: PublicKey): boolean {
+  return !USD_STABLE_MINTS.has(quoteMint.toBase58());
+}
+
+export function meteoraWsolPriceToUsdE6(
+  poolData: Uint8Array,
+  decimals: { base: number; quote: number },
+  solPriceE6: bigint,
+): bigint {
+  const nativeE12 = computeDexSpotPriceE6("meteora-dlmm", poolData, undefined, {
+    base: decimals.base + 6,
+    quote: decimals.quote,
+  });
+  if (nativeE12 <= 0n) return 0n;
+  return (nativeE12 * solPriceE6) / 1_000_000_000_000n;
+}
+
 export interface PriceReadResult {
   priceE6: bigint;
   /** Short description of the price source, e.g. "raydium-clmm:8sLbN…". */
@@ -173,6 +240,17 @@ export async function readPoolPriceE6(
   // ── Per-DEX price computation ─────────────────────────────────────────────
 
   if (entry.dexType === "raydium-clmm") {
+    const poolParsed = parseDexPool("raydium-clmm", poolPk, data);
+    if (raydiumPriceIsNotUsd(poolParsed.quoteMint)) {
+      return {
+        priceE6: 0n,
+        source,
+        skipped: true,
+        skipReason:
+          `Raydium CLMM: quote mint ${poolParsed.quoteMint.toBase58()} is not a USD stable, ` +
+          `so this pool's price is not USD-denominated (see raydiumPriceIsNotUsd)`,
+      };
+    }
     const priceE6 = computeDexSpotPriceE6("raydium-clmm", data);
     if (priceE6 === 0n) {
       return {
@@ -186,9 +264,11 @@ export async function readPoolPriceE6(
   }
 
   if (entry.dexType === "meteora-dlmm") {
+    // Parsed unconditionally (pure byte parsing of an already-fetched account,
+    // no RPC): the quote mint decides whether this pool prices in USD or SOL.
+    const poolParsed = parseDexPool("meteora-dlmm", poolPk, data);
     // Cache mint decimals after the first successful read.
     if (!decimalsCache.has(entry.poolAddress)) {
-      const poolParsed = parseDexPool("meteora-dlmm", poolPk, data);
       const [baseDecimals, quoteDecimals] = await Promise.all([
         withRpcBackoff(() => fetchMintDecimals(mainnetConn, poolParsed.baseMint)),
         withRpcBackoff(() => fetchMintDecimals(mainnetConn, poolParsed.quoteMint)),
@@ -204,6 +284,32 @@ export async function readPoolPriceE6(
       );
     }
     const dec = decimalsCache.get(entry.poolAddress)!;
+
+    // WSOL-quoted pools price in SOL, not USD — convert with this cycle's
+    // SOL/USD rate. See meteoraWsolPriceToUsdE6. Mirrors the pumpswap branch
+    // below: no rate available means SKIP, never publish a SOL price as USD.
+    if (poolParsed.quoteMint.equals(WSOL_MINT)) {
+      if (solPriceE6 === undefined) {
+        return {
+          priceE6: 0n,
+          source,
+          skipped: true,
+          skipReason:
+            "Meteora DLMM: pool is WSOL-quoted but no SOL/USD price was available this cycle",
+        };
+      }
+      const usdE6 = meteoraWsolPriceToUsdE6(data, dec, solPriceE6);
+      if (usdE6 === 0n) {
+        return {
+          priceE6: 0n,
+          source,
+          skipped: true,
+          skipReason: "Meteora DLMM: binStep=0 (pool not initialised or live)",
+        };
+      }
+      return { priceE6: usdE6, source };
+    }
+
     const priceE6 = computeDexSpotPriceE6("meteora-dlmm", data, undefined, dec);
     if (priceE6 === 0n) {
       return {
@@ -454,6 +560,12 @@ export async function readAllPoolPricesE6(
     quoteVault: PublicKey;
   }
   const pumpswapCandidates: PumpswapCandidate[] = [];
+  /** WSOL-quoted Meteora pools: priced in SOL, so they must wait for this
+   *  cycle's SOL/USD rate (resolved below) before they can be published. */
+  const meteoraWsolCandidates: Array<{
+    entry: (typeof entries)[number];
+    poolData: Uint8Array;
+  }> = [];
 
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
@@ -463,19 +575,32 @@ export async function readAllPoolPricesE6(
     const data = new Uint8Array(info.data);
     try {
       if (entry.dexType === "raydium-clmm") {
+        // Only USD-quoted Raydium pools are publishable — see
+        // raydiumPriceIsNotUsd. This still admits the SOL/USD reference pool.
+        const parsedRay = parseDexPool("raydium-clmm", pubkeys[i], data);
+        if (raydiumPriceIsNotUsd(parsedRay.quoteMint)) continue;
         const priceE6 = computeDexSpotPriceE6("raydium-clmm", data);
         if (priceE6 > 0n) {
           out.set(entry.poolAddress, priceE6);
           if (solPriceE6 === undefined && isSolUsdEntry(entry)) solPriceE6 = priceE6;
         }
       } else if (entry.dexType === "meteora-dlmm") {
+        const parsed = parseDexPool("meteora-dlmm", pubkeys[i], data);
         if (!decimalsCache.has(entry.poolAddress)) {
-          const parsed = parseDexPool("meteora-dlmm", pubkeys[i], data);
           const [base, quote] = await Promise.all([
             withRpcBackoff(() => fetchMintDecimals(mainnetConn, parsed.baseMint)),
             withRpcBackoff(() => fetchMintDecimals(mainnetConn, parsed.quoteMint)),
           ]);
           decimalsCache.set(entry.poolAddress, { base, quote });
+        }
+        // A WSOL-quoted Meteora pool prices in SOL, so it cannot be published
+        // until this cycle's SOL/USD rate is known — defer to pass 2b. It also
+        // must never seed `solPriceE6` itself (it is not a SOL/USD quote), and
+        // isSolUsdEntry only matches USDC/USDT-quoted SOL pools, which land in
+        // the branch below and still resolve the rate exactly as before.
+        if (parsed.quoteMint.equals(WSOL_MINT)) {
+          meteoraWsolCandidates.push({ entry, poolData: data });
+          continue;
         }
         const priceE6 = computeDexSpotPriceE6(
           "meteora-dlmm",
@@ -519,6 +644,30 @@ export async function readAllPoolPricesE6(
       }
     } catch {
       // Reference unavailable — pumpswap entries skip this cycle, as before.
+    }
+  }
+
+  // ── Pass 2a: WSOL-quoted Meteora — convert SOL-denominated prices to USD ───
+  // No extra RPC: the pool bytes and decimals were captured in pass 1; only
+  // this cycle's SOL/USD rate was missing. Without a rate we publish nothing
+  // for these markets rather than a SOL price mislabeled as USD.
+  if (meteoraWsolCandidates.length > 0) {
+    if (solPriceE6 === undefined) {
+      console.warn(
+        `[price-reader] skipping ${meteoraWsolCandidates.length} WSOL-quoted Meteora pool(s):` +
+          ` no SOL/USD price available this cycle`,
+      );
+    } else {
+      for (const { entry, poolData } of meteoraWsolCandidates) {
+        const dec = decimalsCache.get(entry.poolAddress);
+        if (!dec) continue;
+        try {
+          const usdE6 = meteoraWsolPriceToUsdE6(poolData, dec, solPriceE6);
+          if (usdE6 > 0n) out.set(entry.poolAddress, usdE6);
+        } catch {
+          /* skip this pool for this cycle; next cycle retries */
+        }
+      }
     }
   }
 
