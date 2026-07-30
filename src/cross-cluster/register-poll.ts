@@ -130,6 +130,17 @@ function toMarketEntry(remote: RemoteMarket): Omit<MarketEntry, "registeredAt"> 
  */
 export const ABSENCE_THRESHOLD = 3;
 
+/** True when the upstream row now describes a DIFFERENT binding than the local
+ *  copy. Only the fields the price path actually reads are compared. */
+function entryDiffers(local: MarketEntry, next: MarketEntry): boolean {
+  return (
+    local.poolAddress !== next.poolAddress ||
+    local.dexType !== next.dexType ||
+    local.symbol !== next.symbol ||
+    local.collateral !== next.collateral
+  );
+}
+
 /** Consecutive-absence counts, persisted across polls for the whole process. */
 const absenceCounts = new Map<string, number>();
 
@@ -154,17 +165,26 @@ export function reconcileMarkets(
   desired: readonly MarketEntry[],
   absences: Map<string, number>,
   threshold: number = ABSENCE_THRESHOLD,
-): { added: string[]; removed: string[] } {
+): { added: string[]; removed: string[]; updated: string[] } {
   const desiredByAddr = new Map(desired.map((m) => [m.marketAddress, m]));
   const added: string[] = [];
   const removed: string[] = [];
+  const updated: string[] = [];
 
   for (const [addr, entry] of desiredByAddr) {
     // Present this cycle — any accumulated absence is stale.
     absences.delete(addr);
-    if (!registry.markets.some((m) => m.marketAddress === addr)) {
+    const idx = registry.markets.findIndex((m) => m.marketAddress === addr);
+    if (idx === -1) {
       registry.markets.push(entry);
       added.push(addr);
+    } else if (entryDiffers(registry.markets[idx], entry)) {
+      // The binding CHANGED upstream. Without this the local copy kept the old
+      // pool forever, so a market re-registered against a corrected pool would
+      // go on being priced from the wrong one — silently, since it is present
+      // in `desired` and so never even accrues an absence.
+      registry.markets[idx] = entry;
+      updated.push(addr);
     }
   }
 
@@ -181,7 +201,7 @@ export function reconcileMarkets(
     }
   }
 
-  return { added, removed };
+  return { added, removed, updated };
 }
 
 /**
@@ -189,7 +209,49 @@ export function reconcileMarkets(
  * instant a market row changes (see registration-stream.ts) — the stream is the
  * wake-up, this stays the single path that actually admits a market.
  */
-export async function pollOnce(registry: Registry, config: RegisterPollConfig): Promise<number> {
+let pollRunning = false;
+let pollRerunQueued = false;
+let pollChain: Promise<number> = Promise.resolve(0);
+
+/**
+ * One registration poll — SERIALIZED.
+ *
+ * Two independent callers invoke this: the periodic loop, and the Supabase
+ * Realtime stream, which fires on ANY `markets` row change (the indexer writes
+ * to that table constantly, so overlap is routine rather than theoretical).
+ * Running two concurrently corrupts the registry, because reconcileMarkets
+ * read-modify-writes it:
+ *   - both see the market missing before either pushes -> DUPLICATE entry, and a
+ *     duplicate in the atomic PushAuthMark batch reverts the whole transaction;
+ *   - both increment the same absence counter -> the 3-strike guard trips in
+ *     ~1.5 rounds, which is precisely the premature retirement it exists to stop.
+ *
+ * A call arriving mid-poll queues exactly ONE follow-up rather than being
+ * dropped, so a Realtime event that lands during a poll still gets acted on and
+ * the ~ms pickup is preserved.
+ */
+export function pollOnce(registry: Registry, config: RegisterPollConfig): Promise<number> {
+  if (pollRunning) {
+    pollRerunQueued = true;
+    return pollChain;
+  }
+  pollChain = (async () => {
+    pollRunning = true;
+    try {
+      let n = await runPollOnce(registry, config);
+      while (pollRerunQueued) {
+        pollRerunQueued = false;
+        n = await runPollOnce(registry, config);
+      }
+      return n;
+    } finally {
+      pollRunning = false;
+    }
+  })();
+  return pollChain;
+}
+
+async function runPollOnce(registry: Registry, config: RegisterPollConfig): Promise<number> {
   // SOURCE OF TRUTH: the `markets` table, filtered to keeper_status='active'.
   // This used to GET the Vercel blob. The row already carried everything needed
   // and the keeper was already subscribed to Realtime on that table, so the blob
@@ -215,10 +277,18 @@ export async function pollOnce(registry: Registry, config: RegisterPollConfig): 
   let admitted = desired;
   if (config.connection && config.expectedOwner && desired.length > 0) {
     try {
-      const infos = await config.connection.getMultipleAccountsInfo(
-        desired.map((m) => new PublicKey(m.marketAddress)),
-        "confirmed",
-      );
+      // Chunked: getMultipleAccountsInfo rejects more than 100 keys, and a
+      // throw here aborts the whole cycle — so past 100 active markets the
+      // registry would freeze permanently rather than degrade.
+      const infos: (Awaited<ReturnType<Connection["getAccountInfo"]>> | null)[] = [];
+      for (let i = 0; i < desired.length; i += 100) {
+        infos.push(
+          ...(await config.connection.getMultipleAccountsInfo(
+            desired.slice(i, i + 100).map((m) => new PublicKey(m.marketAddress)),
+            "confirmed",
+          )),
+        );
+      }
       admitted = desired.filter((m, i) => {
         const owner = infos[i]?.owner ?? null;
         if (!owner) {
@@ -245,12 +315,13 @@ export async function pollOnce(registry: Registry, config: RegisterPollConfig): 
     }
   }
 
-  const { added, removed } = reconcileMarkets(registry, admitted, absenceCounts, ABSENCE_THRESHOLD);
+  const { added, removed, updated } = reconcileMarkets(registry, admitted, absenceCounts, ABSENCE_THRESHOLD);
 
   for (const a of added) console.log(`[register-poll] added ${a}`);
   for (const r of removed) console.log(`[register-poll] retired ${r} (absent from ${ABSENCE_THRESHOLD} consecutive queries)`);
+  for (const u of updated) console.log(`[register-poll] updated binding for ${u}`);
 
-  if (added.length > 0 || removed.length > 0) {
+  if (added.length > 0 || removed.length > 0 || updated.length > 0) {
     try {
       saveRegistry(registry, config.registryPath);
     } catch (err) {

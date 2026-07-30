@@ -100,3 +100,41 @@ describe("reconcileMarkets", () => {
     assert.equal(r.markets[0].dexType, "pumpswap");
   });
 });
+
+describe("reconcileMarkets — binding updates", () => {
+  const entry = (addr: string, over: Partial<MarketEntry> = {}): MarketEntry =>
+    ({ label: addr, marketAddress: addr, poolAddress: "P" + addr, dexType: "pumpswap",
+       assetIndex: 0, symbol: "OLD", collateral: "C", ...over }) as MarketEntry;
+
+  it("replaces the local entry when the POOL changed upstream", () => {
+    // A market re-registered against a corrected pool is still PRESENT in
+    // `desired`, so it never accrues an absence — without an explicit update it
+    // would be priced from the stale pool forever.
+    const reg = { markets: [entry("A")] };
+    const out = reconcileMarkets(reg, [entry("A", { poolAddress: "NEWPOOL" })], new Map(), 3);
+    assert.deepEqual(out.updated, ["A"]);
+    assert.deepEqual(out.added, []);
+    assert.equal(reg.markets[0].poolAddress, "NEWPOOL");
+    assert.equal(reg.markets.length, 1, "must replace, not duplicate");
+  });
+
+  it("replaces when the dexType changed", () => {
+    const reg = { markets: [entry("A")] };
+    const out = reconcileMarkets(reg, [entry("A", { dexType: "meteora-dlmm" })], new Map(), 3);
+    assert.deepEqual(out.updated, ["A"]);
+    assert.equal(reg.markets[0].dexType, "meteora-dlmm");
+  });
+
+  it("replaces when the symbol changed (registration overwrote UNKNOWN)", () => {
+    const reg = { markets: [entry("A")] };
+    const out = reconcileMarkets(reg, [entry("A", { symbol: "REAL" })], new Map(), 3);
+    assert.deepEqual(out.updated, ["A"]);
+    assert.equal(reg.markets[0].symbol, "REAL");
+  });
+
+  it("reports nothing when the binding is identical", () => {
+    const reg = { markets: [entry("A")] };
+    const out = reconcileMarkets(reg, [entry("A")], new Map(), 3);
+    assert.deepEqual(out, { added: [], removed: [], updated: [] });
+  });
+});
