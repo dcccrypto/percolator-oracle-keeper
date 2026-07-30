@@ -22,7 +22,8 @@
  * recovery-cranker).
  */
 import { PublicKey, type Connection } from "@solana/web3.js";
-import { addMarket, saveRegistry } from "./registry.ts";
+import { saveRegistry } from "./registry.ts";
+import { fetchActiveMarkets, type FetchActiveConfig } from "./db-markets.ts";
 import type { Registry, MarketEntry, DexType } from "./registry.ts";
 
 const VALID_DEX_TYPES: ReadonlySet<string> = new Set([
@@ -35,8 +36,10 @@ const DEFAULT_INTERVAL_MS = 30_000;
 const FETCH_TIMEOUT_MS = 8_000;
 
 export interface RegisterPollConfig {
-  /** GET endpoint that returns { markets: RegisteredMarket[] } — the Vercel Blob store. */
-  sourceUrl: string;
+  /** Supabase read config — the market list's single source of truth. */
+  db?: FetchActiveConfig;
+  /** Legacy blob endpoint. Unused since the DB cutover; kept for log context. */
+  sourceUrl?: string;
   /** Path to persist registry.json after any addition. */
   registryPath: string;
   /** Milliseconds between polls (default 30_000). */
@@ -127,6 +130,9 @@ function toMarketEntry(remote: RemoteMarket): Omit<MarketEntry, "registeredAt"> 
  */
 export const ABSENCE_THRESHOLD = 3;
 
+/** Consecutive-absence counts, persisted across polls for the whole process. */
+const absenceCounts = new Map<string, number>();
+
 /**
  * Reconcile the local registry against the desired set.
  *
@@ -184,99 +190,79 @@ export function reconcileMarkets(
  * wake-up, this stays the single path that actually admits a market.
  */
 export async function pollOnce(registry: Registry, config: RegisterPollConfig): Promise<number> {
-  let payload: unknown;
-  try {
-    const resp = await fetch(config.sourceUrl, {
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-    if (!resp.ok) {
-      console.warn(`[register-poll] GET ${config.sourceUrl} → HTTP ${resp.status}`);
+  // SOURCE OF TRUTH: the `markets` table, filtered to keeper_status='active'.
+  // This used to GET the Vercel blob. The row already carried everything needed
+  // and the keeper was already subscribed to Realtime on that table, so the blob
+  // was a second store the notification pointed away from.
+  if (!config.db) {
+    console.warn("[register-poll] no db config — cannot resolve the market list");
+    return 0;
+  }
+
+  const desired = await fetchActiveMarkets(config.db);
+  if (desired === null) {
+    // The query FAILED. Reconciling against "nothing" here would retire every
+    // market, so change nothing and try again next cycle.
+    return 0;
+  }
+
+  // Owner filter (2026-07-23): only price markets owned by the current wrapper.
+  // A retired-wrapper market in the push batch reverts the WHOLE atomic tx with
+  // IncorrectProgramId. Batched into one RPC call, and if that call fails we
+  // abort the entire reconcile rather than act on partial information — an
+  // unverified market must never be added, and a verified one must never be
+  // dropped just because we could not check it.
+  let admitted = desired;
+  if (config.connection && config.expectedOwner && desired.length > 0) {
+    try {
+      const infos = await config.connection.getMultipleAccountsInfo(
+        desired.map((m) => new PublicKey(m.marketAddress)),
+        "confirmed",
+      );
+      admitted = desired.filter((m, i) => {
+        const owner = infos[i]?.owner ?? null;
+        if (!owner) {
+          console.warn(`[register-poll] ${m.marketAddress.slice(0, 8)}… not found on-chain — not admitted`);
+          return false;
+        }
+        if (!owner.equals(config.expectedOwner!)) {
+          console.log(
+            `[register-poll] skipping ${m.marketAddress.slice(0, 8)}… — owner ${owner
+              .toBase58()
+              .slice(0, 8)}… != current wrapper ${config.expectedOwner!.toBase58().slice(0, 8)}… (retired-wrapper market)`,
+          );
+          return false;
+        }
+        return true;
+      });
+    } catch (err) {
+      console.warn(
+        `[register-poll] owner check failed — registry left unchanged this cycle: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
       return 0;
     }
-    payload = await resp.json();
-  } catch (err) {
-    console.warn(
-      `[register-poll] fetch failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return 0;
   }
 
-  const remoteMarkets = (payload as { markets?: unknown } | null)?.markets;
-  if (!Array.isArray(remoteMarkets)) {
-    console.warn("[register-poll] response missing markets[] — skipping this cycle");
-    return 0;
-  }
+  const { added, removed } = reconcileMarkets(registry, admitted, absenceCounts, ABSENCE_THRESHOLD);
 
-  const known = new Set(registry.markets.map((m) => m.marketAddress));
-  let added = 0;
+  for (const a of added) console.log(`[register-poll] added ${a}`);
+  for (const r of removed) console.log(`[register-poll] retired ${r} (absent from ${ABSENCE_THRESHOLD} consecutive queries)`);
 
-  for (const raw of remoteMarkets) {
-    if (typeof raw !== "object" || raw === null) continue;
-    const remote = raw as RemoteMarket;
-
-    const marketAddress = remoteMarketAddress(remote);
-    if (!marketAddress || known.has(marketAddress)) continue;
-
-    const entry = toMarketEntry(remote);
-    if (!entry) {
-      console.warn(
-        `[register-poll] skipping invalid remote market ${marketAddress.slice(0, 8)}…: ` +
-          `${JSON.stringify(raw).slice(0, 200)}`,
-      );
-      continue;
-    }
-
-    // Owner filter (2026-07-23): only admit markets owned by the current wrapper.
-    // The blob store still lists retired-wrapper markets; one of those in the push
-    // batch reverts the whole atomic tx with IncorrectProgramId. On RPC failure or
-    // not-yet-found, skip this cycle (retried on the next poll) rather than admit.
-    if (config.connection && config.expectedOwner) {
-      let owner: PublicKey | null = null;
-      try {
-        const info = await config.connection.getAccountInfo(new PublicKey(marketAddress));
-        owner = info?.owner ?? null;
-      } catch (err) {
-        console.warn(
-          `[register-poll] owner check failed for ${marketAddress.slice(0, 8)}… — skipping this cycle: ` +
-            `${err instanceof Error ? err.message : String(err)}`,
-        );
-        continue;
-      }
-      if (!owner) {
-        console.warn(`[register-poll] ${marketAddress.slice(0, 8)}… not found on-chain — skipping`);
-        continue;
-      }
-      if (!owner.equals(config.expectedOwner)) {
-        console.log(
-          `[register-poll] skipping ${marketAddress.slice(0, 8)}… — owner ${owner
-            .toBase58()
-            .slice(0, 8)}… != current wrapper ${config.expectedOwner
-            .toBase58()
-            .slice(0, 8)}… (retired-wrapper market)`,
-        );
-        continue;
-      }
-    }
-
-    const full = addMarket(registry, entry);
-    known.add(full.marketAddress);
-    added++;
-    console.log(`[register-poll] added ${full.symbol ?? full.label} ${full.marketAddress}`);
-  }
-
-  if (added > 0) {
+  if (added.length > 0 || removed.length > 0) {
     try {
       saveRegistry(registry, config.registryPath);
     } catch (err) {
       console.error(
-        `[register-poll] saveRegistry(${config.registryPath}) failed — new markets are in ` +
-          `memory for this session but were NOT persisted: ` +
+        `[register-poll] saveRegistry(${config.registryPath}) failed — the change is in ` +
+          `memory for this session but was NOT persisted: ` +
           `${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
 
-  return added;
+  return added.length;
 }
 
 /**

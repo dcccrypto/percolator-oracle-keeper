@@ -264,13 +264,25 @@ if (LP_FEE_CRANK_ENABLED) {
 // in place (addMarket + saveRegistry), and it's the SAME registry object passed to
 // startKeeperLoop/startRecoveryCrankLoop below, so a market added here is picked up
 // by both of those loops on their very next cycle.
-if (REGISTER_SOURCE_URL) {
+// The market list now comes from Supabase (`markets` where keeper_status='active')
+// rather than the Vercel blob, so Supabase config — not REGISTER_SOURCE_URL — is
+// what gates registration. The blob was a second store that the Realtime
+// notification this keeper already subscribes to pointed away from.
+if (SUPABASE_URL && SUPABASE_ANON_KEY) {
   const registerPollConfig = {
-    sourceUrl: REGISTER_SOURCE_URL,
+    db: {
+      supabaseUrl: SUPABASE_URL,
+      supabaseAnonKey: SUPABASE_ANON_KEY,
+      network: "devnet",
+      mainnetConn,
+      // Pool -> DEX type, resolved from each pool's on-chain owner and cached
+      // for the process. dex_type is deliberately not a DB column.
+      dexCache: new Map(),
+    },
     registryPath: REGISTRY_PATH,
     intervalMs: REGISTER_POLL_INTERVAL_MS,
     // Owner filter: only admit markets owned by the current wrapper (WRAPPER_PROGRAM_ID
-    // = PROGRAM_IDS_V17.percolator). Keeps retired-wrapper blob entries out of the
+    // = PROGRAM_IDS_V17.percolator). Keeps retired-wrapper entries out of the
     // atomic push batch (they revert it with IncorrectProgramId).
     connection: devnetConn,
     expectedOwner: WRAPPER_PROGRAM_ID,
@@ -281,7 +293,7 @@ if (REGISTER_SOURCE_URL) {
   // for the next tick. It TRIGGERS the poll rather than replacing it — one code
   // path still admits a market, and if the socket drops the loop below covers
   // it. See cross-cluster/registration-stream.ts.
-  if (SUPABASE_URL && SUPABASE_ANON_KEY) {
+  {
     registrationStream = startRegistrationStream({
       supabaseUrl: SUPABASE_URL,
       supabaseAnonKey: SUPABASE_ANON_KEY,
@@ -295,11 +307,6 @@ if (REGISTER_SOURCE_URL) {
         });
       },
     });
-  } else {
-    console.warn(
-      "[registration-stream] SUPABASE_URL/SUPABASE_ANON_KEY unset — push registration" +
-        " disabled, falling back to the periodic poll alone.",
-    );
   }
 
   void startRegisterPollLoop(registry, registerPollConfig).catch((err) => {
