@@ -66,11 +66,47 @@ interface LoopState {
   /** D2a: cycles that hit the cycleTimeoutMs watchdog (runCycle never resolved in time). */
   timeoutCount: number;
   stats: Map<string, MarketStat>;
+  /**
+   * Pricing-outage visibility (2026-07-31 audit). A total mainnet-read
+   * failure used to be the LEAST visible failure in the service: the cycle
+   * logged and returned, per-market stats untouched, /health green, while
+   * every market stayed tradeable against a frozen AuthMark. These fields
+   * make that state impossible to miss.
+   */
+  lastSuccessfulPushAt: number | null;
+  consecutiveBatchReadFailures: number;
+  lastBatchReadError: string | null;
+}
+
+/**
+ * Health status for the pricing pipeline, separated from the handler so it
+ * is testable as a pure function. "stalled-pricing" means: markets are
+ * registered, and either the batch read has failed many times running or no
+ * push has landed for PUSH_STALL_MS — the frozen-mark condition.
+ */
+export const PUSH_STALL_MS = 120_000;
+export const BATCH_FAILURE_ALERT_THRESHOLD = 5;
+export function pricingHealthStatus(
+  state: Pick<
+    LoopState,
+    "lastSuccessfulPushAt" | "consecutiveBatchReadFailures" | "startedAt"
+  >,
+  marketCount: number,
+  nowMs: number,
+): "ok" | "stalled-pricing" {
+  if (marketCount === 0) return "ok"; // empty board: nothing CAN push
+  if (state.consecutiveBatchReadFailures >= BATCH_FAILURE_ALERT_THRESHOLD) {
+    return "stalled-pricing";
+  }
+  // Never pushed since boot counts from process start — a keeper that comes
+  // up broken must not read "ok" forever just because the field is null.
+  const last = state.lastSuccessfulPushAt ?? state.startedAt;
+  return nowMs - last > PUSH_STALL_MS ? "stalled-pricing" : "ok";
 }
 
 // ── Health server ─────────────────────────────────────────────────────────────
 
-function makeHealthHandler(state: LoopState, config: LoopConfig) {
+function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Registry) {
   return (req: http.IncomingMessage, res: http.ServerResponse): void => {
     if (req.url !== "/health" && req.url !== "/") {
       res.writeHead(404);
@@ -109,8 +145,23 @@ function makeHealthHandler(state: LoopState, config: LoopConfig) {
     // genuinely healthy in this state (it is doing exactly what it should);
     // it is the MARKET that is degraded, so alert on the field, not the code.
     const quarantinedMarkets = getQuarantinedMarkets();
+    // stalled-pricing outranks degraded-markets: a frozen mark on EVERY
+    // market (free-option risk against the LPs for the whole outage) is the
+    // condition the 2026-07-31 audit found completely invisible here.
+    const pricingStatus = pricingHealthStatus(state, registry.markets.length, Date.now());
     const payload = JSON.stringify({
-      status: quarantinedMarkets.length > 0 ? "degraded-markets" : "ok",
+      status:
+        pricingStatus !== "ok"
+          ? pricingStatus
+          : quarantinedMarkets.length > 0
+            ? "degraded-markets"
+            : "ok",
+      lastSuccessfulPushAgo:
+        state.lastSuccessfulPushAt !== null
+          ? `${Math.floor((Date.now() - state.lastSuccessfulPushAt) / 1000)}s`
+          : null,
+      consecutiveBatchReadFailures: state.consecutiveBatchReadFailures,
+      lastBatchReadError: state.lastBatchReadError,
       quarantinedMarkets,
       uptimeSec,
       cycleCount: state.cycleCount,
@@ -134,6 +185,27 @@ function makeHealthHandler(state: LoopState, config: LoopConfig) {
 // batched tx is atomic, so we only ever include known-pushable markets.
 const authorityChecked = new Set<string>();
 const notPushable = new Set<string>();
+/**
+ * Audit fix (2026-07-31): these latches used to hold until process restart —
+ * a market whose oracle_authority was later FIXED on-chain stayed unpushable
+ * forever. Re-verify everything every 30 minutes; a wrongly-latched market
+ * self-heals within that horizon, and the cost is one authority read per
+ * market per half hour.
+ */
+const AUTHORITY_RECHECK_MS = 30 * 60_000;
+let lastAuthorityRecheckAt = Date.now();
+function maybeResetAuthorityLatches(): void {
+  if (Date.now() - lastAuthorityRecheckAt < AUTHORITY_RECHECK_MS) return;
+  lastAuthorityRecheckAt = Date.now();
+  if (authorityChecked.size > 0 || notPushable.size > 0) {
+    console.log(
+      `[loop] periodic authority re-check: clearing ${authorityChecked.size} checked / ` +
+        `${notPushable.size} not-pushable latches`,
+    );
+  }
+  authorityChecked.clear();
+  notPushable.clear();
+}
 
 /**
  * Robust AuthMark: per-pool median over a trailing window, so bot round-trips
@@ -180,7 +252,9 @@ async function runCycle(
     }
   }
 
-  // ── 1. One-time oracle-authority check (only pushable markets go in a batch) ─
+  // ── 1. Oracle-authority check (only pushable markets go in a batch) ─────────
+  // "One-time" per 30-minute window — see maybeResetAuthorityLatches.
+  maybeResetAuthorityLatches();
   const unchecked = registry.markets.filter((m) => !authorityChecked.has(m.marketAddress));
   if (unchecked.length > 0) {
     await Promise.all(
@@ -226,9 +300,15 @@ async function runCycle(
     );
   } catch (err) {
     const msg = (err instanceof Error ? err.message : String(err)).slice(0, 160);
-    console.error(`[loop] batch pool read error — ${msg}`);
+    state.consecutiveBatchReadFailures++;
+    state.lastBatchReadError = msg;
+    console.error(
+      `[loop] batch pool read error (${state.consecutiveBatchReadFailures} consecutive) — ${msg}`,
+    );
     return;
   }
+  state.consecutiveBatchReadFailures = 0;
+  state.lastBatchReadError = null;
 
   // ── 3. Build the pushable set for this cycle ────────────────────────────────
   const pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }> = [];
@@ -292,7 +372,11 @@ async function runCycle(
       }
     }
     if (res.pushed && res.signature) {
+      state.lastSuccessfulPushAt = stamp;
       console.log(`[loop] batched push × ${res.count}: sig=${res.signature.slice(0, 16)}…`);
+    } else if (config.dryRun && pushes.length > 0) {
+      // Dry-run "pushes" count as liveness — the pipeline produced prices.
+      state.lastSuccessfulPushAt = stamp;
     }
     if (res.skippedMarkets.length > 0) {
       console.warn(
@@ -361,6 +445,9 @@ export async function startKeeperLoop(
     lastCycleAt: null,
     cycleCount: 0,
     timeoutCount: 0,
+    lastSuccessfulPushAt: null,
+    consecutiveBatchReadFailures: 0,
+    lastBatchReadError: null,
     stats: new Map(
       registry.markets.map((m) => [
         m.marketAddress,
@@ -384,7 +471,7 @@ export async function startKeeperLoop(
   const decimalsCache: DecimalsCache = new Map();
 
   // Health server
-  const server = http.createServer(makeHealthHandler(state, config));
+  const server = http.createServer(makeHealthHandler(state, config, registry));
   server.listen(config.healthPort, config.healthBind, () => {
     console.log(
       `[keeper] Health: http://${config.healthBind}:${config.healthPort}/health`,
