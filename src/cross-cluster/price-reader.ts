@@ -27,7 +27,7 @@
  *   - Other errors: propagated to the caller (per-market isolation in the loop)
  */
 import { Connection, PublicKey } from "@solana/web3.js";
-import type { AccountInfo } from "@solana/web3.js";
+import type { AccountInfo, RpcResponseAndContext } from "@solana/web3.js";
 import {
   detectDexType,
   parseDexPool,
@@ -172,6 +172,83 @@ async function withRpcBackoff<T>(fn: () => Promise<T>): Promise<T> {
   throw new Error("unreachable");
 }
 
+// ── Slot-consistency watermark ───────────────────────────────────────────────
+//
+// WHY THIS EXISTS (2026-07-31, the CATE LP drain)
+// A load-balanced RPC endpoint can serve consecutive requests from different
+// backend nodes, and a lagging node returns account state from a slot we have
+// ALREADY MOVED PAST. For a fast-moving pool that showed up as the published
+// price flapping between two levels ~1.6% apart (fresh vs ~1-minute-stale
+// vault balances) for MINUTES — and the engine converts price oscillation
+// into permanent LP losses (losses realize in full; gains for an underwater
+// account are support-gated and vaporize). That one-way ratchet drained the
+// CATE LP's entire $1,000 seed and pushed it $900+ underwater while the real
+// price went nowhere.
+//
+// THE FIX: every mainnet pricing read carries `minContextSlot` = the highest
+// context slot this process has already observed from that endpoint. A node
+// that is behind must either catch up or return the JSON-RPC "Minimum context
+// slot has not been reached" error — it can never silently hand us the past.
+// On that error we retry briefly (the LB usually routes elsewhere); if the
+// endpoint stays behind we throw and the cycle is skipped, holding the last
+// published price. Holding for 7s is strictly safer than publishing stale.
+//
+// A median/EWMA filter was deliberately NOT used instead: with an alternating
+// fresh/stale pair, median-of-3 still flips levels — slot monotonicity kills
+// the failure mode by construction.
+const slotWatermarks = new Map<string, number>();
+
+/** Test hook: forget every endpoint's watermark. */
+export function resetSlotWatermarksForTests(): void {
+  slotWatermarks.clear();
+}
+
+function isMinContextSlotError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return msg.includes("minimum context slot");
+}
+
+const MIN_SLOT_RETRIES = 3;
+const MIN_SLOT_RETRY_DELAY_MS = 250;
+
+/**
+ * Run a `...AndContext` read pinned to this endpoint's slot watermark, then
+ * advance the watermark to the slot the response was served at.
+ *
+ * The `read` callback MUST forward `minContextSlot` to the RPC call — that is
+ * the entire point. Composes with {@link withRpcBackoff} (backoff outside,
+ * watermark inside): 429s keep their existing retry policy.
+ */
+export async function readAtWatermark<T>(
+  conn: Connection,
+  read: (minContextSlot: number | undefined) => Promise<RpcResponseAndContext<T>>,
+): Promise<T> {
+  const key = conn.rpcEndpoint;
+  for (let attempt = 0; ; attempt++) {
+    const watermark = slotWatermarks.get(key);
+    try {
+      const res = await read(watermark);
+      // Re-read at set time: two concurrent reads may resolve out of order and
+      // the later .set must not lower the mark the earlier one just raised.
+      const current = slotWatermarks.get(key);
+      if (current === undefined || res.context.slot > current) {
+        slotWatermarks.set(key, res.context.slot);
+      }
+      return res.value;
+    } catch (err) {
+      if (isMinContextSlotError(err) && attempt < MIN_SLOT_RETRIES - 1) {
+        console.warn(
+          `[price-reader] RPC node behind watermark ${watermark} — retrying` +
+            ` (attempt ${attempt + 1}/${MIN_SLOT_RETRIES})`,
+        );
+        await new Promise((r) => setTimeout(r, MIN_SLOT_RETRY_DELAY_MS));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
@@ -204,7 +281,9 @@ export async function readPoolPriceE6(
 
   // ── Fetch pool account ────────────────────────────────────────────────────
   const poolInfo = await withRpcBackoff(() =>
-    mainnetConn.getAccountInfo(poolPk, "confirmed"),
+    readAtWatermark(mainnetConn, (minContextSlot) =>
+      mainnetConn.getAccountInfoAndContext(poolPk, { commitment: "confirmed", minContextSlot }),
+    ),
   );
   if (!poolInfo) {
     return {
@@ -333,15 +412,18 @@ export async function readPoolPriceE6(
       };
     }
 
-    // Fetch both vault SPL token accounts
-    const [baseVaultInfo, quoteVaultInfo] = await Promise.all([
-      withRpcBackoff(() =>
-        mainnetConn.getAccountInfo(poolParsed.baseVault!, "confirmed"),
+    // Fetch both vault SPL token accounts in ONE request: a price computed
+    // from vaults read at two different slots is skewed even on a healthy
+    // node, and the watermark guarantees neither is older than anything this
+    // process has already seen.
+    const [baseVaultInfo, quoteVaultInfo] = await withRpcBackoff(() =>
+      readAtWatermark(mainnetConn, (minContextSlot) =>
+        mainnetConn.getMultipleAccountsInfoAndContext(
+          [poolParsed.baseVault!, poolParsed.quoteVault!],
+          { commitment: "confirmed", minContextSlot },
+        ),
       ),
-      withRpcBackoff(() =>
-        mainnetConn.getAccountInfo(poolParsed.quoteVault!, "confirmed"),
-      ),
-    ]);
+    );
     if (!baseVaultInfo || !quoteVaultInfo) {
       return {
         priceE6: 0n,
@@ -504,7 +586,11 @@ async function getMultipleAccountsChunked(
   const out: Array<AccountInfo<Buffer> | null> = [];
   for (let i = 0; i < keys.length; i += MAX_ACCOUNTS_PER_RPC) {
     const chunk = keys.slice(i, i + MAX_ACCOUNTS_PER_RPC);
-    const infos = await withRpcBackoff(() => conn.getMultipleAccountsInfo(chunk, "confirmed"));
+    const infos = await withRpcBackoff(() =>
+      readAtWatermark(conn, (minContextSlot) =>
+        conn.getMultipleAccountsInfoAndContext(chunk, { commitment: "confirmed", minContextSlot }),
+      ),
+    );
     out.push(...infos);
   }
   return out;
@@ -634,7 +720,11 @@ export async function readAllPoolPricesE6(
   if (solPriceE6 === undefined && solUsdReferencePool) {
     try {
       const refPk = new PublicKey(solUsdReferencePool);
-      const refInfo = await withRpcBackoff(() => mainnetConn.getAccountInfo(refPk, "confirmed"));
+      const refInfo = await withRpcBackoff(() =>
+        readAtWatermark(mainnetConn, (minContextSlot) =>
+          mainnetConn.getAccountInfoAndContext(refPk, { commitment: "confirmed", minContextSlot }),
+        ),
+      );
       if (refInfo?.data) {
         const refDex = detectDexType(refInfo.owner);
         if (refDex === "raydium-clmm") {
