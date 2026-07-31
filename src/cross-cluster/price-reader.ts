@@ -228,6 +228,15 @@ export async function readAtWatermark<T>(
     const watermark = slotWatermarks.get(key);
     try {
       const res = await read(watermark);
+      // ENFORCE client-side too: a provider that silently ignores
+      // `minContextSlot` would otherwise hand us the past without the error
+      // this loop retries on. A response served below the requested slot is
+      // treated exactly like the server-side rejection.
+      if (watermark !== undefined && res.context.slot < watermark) {
+        throw new Error(
+          `Minimum context slot has not been reached (served ${res.context.slot} < watermark ${watermark})`,
+        );
+      }
       // Re-read at set time: two concurrent reads may resolve out of order and
       // the later .set must not lower the mark the earlier one just raised.
       const current = slotWatermarks.get(key);

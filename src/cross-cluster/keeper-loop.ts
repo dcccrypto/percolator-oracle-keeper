@@ -21,6 +21,7 @@ import { Connection, Keypair } from "@solana/web3.js";
 import type { Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
 import { readAllPoolPricesE6 } from "./price-reader.ts";
+import { createMarkSmoother } from "./mark-smoother.ts";
 import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets } from "./auth-mark-pusher.ts";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -133,6 +134,13 @@ function makeHealthHandler(state: LoopState, config: LoopConfig) {
 // batched tx is atomic, so we only ever include known-pushable markets.
 const authorityChecked = new Set<string>();
 const notPushable = new Set<string>();
+
+/**
+ * Robust AuthMark: per-pool median over a trailing window, so bot round-trips
+ * on a hot pool (two-level ±1–2% churn — what drained the CATE LP) never
+ * reach the engine as oscillation. See mark-smoother.ts for the full story.
+ */
+const markSmoother = createMarkSmoother();
 // Blockhash cache — a fresh one is valid ~60-90s; refetch every 15s so each
 // cycle doesn't pay a getLatestBlockhash round-trip.
 let cachedBlockhash: { blockhash: string; lastValidBlockHeight: number } | null = null;
@@ -224,15 +232,18 @@ async function runCycle(
 
   // ── 3. Build the pushable set for this cycle ────────────────────────────────
   const pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }> = [];
+  const smoothNowMs = Date.now();
   for (const entry of registry.markets) {
     if (notPushable.has(entry.marketAddress)) continue;
-    const priceE6 = prices.get(entry.poolAddress);
+    const rawPriceE6 = prices.get(entry.poolAddress);
     const stat = state.stats.get(entry.marketAddress)!;
-    if (priceE6 === undefined || priceE6 <= 0n) {
+    if (rawPriceE6 === undefined || rawPriceE6 <= 0n) {
       stat.totalErrors++;
       stat.lastErrorMsg = "no pool price this cycle";
       continue;
     }
+    // The mark that settles trades is the SMOOTHED price, never raw spot.
+    const priceE6 = markSmoother.smooth(entry.poolAddress, rawPriceE6, smoothNowMs);
     stat.lastPriceE6 = priceE6;
     pushes.push({ marketAddress: entry.marketAddress, assetIndex: entry.assetIndex, priceE6 });
   }

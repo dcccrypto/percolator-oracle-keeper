@@ -47,20 +47,27 @@ describe("readAtWatermark", () => {
     assert.deepEqual(seen, [undefined, 100]);
   });
 
-  it("never lowers the watermark when a response comes from an older slot", async () => {
+  it("rejects a response served below the requested slot (provider ignoring minContextSlot)", async () => {
     const conn = { rpcEndpoint: "https://ep-a" } as Connection;
-    const seen: Array<number | undefined> = [];
-    const slots = [200, 150, 0];
-    const read = (mcs: number | undefined) => {
-      seen.push(mcs);
-      return Promise.resolve(ctx(slots.shift()!, null));
-    };
-    await readAtWatermark(conn, read);
-    // A response CAN claim an older slot only if the node misbehaves — the
-    // point is the stored watermark must not regress because of it.
-    await readAtWatermark(conn, read);
-    await readAtWatermark(conn, read);
-    assert.deepEqual(seen, [undefined, 200, 200]);
+    await readAtWatermark(conn, () => Promise.resolve(ctx(200, 0)));
+    // Node claims slot 150 < watermark 200 twice, then catches up: the stale
+    // responses must be DISCARDED (retried), never returned to the caller.
+    const slots = [150, 150, 201];
+    const served: string[] = ["stale-a", "stale-b", "fresh"];
+    let i = 0;
+    const value = await readAtWatermark(conn, () => {
+      const r = ctx(slots[i], served[i]);
+      i++;
+      return Promise.resolve(r);
+    });
+    assert.equal(value, "fresh");
+    assert.equal(i, 3);
+    // And a node that NEVER catches up exhausts retries and throws — the
+    // cycle skips rather than pricing off the past.
+    await assert.rejects(
+      readAtWatermark(conn, () => Promise.resolve(ctx(10, "ancient"))),
+      /[Mm]inimum context slot/,
+    );
   });
 
   it("keeps watermarks independent per endpoint", async () => {
