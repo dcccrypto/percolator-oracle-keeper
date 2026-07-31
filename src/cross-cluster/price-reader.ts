@@ -198,9 +198,27 @@ async function withRpcBackoff<T>(fn: () => Promise<T>): Promise<T> {
 // the failure mode by construction.
 const slotWatermarks = new Map<string, number>();
 
+/**
+ * Poisoned-watermark escape hatch. A single node reporting an INFLATED
+ * context.slot would raise the watermark above the real chain tip — and then
+ * every honest node fails the minimum-context-slot check forever: pricing
+ * freezes until a human restarts the process, and frozen prices eventually
+ * deep-stale the on-chain markets (the exact class of outage this file
+ * exists to prevent). So: after MAX_CONSECUTIVE_MIN_SLOT_FAILURES reads in a
+ * row die on the min-slot check, the endpoint's watermark is DROPPED and
+ * rebuilt from the next response. Damage from a real poisoning is bounded to
+ * ~3 skipped reads (~20s of held prices); the one stale read that could slip
+ * through right after a reset is exactly what the downstream median smoother
+ * absorbs. Failures counted here are ONLY min-slot rejections — 429s and
+ * network errors never touch the watermark.
+ */
+const consecutiveMinSlotFailures = new Map<string, number>();
+const MAX_CONSECUTIVE_MIN_SLOT_FAILURES = 3;
+
 /** Test hook: forget every endpoint's watermark. */
 export function resetSlotWatermarksForTests(): void {
   slotWatermarks.clear();
+  consecutiveMinSlotFailures.clear();
 }
 
 function isMinContextSlotError(err: unknown): boolean {
@@ -243,6 +261,7 @@ export async function readAtWatermark<T>(
       if (current === undefined || res.context.slot > current) {
         slotWatermarks.set(key, res.context.slot);
       }
+      consecutiveMinSlotFailures.delete(key);
       return res.value;
     } catch (err) {
       if (isMinContextSlotError(err) && attempt < MIN_SLOT_RETRIES - 1) {
@@ -252,6 +271,19 @@ export async function readAtWatermark<T>(
         );
         await new Promise((r) => setTimeout(r, MIN_SLOT_RETRY_DELAY_MS));
         continue;
+      }
+      if (isMinContextSlotError(err)) {
+        const fails = (consecutiveMinSlotFailures.get(key) ?? 0) + 1;
+        consecutiveMinSlotFailures.set(key, fails);
+        if (fails >= MAX_CONSECUTIVE_MIN_SLOT_FAILURES) {
+          console.error(
+            `[price-reader] ${fails} consecutive reads rejected below watermark ` +
+              `${slotWatermarks.get(key)} on ${key} — watermark likely poisoned by an ` +
+              `inflated context slot. DROPPING it; the next response rebuilds it.`,
+          );
+          slotWatermarks.delete(key);
+          consecutiveMinSlotFailures.delete(key);
+        }
       }
       throw err;
     }

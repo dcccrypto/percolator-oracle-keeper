@@ -114,6 +114,55 @@ describe("readAtWatermark", () => {
     assert.equal(calls, 3);
   });
 
+  it("drops a poisoned watermark after 3 consecutive min-slot exhaustions", async () => {
+    const conn = { rpcEndpoint: "https://ep-a" } as Connection;
+    // Poison: one node claims a slot far above the real tip.
+    await readAtWatermark(conn, () => Promise.resolve(ctx(999_999_999, 0)));
+    const behind = () =>
+      Promise.reject(new Error("Minimum context slot has not been reached"));
+    // Three full reads (each with its internal retries) die on the check…
+    await assert.rejects(readAtWatermark(conn, behind));
+    await assert.rejects(readAtWatermark(conn, behind));
+    await assert.rejects(readAtWatermark(conn, behind));
+    // …and the 4th starts FRESH: no minContextSlot demanded, honest node accepted.
+    const seen: Array<number | undefined> = [];
+    const value = await readAtWatermark(conn, (mcs) => {
+      seen.push(mcs);
+      return Promise.resolve(ctx(500, "recovered"));
+    });
+    assert.equal(value, "recovered");
+    assert.deepEqual(seen, [undefined]);
+  });
+
+  it("a successful read resets the poisoning counter", async () => {
+    const conn = { rpcEndpoint: "https://ep-a" } as Connection;
+    await readAtWatermark(conn, () => Promise.resolve(ctx(1000, 0)));
+    const behind = () =>
+      Promise.reject(new Error("Minimum context slot has not been reached"));
+    // Two failures, then a success, then two more failures: the counter must
+    // have reset — the watermark survives (next read still demands 1001).
+    await assert.rejects(readAtWatermark(conn, behind));
+    await assert.rejects(readAtWatermark(conn, behind));
+    await readAtWatermark(conn, () => Promise.resolve(ctx(1001, 0)));
+    await assert.rejects(readAtWatermark(conn, behind));
+    await assert.rejects(readAtWatermark(conn, behind));
+    const seen: Array<number | undefined> = [];
+    await assert.rejects(
+      readAtWatermark(conn, (mcs) => {
+        seen.push(mcs);
+        return behind();
+      }),
+    );
+    // That was the 3rd consecutive failure — watermark dropped only NOW.
+    assert.equal(seen[0], 1001);
+    const after: Array<number | undefined> = [];
+    await readAtWatermark(conn, (mcs) => {
+      after.push(mcs);
+      return Promise.resolve(ctx(1002, 0));
+    });
+    assert.deepEqual(after, [undefined]);
+  });
+
   it("propagates other errors immediately without retrying", async () => {
     const conn = { rpcEndpoint: "https://ep-a" } as Connection;
     let calls = 0;
