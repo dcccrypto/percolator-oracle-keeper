@@ -45,7 +45,16 @@ export interface MarkSmootherOptions {
   minSamples?: number;
 }
 
-const DEFAULT_WINDOW_MS = 90_000;
+/**
+ * 180s, not 90s: live measurement after the first deploy (2026-07-31) showed
+ * CATE's churn runs stretch to 50–70s, so a 90s window still let the median's
+ * majority flip about once a minute (half-gap steps of ~36 units). A window
+ * must comfortably exceed 2× the longest churn run to pin the majority level;
+ * 180s fully suppresses runs up to ~90s. The cost — genuine regime shifts
+ * surface with ~90s lag — is immaterial: the engine only absorbs 4 bps/slot,
+ * so a 160 bps move takes minutes to settle in regardless.
+ */
+const DEFAULT_WINDOW_MS = 180_000;
 const DEFAULT_MIN_SAMPLES = 3;
 /** Hard per-pool cap so a misbehaving caller cannot grow memory unbounded. */
 const MAX_SAMPLES_PER_POOL = 64;
