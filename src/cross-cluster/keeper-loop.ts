@@ -233,6 +233,12 @@ async function runCycle(
   // ── 3. Build the pushable set for this cycle ────────────────────────────────
   const pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }> = [];
   const smoothNowMs = Date.now();
+  // Smooth once per POOL per cycle, not once per market: N markets sharing a
+  // pool would insert N identical samples per cycle, silently shrinking the
+  // smoother's time window by N× against its MAX_SAMPLES cap (3 sharers cut
+  // the 180s window to ~149s — undoing the widening that was deployed
+  // precisely because 90s was insufficient).
+  const smoothedThisCycle = new Map<string, bigint>();
   for (const entry of registry.markets) {
     if (notPushable.has(entry.marketAddress)) continue;
     const rawPriceE6 = prices.get(entry.poolAddress);
@@ -243,7 +249,11 @@ async function runCycle(
       continue;
     }
     // The mark that settles trades is the SMOOTHED price, never raw spot.
-    const priceE6 = markSmoother.smooth(entry.poolAddress, rawPriceE6, smoothNowMs);
+    let priceE6 = smoothedThisCycle.get(entry.poolAddress);
+    if (priceE6 === undefined) {
+      priceE6 = markSmoother.smooth(entry.poolAddress, rawPriceE6, smoothNowMs);
+      smoothedThisCycle.set(entry.poolAddress, priceE6);
+    }
     stat.lastPriceE6 = priceE6;
     pushes.push({ marketAddress: entry.marketAddress, assetIndex: entry.assetIndex, priceE6 });
   }

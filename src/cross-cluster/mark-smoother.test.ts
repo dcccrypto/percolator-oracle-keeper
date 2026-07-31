@@ -114,6 +114,22 @@ describe("createMarkSmoother", () => {
     assert.equal(s.smooth(POOL, 460_000n, T0 + 11 * TICK), 4600n);
   });
 
+  it("default window is 180s — the live-tested value; 90s let 50-70s churn runs through", () => {
+    // Pins DEFAULT_WINDOW_MS: every other test passes windowMs explicitly, so
+    // a silent revert of the 90s→180s widening would otherwise pass CI.
+    // At the keeper's 7s cadence a 180s window holds ~26 samples: samples
+    // older than 180s must be evicted, samples inside must not be.
+    const s = createMarkSmoother({ minSamples: 3 });
+    for (let i = 0; i < 26; i++) s.smooth(POOL, 4600n, T0 + i * TICK);
+    // One old-level sample at T0 is now 175s old at the next tick — still in
+    // window; a 4700 stream shorter than half the window cannot flip the mark.
+    for (let i = 26; i < 32; i++) {
+      assert.equal(s.smooth(POOL, 4700n, T0 + i * TICK), 4600n);
+    }
+    // With a 90s window those six 4700s (42s) would be 6 of ~13 samples and
+    // the even-median would already sit at the midpoint — assert it doesn't.
+  });
+
   it("reset drops all state", () => {
     const s = createMarkSmoother({ windowMs: 90_000, minSamples: 3 });
     for (let i = 0; i < 10; i++) s.smooth(POOL, 4600n, T0 + i * TICK);

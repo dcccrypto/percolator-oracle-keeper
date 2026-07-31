@@ -268,6 +268,26 @@ async function runPollOnce(registry: Registry, config: RegisterPollConfig): Prom
     return 0;
   }
 
+  // Wipe-the-board guard: a SUCCESSFUL query returning zero rows while we
+  // locally hold several markets is far more likely to be config drift than a
+  // real mass retirement — an RLS policy regression returns 200 [] (PostgREST
+  // filters rows silently, it does not error), and so does a wrong `network`
+  // env value or a keeper_status enum change. ABSENCE_THRESHOLD only guards
+  // against a single odd poll; systematic drift passes it in ~60-90s and then
+  // retires EVERYTHING, the cranker goes idle, and every market crosses the
+  // irreversible accrue-staleness cliff. Retiring the LAST one or two markets
+  // (a deliberate clean-slate) still works; going from 3+ straight to zero
+  // requires a human to look at why.
+  if (desired.length === 0 && registry.markets.length >= 3) {
+    console.error(
+      `[register-poll] REFUSING to reconcile: DB returned 0 active markets while ` +
+        `${registry.markets.length} are registered locally — this looks like RLS/config ` +
+        `drift, not a real mass retirement. Fix the query path or retire markets in ` +
+        `smaller batches.`,
+    );
+    return 0;
+  }
+
   // Owner filter (2026-07-23): only price markets owned by the current wrapper.
   // A retired-wrapper market in the push batch reverts the WHOLE atomic tx with
   // IncorrectProgramId. Batched into one RPC call, and if that call fails we

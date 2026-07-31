@@ -222,6 +222,15 @@ export function resetSlotWatermarksForTests(): void {
 }
 
 function isMinContextSlotError(err: unknown): boolean {
+  // Match the JSON-RPC code (-32016) FIRST: providers and proxies reword the
+  // message, and a reworded rejection that fails this predicate would skip
+  // both the retry AND the poisoned-watermark counter — reopening the
+  // permanent-freeze path this file exists to close. web3.js surfaces the
+  // code on SolanaJSONRPCError; the text match stays as a fallback for
+  // wrappers that swallow it.
+  if (typeof err === "object" && err !== null && "code" in err && (err as { code: unknown }).code === -32016) {
+    return true;
+  }
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   return msg.includes("minimum context slot");
 }
@@ -820,7 +829,20 @@ export async function readAllPoolPricesE6(
       return { baseVaultPos, quoteVaultPos, mintPos };
     });
 
-    const extraInfos = await getMultipleAccountsChunked(mainnetConn, extraAddrs);
+    // Contained: a pass-2 failure (rate limit, behind node) must not discard
+    // the pass-1 raydium/meteora prices already computed above — throwing
+    // here used to abort the WHOLE cycle for every market. Now the pumpswap
+    // markets skip this cycle ("no pool price") and everything else publishes.
+    let extraInfos: Array<AccountInfo<Buffer> | null>;
+    try {
+      extraInfos = await getMultipleAccountsChunked(mainnetConn, extraAddrs);
+    } catch (err) {
+      console.warn(
+        `[price-reader] pumpswap vault batch failed — skipping ${pumpswapCandidates.length} ` +
+          `pumpswap market(s) this cycle: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`,
+      );
+      return out;
+    }
 
     for (let c = 0; c < pumpswapCandidates.length; c++) {
       const { entry, poolData } = pumpswapCandidates[c];
