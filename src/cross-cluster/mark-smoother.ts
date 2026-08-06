@@ -28,9 +28,10 @@
  *     excursion drags the mean), and it is not robust to a single wild
  *     outlier. The median ignores both until they hold a majority.
  *
- * Cold start / gaps: below `minSamples` readings in the window the latest raw
- * price passes through unchanged — a freshly listed market prices immediately,
- * and a long outage (window fully evicted) re-primes the same way.
+ * Cold start / gaps: below `minSamples` readings the smoother withholds the
+ * mark instead of publishing raw spot. This keeps a freshly listed market and a
+ * post-outage / post-eviction pool from using a single unfiltered reading as the
+ * settlement mark.
  */
 
 interface Sample {
@@ -41,7 +42,7 @@ interface Sample {
 export interface MarkSmootherOptions {
   /** Trailing window the median is computed over (ms). */
   windowMs?: number;
-  /** Below this many samples in the window, pass the raw price through. */
+  /** Below this many samples in the window, withhold instead of publishing raw. */
   minSamples?: number;
 }
 
@@ -61,10 +62,12 @@ const MAX_SAMPLES_PER_POOL = 64;
 
 export interface MarkSmoother {
   /**
-   * Record `priceE6` for `poolAddress` at `nowMs` and return the smoothed
-   * mark to publish this cycle.
+   * Record `priceE6` for `poolAddress` at `nowMs`.
+   *
+   * Returns the smoothed mark to publish this cycle, or `null` while the pool
+   * is still priming/re-priming and publishing would require a raw passthrough.
    */
-  smooth(poolAddress: string, priceE6: bigint, nowMs: number): bigint;
+  smooth(poolAddress: string, priceE6: bigint, nowMs: number): bigint | null;
   /** Drop every window (tests / registry rebuilds). */
   reset(): void;
 }
@@ -84,7 +87,7 @@ export function createMarkSmoother(opts: MarkSmootherOptions = {}): MarkSmoother
   const windows = new Map<string, Sample[]>();
 
   return {
-    smooth(poolAddress: string, priceE6: bigint, nowMs: number): bigint {
+    smooth(poolAddress: string, priceE6: bigint, nowMs: number): bigint | null {
       let win = windows.get(poolAddress);
       if (!win) {
         win = [];
@@ -99,7 +102,12 @@ export function createMarkSmoother(opts: MarkSmootherOptions = {}): MarkSmoother
       if (firstLive > 0) win.splice(0, firstLive);
       if (win.length > MAX_SAMPLES_PER_POOL) win.splice(0, win.length - MAX_SAMPLES_PER_POOL);
 
-      if (win.length < minSamples) return priceE6;
+      if (win.length < minSamples) {
+        // Do not publish a raw single/few-sample spot. This covers both first
+        // listing and steady-state re-prime after a liveness gap fully evicts
+        // the window.
+        return null;
+      }
       // Compute over an EVEN count (drop the single oldest sample when odd):
       // an odd-count median flips by parity under a balanced two-level
       // ping-pong (7:6 → level A, then 6:7 → level B every push) — the exact
