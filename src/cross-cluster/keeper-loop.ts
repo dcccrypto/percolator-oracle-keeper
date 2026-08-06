@@ -275,6 +275,16 @@ function priceE6ToUsdNumber(priceE6: bigint): number {
   return Number(priceE6) / 1_000_000;
 }
 
+function cloneCircuitBreakerState(state: CircuitBreakerState): CircuitBreakerState {
+  return {
+    symbol: state.symbol,
+    lastPrice: state.lastPrice,
+    circuitBreakerTrips: state.circuitBreakerTrips,
+    cbTripPrice: state.cbTripPrice,
+    cbConsecutiveTrips: state.cbConsecutiveTrips,
+  };
+}
+
 // Blockhash cache — a fresh one is valid ~60-90s; refetch every 15s so each
 // cycle doesn't pay a getLatestBlockhash round-trip.
 let cachedBlockhash: { blockhash: string; lastValidBlockHeight: number } | null = null;
@@ -381,6 +391,7 @@ async function runCycle(
   // the 180s window to ~149s — undoing the widening that was deployed
   // precisely because 90s was insufficient).
   const smoothedThisCycle = new Map<string, bigint | null>();
+  const pendingCircuitBreakerStates = new Map<string, CircuitBreakerState>();
   for (const entry of registry.markets) {
     if (notPushable.has(entry.marketAddress)) continue;
     const rawPriceE6 = prices.get(entry.poolAddress);
@@ -402,23 +413,41 @@ async function runCycle(
       continue;
     }
 
-    const circuitBreakerState = getCrossClusterCircuitBreakerState(
+    const currentCircuitBreakerState = getCrossClusterCircuitBreakerState(
       entry.marketAddress,
       entry.label,
     );
+    const candidateCircuitBreakerState = cloneCircuitBreakerState(
+      currentCircuitBreakerState,
+    );
     const priceUsd = priceE6ToUsdNumber(priceE6);
-    const allowed = checkCircuitBreaker(circuitBreakerState, priceUsd, {
+    const allowed = checkCircuitBreaker(candidateCircuitBreakerState, priceUsd, {
       maxMovePct: CROSS_CLUSTER_MAX_MOVE_PCT,
       confirmTrips: CROSS_CLUSTER_CIRCUIT_BREAKER_CONFIRM_TRIPS,
       log: (msg) => console.warn(`[loop] ${msg}`),
     });
     if (!allowed) {
+      // Keep breaker trip accounting for sustained-relocation detection, but do
+      // not advance the accepted baseline. checkCircuitBreaker() does not move
+      // lastPrice on a rejected candidate.
+      crossClusterCircuitBreakerStates.set(
+        entry.marketAddress,
+        candidateCircuitBreakerState,
+      );
       stat.totalErrors++;
       stat.lastErrorMsg =
         `circuit breaker blocked mark move at ${priceUsd.toFixed(6)}`;
       continue;
     }
-    circuitBreakerState.lastPrice = priceUsd;
+
+    // The candidate is breaker-accepted, but it is not the published AuthMark
+    // yet. Stage the new baseline and commit it only after pushAuthMarkBatch
+    // confirms this market was actually pushed.
+    candidateCircuitBreakerState.lastPrice = priceUsd;
+    pendingCircuitBreakerStates.set(
+      entry.marketAddress,
+      candidateCircuitBreakerState,
+    );
 
     stat.lastPriceE6 = priceE6;
     pushes.push({ marketAddress: entry.marketAddress, assetIndex: entry.assetIndex, priceE6 });
@@ -449,6 +478,15 @@ async function runCycle(
       if (config.dryRun) {
         stat.lastSig = "DRY_RUN";
       } else if (pushedSet.has(p.marketAddress) && res.signature) {
+        const pendingCircuitBreakerState = pendingCircuitBreakerStates.get(
+          p.marketAddress,
+        );
+        if (pendingCircuitBreakerState) {
+          crossClusterCircuitBreakerStates.set(
+            p.marketAddress,
+            pendingCircuitBreakerState,
+          );
+        }
         stat.totalPushes++;
         stat.lastPushAt = stamp;
         stat.lastSig = res.signature;

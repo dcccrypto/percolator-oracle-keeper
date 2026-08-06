@@ -177,5 +177,9 @@ describe("keeper-loop wiring", () => {
     assert.match(src, /markSmoother\.smooth\(entry\.poolAddress,\s*rawPriceE6/);
     assert.match(src, /priceE6 === null/);
     assert.match(src, /checkCircuitBreaker\(/);
+    assert.match(src, /cloneCircuitBreakerState/);
+    assert.match(src, /pendingCircuitBreakerStates/);
+    assert.match(src, /pushedSet\.has\(p\.marketAddress\) && res\.signature/);
+    assert.doesNotMatch(src, /circuitBreakerState\.lastPrice = priceUsd/);
   });
 });
