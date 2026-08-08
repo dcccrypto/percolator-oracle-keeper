@@ -21,9 +21,28 @@ import { crankLpFeesOnce, crankAllLpFeesOnce } from "./lp-fee-cranker.ts";
 const KEEPER = Keypair.generate();
 
 /** Connection stub: control which of [registry, ledger] exist, and how send behaves. */
+/**
+ * A registry the SDK will actually parse. The old fake handed back a zeroed
+ * buffer, which threw inside parseLpVaultRegistry and silently exercised only
+ * the fallback path — so no test ever covered the real domain or share count.
+ */
+function registryBuf(opts: { shares?: bigint; domain?: number } = {}): Buffer {
+  const b = Buffer.alloc(176);
+  b.writeBigUInt64LE(0x5045_5243_5631_3600n, 0); // V17_MAGIC
+  b.writeUInt16LE(17, 8);                        // V17_EXPECTED_VERSION
+  b.writeUInt8(5, 10);                           // kind = LpVaultRegistry
+  const H = 16;                                  // V17_ACCOUNT_HEADER_LEN
+  const shares = opts.shares ?? 1_000_000n;
+  b.writeBigUInt64LE(shares & 0xffff_ffff_ffff_ffffn, H + 64);
+  b.writeBigUInt64LE(shares >> 64n, H + 72);     // u128 LE
+  b.writeUInt16LE(opts.domain ?? 2, H + 132);    // domain
+  return b;
+}
+
 function fakeConn(opts: {
   registry?: boolean;
-  ledger?: boolean;
+  shares?: bigint;
+  domain?: number;
   sendError?: unknown;
 }) {
   let sends = 0;
@@ -32,8 +51,9 @@ function fakeConn(opts: {
     conn: {
       async getMultipleAccountsInfo() {
         return [
-          opts.registry === false ? null : { data: Buffer.alloc(176) },
-          opts.ledger === false ? null : { data: Buffer.alloc(240) },
+          opts.registry === false
+            ? null
+            : { data: registryBuf({ shares: opts.shares, domain: opts.domain }) },
         ];
       },
       async getLatestBlockhash() {
@@ -65,12 +85,23 @@ describe("crankLpFeesOnce — only spend a transaction when there is something t
   });
 
   it("skips a market with no LP depositor yet, instead of failing every cycle", async () => {
-    // The backing ledger is created LAZILY by the first DepositToLpVault, so on
-    // a brand-new market it does not exist. Cranking anyway fails
-    // IncorrectProgramId — alarming in logs, but it only means "no LPs yet".
-    const f = fakeConn({ ledger: false });
+    // v17 dual-domain: ledger absence is NO LONGER the signal. The program now
+    // creates the target ledger on first use, so a missing ledger just means
+    // "this pot has not been funded", not "there are no LPs". The registry's
+    // share count is the direct signal — and it is what the program itself
+    // checks before crediting atoms no share could ever claim.
+    const f = fakeConn({ shares: 0n });
     assert.equal(await crankLpFeesOnce(f.conn as never, KEEPER, MARKET(), false), "skipped");
     assert.equal(f.sends, 0, "no depositors must cost no transaction");
+  });
+
+  it("cranks a vault bound to a non-zero domain", async () => {
+    // The old code hardcoded domain 0. A market that appends an asset binds its
+    // vault to that asset's domain, so the ledger PDAs were derived for the
+    // wrong pot entirely.
+    const f = fakeConn({ domain: 3, shares: 5_000n });
+    assert.equal(await crankLpFeesOnce(f.conn as never, KEEPER, MARKET(), false), "cranked");
+    assert.equal(f.sends, 1);
   });
 
   it("treats Custom(38) NoFeesToCrank as healthy, not as a failure", async () => {

@@ -54,12 +54,20 @@ import {
   buildAccountMetas,
   deriveLpVaultRegistry,
   deriveLpBackingLedger,
+  parseLpVaultRegistry,
 } from "@percolatorct/sdk";
+import { SystemProgram } from "@solana/web3.js";
 import type { Registry } from "./registry.ts";
 import { WRAPPER_PROGRAM_ID } from "./auth-mark-pusher.ts";
 
-/** LP vaults serve backing domain 0; domain 1 has no vault (see CreateLpVault). */
-const LP_VAULT_DOMAIN = 0;
+/**
+ * Fallback only. v17 vaults are DUAL-DOMAIN: the vault serves both pots of its
+ * asset and its own pot is `registry.domain`, which is NOT always 0 (a market
+ * that appends an asset binds the vault to that asset's domain). We read the
+ * real value off the registry below and only fall back to this if the account
+ * cannot be parsed.
+ */
+const LP_VAULT_DOMAIN_FALLBACK = 0;
 
 const COMPUTE_UNIT_LIMIT = 120_000;
 
@@ -110,23 +118,39 @@ export async function crankLpFeesOnce(
   }
 
   const [registry] = deriveLpVaultRegistry(WRAPPER_PROGRAM_ID, market);
-  const [ledger] = deriveLpBackingLedger(WRAPPER_PROGRAM_ID, market, LP_VAULT_DOMAIN);
 
-  // Both reads in ONE round trip — this runs per market per cycle.
+  // ONE round trip, as before. Dual-domain changed WHICH signal tells us not to
+  // bother sending: the ledger's existence used to stand in for "has a depositor",
+  // but the program now creates the target ledger on first use, so a missing
+  // ledger is no longer a reason to skip. The registry's own share count is the
+  // direct signal and costs no extra read — it is also exactly what the program
+  // checks (it rejects LpVaultZeroSharesMinted when no share can claim the atoms).
   let infos: Array<{ data: Buffer } | null>;
   try {
-    infos = (await devnetConn.getMultipleAccountsInfo([registry, ledger], "confirmed")) as Array<
+    infos = (await devnetConn.getMultipleAccountsInfo([registry], "confirmed")) as Array<
       { data: Buffer } | null
     >;
   } catch (err) {
     return { error: `account read failed: ${(err as Error).message.slice(0, 100)}` };
   }
-  const [registryInfo, ledgerInfo] = infos;
+  const [registryInfo] = infos;
 
-  // No vault, or no depositor yet -> nothing to distribute. Skipping locally
-  // keeps a market with no LPs from costing a transaction every single cycle.
+  // No vault -> nothing to distribute. Skipping locally keeps a market with no
+  // LP vault from costing a transaction every single cycle.
   if (!registryInfo) return "skipped";
-  if (!ledgerInfo) return "skipped";
+
+  let domainIdx = LP_VAULT_DOMAIN_FALLBACK;
+  try {
+    const parsed = parseLpVaultRegistry(new Uint8Array(registryInfo.data));
+    domainIdx = Number(parsed.domain);
+    if (parsed.totalLpSharesOutstanding === 0n) return "skipped";
+  } catch {
+    // Unparseable registry: fall back rather than skip, so a layout change does
+    // not silently stop fee cranking on every market at once.
+  }
+
+  const [ledger] = deriveLpBackingLedger(WRAPPER_PROGRAM_ID, market, domainIdx);
+  const [siblingLedger] = deriveLpBackingLedger(WRAPPER_PROGRAM_ID, market, domainIdx ^ 1);
 
   if (dryRun) {
     console.log(`[lp-fee] [DRY-RUN] LpVaultCrankFees ${marketAddress.slice(0, 8)}…`);
@@ -143,8 +167,10 @@ export async function crankLpFeesOnce(
         market,
         registry,
         ledger,
+        siblingLedger,
+        systemProgram: SystemProgram.programId,
       }),
-      data: Buffer.from(encodeLpVaultCrankFees()),
+      data: Buffer.from(encodeLpVaultCrankFees({ domain: domainIdx })),
     }),
   );
 
