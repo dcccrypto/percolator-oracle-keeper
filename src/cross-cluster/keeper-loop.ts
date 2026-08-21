@@ -22,6 +22,8 @@ import type { Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
 import { readAllPoolPricesE6 } from "./price-reader.ts";
 import { createMarkSmoother } from "./mark-smoother.ts";
+import { checkCircuitBreaker } from "../circuit-breaker.ts";
+import type { CircuitBreakerState } from "../circuit-breaker.ts";
 import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets } from "./auth-mark-pusher.ts";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -213,6 +215,104 @@ function maybeResetAuthorityLatches(): void {
  * reach the engine as oscillation. See mark-smoother.ts for the full story.
  */
 const markSmoother = createMarkSmoother();
+
+function parseCrossClusterPositiveNumberEnv(
+  name: string,
+  fallback: number,
+  maxExclusive?: number,
+): number {
+  const raw = process.env[name];
+  const value = raw === undefined || raw.trim() === "" ? fallback : Number(raw);
+
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a finite positive number`);
+  }
+  if (maxExclusive !== undefined && value >= maxExclusive) {
+    throw new Error(`${name} must be less than ${maxExclusive}`);
+  }
+  return value;
+}
+
+function parseCrossClusterPositiveIntegerEnv(name: string, fallback: number): number {
+  const value = parseCrossClusterPositiveNumberEnv(name, fallback);
+  if (!Number.isInteger(value)) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+const CROSS_CLUSTER_MAX_MOVE_PCT = parseCrossClusterPositiveNumberEnv(
+  "CROSS_CLUSTER_MAX_MOVE_PCT",
+  10,
+  100,
+);
+const CROSS_CLUSTER_CIRCUIT_BREAKER_CONFIRM_TRIPS = parseCrossClusterPositiveIntegerEnv(
+  "CROSS_CLUSTER_CIRCUIT_BREAKER_CONFIRM_TRIPS",
+  3,
+);
+
+const crossClusterCircuitBreakerStates = new Map<string, CircuitBreakerState>();
+
+function getCrossClusterCircuitBreakerState(
+  marketAddress: string,
+  label: string,
+): CircuitBreakerState {
+  let state = crossClusterCircuitBreakerStates.get(marketAddress);
+  if (!state) {
+    state = {
+      symbol: label,
+      lastPrice: 0,
+      circuitBreakerTrips: 0,
+      cbTripPrice: 0,
+      cbConsecutiveTrips: 0,
+    };
+    crossClusterCircuitBreakerStates.set(marketAddress, state);
+  }
+  return state;
+}
+
+function priceE6ToUsdNumber(priceE6: bigint): number {
+  return Number(priceE6) / 1_000_000;
+}
+
+/**
+ * Split a breaker-accepted candidate into (a) the accounting that MUST be
+ * committed immediately and (b) the baseline that may only be committed once
+ * the mark is actually published.
+ *
+ * `checkCircuitBreaker()` resets `cbConsecutiveTrips` when it accepts a price.
+ * That reset is load-bearing: circuit-breaker.ts documents "the next push at
+ * the normal level resets cbConsecutiveTrips, so the spike can never accumulate
+ * to confirmTrips". Deferring the whole candidate until a successful push would
+ * throw the reset away on every dropped cycle — and on this keeper roughly one
+ * cycle in five ends with no successful batch push. A spike could then
+ * accumulate across dropped cycles and re-baseline the breaker onto a bad
+ * price, which is precisely what the breaker exists to prevent.
+ *
+ * So: trip accounting commits now, `lastPrice` defers.
+ */
+export function splitBreakerCommit(
+  current: CircuitBreakerState,
+  candidate: CircuitBreakerState,
+  acceptedPriceUsd: number,
+): { commitNow: CircuitBreakerState; deferred: CircuitBreakerState } {
+  const commitNow = cloneCircuitBreakerState(candidate);
+  commitNow.lastPrice = current.lastPrice; // baseline does NOT advance yet
+  const deferred = cloneCircuitBreakerState(candidate);
+  deferred.lastPrice = acceptedPriceUsd; // advances only on a confirmed push
+  return { commitNow, deferred };
+}
+
+function cloneCircuitBreakerState(state: CircuitBreakerState): CircuitBreakerState {
+  return {
+    symbol: state.symbol,
+    lastPrice: state.lastPrice,
+    circuitBreakerTrips: state.circuitBreakerTrips,
+    cbTripPrice: state.cbTripPrice,
+    cbConsecutiveTrips: state.cbConsecutiveTrips,
+  };
+}
+
 // Blockhash cache — a fresh one is valid ~60-90s; refetch every 15s so each
 // cycle doesn't pay a getLatestBlockhash round-trip.
 let cachedBlockhash: { blockhash: string; lastValidBlockHeight: number } | null = null;
@@ -318,7 +418,8 @@ async function runCycle(
   // smoother's time window by N× against its MAX_SAMPLES cap (3 sharers cut
   // the 180s window to ~149s — undoing the widening that was deployed
   // precisely because 90s was insufficient).
-  const smoothedThisCycle = new Map<string, bigint>();
+  const smoothedThisCycle = new Map<string, bigint | null>();
+  const pendingCircuitBreakerStates = new Map<string, CircuitBreakerState>();
   for (const entry of registry.markets) {
     if (notPushable.has(entry.marketAddress)) continue;
     const rawPriceE6 = prices.get(entry.poolAddress);
@@ -334,6 +435,61 @@ async function runCycle(
       priceE6 = markSmoother.smooth(entry.poolAddress, rawPriceE6, smoothNowMs);
       smoothedThisCycle.set(entry.poolAddress, priceE6);
     }
+    if (priceE6 === null) {
+      stat.totalErrors++;
+      stat.lastErrorMsg = "mark smoother re-priming — withholding push until minSamples";
+      continue;
+    }
+
+    const currentCircuitBreakerState = getCrossClusterCircuitBreakerState(
+      entry.marketAddress,
+      entry.label,
+    );
+    const candidateCircuitBreakerState = cloneCircuitBreakerState(
+      currentCircuitBreakerState,
+    );
+    const priceUsd = priceE6ToUsdNumber(priceE6);
+    const allowed = checkCircuitBreaker(candidateCircuitBreakerState, priceUsd, {
+      maxMovePct: CROSS_CLUSTER_MAX_MOVE_PCT,
+      confirmTrips: CROSS_CLUSTER_CIRCUIT_BREAKER_CONFIRM_TRIPS,
+      log: (msg) => console.warn(`[loop] ${msg}`),
+    });
+    if (!allowed) {
+      // Keep breaker trip accounting for sustained-relocation detection, but do
+      // not advance the accepted baseline. checkCircuitBreaker() does not move
+      // lastPrice on a rejected candidate.
+      crossClusterCircuitBreakerStates.set(
+        entry.marketAddress,
+        candidateCircuitBreakerState,
+      );
+      stat.totalErrors++;
+      stat.lastErrorMsg =
+        `circuit breaker blocked mark move at ${priceUsd.toFixed(6)}`;
+      continue;
+    }
+
+    // The candidate is breaker-accepted, but it is not the published AuthMark
+    // yet. Stage the new baseline and commit it only after pushAuthMarkBatch
+    // confirms this market was actually pushed.
+    //
+    // TRIP ACCOUNTING IS COMMITTED NOW, BASELINE IS NOT. checkCircuitBreaker()
+    // resets cbConsecutiveTrips on an accepted price — that reset is what makes
+    // circuit-breaker.ts's documented invariant hold ("the next push at the
+    // normal level resets cbConsecutiveTrips, so the spike can never accumulate
+    // to confirmTrips"). Deferring the WHOLE candidate would discard the reset
+    // whenever the push does not land, and on this keeper roughly one cycle in
+    // five ends without a successful batch push (254,292 pushes over 324,639
+    // cycles, plus 3,645 hard timeouts). A spike could then accumulate across
+    // dropped cycles and re-baseline the breaker onto a bad price — the exact
+    // failure the breaker exists to prevent. Only `lastPrice` may be deferred.
+    const { commitNow, deferred } = splitBreakerCommit(
+      currentCircuitBreakerState,
+      candidateCircuitBreakerState,
+      priceUsd,
+    );
+    crossClusterCircuitBreakerStates.set(entry.marketAddress, commitNow);
+    pendingCircuitBreakerStates.set(entry.marketAddress, deferred);
+
     stat.lastPriceE6 = priceE6;
     pushes.push({ marketAddress: entry.marketAddress, assetIndex: entry.assetIndex, priceE6 });
   }
@@ -363,6 +519,15 @@ async function runCycle(
       if (config.dryRun) {
         stat.lastSig = "DRY_RUN";
       } else if (pushedSet.has(p.marketAddress) && res.signature) {
+        const pendingCircuitBreakerState = pendingCircuitBreakerStates.get(
+          p.marketAddress,
+        );
+        if (pendingCircuitBreakerState) {
+          crossClusterCircuitBreakerStates.set(
+            p.marketAddress,
+            pendingCircuitBreakerState,
+          );
+        }
         stat.totalPushes++;
         stat.lastPushAt = stamp;
         stat.lastSig = res.signature;
