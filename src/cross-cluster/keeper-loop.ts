@@ -275,6 +275,34 @@ function priceE6ToUsdNumber(priceE6: bigint): number {
   return Number(priceE6) / 1_000_000;
 }
 
+/**
+ * Split a breaker-accepted candidate into (a) the accounting that MUST be
+ * committed immediately and (b) the baseline that may only be committed once
+ * the mark is actually published.
+ *
+ * `checkCircuitBreaker()` resets `cbConsecutiveTrips` when it accepts a price.
+ * That reset is load-bearing: circuit-breaker.ts documents "the next push at
+ * the normal level resets cbConsecutiveTrips, so the spike can never accumulate
+ * to confirmTrips". Deferring the whole candidate until a successful push would
+ * throw the reset away on every dropped cycle — and on this keeper roughly one
+ * cycle in five ends with no successful batch push. A spike could then
+ * accumulate across dropped cycles and re-baseline the breaker onto a bad
+ * price, which is precisely what the breaker exists to prevent.
+ *
+ * So: trip accounting commits now, `lastPrice` defers.
+ */
+export function splitBreakerCommit(
+  current: CircuitBreakerState,
+  candidate: CircuitBreakerState,
+  acceptedPriceUsd: number,
+): { commitNow: CircuitBreakerState; deferred: CircuitBreakerState } {
+  const commitNow = cloneCircuitBreakerState(candidate);
+  commitNow.lastPrice = current.lastPrice; // baseline does NOT advance yet
+  const deferred = cloneCircuitBreakerState(candidate);
+  deferred.lastPrice = acceptedPriceUsd; // advances only on a confirmed push
+  return { commitNow, deferred };
+}
+
 function cloneCircuitBreakerState(state: CircuitBreakerState): CircuitBreakerState {
   return {
     symbol: state.symbol,
@@ -443,11 +471,24 @@ async function runCycle(
     // The candidate is breaker-accepted, but it is not the published AuthMark
     // yet. Stage the new baseline and commit it only after pushAuthMarkBatch
     // confirms this market was actually pushed.
-    candidateCircuitBreakerState.lastPrice = priceUsd;
-    pendingCircuitBreakerStates.set(
-      entry.marketAddress,
+    //
+    // TRIP ACCOUNTING IS COMMITTED NOW, BASELINE IS NOT. checkCircuitBreaker()
+    // resets cbConsecutiveTrips on an accepted price — that reset is what makes
+    // circuit-breaker.ts's documented invariant hold ("the next push at the
+    // normal level resets cbConsecutiveTrips, so the spike can never accumulate
+    // to confirmTrips"). Deferring the WHOLE candidate would discard the reset
+    // whenever the push does not land, and on this keeper roughly one cycle in
+    // five ends without a successful batch push (254,292 pushes over 324,639
+    // cycles, plus 3,645 hard timeouts). A spike could then accumulate across
+    // dropped cycles and re-baseline the breaker onto a bad price — the exact
+    // failure the breaker exists to prevent. Only `lastPrice` may be deferred.
+    const { commitNow, deferred } = splitBreakerCommit(
+      currentCircuitBreakerState,
       candidateCircuitBreakerState,
+      priceUsd,
     );
+    crossClusterCircuitBreakerStates.set(entry.marketAddress, commitNow);
+    pendingCircuitBreakerStates.set(entry.marketAddress, deferred);
 
     stat.lastPriceE6 = priceE6;
     pushes.push({ marketAddress: entry.marketAddress, assetIndex: entry.assetIndex, priceE6 });
