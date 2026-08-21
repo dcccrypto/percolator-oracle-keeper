@@ -49,7 +49,11 @@ import * as http from "http";
 import * as crypto from "crypto";
 
 // ── Config ──────────────────────────────────────────────────
-import { parsePositiveNumberEnv, requireProgramIdForSupabaseMode } from "./env-utils.ts";
+import {
+  parsePositiveLamportsFromSolEnv,
+  parsePositiveNumberEnv,
+  requireProgramIdForSupabaseMode,
+} from "./env-utils.ts";
 import { checkCircuitBreaker as _checkCircuitBreaker } from "./circuit-breaker.ts";
 import type { CircuitBreakerState } from "./circuit-breaker.ts";
 import { selectMarketGroupOffset } from "./wrapper-market-group-offset.ts";
@@ -865,9 +869,10 @@ let startTime = Date.now();
 // Devops audit 2026-03-14: wallet FF7KFfU5 exhausted twice in one day from
 // ~20+ markets per 3-second cycle. Guard prevents on-chain txn drain when
 // balance is low. Default: 0.05 SOL (50_000_000 lamports).
-const MIN_KEEPER_BALANCE_LAMPORTS = process.env.MIN_KEEPER_BALANCE_SOL
-  ? Math.round(parsePositiveNumberEnv("MIN_KEEPER_BALANCE_SOL", 0.05) * 1e9)
-  : 50_000_000;
+const MIN_KEEPER_BALANCE_LAMPORTS = parsePositiveLamportsFromSolEnv(
+  "MIN_KEEPER_BALANCE_SOL",
+  0.05,
+);
 // Interval between balance refreshes (default: every 30 s = ~10 push cycles at 3s interval)
 const BALANCE_CHECK_INTERVAL_MS = parsePositiveNumberEnv("BALANCE_CHECK_INTERVAL_MS", 30000);
 let walletBalanceLamports: number | null = null;

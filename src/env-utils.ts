@@ -60,3 +60,58 @@ export function requireProgramIdForSupabaseMode(
     );
   }
 }
+
+/**
+ * Number of lamports in one SOL.
+ */
+export const LAMPORTS_PER_SOL = 1_000_000_000;
+const LAMPORTS_PER_SOL_BIGINT = 1_000_000_000n;
+
+/**
+ * Parse a positive SOL-denominated environment variable into lamports exactly.
+ *
+ * This intentionally parses the decimal string instead of multiplying a JS
+ * floating-point number by 1e9. The keeper balance guard compares lamports at
+ * runtime, so the converted value must be a positive, safe, whole-lamport
+ * integer with no silent rounding.
+ */
+export function parsePositiveLamportsFromSolEnv(name: string, fallbackSol: number): number {
+  const raw = process.env[name];
+  const rawValue = raw == null || raw.trim() === "" ? String(fallbackSol) : raw.trim();
+
+  if (!/^(?:\d+|\d+\.\d*|\.\d+)$/.test(rawValue)) {
+    throw new Error(
+      `${name} must be a finite positive decimal SOL amount (got: ${JSON.stringify(raw)})`,
+    );
+  }
+
+  const [wholeRaw, fractionRaw = ""] = rawValue.split(".");
+  const wholePart = wholeRaw === "" ? "0" : wholeRaw;
+  const fractionPadded = fractionRaw.padEnd(9, "0");
+  const lamportFraction = fractionPadded.slice(0, 9);
+  const fractionalRemainder = fractionRaw.slice(9);
+
+  const lamports =
+    BigInt(wholePart) * LAMPORTS_PER_SOL_BIGINT +
+    BigInt(lamportFraction === "" ? "0" : lamportFraction);
+
+  if (lamports <= 0n) {
+    throw new Error(
+      `${name} must convert to at least 1 whole lamport (got: ${rawValue} SOL -> ${lamports} lamports)`,
+    );
+  }
+
+  if (/[1-9]/.test(fractionalRemainder)) {
+    throw new Error(
+      `${name} converts to a fractional lamport amount (got: ${rawValue} SOL)`,
+    );
+  }
+
+  if (lamports > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(
+      `${name} converts to an unsafe lamport amount (got: ${rawValue} SOL -> ${lamports} lamports)`,
+    );
+  }
+
+  return Number(lamports);
+}
