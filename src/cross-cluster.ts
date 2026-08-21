@@ -37,6 +37,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { loadRegistry } from "./cross-cluster/registry.ts";
+import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { crankAllOnce, startRecoveryCrankLoop } from "./cross-cluster/recovery-cranker.ts";
 import { startLpFeeCrankLoop } from "./cross-cluster/lp-fee-cranker.ts";
@@ -75,6 +76,29 @@ if (!MAINNET_RPC) {
 if (!DEVNET_RPC) {
   console.error("[fatal] DEVNET_RPC_URL is required (e.g. https://devnet.helius-rpc.com/?api-key=...)");
   process.exit(1);
+}
+
+// These two carry the Helius API key in the query string and are the ONLY RPC
+// endpoints the running keeper uses (launchd -> start-keeper.sh -> this file).
+// A plaintext http:// endpoint would put that key on the wire in clear, so the
+// same scheme check #89 added for the legacy entry point is applied here, where
+// it actually protects something. http:// stays available for localhost when
+// ALLOW_INSECURE_LOCAL_RPC=true, matching rpc-url.ts's contract exactly.
+{
+  const allowInsecureLocalRpc = isExplicitTrue(process.env.ALLOW_INSECURE_LOCAL_RPC);
+  for (const [name, value] of [
+    ["MAINNET_RPC_URL", MAINNET_RPC],
+    ["DEVNET_RPC_URL", DEVNET_RPC],
+  ] as const) {
+    const problem = validateRpcEndpoint(name, value, {
+      required: true,
+      allowInsecureLocalRpc,
+    });
+    if (problem) {
+      console.error(`[fatal] ${problem}`);
+      process.exit(1);
+    }
+  }
 }
 
 // ── Keeper keypair ─────────────────────────────────────────────────────────────
