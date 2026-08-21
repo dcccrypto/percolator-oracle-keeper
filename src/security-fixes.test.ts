@@ -14,6 +14,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { parsePositiveNumberEnv } from "./env-utils.ts";
+import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { checkCircuitBreaker } from "./circuit-breaker.ts";
 import type { CircuitBreakerState } from "./circuit-breaker.ts";
 
@@ -352,5 +353,102 @@ describe("#34 DexScreener tighter circuit-breaker bound", () => {
       }
     });
     assert.equal(counter, 0, "jupiter-ca should reset the low-trust counter");
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════
+// #69 — Secure RPC URL validation
+// ══════════════════════════════════════════════════════════════
+describe("#69 secure RPC URL validation", () => {
+  it("accepts HTTPS RPC_URL", () => {
+    assert.equal(
+      validateRpcEndpoint("RPC_URL", "https://rpc.example.com", { required: true }),
+      null,
+    );
+  });
+
+  it("rejects missing required RPC_URL", () => {
+    assert.match(
+      validateRpcEndpoint("RPC_URL", "", { required: true }) ?? "",
+      /RPC_URL is required/,
+    );
+  });
+
+  it("allows empty optional VERIFY_RPC_URL", () => {
+    assert.equal(
+      validateRpcEndpoint("VERIFY_RPC_URL", "", { required: false }),
+      null,
+    );
+  });
+
+  it("rejects plaintext remote RPC_URL by default", () => {
+    assert.match(
+      validateRpcEndpoint("RPC_URL", "http://attacker-rpc.local", { required: true }) ?? "",
+      /must use secure https protocol/,
+    );
+  });
+
+  it("rejects plaintext remote VERIFY_RPC_URL by default", () => {
+    assert.match(
+      validateRpcEndpoint("VERIFY_RPC_URL", "http://attacker-verify-rpc.local") ?? "",
+      /must use secure https protocol/,
+    );
+  });
+
+  it("rejects plaintext localhost RPC_URL unless explicitly allowed", () => {
+    assert.match(
+      validateRpcEndpoint("RPC_URL", "http://localhost:8899", { required: true }) ?? "",
+      /must use secure https protocol/,
+    );
+  });
+
+  it("allows plaintext localhost RPC_URL only with explicit local-development opt-in", () => {
+    assert.equal(
+      validateRpcEndpoint("RPC_URL", "http://localhost:8899", {
+        required: true,
+        allowInsecureLocalRpc: true,
+      }),
+      null,
+    );
+
+    assert.equal(
+      validateRpcEndpoint("VERIFY_RPC_URL", "http://127.0.0.1:8899", {
+        allowInsecureLocalRpc: true,
+      }),
+      null,
+    );
+  });
+
+  it("rejects plaintext remote RPC_URL even when local insecure opt-in is enabled", () => {
+    assert.match(
+      validateRpcEndpoint("RPC_URL", "http://attacker-rpc.local", {
+        required: true,
+        allowInsecureLocalRpc: true,
+      }) ?? "",
+      /must use secure https protocol/,
+    );
+  });
+
+  it("rejects non-HTTP RPC_URL protocols", () => {
+    assert.match(
+      validateRpcEndpoint("RPC_URL", "ws://rpc.example.com", { required: true }) ?? "",
+      /must use secure https protocol/,
+    );
+  });
+
+  it("rejects invalid RPC_URL syntax", () => {
+    assert.match(
+      validateRpcEndpoint("RPC_URL", "not a url", { required: true }) ?? "",
+      /not a valid URL/,
+    );
+  });
+
+  it("parses ALLOW_INSECURE_LOCAL_RPC as explicit true only", () => {
+    assert.equal(isExplicitTrue("true"), true);
+    assert.equal(isExplicitTrue(" TRUE "), true);
+    assert.equal(isExplicitTrue("false"), false);
+    assert.equal(isExplicitTrue("1"), false);
+    assert.equal(isExplicitTrue(undefined), false);
   });
 });

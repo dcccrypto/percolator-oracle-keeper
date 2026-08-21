@@ -54,6 +54,7 @@ import {
   parsePositiveNumberEnv,
   requireProgramIdForSupabaseMode,
 } from "./env-utils.ts";
+import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { checkCircuitBreaker as _checkCircuitBreaker } from "./circuit-breaker.ts";
 import type { CircuitBreakerState } from "./circuit-breaker.ts";
 import { selectMarketGroupOffset } from "./wrapper-market-group-offset.ts";
@@ -149,7 +150,7 @@ const ADMIN_KP_PATH = process.env.ADMIN_KEYPAIR_PATH ??
 // RPC_URL is required and validated at startup by validateEnvironmentConfig()
 // Removed silent fallback to prevent misconfigured production deployments from
 // accidentally connecting to public devnet (HIGH-002 security hardening)
-const RPC_URL = process.env.RPC_URL!;
+const RPC_URL = process.env.RPC_URL!.trim();
 
 const conn = new Connection(RPC_URL, "confirmed");
 
@@ -157,8 +158,9 @@ const conn = new Connection(RPC_URL, "confirmed");
 // Set VERIFY_RPC_URL to a different RPC endpoint to cross-check that the
 // submitted transaction actually landed on-chain. Falls back to the primary
 // conn if VERIFY_RPC_URL is not set.
-const connVerify: Connection | null = process.env.VERIFY_RPC_URL
-  ? new Connection(process.env.VERIFY_RPC_URL, "confirmed")
+const VERIFY_RPC_URL = (process.env.VERIFY_RPC_URL ?? "").trim();
+const connVerify: Connection | null = VERIFY_RPC_URL
+  ? new Connection(VERIFY_RPC_URL, "confirmed")
   : null;
 
 /**
@@ -474,20 +476,24 @@ async function getAccountInfoWithTimeout(
 function validateEnvironmentConfig(): void {
   const errors: string[] = [];
 
-  // Validate RPC_URL (critical — cannot crank without valid RPC)
+  // Validate RPC endpoints.
+  // #69: RPC transport is oracle-critical. Production endpoints must use HTTPS.
+  // Plaintext HTTP is only allowed for explicit local development opt-in.
+  const allowInsecureLocalRpc = isExplicitTrue(process.env.ALLOW_INSECURE_LOCAL_RPC);
+
   const rpcUrl = (process.env.RPC_URL ?? "").trim();
-  if (!rpcUrl) {
-    errors.push("RPC_URL is required but not set or empty. Set RPC_URL to your Solana RPC endpoint.");
-  } else {
-    try {
-      const url = new URL(rpcUrl);
-      if (!url.protocol.match(/^https?:$/)) {
-        errors.push(`RPC_URL must use http or https protocol, got: ${url.protocol}`);
-      }
-    } catch (e) {
-      errors.push(`RPC_URL is not a valid URL: ${rpcUrl}`);
-    }
-  }
+  const rpcUrlError = validateRpcEndpoint("RPC_URL", rpcUrl, {
+    required: true,
+    allowInsecureLocalRpc,
+  });
+  if (rpcUrlError) errors.push(rpcUrlError);
+
+  const verifyRpcUrl = (process.env.VERIFY_RPC_URL ?? "").trim();
+  const verifyRpcUrlError = validateRpcEndpoint("VERIFY_RPC_URL", verifyRpcUrl, {
+    required: false,
+    allowInsecureLocalRpc,
+  });
+  if (verifyRpcUrlError) errors.push(verifyRpcUrlError);
 
   // Validate HERMES_URL (must be HTTPS to prevent SSRF and price injection)
   const hermesUrl = (process.env.HERMES_URL ?? "").trim();
