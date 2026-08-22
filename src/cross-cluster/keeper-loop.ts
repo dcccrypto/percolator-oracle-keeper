@@ -251,6 +251,12 @@ const CROSS_CLUSTER_CIRCUIT_BREAKER_CONFIRM_TRIPS = parseCrossClusterPositiveInt
   3,
 );
 
+if (CROSS_CLUSTER_CIRCUIT_BREAKER_CONFIRM_TRIPS < 2) {
+  throw new Error(
+    "CROSS_CLUSTER_CIRCUIT_BREAKER_CONFIRM_TRIPS must be at least 2",
+  );
+}
+
 const crossClusterCircuitBreakerStates = new Map<string, CircuitBreakerState>();
 
 function getCrossClusterCircuitBreakerState(
