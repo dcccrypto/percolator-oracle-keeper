@@ -25,6 +25,14 @@ import { createMarkSmoother } from "./mark-smoother.ts";
 import { checkCircuitBreaker } from "../circuit-breaker.ts";
 import type { CircuitBreakerState } from "../circuit-breaker.ts";
 import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets } from "./auth-mark-pusher.ts";
+import {
+  type WalletBalanceState,
+  createWalletBalanceState,
+  shouldRefreshBalance,
+  applyBalanceReading,
+  recordBalanceReadFailure,
+  formatSol,
+} from "./wallet-balance-guard.ts";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -43,6 +51,14 @@ export interface LoopConfig {
    * See the `Promise.race` in the main loop below for why this exists.
    */
   cycleTimeoutMs?: number;
+  /**
+   * #71: pause pushes below this balance. The guard existed only in the dead
+   * index.ts, so the live keeper had none. Required — there is no safe default
+   * for "how broke is too broke to sign".
+   */
+  minKeeperBalanceLamports: number;
+  /** How often to re-read the keeper's balance. */
+  balanceCheckIntervalMs: number;
 }
 
 interface MarketStat {
@@ -78,6 +94,8 @@ interface LoopState {
   lastSuccessfulPushAt: number | null;
   consecutiveBatchReadFailures: number;
   lastBatchReadError: string | null;
+  /** #71 wallet-balance guard state. */
+  wallet: WalletBalanceState;
 }
 
 /**
@@ -152,6 +170,8 @@ function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Regis
     // condition the 2026-07-31 audit found completely invisible here.
     const pricingStatus = pricingHealthStatus(state, registry.markets.length, Date.now());
     const payload = JSON.stringify({
+      walletLow: state.wallet.low,
+      walletBalanceSol: formatSol(state.wallet.balanceLamports),
       status:
         pricingStatus !== "ok"
           ? pricingStatus
@@ -509,6 +529,50 @@ async function runCycle(
     cachedBlockhashAt = now;
   }
 
+  // ── 4b. Wallet-balance guard (#71) ──────────────────────────────────────────
+  // A keeper that cannot pay produces reverting transactions, not fresh marks.
+  // Pausing makes the stall explicit on /health instead of burning what is left
+  // of the balance on transactions that fail. Checked here — after prices are
+  // computed, before anything is signed — so a low wallet costs no RPC writes.
+  {
+    const nowMs = Date.now();
+    if (shouldRefreshBalance(state.wallet, nowMs, config.balanceCheckIntervalMs)) {
+      try {
+        const lamports = await devnetConn.getBalance(keeper.publicKey, "confirmed");
+        const transition = applyBalanceReading(
+          state.wallet,
+          lamports,
+          config.minKeeperBalanceLamports,
+          nowMs,
+        );
+        if (transition === "went-low") {
+          console.error(
+            `[keeper][ALERT] WALLET LOW: ${formatSol(lamports)} SOL is below the ` +
+              `${formatSol(config.minKeeperBalanceLamports)} SOL threshold — PAUSING PUSHES. ` +
+              `Refund ${keeper.publicKey.toBase58()}`,
+          );
+        } else if (transition === "recovered") {
+          console.log(
+            `[keeper] WALLET REFUNDED: ${formatSol(lamports)} SOL — resuming pushes.`,
+          );
+        }
+      } catch (err) {
+        // Deliberately does NOT clear a previous `low` verdict: an RPC failure is
+        // not evidence of funds. See recordBalanceReadFailure's doc comment.
+        recordBalanceReadFailure(state.wallet, nowMs);
+        console.error(
+          `[keeper] wallet balance check failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    if (state.wallet.low) {
+      console.error(
+        `[keeper] wallet low (${formatSol(state.wallet.balanceLamports)} SOL) — skipping ${pushes.length} push(es) this cycle`,
+      );
+      return;
+    }
+  }
+
   // ── 5. One batched PushAuthMark tx, fire-and-forget ─────────────────────────
   try {
     const res = await pushAuthMarkBatch(devnetConn, keeper, pushes, nowSlot, cachedBlockhash, config.dryRun);
@@ -618,6 +682,7 @@ export async function startKeeperLoop(
     timeoutCount: 0,
     lastSuccessfulPushAt: null,
     consecutiveBatchReadFailures: 0,
+    wallet: createWalletBalanceState(),
     lastBatchReadError: null,
     stats: new Map(
       registry.markets.map((m) => [
