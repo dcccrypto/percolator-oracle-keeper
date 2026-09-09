@@ -40,6 +40,7 @@ import { loadRegistry } from "./cross-cluster/registry.ts";
 import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
+import { MIN_POOL_LIQUIDITY_USD_E6 } from "./cross-cluster/price-reader.ts";
 import { crankAllOnce, startRecoveryCrankLoop } from "./cross-cluster/recovery-cranker.ts";
 import { startLpFeeCrankLoop } from "./cross-cluster/lp-fee-cranker.ts";
 import { startRegisterPollLoop, pollOnce } from "./cross-cluster/register-poll.ts";
@@ -396,6 +397,22 @@ void startRegistryReloadLoop(registry, {
     `[registry-reload] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
   );
 });
+
+// #100 — announce the liquidity floor's state. Off by default, because the value
+// is a policy call that depends on the depth of the markets actually listed, and
+// no floor has ever existed in this repo's history. Announcing beats defaulting
+// silently: a guard nobody knows is off is worse than no guard.
+if (MIN_POOL_LIQUIDITY_USD_E6 === 0n) {
+  console.warn(
+    "[cross-cluster] MIN_POOL_LIQUIDITY_USD is unset — the #100 liquidity floor is OFF. " +
+      "Any creator-supplied pool is priced regardless of depth. Set it to enable the floor.",
+  );
+} else {
+  console.log(
+    `[cross-cluster] liquidity floor: $${(Number(MIN_POOL_LIQUIDITY_USD_E6) / 1e6).toFixed(2)} ` +
+      "(pumpswap markets; other DEX types expose no reserves — see #100)",
+  );
+}
 
 await startKeeperLoop(mainnetConn, devnetConn, keeper, registry, {
   intervalMs: CC_INTERVAL_MS,

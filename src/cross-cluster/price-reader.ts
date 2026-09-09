@@ -354,6 +354,75 @@ export function checkMintBinding(
   };
 }
 
+/** SPL token-account minimum length for the amount field at offset 64. */
+const MIN_VAULT_LEN = 72;
+
+/**
+ * #100 — quote-side depth of a PumpSwap pool, in USD (E6).
+ *
+ * The floor answers "how much USD does it take to move this mark", so the quote
+ * reserve is the right measure: it is what an attacker must put up to shift the
+ * pool. Base-side depth is denominated in the very token whose price is in doubt,
+ * so it cannot bound the cost of manipulating it.
+ *
+ * Returns null when the depth cannot be established — an unreadable vault or a
+ * WSOL-quoted pool with no SOL/USD rate this cycle. Callers MUST treat null as
+ * "unknown", not "fine": a floor that passes when it cannot measure is not a floor.
+ *
+ * Only PumpSwap is supported, and that is not an arbitrary limitation:
+ * `parseDexPool` exposes `baseVault`/`quoteVault` for pumpswap ONLY. Raydium CLMM
+ * prices from `sqrtPrice` and Meteora DLMM from `binStep`; neither returns vault
+ * addresses, so there are no reserves to read without extending the SDK. Every
+ * market currently registered is pumpswap, so this covers the live board.
+ */
+export function pumpswapQuoteDepthUsdE6(
+  quoteVaultData: Uint8Array,
+  quoteDecimals: number,
+  isWsolQuoted: boolean,
+  solPriceE6: bigint | undefined,
+): bigint | null {
+  if (quoteVaultData.length < MIN_VAULT_LEN) return null;
+  const dv = new DataView(
+    quoteVaultData.buffer,
+    quoteVaultData.byteOffset,
+    quoteVaultData.byteLength,
+  );
+  const amount =
+    BigInt(dv.getUint32(64, true)) | (BigInt(dv.getUint32(68, true)) << 32n);
+  if (amount === 0n) return 0n;
+
+  const scale = 10n ** BigInt(quoteDecimals);
+  if (isWsolQuoted) {
+    if (solPriceE6 === undefined || solPriceE6 <= 0n) return null;
+    // amount(lamports) / 10^dec * solUsdE6  -> USD E6
+    return (amount * solPriceE6) / scale;
+  }
+  // USD-stable quote: 1 unit ~= $1. amount / 10^dec * 1e6 -> USD E6
+  return (amount * 1_000_000n) / scale;
+}
+
+/**
+ * #100 — the configured minimum, in USD E6. 0 disables the floor.
+ *
+ * Deliberately defaults to OFF and announces it at boot. A floor is a policy
+ * number that depends on the depth of the markets actually listed, and across
+ * this repo's history NO liquidity floor has ever existed — so there is no prior
+ * value to restore and nothing to infer. Guessing one silently could refuse
+ * legitimate markets; defaulting to off silently would be a guard that guards
+ * nothing. Announcing it is the honest middle.
+ */
+export const MIN_POOL_LIQUIDITY_USD_E6: bigint = (() => {
+  const raw = (process.env.MIN_POOL_LIQUIDITY_USD ?? "").trim();
+  if (raw === "") return 0n;
+  if (!/^\d+(\.\d+)?$/.test(raw)) {
+    throw new Error(
+      `MIN_POOL_LIQUIDITY_USD must be a non-negative decimal USD amount (got: ${JSON.stringify(raw)})`,
+    );
+  }
+  const [whole, frac = ""] = raw.split(".");
+  return BigInt(whole) * 1_000_000n + BigInt((frac + "000000").slice(0, 6));
+})();
+
 export async function readPoolPriceE6(
   mainnetConn: Connection,
   entry: Pick<MarketEntry, "poolAddress" | "dexType" | "label" | "mainnetCa">,
@@ -541,7 +610,6 @@ export async function readPoolPriceE6(
 
     // SPL token account: u64 amount is at byte offset 64.
     // Min length = 72 bytes (64 header + 8 for amount).
-    const MIN_VAULT_LEN = 72;
     if (
       baseVaultData.length < MIN_VAULT_LEN ||
       quoteVaultData.length < MIN_VAULT_LEN
@@ -598,6 +666,27 @@ export async function readPoolPriceE6(
         skipped: true,
         skipReason: "PumpSwap: pool is WSOL-quoted but no SOL/USD price was available this cycle",
       };
+    }
+
+    // #100 — same floor on the single-pool path, so the two cannot diverge.
+    if (MIN_POOL_LIQUIDITY_USD_E6 > 0n) {
+      const depth = pumpswapQuoteDepthUsdE6(
+        quoteVaultData,
+        dec.quote,
+        isWsolQuoted,
+        solPriceE6,
+      );
+      if (depth === null || depth < MIN_POOL_LIQUIDITY_USD_E6) {
+        return {
+          priceE6: 0n,
+          source,
+          skipped: true,
+          skipReason:
+            `PumpSwap: below the liquidity floor (depth=` +
+            `${depth === null ? "unknown" : `$${(Number(depth) / 1e6).toFixed(2)}`} ` +
+            `< $${(Number(MIN_POOL_LIQUIDITY_USD_E6) / 1e6).toFixed(2)})`,
+        };
+      }
     }
 
     let priceE6: bigint;
@@ -950,6 +1039,28 @@ export async function readAllPoolPricesE6(
           `[price-reader] PumpSwap ${entry.poolAddress.slice(0, 8)}… decimals cached (batched):` +
             ` base=${dec.base} quote=${dec.quote}`,
         );
+      }
+
+      // #100 — minimum-liquidity floor. Checked on THIS path because this is the
+      // one the keeper loop calls; the binding fix had to be corrected for
+      // exactly that reason (see #110).
+      if (MIN_POOL_LIQUIDITY_USD_E6 > 0n) {
+        const depth = pumpswapQuoteDepthUsdE6(
+          new Uint8Array(quoteVaultInfo.data),
+          dec.quote,
+          pumpswapCandidates[c].quoteMint.equals(WSOL_MINT),
+          solPriceE6,
+        );
+        // null means the depth could NOT be established. Skip — a floor that
+        // passes when it cannot measure is not a floor.
+        if (depth === null || depth < MIN_POOL_LIQUIDITY_USD_E6) {
+          console.error(
+            `[price-reader] ${entry.label}: pool below the liquidity floor — ` +
+              `depth=${depth === null ? "unknown" : `$${(Number(depth) / 1e6).toFixed(2)}`} ` +
+              `< $${(Number(MIN_POOL_LIQUIDITY_USD_E6) / 1e6).toFixed(2)}. Refusing to price it.`,
+          );
+          continue;
+        }
       }
 
       try {
