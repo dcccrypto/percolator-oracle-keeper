@@ -319,9 +319,44 @@ export async function readAtWatermark<T>(
  * A returned `skipped=true` result means the pool is not live or failed a
  * validation check — the caller should skip pushing this market for the cycle.
  */
+/**
+ * #100 — bind the market's token to the pool actually being priced.
+ *
+ * A creator supplies `dex_pool_address` freely. Until now nothing checked that
+ * the pool prices the token the market is FOR: `baseMint` was parsed but used
+ * only to fetch decimals, never compared to anything. A pool for an entirely
+ * different token was therefore accepted as the AuthMark every trade in that
+ * market settles against — not merely a thin pool, the wrong asset.
+ *
+ * The market's token must appear on one side of the pair. Either side is
+ * legitimate: a TOKEN/USDC pool has it as base, a WSOL/TOKEN pool as quote.
+ *
+ * Absent `mainnetCa` returns ok. That is deliberate and it is a real gap, not an
+ * oversight: pre-seeded registry.json entries predate the column, and failing
+ * them closed would take live markets offline. It is recorded on #100 rather
+ * than hidden here — the binding protects every market the DB registers, which
+ * is every market a creator can add.
+ */
+export function checkMintBinding(
+  mainnetCa: string | undefined,
+  baseMint: PublicKey,
+  quoteMint: PublicKey,
+): { ok: true } | { ok: false; reason: string } {
+  if (!mainnetCa) return { ok: true };
+  const base = baseMint.toBase58();
+  const quote = quoteMint.toBase58();
+  if (mainnetCa === base || mainnetCa === quote) return { ok: true };
+  return {
+    ok: false,
+    reason:
+      `pool prices the WRONG TOKEN: market mainnet_ca ${mainnetCa} is neither ` +
+      `base ${base} nor quote ${quote}. Refusing to use it as the AuthMark.`,
+  };
+}
+
 export async function readPoolPriceE6(
   mainnetConn: Connection,
-  entry: Pick<MarketEntry, "poolAddress" | "dexType" | "label">,
+  entry: Pick<MarketEntry, "poolAddress" | "dexType" | "label" | "mainnetCa">,
   decimalsCache: DecimalsCache,
   solPriceE6?: bigint,
 ): Promise<PriceReadResult> {
@@ -370,6 +405,12 @@ export async function readPoolPriceE6(
 
   if (entry.dexType === "raydium-clmm") {
     const poolParsed = parseDexPool("raydium-clmm", poolPk, data);
+    {
+      const bind = checkMintBinding(entry.mainnetCa, poolParsed.baseMint, poolParsed.quoteMint);
+      if (!bind.ok) {
+        return { priceE6: 0n, source, skipped: true, skipReason: bind.reason };
+      }
+    }
     if (raydiumPriceIsNotUsd(poolParsed.quoteMint)) {
       return {
         priceE6: 0n,
@@ -396,6 +437,12 @@ export async function readPoolPriceE6(
     // Parsed unconditionally (pure byte parsing of an already-fetched account,
     // no RPC): the quote mint decides whether this pool prices in USD or SOL.
     const poolParsed = parseDexPool("meteora-dlmm", poolPk, data);
+    {
+      const bind = checkMintBinding(entry.mainnetCa, poolParsed.baseMint, poolParsed.quoteMint);
+      if (!bind.ok) {
+        return { priceE6: 0n, source, skipped: true, skipReason: bind.reason };
+      }
+    }
     // Cache mint decimals after the first successful read.
     if (!decimalsCache.has(entry.poolAddress)) {
       const [baseDecimals, quoteDecimals] = await Promise.all([
@@ -453,6 +500,12 @@ export async function readPoolPriceE6(
 
   if (entry.dexType === "pumpswap") {
     const poolParsed = parseDexPool("pumpswap", poolPk, data);
+    {
+      const bind = checkMintBinding(entry.mainnetCa, poolParsed.baseMint, poolParsed.quoteMint);
+      if (!bind.ok) {
+        return { priceE6: 0n, source, skipped: true, skipReason: bind.reason };
+      }
+    }
     if (!poolParsed.baseVault || !poolParsed.quoteVault) {
       return {
         priceE6: 0n,
