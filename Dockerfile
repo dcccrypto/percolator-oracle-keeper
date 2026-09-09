@@ -37,4 +37,11 @@ ENV MAX_PRICE_MOVE_PCT=10
 ENV STALE_THRESHOLD_S=30
 
 # Use tsx to run TypeScript directly (same as original oracle-keeper)
-CMD ["npx", "tsx", "src/index.ts"]
+# The LIVE keeper is src/cross-cluster.ts. src/index.ts is a separate, superseded
+# keeper that has never been deployed: launchd runs cross-cluster, and the log line
+# production writes ("[keeper] === Cycle N ===") exists only in cross-cluster/keeper-loop.ts.
+# This CMD pointed at index.ts because Railway was configured at repo creation
+# (ed4b7e2), when index.ts WAS the only keeper. Cross-cluster took over later and
+# the container config was never updated — so a Railway deploy would have booted
+# the untested keeper.
+CMD ["npx", "tsx", "src/cross-cluster.ts"]
