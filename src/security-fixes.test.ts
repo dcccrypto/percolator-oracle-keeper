@@ -107,62 +107,13 @@ describe("#44 parsePositiveNumberEnv max bound", () => {
   });
 });
 
-// ══════════════════════════════════════════════════════════════
 // #32 — slab program ID allowlist
-// ══════════════════════════════════════════════════════════════
 //
-// isAllowedProgramId lives inside index.ts (which can't be imported without
-// side-effects). We replicate the same logic here as a pure function to test
-// the allowlist semantics independently.
-
-describe("#32 slab program ID allowlist", () => {
-  function makeAllowlist(...ids: string[]): Set<string> {
-    const s = new Set<string>();
-    for (const id of ids) s.add(id);
-    return s;
-  }
-
-  function isAllowedProgramId(
-    allowedProgramIds: Set<string>,
-    ownerBase58: string,
-  ): boolean {
-    if (allowedProgramIds.size === 0) return false;
-    return allowedProgramIds.has(ownerBase58);
-  }
-
-  const legitimateProgram = "FxfD4XY4TYQhBCZpBNbM7FQ5FPgdRDhXf1Rkj9u8VNm";
-  const attackerProgram   = "AttAcKeRProgRAm111111111111111111111111111111";
-
-  it("allows a slab owned by the expected program", () => {
-    const allowlist = makeAllowlist(legitimateProgram);
-    assert.ok(isAllowedProgramId(allowlist, legitimateProgram));
-  });
-
-  it("rejects a slab owned by an attacker program not in the allowlist", () => {
-    const allowlist = makeAllowlist(legitimateProgram);
-    assert.equal(isAllowedProgramId(allowlist, attackerProgram), false,
-      "Attacker-owned slab must be rejected");
-  });
-
-  it("allows a slab when multiple program IDs are allowlisted (ADDITIONAL_PROGRAM_IDS)", () => {
-    const legacyProgram = "FwfBtNNUUEjFnX6BqNJKdgxHXKiU5KmTJq5vCHY5tqc";
-    const allowlist = makeAllowlist(legitimateProgram, legacyProgram);
-    assert.ok(isAllowedProgramId(allowlist, legacyProgram),
-      "Legacy allowlisted program must be accepted");
-  });
-
-  it("rejects any owner when the allowlist is empty (uninitialised guard)", () => {
-    const allowlist = makeAllowlist(); // empty
-    assert.equal(isAllowedProgramId(allowlist, legitimateProgram), false,
-      "Empty allowlist must block everything as a safety measure");
-  });
-
-  it("does not grant access for a substring or prefix match", () => {
-    const allowlist = makeAllowlist(legitimateProgram);
-    const partialId = legitimateProgram.slice(0, 8);
-    assert.equal(isAllowedProgramId(allowlist, partialId), false);
-  });
-});
+// REMOVED with src/index.ts. `isAllowedProgramId` lived inside that file, and the
+// test replicated its logic inline rather than importing it. With the file gone the
+// block would have asserted against a COPY of deleted code — a test that can only
+// ever agree with itself. If the allowlist returns on the live path it needs a real
+// exported function and a test that imports it.
 
 // ══════════════════════════════════════════════════════════════
 // #33 — first-push cross-check logic

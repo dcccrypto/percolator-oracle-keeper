@@ -137,32 +137,10 @@ describe("parsePositiveNumberEnv", () => {
     });
   });
 
-  describe("circuit-breaker behavior with valid threshold", () => {
-    /**
-     * Simulate the circuit-breaker comparison to confirm that with a valid
-     * MAX_PRICE_MOVE_PCT=10, a 900% move would be rejected.
-     *
-     * We do not import checkCircuitBreaker (it's not exported) so we replicate
-     * the comparison logic inline — this is the exact expression from index.ts:557.
-     */
-    it("rejects a 900% price move when breaker is configured with threshold 10", () => {
-      const threshold = parsePositiveNumberEnv("MAX_PRICE_MOVE_PCT", 10); // uses fallback = 10
-      const lastPrice = 100;
-      const newPrice = 1000; // +900%
-      const movePct = Math.abs((newPrice - lastPrice) / lastPrice) * 100; // 900
-      const rejected = movePct > threshold;
-      assert.ok(rejected, `Expected 900% move to be rejected (movePct=${movePct}, threshold=${threshold})`);
-    });
-
-    it("accepts a small move within the threshold", () => {
-      const threshold = parsePositiveNumberEnv("MAX_PRICE_MOVE_PCT", 10);
-      const lastPrice = 100;
-      const newPrice = 105; // +5%
-      const movePct = Math.abs((newPrice - lastPrice) / lastPrice) * 100; // 5
-      const accepted = !(movePct > threshold);
-      assert.ok(accepted, `Expected 5% move to be accepted (movePct=${movePct}, threshold=${threshold})`);
-    });
-  });
+  // REMOVED with src/index.ts. This block replicated the breaker comparison
+  // "from index.ts:557" inline, and its premise was already stale — the real
+  // checkCircuitBreaker IS exported and IS tested against directly in
+  // src/circuit-breaker.test.ts, including the cumulative bound added for #82.
 });
 
 // ── requireProgramIdForSupabaseMode (issue #29 fix) ──────────────────────────
