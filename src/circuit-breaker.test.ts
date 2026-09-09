@@ -203,3 +203,85 @@ describe("confirmTrips = 1 (instant re-baseline on first trip)", () => {
     assert.ok(s.lastPrice >= 115 && s.lastPrice <= 125);
   });
 });
+
+// ── #76 / #82 ────────────────────────────────────────────────────────────────
+
+describe("#76 a republished last-known price must not clear a relocation run", () => {
+  const cfg = { maxMovePct: 10, confirmTrips: 3, log: () => {} };
+  const fresh = () => ({
+    symbol: "T", lastPrice: 100, circuitBreakerTrips: 0,
+    cbTripPrice: 0, cbConsecutiveTrips: 0,
+  });
+
+  it("an IDENTICAL price does not reset the run", () => {
+    const s = fresh();
+    checkCircuitBreaker(s, 130, cfg);            // trip 1 at the new level
+    assert.equal(s.cbConsecutiveTrips, 1);
+    checkCircuitBreaker(s, 100, cfg);            // republish of lastPrice
+    assert.equal(
+      s.cbConsecutiveTrips, 1,
+      "a republish of the baseline is not a new observation and must not clear the run",
+    );
+  });
+
+  it("a genuinely DIFFERENT in-threshold price still resets — #30's invariant holds", () => {
+    const s = fresh();
+    checkCircuitBreaker(s, 130, cfg);
+    assert.equal(s.cbConsecutiveTrips, 1);
+    checkCircuitBreaker(s, 105, cfg);            // real tick back at the normal level
+    assert.equal(
+      s.cbConsecutiveTrips, 0,
+      "an intermittent spike must still be unable to accumulate to confirmTrips",
+    );
+  });
+});
+
+describe("#82 cumulative drift bound", () => {
+  const base = { maxMovePct: 10, confirmTrips: 2, log: () => {} };
+  const fresh = () => ({
+    symbol: "T", lastPrice: 100, circuitBreakerTrips: 0,
+    cbTripPrice: 0, cbConsecutiveTrips: 0,
+  });
+
+  /** Walk one confirmed relocation to `to`, returning whether it was accepted. */
+  function relocate(s: any, to: number, cfg: any) {
+    let ok = false;
+    for (let i = 0; i < cfg.confirmTrips; i++) ok = checkCircuitBreaker(s, to, cfg);
+    return ok;
+  }
+
+  it("allows a single confirmed relocation inside the bound", () => {
+    const s = fresh();
+    const cfg = { ...base, maxCumulativeMovePct: 30, now: () => 0 };
+    assert.equal(relocate(s, 115, cfg), true);
+    assert.equal(s.lastPrice, 115);
+  });
+
+  it("REFUSES a sustained walk that exceeds the cumulative bound", () => {
+    const s = fresh();
+    const cfg = { ...base, maxCumulativeMovePct: 25, now: () => 0 };
+    assert.equal(relocate(s, 115, cfg), true, "first step is legal");
+    // second step is legal on its own (115 -> 132 is ~15%) but cumulative from
+    // the anchor 100 would be 32% > 25%
+    assert.equal(relocate(s, 132, cfg), false, "the walk must be refused");
+    assert.equal(s.lastPrice, 115, "baseline must not advance past the bound");
+  });
+
+  it("is a RATE limit, not a wedge — the walk completes after the window rolls", () => {
+    const s = fresh();
+    let t = 0;
+    const cfg = { ...base, maxCumulativeMovePct: 25, driftWindowMs: 1000, now: () => t };
+    relocate(s, 115, cfg);
+    assert.equal(relocate(s, 132, cfg), false);
+    t = 2000;                                    // window rolls over
+    assert.equal(relocate(s, 132, cfg), true, "#30's un-wedging must survive");
+    assert.equal(s.lastPrice, 132);
+  });
+
+  it("defaults to 3x maxMovePct when unset", () => {
+    const s = fresh();
+    const cfg = { ...base, now: () => 0 };       // default cumulative = 30%
+    assert.equal(relocate(s, 115, cfg), true);
+    assert.equal(relocate(s, 132, cfg), false, "32% from anchor exceeds the 30% default");
+  });
+});
