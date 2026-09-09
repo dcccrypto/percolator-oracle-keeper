@@ -78,20 +78,30 @@ if (!DEVNET_RPC) {
   process.exit(1);
 }
 
-// These two carry the Helius API key in the query string and are the ONLY RPC
-// endpoints the running keeper uses (launchd -> start-keeper.sh -> this file).
-// A plaintext http:// endpoint would put that key on the wire in clear, so the
-// same scheme check #89 added for the legacy entry point is applied here, where
+// The two RPC endpoints carry the Helius API key in the query string and are the
+// ONLY RPC endpoints the running keeper uses (launchd -> start-keeper.sh -> this
+// file). A plaintext http:// endpoint would put that key on the wire in clear, so
+// the same scheme check #89 added for the legacy entry point is applied here, where
 // it actually protects something. http:// stays available for localhost when
 // ALLOW_INSECURE_LOCAL_RPC=true, matching rpc-url.ts's contract exactly.
+//
+// #65: SUPABASE_URL is validated by the SAME rule, deliberately. The reported
+// defect was `/^https?:$/` in the legacy entry point, but the live path had no
+// scheme check at ALL — worse than filed. It matters more than the anon key it
+// carries: this feed supplies `dex_pool_address`, which becomes the AuthMark every
+// trade in that market settles against (#100). A MITM on a plaintext Supabase URL
+// therefore picks the settlement price. It is `required: false` because Supabase
+// registration is optional (see the `SUPABASE_URL && SUPABASE_ANON_KEY` guard
+// below); when it IS set, it must be secure.
 {
   const allowInsecureLocalRpc = isExplicitTrue(process.env.ALLOW_INSECURE_LOCAL_RPC);
-  for (const [name, value] of [
-    ["MAINNET_RPC_URL", MAINNET_RPC],
-    ["DEVNET_RPC_URL", DEVNET_RPC],
+  for (const [name, value, required] of [
+    ["MAINNET_RPC_URL", MAINNET_RPC, true],
+    ["DEVNET_RPC_URL", DEVNET_RPC, true],
+    ["SUPABASE_URL", process.env.SUPABASE_URL, false],
   ] as const) {
     const problem = validateRpcEndpoint(name, value, {
-      required: true,
+      required,
       allowInsecureLocalRpc,
     });
     if (problem) {
