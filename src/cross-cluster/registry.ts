@@ -30,6 +30,12 @@ export interface MarketEntry {
   /** DEX type for price computation. */
   dexType: DexType;
   /**
+   * #100 — the mainnet contract address this market is FOR, when the DB knows it.
+   * Bound against the pool's base/quote mint before the pool is trusted as a price
+   * source, so a creator cannot point a market at a pool for a different token.
+   */
+  mainnetCa?: string;
+  /**
    * Asset slot index in the slab.
    * Current markets use a single asset at index 0.
    */

@@ -82,6 +82,8 @@ export function rowsToEntries(rows: readonly DbMarketRow[], dexByPool: DexCache)
       assetIndex: 0,
       symbol: r.symbol ?? undefined,
       collateral: r.mint_address,
+      // #100: previously SELECTed and then dropped on the floor here.
+      mainnetCa: r.mainnet_ca ?? undefined,
     } as MarketEntry);
   }
   return out;
