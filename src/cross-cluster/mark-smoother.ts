@@ -44,6 +44,21 @@ export interface MarkSmootherOptions {
   windowMs?: number;
   /** Below this many samples in the window, withhold instead of publishing raw. */
   minSamples?: number;
+  /**
+   * #92 — minimum TIME SPAN the window must cover before a mark is published.
+   *
+   * A sample COUNT alone does not defeat a timed churn attack. At the 7s default
+   * cycle, minSamples=3 publishes after 21 seconds — and the CATE runs this
+   * smoother was built for lasted 30-70 seconds. The first three samples would
+   * therefore sit entirely inside the attack, and the median of three
+   * manipulated readings is manipulated. The count gate delays publication; it
+   * does not filter.
+   *
+   * A span gate is what the window's own reasoning already implies: "a window
+   * must comfortably exceed 2x the longest churn run". That has to hold at cold
+   * start too, not only in steady state.
+   */
+  minSpanMs?: number;
 }
 
 /**
@@ -57,6 +72,19 @@ export interface MarkSmootherOptions {
  */
 const DEFAULT_WINDOW_MS = 180_000;
 const DEFAULT_MIN_SAMPLES = 3;
+/**
+ * 5/6 of the window (150s at the 180s default): comfortably beyond 2x the longest
+ * observed CATE churn run (70s), matching the reasoning behind DEFAULT_WINDOW_MS,
+ * and a little under the window itself so a pool that has just filled it is not
+ * held back by rounding.
+ *
+ * Cost: after a restart a pool withholds for ~150s instead of ~21s. That is the
+ * right trade — withholding leaves the previous on-chain mark in place, which is
+ * stale but TRUSTED, whereas publishing early substitutes an attacker-chosen one.
+ * The smoother's own note already accepts ~90s of lag as immaterial, because the
+ * engine absorbs only 4 bps/slot.
+ */
+const DEFAULT_MIN_SPAN_FRACTION = 5 / 6;
 /** Hard per-pool cap so a misbehaving caller cannot grow memory unbounded. */
 const MAX_SAMPLES_PER_POOL = 64;
 
@@ -84,6 +112,11 @@ function medianE6(values: bigint[]): bigint {
 export function createMarkSmoother(opts: MarkSmootherOptions = {}): MarkSmoother {
   const windowMs = opts.windowMs ?? DEFAULT_WINDOW_MS;
   const minSamples = opts.minSamples ?? DEFAULT_MIN_SAMPLES;
+  // Derived from the window rather than absolute: the requirement is "the window
+  // is substantially full", which has to scale with whatever window a caller
+  // configures. 5/6 of the 180s default is 150s — comfortably beyond 2x the
+  // longest observed churn run (70s), matching the window's own reasoning.
+  const minSpanMs = opts.minSpanMs ?? Math.floor(windowMs * DEFAULT_MIN_SPAN_FRACTION);
   const windows = new Map<string, Sample[]>();
 
   return {
@@ -108,6 +141,18 @@ export function createMarkSmoother(opts: MarkSmootherOptions = {}): MarkSmoother
         // the window.
         return null;
       }
+      // #92 — a sample COUNT is not a filter against a TIMED attack. At the 7s
+      // default cycle, minSamples=3 is satisfied 21 seconds after a restart, and
+      // the CATE churn runs this module was built for lasted 30-70 seconds: the
+      // first three samples would sit entirely inside the attack, and a median of
+      // three manipulated readings is manipulated. Require the window to actually
+      // SPAN the period it claims to smooth over before trusting it.
+      //
+      // Withholding here leaves the previously published on-chain mark in place —
+      // stale, but trusted — which is strictly better than substituting one an
+      // attacker chose.
+      const span = win[win.length - 1].t - win[0].t;
+      if (span < minSpanMs) return null;
       // Compute over an EVEN count (drop the single oldest sample when odd):
       // an odd-count median flips by parity under a balanced two-level
       // ping-pong (7:6 → level A, then 6:7 → level B every push) — the exact

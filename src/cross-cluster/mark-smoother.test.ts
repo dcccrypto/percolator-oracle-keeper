@@ -21,20 +21,35 @@ const T0 = 1_000_000;
 const TICK = 7_000; // the keeper's push cadence
 
 describe("createMarkSmoother", () => {
-  it("withholds prices until minSamples readings exist", () => {
+  it("withholds until the window SPANS its period — a sample COUNT is not a filter (#92)", () => {
+    // This test previously asserted that the THIRD sample publishes, at T0+14s.
+    // That was the defect #92 reported: the CATE churn runs this module exists to
+    // filter lasted 30-70 seconds, so three samples taken 21 seconds apart sit
+    // entirely inside the attack, and the median of three manipulated readings is
+    // manipulated. minSamples delays publication; it does not filter.
     const s = createMarkSmoother({ windowMs: 90_000, minSamples: 3 });
+    // minSamples is satisfied at the third sample, but the span is not.
     assert.equal(s.smooth(POOL, 4700n, T0), null);
     assert.equal(s.smooth(POOL, 4712n, T0 + TICK), null);
-    // Third sample crosses the threshold: 3 is odd, so the oldest is dropped
-    // and the median averages the two newest — (4712 + 4706) / 2.
-    assert.equal(s.smooth(POOL, 4706n, T0 + 2 * TICK), 4709n);
+    assert.equal(
+      s.smooth(POOL, 4706n, T0 + 2 * TICK),
+      null,
+      "three samples spanning 14s must NOT publish — that is the #92 hole",
+    );
+    // Required span is 5/6 of the window = 75s here. Keep feeding until it is met.
+    let out: bigint | null = null;
+    for (let i = 3; i <= 12; i++) out = s.smooth(POOL, 4706n, T0 + i * TICK);
+    assert.notEqual(out, null, "once the window spans its period, it publishes");
   });
 
   it("is the identity on a constant series after the window primes", () => {
     const s = createMarkSmoother();
-    assert.equal(s.smooth(POOL, 4643n, T0), null);
-    assert.equal(s.smooth(POOL, 4643n, T0 + TICK), null);
-    for (let i = 2; i < 20; i++) {
+    // Default window 180s -> required span 150s -> ~22 ticks at 7s before the
+    // first publish. Priming takes longer than it used to, by design (#92).
+    for (let i = 0; i < 22; i++) {
+      assert.equal(s.smooth(POOL, 4643n, T0 + i * TICK), null);
+    }
+    for (let i = 22; i < 40; i++) {
       assert.equal(s.smooth(POOL, 4643n, T0 + i * TICK), 4643n);
     }
   });
@@ -95,9 +110,15 @@ describe("createMarkSmoother", () => {
     // 10-minute gap — everything above is stale. The first readings after the
     // gap are below minSamples, so publishing is withheld instead of raw.
     const afterGap = T0 + 12 * TICK + 600_000;
+    // Re-priming after a gap is a cold start, and #92 is exactly about not
+    // trusting a cold window early: the required 75s span must be re-earned,
+    // not just minSamples readings.
     assert.equal(s.smooth(POOL, 5000n, afterGap), null);
     assert.equal(s.smooth(POOL, 5004n, afterGap + TICK), null);
-    assert.equal(s.smooth(POOL, 5002n, afterGap + 2 * TICK), 5003n);
+    assert.equal(s.smooth(POOL, 5002n, afterGap + 2 * TICK), null);
+    let out: bigint | null = null;
+    for (let i = 3; i <= 12; i++) out = s.smooth(POOL, 5002n, afterGap + i * TICK);
+    assert.notEqual(out, null, "publishes once the re-primed window spans its period");
   });
 
   it("withholds the first manipulated reading after a full sample-window gap", () => {
@@ -106,8 +127,9 @@ describe("createMarkSmoother", () => {
     const manip = 3_000_000n;
     let t = T0;
 
-    for (let i = 0; i < 12; i++) {
-      assert.equal(s.smooth(POOL, fair, t), i < 2 ? null : fair);
+    // Default window 180s -> 150s required span -> ~22 ticks before publishing.
+    for (let i = 0; i < 30; i++) {
+      assert.equal(s.smooth(POOL, fair, t), i < 22 ? null : fair);
       t += TICK;
     }
 
@@ -124,12 +146,13 @@ describe("createMarkSmoother", () => {
     const s = createMarkSmoother({ windowMs: 90_000, minSamples: 1 });
     const A = "PoolAAA";
     const B = "PoolBBB";
-    for (let i = 0; i < 9; i++) {
+    // 12 ticks = 77s, past the 75s span required for a 90s window.
+    for (let i = 0; i < 12; i++) {
       s.smooth(A, 100n, T0 + i * TICK);
       s.smooth(B, 900n, T0 + i * TICK);
     }
-    assert.equal(s.smooth(A, 100n, T0 + 9 * TICK), 100n);
-    assert.equal(s.smooth(B, 900n, T0 + 9 * TICK), 900n);
+    assert.equal(s.smooth(A, 100n, T0 + 12 * TICK), 100n);
+    assert.equal(s.smooth(B, 900n, T0 + 12 * TICK), 900n);
   });
 
   it("median (not mean): a single wild outlier does not move the mark", () => {
@@ -160,9 +183,14 @@ describe("createMarkSmoother", () => {
     const s = createMarkSmoother({ windowMs: 90_000, minSamples: 3 });
     for (let i = 0; i < 10; i++) s.smooth(POOL, 4600n, T0 + i * TICK);
     s.reset();
+    // A reset is a cold start: the 75s span must be re-earned, not just
+    // minSamples readings (#92).
     assert.equal(s.smooth(POOL, 9999n, T0 + 11 * TICK), null);
     assert.equal(s.smooth(POOL, 10001n, T0 + 12 * TICK), null);
-    assert.equal(s.smooth(POOL, 9997n, T0 + 13 * TICK), 9999n);
+    assert.equal(s.smooth(POOL, 9997n, T0 + 13 * TICK), null);
+    let out: bigint | null = null;
+    for (let i = 14; i <= 23; i++) out = s.smooth(POOL, 9999n, T0 + i * TICK);
+    assert.notEqual(out, null, "publishes once the re-primed window spans its period");
   });
 });
 
@@ -181,5 +209,55 @@ describe("keeper-loop wiring", () => {
     assert.match(src, /pendingCircuitBreakerStates/);
     assert.match(src, /pushedSet\.has\(p\.marketAddress\) && res\.signature/);
     assert.doesNotMatch(src, /circuitBreakerState\.lastPrice = priceUsd/);
+  });
+});
+
+describe("#92 cold-start manipulation window", () => {
+  const TICK = 7_000;
+  const T0 = 1_000_000;
+  const POOL = "PoolCold";
+
+  it("a 70s churn run starting at cold start publishes NOTHING", () => {
+    // The CATE attack, reproduced at the moment of a restart: a bot round-trips
+    // the pool in a run lasting up to 70s. Before this fix, minSamples=3 was
+    // satisfied 21s in, and the median of those three in-attack readings was
+    // published as the settlement mark.
+    const s = createMarkSmoother(); // production defaults: 180s window
+    const fair = 1_000_000n;
+    const manip = 1_016_000n; // +1.6%, the observed CATE amplitude
+    const published: Array<bigint | null> = [];
+    // 10 ticks = 70s, the longest observed churn run.
+    for (let i = 0; i < 10; i++) {
+      published.push(s.smooth(POOL, i % 2 === 0 ? fair : manip, T0 + i * TICK));
+    }
+    assert.deepEqual(
+      published.filter((p) => p !== null),
+      [],
+      "nothing may be published while the window is younger than the attack it must filter",
+    );
+  });
+
+  it("the withhold lasts longer than the longest observed churn run", () => {
+    const s = createMarkSmoother();
+    const firstPublishTick = (() => {
+      for (let i = 0; i < 100; i++) {
+        if (s.smooth(POOL, 1_000_000n, T0 + i * TICK) !== null) return i;
+      }
+      return -1;
+    })();
+    assert.notEqual(firstPublishTick, -1, "it must eventually publish");
+    const withheldMs = firstPublishTick * TICK;
+    assert.ok(
+      withheldMs > 70_000,
+      `cold-start withhold is ${withheldMs}ms; it must exceed the 70s longest churn run, ` +
+        "otherwise a run that starts at restart is inside the first published median",
+    );
+  });
+
+  it("still publishes in steady state — the gate must not wedge a live pool", () => {
+    const s = createMarkSmoother();
+    let out: bigint | null = null;
+    for (let i = 0; i < 40; i++) out = s.smooth(POOL, 1_000_000n, T0 + i * TICK);
+    assert.equal(out, 1_000_000n, "a primed window must keep publishing");
   });
 });
