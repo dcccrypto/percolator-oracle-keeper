@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Periodic log rotation for the oracle keeper.
+
+  INSTALL (one-time, no sudo required — this is a user agent, like the keeper itself):
+
+    cp scripts/com.percolator.keeper-log-rotate.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.percolator.keeper-log-rotate.plist
+
+  Runs hourly. rotate-keeper-logs.sh is a no-op below the size cap, so an hourly
+  tick is cheap: it stats two files and exits.
+
+  Deliberately a SEPARATE agent from the keeper. Rotating from inside the keeper
+  process would not work — launchd owns the file descriptors, not the process.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.percolator.keeper-log-rotate</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/khubair/percolator-oracle-keeper/scripts/rotate-keeper-logs.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/khubair/percolator-oracle-keeper/logs/rotate.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/khubair/percolator-oracle-keeper/logs/rotate.log</string>
+</dict>
+</plist>
