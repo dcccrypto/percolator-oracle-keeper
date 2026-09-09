@@ -75,3 +75,56 @@ describe("#100 mainnet_ca must survive the DB -> entry mapping", () => {
     assert.equal(e.mainnetCa, undefined);
   });
 });
+
+describe("#100 the binding must be on EVERY pool-parse site, not just one path", () => {
+  /**
+   * This test exists because I got it wrong.
+   *
+   * The binding was first added only inside `readPoolPriceE6`. The keeper loop calls
+   * `readAllPoolPricesE6` — the batched fast path — which parses pools at its own
+   * three sites. So the guard shipped, passed its unit tests, and protected nothing
+   * in production. Its `Pick<MarketEntry, …>` did not even include `mainnetCa`, which
+   * is why it could not have worked.
+   *
+   * A behavioural test of the fast path would need a mocked Connection and fabricated
+   * pool bytes for three DEX layouts. This is deliberately a STRUCTURAL test instead,
+   * and it is honest about what it proves: not that the binding is correct — the tests
+   * above do that — but that no `parseDexPool` call site is left unguarded. That is
+   * exactly the failure that occurred, and the one most likely to recur when a fourth
+   * DEX or a third read path is added.
+   */
+  it("every parseDexPool call is followed by a checkMintBinding", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const path = await import("node:path");
+    const src = readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "price-reader.ts"),
+      "utf8",
+    );
+
+    const lines = src.split("\n");
+    const parseSites = lines
+      .map((l, i) => ({ l, i }))
+      .filter(({ l }) => l.includes("parseDexPool(") && !l.includes("import"));
+
+    assert.ok(
+      parseSites.length >= 6,
+      `expected at least 6 parseDexPool sites (3 per read path), found ${parseSites.length} — ` +
+        "if the file was restructured, update this test rather than deleting it",
+    );
+
+    const unguarded = parseSites.filter(({ i }) => {
+      // the binding must appear within a few lines of the parse
+      const window = lines.slice(i, i + 12).join("\n");
+      return !window.includes("checkMintBinding");
+    });
+
+    assert.deepEqual(
+      unguarded.map(({ i }) => `line ${i + 1}: ${lines[i].trim()}`),
+      [],
+      "every parseDexPool site must bind mainnet_ca to the pool's mints — an unguarded " +
+        "site means a creator-supplied pool for the WRONG TOKEN is accepted as the AuthMark " +
+        "on that path",
+    );
+  });
+});
