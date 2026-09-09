@@ -701,7 +701,7 @@ async function getMultipleAccountsChunked(
 
 export async function readAllPoolPricesE6(
   mainnetConn: Connection,
-  entries: Array<Pick<MarketEntry, "poolAddress" | "dexType" | "label" | "symbol">>,
+  entries: Array<Pick<MarketEntry, "poolAddress" | "dexType" | "label" | "symbol" | "mainnetCa">>,
   decimalsCache: DecimalsCache,
   /**
    * Mainnet raydium-clmm SOL/USDC pool used as the SOL/USD reference when no
@@ -767,6 +767,16 @@ export async function readAllPoolPricesE6(
         // Only USD-quoted Raydium pools are publishable — see
         // raydiumPriceIsNotUsd. This still admits the SOL/USD reference pool.
         const parsedRay = parseDexPool("raydium-clmm", pubkeys[i], data);
+        // #100 — the binding must be on THIS path. The keeper loop calls
+        // readAllPoolPricesE6, not readPoolPriceE6; guarding only the latter
+        // would be a check that never runs in production.
+        if (!checkMintBinding(entry.mainnetCa, parsedRay.baseMint, parsedRay.quoteMint).ok) {
+          console.error(
+            `[price-reader] ${entry.label}: WRONG-TOKEN pool refused — mainnet_ca ` +
+              `${entry.mainnetCa} is neither base nor quote of ${entry.poolAddress}`,
+          );
+          continue;
+        }
         if (raydiumPriceIsNotUsd(parsedRay.quoteMint)) continue;
         const priceE6 = computeDexSpotPriceE6("raydium-clmm", data);
         if (priceE6 > 0n) {
@@ -775,6 +785,13 @@ export async function readAllPoolPricesE6(
         }
       } else if (entry.dexType === "meteora-dlmm") {
         const parsed = parseDexPool("meteora-dlmm", pubkeys[i], data);
+        if (!checkMintBinding(entry.mainnetCa, parsed.baseMint, parsed.quoteMint).ok) {
+          console.error(
+            `[price-reader] ${entry.label}: WRONG-TOKEN pool refused — mainnet_ca ` +
+              `${entry.mainnetCa} is neither base nor quote of ${entry.poolAddress}`,
+          );
+          continue;
+        }
         if (!decimalsCache.has(entry.poolAddress)) {
           const [base, quote] = await Promise.all([
             withRpcBackoff(() => fetchMintDecimals(mainnetConn, parsed.baseMint)),
@@ -803,6 +820,13 @@ export async function readAllPoolPricesE6(
         }
       } else if (entry.dexType === "pumpswap") {
         const parsed = parseDexPool("pumpswap", pubkeys[i], data);
+        if (!checkMintBinding(entry.mainnetCa, parsed.baseMint, parsed.quoteMint).ok) {
+          console.error(
+            `[price-reader] ${entry.label}: WRONG-TOKEN pool refused — mainnet_ca ` +
+              `${entry.mainnetCa} is neither base nor quote of ${entry.poolAddress}`,
+          );
+          continue;
+        }
         if (!parsed.baseVault || !parsed.quoteVault) continue;
         pumpswapCandidates.push({
           entry,
