@@ -37,6 +37,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { loadRegistry } from "./cross-cluster/registry.ts";
+import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { crankAllOnce, startRecoveryCrankLoop } from "./cross-cluster/recovery-cranker.ts";
@@ -109,6 +110,36 @@ if (!DEVNET_RPC) {
       process.exit(1);
     }
   }
+}
+
+// #71: parsed HERE, in the fail-fast section, deliberately. The guard existed only
+// in the dead index.ts so the live keeper had none at all. Parsing it later — after
+// the crank and registration loops are already running — meant a bad value threw
+// into a process that then refused to exit, because those loops keep the event loop
+// alive. Config must fail before anything starts.
+//
+// The parser is the one #95 added: it rejects a sub-lamport threshold that would
+// round to zero and silently disable the guard, which was #71's original report.
+//
+// Wrapped in try/catch and exiting explicitly, matching the `[fatal]` pattern the
+// RPC checks above use. A bare throw here would NOT be fatal: the
+// `uncaughtException` handler at the top of this file logs and returns, which
+// suppresses Node's non-zero exit, so a misconfigured keeper would report success
+// to its supervisor and simply never push. Config errors must exit 1.
+let MIN_KEEPER_BALANCE_LAMPORTS: number;
+let BALANCE_CHECK_INTERVAL_MS: number;
+try {
+  MIN_KEEPER_BALANCE_LAMPORTS = parsePositiveLamportsFromSolEnv(
+    "MIN_KEEPER_BALANCE_SOL",
+    0.05,
+  );
+  BALANCE_CHECK_INTERVAL_MS = parsePositiveNumberEnv(
+    "BALANCE_CHECK_INTERVAL_MS",
+    30_000,
+  );
+} catch (err) {
+  console.error(`[fatal] ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
 }
 
 // ── Keeper keypair ─────────────────────────────────────────────────────────────
@@ -372,4 +403,6 @@ await startKeeperLoop(mainnetConn, devnetConn, keeper, registry, {
   healthBind: CC_HEALTH_BIND,
   dryRun: DRY_RUN,
   cycleTimeoutMs: CC_CYCLE_TIMEOUT_MS,
+  minKeeperBalanceLamports: MIN_KEEPER_BALANCE_LAMPORTS,
+  balanceCheckIntervalMs: BALANCE_CHECK_INTERVAL_MS,
 });
