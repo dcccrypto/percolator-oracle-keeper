@@ -29,23 +29,56 @@
  *
  * What it does:
  *   Every `intervalMs` (default 20s), fire one `PermissionlessCrank`
- *   (action=0=Refresh) per registry market, targeting that market's
- *   matcher-enabled ("LP vault") portfolio — any account whose stored
- *   `market` field matches the slab works for Refresh, but the LP portfolio
- *   is a stable, market-owned account that won't disappear if a user closes
- *   their position, so it's the safest fixed target.
+ *   per registry market, targeting that market's matcher-enabled ("LP
+ *   vault") portfolio — any account whose stored `market` field matches the
+ *   slab works, but the LP portfolio is a stable, market-owned account that
+ *   won't disappear if a user closes their position, so it's the safest
+ *   fixed target.
+ *
+ *   v16-migration wire (VERSION 18, integration `a9318945`, dcccrypto/
+ *   percolator-prog @ `sync/integration-v16`): the old caller-chosen
+ *   `action`/`assetIndex`/`recoveryReason` fields are GONE. The wrapper's
+ *   handler (`handle_permissionless_crank_zero_copy`, v16_program.rs) no
+ *   longer lets the caller pick an action at all — the engine's
+ *   `AutoCrankPlanV16` selector does that internally. What the caller now
+ *   supplies is a bounded set of `CrankObservationHint { asset_index,
+ *   oracle_accounts }` — raw evidence hints naming which assets it has
+ *   fresh price/funding evidence for, and how many trailing oracle
+ *   AccountInfos (if any) that evidence occupies in the instruction's
+ *   account list.
+ *
+ *   This loop sends exactly one hint, `{ assetIndex: 0, oracleAccounts: 0 }`
+ *   — these are single-asset (asset_index 0) markets on AUTH_MARK oracle
+ *   mode (the cross-cluster oracle loop only ever pushes PushAuthMark, see
+ *   above), so `hybrid_effective_price_for_crank_view` takes its
+ *   `profile_is_auth_mark` branch: the crank price comes straight from the
+ *   wrapper's own committed `mark_ewma_e6` (set by the last PushAuthMark),
+ *   with NO external oracle account reads at all — `oracle_accounts: 0` is
+ *   therefore not an empty/placeholder hint, it is the CORRECT declared
+ *   count for this asset's oracle mode, and matches
+ *   `ACCOUNTS_PERMISSIONLESS_CRANK_BASE` (owner/market/portfolio only, no
+ *   oracle tail). Sending the hint (rather than an empty `observations: []`)
+ *   is what makes the engine actually walk this asset's per-hint
+ *   oracle-reading loop and call `accrue_asset_to_not_atomic` for it — an
+ *   empty observations array would still satisfy a market already in
+ *   Recovery mode (mode==2 short-circuits before consuming any hint) but
+ *   would do NO accrual work at all on a Live-mode market, defeating this
+ *   loop's entire purpose. `nowSlot: 0n` remains correct: the wrapper
+ *   authenticates against `Clock::get()` via `authenticated_slot_or_fallback`
+ *   regardless of the caller-supplied value (only used as a fallback if the
+ *   Clock sysvar read itself fails).
  *
  * Deliberately separate from the oracle push loop:
  *   - Independent interval (crank only needs to run every ~10-30s; the
  *     oracle push runs every ~0.5-7s and must not be slowed down by this).
  *   - Independent errors — a crank failure never touches oracle-push state.
- *   - One instruction per transaction. Multiple Refresh crank instructions
- *     CANNOT be batched in a single tx: the first one's
- *     `accrue_asset_to_not_atomic` bumps `oracle_epoch`, which invalidates
- *     account health certs for any subsequent instruction in the same tx
- *     (`EngineStale` / Custom(19)). So unlike `pushAuthMarkBatch`, this sends
- *     one tx per market per cycle, fire-and-forget (no confirm await), same
- *     as the push loop's fire-and-forget style.
+ *   - One instruction per transaction. Multiple crank instructions CANNOT
+ *     be batched in a single tx: the first one's `accrue_asset_to_not_atomic`
+ *     bumps `oracle_epoch`, which invalidates account health certs for any
+ *     subsequent instruction in the same tx (`EngineStale` / Custom(19)). So
+ *     unlike `pushAuthMarkBatch`, this sends one tx per market per cycle,
+ *     fire-and-forget (no confirm await), same as the push loop's
+ *     fire-and-forget style.
  */
 import {
   Connection,
@@ -57,11 +90,11 @@ import {
 } from "@solana/web3.js";
 import {
   encodePermissionlessCrank,
-  CrankAction,
   ACCOUNTS_PERMISSIONLESS_CRANK_BASE,
   buildAccountMetas,
   PROGRAM_IDS_V17,
 } from "@percolatorct/sdk";
+import type { CrankObservationHint } from "@percolatorct/sdk";
 import type { MarketEntry, Registry } from "./registry.ts";
 
 const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
@@ -210,6 +243,13 @@ async function findLpPortfolio(
   return null;
 }
 
+// These are single-asset markets — every registry market's only engine
+// asset lives at index 0 (matches the pre-migration wire's fixed
+// `assetIndex: 0` field). See the module doc comment above for why the
+// observation hint below is `{ assetIndex: CRANKED_ASSET_INDEX,
+// oracleAccounts: 0 }` and not an empty `observations: []`.
+const CRANKED_ASSET_INDEX = 0;
+
 // Exported for testing (see recovery-cranker.test.ts): pins the exact
 // PermissionlessCrank wire format this loop sends on every cycle.
 export function buildCrankIx(owner: PublicKey, market: PublicKey, portfolio: PublicKey): TransactionInstruction {
@@ -218,15 +258,21 @@ export function buildCrankIx(owner: PublicKey, market: PublicKey, portfolio: Pub
     market,
     portfolio,
   });
+  // v16-migration wire (VERSION 18, a9318945): PermissionlessCrank no longer
+  // takes action/assetIndex/recoveryReason — it takes now_slot plus a bounded
+  // list of CrankObservationHint{asset_index, oracle_accounts}. See the
+  // module doc comment for the full reasoning; in short, one hint naming
+  // this market's only asset (index 0) with 0 oracle accounts (AUTH_MARK
+  // mode reads the wrapper's own committed mark_ewma_e6, no external oracle
+  // accounts needed or attached) is what makes the engine actually accrue
+  // this asset forward on a Live-mode market — an empty observations array
+  // would be a true no-op crank here, not a "safe default".
+  const observations: CrankObservationHint[] = [
+    { assetIndex: CRANKED_ASSET_INDEX, oracleAccounts: 0 },
+  ];
   const data = encodePermissionlessCrank({
-    // W3 (upstream wrapper #206): wire no longer accepts closeQ/feeBps —
-    // liquidation size/fee are engine-selected. Refresh (action=0) never
-    // used these fields for real work anyway; removed to match the new
-    // 29-byte layout (was 53 bytes pre-W3).
-    action: CrankAction.FeeSweep, // 0 = Refresh (the only recovery-relevant action the wrapper exposes permissionlessly)
-    assetIndex: 0,
-    nowSlot: 0n, // program authenticates against Clock::get() regardless of this value
-    recoveryReason: 0, // any nonzero value is rejected by the wrapper (InvalidInstruction) — must stay 0
+    nowSlot: 0n, // program authenticates against Clock::get() regardless of this value (authenticated_slot_or_fallback)
+    observations,
   });
   return new TransactionInstruction({
     programId: WRAPPER_PROGRAM_ID,
