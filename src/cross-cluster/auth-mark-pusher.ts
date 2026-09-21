@@ -41,9 +41,11 @@ import {
   ACCOUNTS_PUSH_AUTH_MARK,
   buildAccountMetas,
   parseAssetOracleProfileV17,
+  parseAssetControlSequencesV17,
   V17_MARKET_GROUP_LEN,
   V17_MARKET_ASSET_SLOT_LEN,
   V17_ASSET_ORACLE_PROFILE_LEN,
+  V17_ASSET_ORACLE_WRAPPER_LEN,
   PROGRAM_IDS_V17,
 } from "@percolatorct/sdk";
 import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
@@ -180,6 +182,80 @@ export async function fetchOracleAuthority(
   }
 }
 
+/** Minimal LE u64 reader — `@percolatorct/sdk`'s own `readU64LE` (slab.ts) is module-private, not exported. */
+function readU64LE(data: Uint8Array, off: number): bigint {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const lo = view.getUint32(off, true);
+  const hi = view.getUint32(off + 4, true);
+  return (BigInt(hi) << 32n) | BigInt(lo);
+}
+
+// ── v18 PushAuthMark generation fields (market_id + observation_sequence) ──────
+//
+// The v18 wire (percolator-prog sync/integration-v16@a9318945) grew
+// PushAuthMarkArgs from {assetIndex, nowSlot, markE6} to {assetIndex, marketId,
+// nowSlot, markE6, observationSequence} — both new fields must be LIVE-READ per
+// push, never cached/constant, or every push after the first is rejected on-chain.
+//
+// market_id (this asset's generation counter):
+//   handle_push_auth_mark calls require_asset_generation_view(group, asset_index,
+//   expected_market_id), which compares the caller-supplied value against
+//   group.markets[asset_index].engine.asset.market_id — AssetStateV16Account's
+//   OWN market_id field (percolator engine, frozen `~/percolator@c141d47f`,
+//   src/v16.rs `struct AssetStateV16Account`), the FIRST field (byte offset 0),
+//   immediately AFTER the asset's full 1024-byte wrapper-T slot
+//   ({@link V17_ASSET_ORACLE_WRAPPER_LEN}) — NOT inside AssetOracleProfileV16.
+//   This relative offset (0) is cross-checked against the SDK's own
+//   dump_layout-ground-truthed oi_eff_long_q/oi_eff_short_q offsets (289/305,
+//   slab.ts V17_ASSET_STATE_OI_LONG_REL/SHORT_REL): AssetStateV16Account is
+//   #[repr(C)] + bytemuck::Pod (zero implicit padding, every field an align-1
+//   wrapper), so manually walking its declared field order from market_id(0)
+//   reproduces 289/305 exactly — confirming market_id sits at relative offset 0.
+//   A mismatch here throws AssetGenerationMismatch, not a silent misprice, so a
+//   wrong value fails closed on-chain.
+//
+// observation_sequence (replay nonce, NOT a CAS):
+//   handle_push_auth_mark calls advance_control_sequence_view(group,
+//   asset_index, ControlSequenceLane::OracleObservation, observation_sequence),
+//   which resolves to state::require_newer_control_sequence(current, proposed) =
+//   `if proposed <= current { Err(EngineStale) }`. That is a STRICTLY-INCREASING
+//   nonce, distinct from the CAS mechanism `require_current_authority_epoch`
+//   uses for authority_epoch (expected == current, exact match) — the wrapper's
+//   own doc comment on `advance_authority_epoch_view` explicitly calls out that
+//   `authority_epoch` was carved OUT of this uniform-nonce lane precisely
+//   because the other 13 tags (OracleObservation included) keep the
+//   strictly-increasing contract. On success the stored watermark becomes
+//   EXACTLY `proposed` (no implicit +1), so this reads the CURRENT
+//   `oracle_observation` watermark (AssetControlSequencesV16, {@link
+//   parseAssetControlSequencesV17}) and submits current+1 — the minimal valid
+//   value, matching the SDK JSDoc's own `nextObservationSequence` naming.
+//
+// Returns null on any parse failure (bad magic/version, unrecognized VERSION,
+// or a buffer too short for this asset's slot) — callers must skip this push
+// this cycle, never guess a value.
+function parsePushAuthMarkGenerationFields(
+  data: Uint8Array,
+  assetIndex: number,
+): { marketId: bigint; observationSequence: bigint } | null {
+  const groupOffResult = selectMarketGroupOffset(data);
+  if (!groupOffResult.ok) return null;
+  const profileOff =
+    groupOffResult.marketGroupOff +
+    V17_MARKET_GROUP_LEN +
+    assetIndex * V17_MARKET_ASSET_SLOT_LEN;
+
+  const engineAssetOff = profileOff + V17_ASSET_ORACLE_WRAPPER_LEN;
+  if (data.length < engineAssetOff + 8) return null;
+  const marketId = readU64LE(data, engineAssetOff);
+
+  try {
+    const seqs = parseAssetControlSequencesV17(data, profileOff);
+    return { marketId, observationSequence: seqs.oracleObservation + 1n };
+  } catch {
+    return null;
+  }
+}
+
 // ── Push instruction ──────────────────────────────────────────────────────────
 
 /**
@@ -194,14 +270,22 @@ function buildPushAuthMarkIx(
   oracleAuthority: PublicKey,
   market: PublicKey,
   assetIndex: number,
+  marketId: bigint,
   nowSlot: bigint,
   priceE6: bigint,
+  observationSequence: bigint,
 ): TransactionInstruction {
   const accountMetas = buildAccountMetas(ACCOUNTS_PUSH_AUTH_MARK, {
     oracleAuthority,
     market,
   });
-  const data = encodePushAuthMark({ assetIndex, nowSlot, markE6: priceE6 });
+  const data = encodePushAuthMark({
+    assetIndex,
+    marketId,
+    nowSlot,
+    markE6: priceE6,
+    observationSequence,
+  });
   return new TransactionInstruction({
     programId: WRAPPER_PROGRAM_ID,
     keys: accountMetas,
@@ -256,17 +340,42 @@ export async function pushAuthMark(
     return { pushed: false, authorityMismatch: true, priceE6, nowSlot };
   }
 
-  // ── 3. Build instruction (using keeper's web3.js TransactionInstruction) ─
+  // ── 3. Live-read market_id + observation_sequence for THIS push ─────────
+  // See parsePushAuthMarkGenerationFields's doc comment for the exact
+  // handler-derived semantics of each field. Fresh read every call — never
+  // cached — because observation_sequence is a strictly-increasing nonce
+  // that the wrapper rejects if it is not greater than the last one it saw.
   const marketPk = new PublicKey(marketAddress);
+  const acctInfo = await devnetConn.getAccountInfo(marketPk, "confirmed");
+  if (!acctInfo) {
+    console.warn(
+      `[pusher] ${marketAddress.slice(0, 8)}… account not found — skipping`,
+    );
+    return { pushed: false, authorityMismatch: false, priceE6, nowSlot };
+  }
+  const genFields = parsePushAuthMarkGenerationFields(
+    new Uint8Array(acctInfo.data),
+    assetIndex,
+  );
+  if (!genFields) {
+    console.warn(
+      `[pusher] ${marketAddress.slice(0, 8)}… could not read market_id/observation_sequence — skipping`,
+    );
+    return { pushed: false, authorityMismatch: false, priceE6, nowSlot };
+  }
+
+  // ── 4. Build instruction (using keeper's web3.js TransactionInstruction) ─
   const ix = buildPushAuthMarkIx(
     keeper.publicKey,
     marketPk,
     assetIndex,
+    genFields.marketId,
     nowSlot,
     priceE6,
+    genFields.observationSequence,
   );
 
-  // ── 4. Dry-run: log and return ───────────────────────────────────────────
+  // ── 5. Dry-run: log and return ───────────────────────────────────────────
   if (dryRun) {
     console.log(
       `[DRY-RUN] PushAuthMark market=${marketAddress.slice(0, 8)}…` +
@@ -277,7 +386,7 @@ export async function pushAuthMark(
     return { pushed: false, dryRun: true, priceE6, nowSlot };
   }
 
-  // ── 5. Simulate first (fast-fail for wrong authority / bad state) ────────
+  // ── 6. Simulate first (fast-fail for wrong authority / bad state) ────────
   const bh = await devnetConn.getLatestBlockhash("confirmed");
 
   {
@@ -300,7 +409,7 @@ export async function pushAuthMark(
     }
   }
 
-  // ── 6. Send ───────────────────────────────────────────────────────────────
+  // ── 7. Send ───────────────────────────────────────────────────────────────
   const sendTx = new Transaction();
   sendTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT }));
   sendTx.add(ix);
@@ -363,13 +472,25 @@ const MAX_TX_BYTES = 1232;
 /** Safety margin under MAX_TX_BYTES (signature/blockhash jitter). */
 const TX_SIZE_MARGIN = 32;
 
+/** Caller-facing push request — unchanged shape, so keeper-loop.ts needs no edits. */
+type AuthMarkPushInput = { marketAddress: string; assetIndex: number; priceE6: bigint };
+
+/**
+ * Internal, enriched push item — `AuthMarkPushInput` plus the two v18-NEW
+ * fields {@link parsePushAuthMarkGenerationFields} live-reads per market per
+ * cycle. Only constructed AFTER a fresh account read succeeds; a market whose
+ * fields could not be read never reaches this shape (it is reported via
+ * `skippedMarkets` instead — see `pushAuthMarkBatch`).
+ */
+type AuthMarkPushItem = AuthMarkPushInput & { marketId: bigint; observationSequence: bigint };
+
 /**
  * Build one PushAuthMark tx for a slice of markets and return it with its
  * serialized size, so the caller can size-check BEFORE sending.
  */
 function buildPushTx(
   keeper: Keypair,
-  pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>,
+  pushes: AuthMarkPushItem[],
   nowSlot: bigint,
   blockhash: { blockhash: string; lastValidBlockHeight: number },
 ): { tx: Transaction; size: number } {
@@ -385,8 +506,10 @@ function buildPushTx(
         keeper.publicKey,
         new PublicKey(p.marketAddress),
         p.assetIndex,
+        p.marketId,
         nowSlot,
         p.priceE6,
+        p.observationSequence,
       ),
     );
   }
@@ -425,12 +548,12 @@ function buildPushTx(
  */
 function chunkPushes(
   keeper: Keypair,
-  pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>,
+  pushes: AuthMarkPushItem[],
   nowSlot: bigint,
   blockhash: { blockhash: string; lastValidBlockHeight: number },
-): Array<Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>> {
-  const chunks: Array<Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>> = [];
-  let current: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }> = [];
+): AuthMarkPushItem[][] {
+  const chunks: AuthMarkPushItem[][] = [];
+  let current: AuthMarkPushItem[] = [];
 
   for (const p of pushes) {
     const candidate = [...current, p];
@@ -452,6 +575,51 @@ function chunkPushes(
   }
   if (current.length > 0) chunks.push(current);
   return chunks;
+}
+
+/** Composite key — the same market address can (in principle) carry more than one asset index. */
+function pushGenerationKey(p: { marketAddress: string; assetIndex: number }): string {
+  return `${p.marketAddress}:${p.assetIndex}`;
+}
+
+/**
+ * Batched live-read of market_id + observation_sequence for every push this
+ * cycle, via ONE `getMultipleAccountsInfo` call — not one `getAccountInfo`
+ * per market. `pushAuthMarkBatch` was specifically optimized down to "~3 RPC
+ * calls per cycle (was ~25)" (see `runCycle`'s doc comment in keeper-loop.ts);
+ * this keeps that budget by adding exactly one more batched call, not N.
+ *
+ * A market whose account could not be fetched, or whose bytes fail to parse
+ * (bad magic/version, unrecognized VERSION, buffer too short for this
+ * asset's slot), is simply absent from the returned map — the caller must
+ * treat that as "skip this push this cycle" (see
+ * {@link parsePushAuthMarkGenerationFields}'s doc comment), never guess.
+ */
+async function fetchPushAuthMarkGenerationFields(
+  devnetConn: Connection,
+  pushes: AuthMarkPushInput[],
+): Promise<Map<string, { marketId: bigint; observationSequence: bigint }>> {
+  const uniqueAddrs = [...new Set(pushes.map((p) => p.marketAddress))];
+  const infos = await devnetConn.getMultipleAccountsInfo(
+    uniqueAddrs.map((a) => new PublicKey(a)),
+    "confirmed",
+  );
+  const dataByAddr = new Map<string, Uint8Array>();
+  uniqueAddrs.forEach((addr, i) => {
+    const info = infos[i];
+    if (info) dataByAddr.set(addr, new Uint8Array(info.data));
+  });
+
+  const result = new Map<string, { marketId: bigint; observationSequence: bigint }>();
+  for (const p of pushes) {
+    const key = pushGenerationKey(p);
+    if (result.has(key)) continue;
+    const data = dataByAddr.get(p.marketAddress);
+    if (!data) continue;
+    const fields = parsePushAuthMarkGenerationFields(data, p.assetIndex);
+    if (fields) result.set(key, fields);
+  }
+  return result;
 }
 
 export async function pushAuthMarkBatch(
@@ -495,18 +663,46 @@ export async function pushAuthMarkBatch(
     return { pushed: false, count: 0, pushedMarkets: [], skippedMarkets: pushes.map((p) => p.marketAddress) };
   }
 
-  const chunks = chunkPushes(keeper, eligible, nowSlot, blockhash);
+  // Live-read market_id + observation_sequence for every eligible market —
+  // fresh every call, never cached. observation_sequence is the
+  // OracleObservation control-sequence lane's strictly-increasing replay
+  // nonce (see parsePushAuthMarkGenerationFields's doc comment): the wrapper
+  // rejects a push whose proposed value is not STRICTLY GREATER than the
+  // value it last stored, so reusing a stale/cached sequence across pushes
+  // would make every push after the first one revert.
+  const generationFields = await fetchPushAuthMarkGenerationFields(devnetConn, eligible);
+  const pushable: AuthMarkPushItem[] = [];
+  const missingGeneration: string[] = [];
+  for (const p of eligible) {
+    const fields = generationFields.get(pushGenerationKey(p));
+    if (!fields) {
+      missingGeneration.push(p.marketAddress);
+      continue;
+    }
+    pushable.push({ ...p, marketId: fields.marketId, observationSequence: fields.observationSequence });
+  }
+  if (missingGeneration.length > 0) {
+    console.warn(
+      `[push] skipping ${missingGeneration.length} market(s) — could not live-read market_id/observation_sequence this cycle: ` +
+        missingGeneration.map((m) => m.slice(0, 8) + "…").join(", "),
+    );
+  }
+  if (pushable.length === 0) {
+    return { pushed: false, count: 0, pushedMarkets: [], skippedMarkets: pushes.map((p) => p.marketAddress) };
+  }
+
+  const chunks = chunkPushes(keeper, pushable, nowSlot, blockhash);
 
   if (dryRun) {
     console.log(
-      `[DRY-RUN] PushAuthMark × ${eligible.length} in ${chunks.length} tx(s) @ slot ${nowSlot} ` +
-        `(${eligible.map((p) => `$${(Number(p.priceE6) / 1e6).toFixed(4)}`).join(", ")})`,
+      `[DRY-RUN] PushAuthMark × ${pushable.length} in ${chunks.length} tx(s) @ slot ${nowSlot} ` +
+        `(${pushable.map((p) => `$${(Number(p.priceE6) / 1e6).toFixed(4)}`).join(", ")})`,
     );
     return {
       pushed: false,
-      count: eligible.length,
-      pushedMarkets: eligible.map((p) => p.marketAddress),
-      skippedMarkets: [],
+      count: pushable.length,
+      pushedMarkets: pushable.map((p) => p.marketAddress),
+      skippedMarkets: missingGeneration,
     };
   }
 
@@ -520,9 +716,7 @@ export async function pushAuthMarkBatch(
    * Returns the markets that a revert proves cannot be pushed right now, so the
    * caller can isolate them. An empty array means the chunk went out clean.
    */
-  const sendChunk = async (
-    chunk: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>,
-  ): Promise<Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>> => {
+  const sendChunk = async (chunk: AuthMarkPushItem[]): Promise<AuthMarkPushItem[]> => {
     const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
     tx.sign(keeper);
 

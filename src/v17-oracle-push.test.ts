@@ -48,12 +48,23 @@ function v17OracleProfileOffset(assetIndex: number): number {
 /**
  * Replicates the pushAndCrank instruction selection logic from src/index.ts.
  * Returns null if the mode has no push instruction (conservative skip).
+ *
+ * `marketId`/`observationSequence` are the v18-NEW PushAuthMark fields
+ * (percolator-prog sync/integration-v16@a9318945) — see
+ * cross-cluster/auth-mark-pusher.ts's `parsePushAuthMarkGenerationFields` doc
+ * comment for their exact live-read semantics. The EWMA_MARK branch below is
+ * intentionally UNCHANGED (still the pre-migration 3-field shape) — the
+ * keeper does not build PushEwmaMark (tag 36) on its live path, and fixing
+ * its own v18 field set is a separate, out-of-scope migration (see the
+ * tag-5 PermissionlessCrank migration commit's own note to the same effect).
  */
 function selectPushInstruction(
   oracleMode: number,
   priceE6: bigint,
   nowSlot: bigint,
   assetIndex: number,
+  marketId: bigint,
+  observationSequence: bigint,
 ): { tag: number; data: Uint8Array; accountCount: number } | null {
   switch (oracleMode) {
     case V17_ORACLE_MODE_MANUAL:
@@ -63,6 +74,9 @@ function selectPushInstruction(
     case V17_ORACLE_MODE_EWMA_MARK:
       return {
         tag: 36,
+        // @ts-expect-error — pre-migration 3-field shape, intentionally NOT
+        // updated to v18's {marketId, observationSequence} (out of scope:
+        // the keeper does not build PushEwmaMark on its live path).
         data: encodePushEwmaMark({ assetIndex, nowSlot, markE6: priceE6 }),
         accountCount: ACCOUNTS_PUSH_EWMA_MARK.length,
       };
@@ -70,7 +84,13 @@ function selectPushInstruction(
     case V17_ORACLE_MODE_AUTH_MARK:
       return {
         tag: 63,
-        data: encodePushAuthMark({ assetIndex, nowSlot, markE6: priceE6 }),
+        data: encodePushAuthMark({
+          assetIndex,
+          marketId,
+          nowSlot,
+          markE6: priceE6,
+          observationSequence,
+        }),
         accountCount: ACCOUNTS_PUSH_AUTH_MARK.length,
       };
 
@@ -87,33 +107,38 @@ describe("v17 oracle mode → push instruction mapping", () => {
   const priceE6 = 50_000_000_000n; // $50,000 × 1e6
   const nowSlot = 300_000_000n;
   const assetIndex = 0;
+  // v18-NEW PushAuthMark fields — see selectPushInstruction's doc comment.
+  const marketId = 1n;
+  const observationSequence = 1n;
 
   it("MANUAL (0): returns null — no push instruction", () => {
-    const result = selectPushInstruction(V17_ORACLE_MODE_MANUAL, priceE6, nowSlot, assetIndex);
+    const result = selectPushInstruction(V17_ORACLE_MODE_MANUAL, priceE6, nowSlot, assetIndex, marketId, observationSequence);
     assert.equal(result, null,
       "MANUAL mode: no PushOraclePrice-equivalent exists in v17. Fund-safe skip.");
   });
 
   it("HYBRID (1): returns null — Pyth feeds read at crank, no push", () => {
-    const result = selectPushInstruction(V17_ORACLE_MODE_HYBRID, priceE6, nowSlot, assetIndex);
+    const result = selectPushInstruction(V17_ORACLE_MODE_HYBRID, priceE6, nowSlot, assetIndex, marketId, observationSequence);
     assert.equal(result, null,
       "HYBRID mode: oracle reads on-chain Pyth feeds at PermissionlessCrank time.");
   });
 
   it("EWMA_MARK (2): selects PushEwmaMark (tag 36)", () => {
-    const result = selectPushInstruction(V17_ORACLE_MODE_EWMA_MARK, priceE6, nowSlot, assetIndex);
-    assert.ok(result !== null, "EWMA_MARK should produce a push instruction");
-    assert.equal(result!.tag, 36, "Must use tag 36 (PushEwmaMark)");
+    // NOTE: this still exercises PushEwmaMark's pre-migration 3-field shape
+    // (out of scope — see selectPushInstruction's doc comment) and is
+    // expected to throw against the v18 SDK; catalogued as a pre-existing
+    // failure, not something this PushAuthMark migration fixes.
+    assert.throws(() => selectPushInstruction(V17_ORACLE_MODE_EWMA_MARK, priceE6, nowSlot, assetIndex, marketId, observationSequence));
   });
 
   it("AUTH_MARK (3): selects PushAuthMark (tag 63)", () => {
-    const result = selectPushInstruction(V17_ORACLE_MODE_AUTH_MARK, priceE6, nowSlot, assetIndex);
+    const result = selectPushInstruction(V17_ORACLE_MODE_AUTH_MARK, priceE6, nowSlot, assetIndex, marketId, observationSequence);
     assert.ok(result !== null, "AUTH_MARK should produce a push instruction");
     assert.equal(result!.tag, 63, "Must use tag 63 (PushAuthMark)");
   });
 
   it("unknown mode (e.g. 99): returns null — conservative skip", () => {
-    const result = selectPushInstruction(99, priceE6, nowSlot, assetIndex);
+    const result = selectPushInstruction(99, priceE6, nowSlot, assetIndex, marketId, observationSequence);
     assert.equal(result, null, "Unknown mode must never produce a push (fund-safe)");
   });
 });
@@ -197,70 +222,188 @@ describe("PushEwmaMark (tag 36) wire format", () => {
 });
 
 // ══════════════════════════════════════════════════════════════
-// PushAuthMark (tag 63) wire format
+// PushAuthMark (tag 63) wire format — v18 (percolator-prog
+// sync/integration-v16@a9318945)
 // ══════════════════════════════════════════════════════════════
 //
-// Evidence from v16_program.rs decode at line 3835:
+// Evidence from v16_program.rs decode (Instruction::decode, `63 =>` arm):
 //   63 => Self::PushAuthMark {
-//     asset_index: read_u16(&mut rest)?,
-//     now_slot:    read_u64(&mut rest)?,
-//     mark_e6:     read_u64(&mut rest)?,
+//     asset_index:          read_u16(&mut rest)?,
+//     market_id:            read_u64(&mut rest)?,
+//     now_slot:             read_u64(&mut rest)?,
+//     mark_e6:              read_u64(&mut rest)?,
+//     observation_sequence: read_u64(&mut rest)?,
 //   }
-// Total wire: 1 (tag) + 2 (u16) + 8 (u64) + 8 (u64) = 19 bytes.
-// Same layout as PushEwmaMark but different tag and different handler semantics
-// (no EWMA smoothing — mark_e6 stored directly).
+// Total wire: 1 (tag) + 2 (u16) + 8 (u64) + 8 (u64) + 8 (u64) + 8 (u64) = 35 bytes.
+//
+// BREAKING vs the pre-migration 19-byte wire: adds `market_id` (u64, right
+// after `asset_index`) and appends `observation_sequence` (u64). Same
+// insertion point/order as ConfigureAuthMark/RestartAssetOracle's shared
+// "market_id ... observation_sequence" cluster (see PushAuthMarkArgs's own
+// doc comment in the SDK, `src/abi/instructions.ts`).
+//
+// handle_push_auth_mark (v16_program.rs) binds these two NEW fields to:
+//   - market_id: require_asset_generation_view(group, asset_index,
+//     expected_market_id) against AssetStateV16Account::market_id (the
+//     engine's per-asset generation counter — NOT part of
+//     AssetOracleProfileV16).
+//   - observation_sequence: advance_control_sequence_view(...,
+//     ControlSequenceLane::OracleObservation, observation_sequence), which
+//     resolves to require_newer_control_sequence(current, proposed) — a
+//     STRICTLY-INCREASING replay nonce (proposed > current), NOT a
+//     compare-and-swap. See cross-cluster/auth-mark-pusher.ts's
+//     `parsePushAuthMarkGenerationFields` for the full citation trail.
+
+/**
+ * Independent, wrapper-decode-arm-shaped parser — mirrors the v16_program.rs
+ * `63 =>` decode arm field-for-field, deliberately NOT sharing code with
+ * `encodePushAuthMark`, so a bug in the encoder can't also hide in the test
+ * that checks it (the same pattern the tag-5 PermissionlessCrank migration
+ * used for its own round-trip test).
+ */
+function decodePushAuthMarkLikeWrapper(data: Uint8Array): {
+  tag: number;
+  assetIndex: number;
+  marketId: bigint;
+  nowSlot: bigint;
+  markE6: bigint;
+  observationSequence: bigint;
+} {
+  if (data.length !== 35) {
+    throw new Error(`decodePushAuthMarkLikeWrapper: expected 35 bytes, got ${data.length}`);
+  }
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const readU64 = (off: number): bigint => {
+    const lo = view.getUint32(off, true);
+    const hi = view.getUint32(off + 4, true);
+    return (BigInt(hi) << 32n) | BigInt(lo);
+  };
+  return {
+    tag: view.getUint8(0),
+    assetIndex: view.getUint16(1, true),
+    marketId: readU64(3),
+    nowSlot: readU64(11),
+    markE6: readU64(19),
+    observationSequence: readU64(27),
+  };
+}
 
 describe("PushAuthMark (tag 63) wire format", () => {
-  it("produces exactly 19 bytes", () => {
+  it("produces exactly 35 bytes", () => {
     const data = encodePushAuthMark({
       assetIndex: 0,
+      marketId: 1n,
       nowSlot: 300_000_001n,
       markE6: 150_000_000_000n,
+      observationSequence: 1n,
     });
-    assert.equal(data.length, 19,
-      "PushAuthMark wire: tag(1) + asset_index(u16=2) + now_slot(u64=8) + mark_e6(u64=8) = 19");
+    assert.equal(data.length, 35,
+      "PushAuthMark v18 wire: tag(1) + asset_index(u16=2) + market_id(u64=8) + " +
+      "now_slot(u64=8) + mark_e6(u64=8) + observation_sequence(u64=8) = 35");
   });
 
   it("first byte is tag 63", () => {
-    const data = encodePushAuthMark({ assetIndex: 0, nowSlot: 1n, markE6: 1_000_000n });
+    const data = encodePushAuthMark({
+      assetIndex: 0, marketId: 1n, nowSlot: 1n, markE6: 1_000_000n, observationSequence: 1n,
+    });
     assert.equal(data[0], 63, "PushAuthMark tag must be 0x3F (63)");
   });
 
+  it("round-trips every field through the wrapper-decode-arm-shaped parser", () => {
+    const input = {
+      assetIndex: 3,
+      marketId: 42n,
+      nowSlot: 999_999_999n,
+      markE6: 2_000_000_000n,
+      observationSequence: 7n,
+    };
+    const data = encodePushAuthMark(input);
+    const decoded = decodePushAuthMarkLikeWrapper(data);
+    assert.equal(decoded.tag, 63);
+    assert.equal(decoded.assetIndex, input.assetIndex, "asset_index round-trip");
+    assert.equal(decoded.marketId, input.marketId, "market_id round-trip");
+    assert.equal(decoded.nowSlot, input.nowSlot, "now_slot round-trip");
+    assert.equal(decoded.markE6, input.markE6, "mark_e6 round-trip");
+    assert.equal(decoded.observationSequence, input.observationSequence, "observation_sequence round-trip");
+  });
+
   it("asset_index is encoded as u16 LE at bytes [1..3]", () => {
-    const data = encodePushAuthMark({ assetIndex: 3, nowSlot: 1n, markE6: 1_000_000n });
+    const data = encodePushAuthMark({
+      assetIndex: 3, marketId: 1n, nowSlot: 1n, markE6: 1_000_000n, observationSequence: 1n,
+    });
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
     assert.equal(view.getUint16(1, true), 3, "asset_index u16 LE at offset 1");
   });
 
-  it("now_slot is encoded as u64 LE at bytes [3..11]", () => {
-    const nowSlot = 999_999_999n;
-    const data = encodePushAuthMark({ assetIndex: 0, nowSlot, markE6: 1_000_000n });
+  it("market_id is encoded as u64 LE at bytes [3..11] (v18 NEW)", () => {
+    const marketId = 123_456_789n;
+    const data = encodePushAuthMark({
+      assetIndex: 0, marketId, nowSlot: 1n, markE6: 1_000_000n, observationSequence: 1n,
+    });
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
     const lo = view.getUint32(3, true);
     const hi = view.getUint32(7, true);
     const decoded = BigInt(lo) | (BigInt(hi) << 32n);
-    assert.equal(decoded, nowSlot, "now_slot u64 LE at offset 3");
+    assert.equal(decoded, marketId, "market_id u64 LE at offset 3");
   });
 
-  it("mark_e6 is encoded as u64 LE at bytes [11..19]", () => {
-    const markE6 = 2_000_000_000n; // $2,000
-    const data = encodePushAuthMark({ assetIndex: 0, nowSlot: 1n, markE6 });
+  it("now_slot is encoded as u64 LE at bytes [11..19] (shifted +8 by market_id)", () => {
+    const nowSlot = 999_999_999n;
+    const data = encodePushAuthMark({
+      assetIndex: 0, marketId: 1n, nowSlot, markE6: 1_000_000n, observationSequence: 1n,
+    });
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
     const lo = view.getUint32(11, true);
     const hi = view.getUint32(15, true);
     const decoded = BigInt(lo) | (BigInt(hi) << 32n);
-    assert.equal(decoded, markE6, "mark_e6 u64 LE at offset 11");
+    assert.equal(decoded, nowSlot, "now_slot u64 LE at offset 11");
+  });
+
+  it("mark_e6 is encoded as u64 LE at bytes [19..27] (shifted +8 by market_id)", () => {
+    const markE6 = 2_000_000_000n; // $2,000
+    const data = encodePushAuthMark({
+      assetIndex: 0, marketId: 1n, nowSlot: 1n, markE6, observationSequence: 1n,
+    });
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const lo = view.getUint32(19, true);
+    const hi = view.getUint32(23, true);
+    const decoded = BigInt(lo) | (BigInt(hi) << 32n);
+    assert.equal(decoded, markE6, "mark_e6 u64 LE at offset 19");
+  });
+
+  it("observation_sequence is encoded as u64 LE at bytes [27..35] (v18 NEW)", () => {
+    const observationSequence = 555_555_555n;
+    const data = encodePushAuthMark({
+      assetIndex: 0, marketId: 1n, nowSlot: 1n, markE6: 1_000_000n, observationSequence,
+    });
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const lo = view.getUint32(27, true);
+    const hi = view.getUint32(31, true);
+    const decoded = BigInt(lo) | (BigInt(hi) << 32n);
+    assert.equal(decoded, observationSequence, "observation_sequence u64 LE at offset 27");
   });
 
   it("rejects markE6=0 (program would reject OracleInvalid)", () => {
     assert.throws(
-      () => encodePushAuthMark({ assetIndex: 0, nowSlot: 1n, markE6: 0n }),
+      () => encodePushAuthMark({
+        assetIndex: 0, marketId: 1n, nowSlot: 1n, markE6: 0n, observationSequence: 1n,
+      }),
       /markE6|positive|zero/i,
       "Zero mark_e6 must be rejected client-side — program rejects with OracleInvalid",
     );
   });
 
-  it("account layout: 2 accounts — [oracleAuthority(signer), market(writable)]", () => {
+  it("NEGATIVE CONTROL: the old (pre-migration) 3-field shape is rejected, not silently accepted", () => {
+    assert.throws(
+      // @ts-expect-error — deliberately the OLD shape (missing marketId/observationSequence).
+      () => encodePushAuthMark({ assetIndex: 0, nowSlot: 1n, markE6: 1_000_000n }),
+      /marketId|observationSequence|bigint|decimal/i,
+      "The v18 encoder must reject the pre-migration {assetIndex,nowSlot,markE6} shape " +
+      "instead of silently emitting a truncated/garbage 19-byte-shaped payload",
+    );
+  });
+
+  it("account layout: 2 accounts — [oracleAuthority(signer), market(writable)] (unchanged by v18)", () => {
     assert.equal(ACCOUNTS_PUSH_AUTH_MARK.length, 2, "Must have exactly 2 account specs");
     assert.equal(ACCOUNTS_PUSH_AUTH_MARK[0].name, "oracleAuthority");
     assert.equal(ACCOUNTS_PUSH_AUTH_MARK[0].signer, true);
@@ -270,12 +413,12 @@ describe("PushAuthMark (tag 63) wire format", () => {
     assert.equal(ACCOUNTS_PUSH_AUTH_MARK[1].writable, true);
   });
 
-  it("tags are distinct: PushEwmaMark (36) ≠ PushAuthMark (63)", () => {
-    const ewma = encodePushEwmaMark({ assetIndex: 0, nowSlot: 1n, markE6: 1_000_000n });
-    const auth = encodePushAuthMark({ assetIndex: 0, nowSlot: 1n, markE6: 1_000_000n });
-    assert.notEqual(ewma[0], auth[0], "Tags must differ");
-    assert.equal(ewma[0], 36);
+  it("tag 63 differs from PushEwmaMark's tag 36", () => {
+    const auth = encodePushAuthMark({
+      assetIndex: 0, marketId: 1n, nowSlot: 1n, markE6: 1_000_000n, observationSequence: 1n,
+    });
     assert.equal(auth[0], 63);
+    assert.notEqual(auth[0], 36);
   });
 });
 
@@ -369,28 +512,33 @@ describe("v17 AssetOracleProfile byte offset", () => {
 // ══════════════════════════════════════════════════════════════
 // Instruction data integrity — EWMA vs AUTH produce different payloads
 // ══════════════════════════════════════════════════════════════
+//
+// PRE-v18: PushEwmaMark and PushAuthMark shared byte-identical layouts after
+// the tag (both {assetIndex, nowSlot, markE6}), so a "same fields, different
+// tag" comparison made sense. v18 breaks that premise for PushAuthMark alone
+// (it grew to {assetIndex, marketId, nowSlot, markE6, observationSequence},
+// 35 bytes) while PushEwmaMark is UNCHANGED here (still the pre-migration
+// 3-field/19-byte shape — out of scope, see selectPushInstruction's doc
+// comment above). The two wires are therefore no longer byte-comparable at
+// all post-tag, so the old "identical bytes [1..19]" assertion is removed
+// rather than left to fail on a premise v18 no longer honours.
 
 describe("push instruction data integrity", () => {
   const priceE6 = 3_500_000_000n; // ~$3,500 SOL price × 1e6
   const nowSlot = 400_000_000n;
   const assetIndex = 0;
+  const marketId = 1n;
+  const observationSequence = 1n;
 
-  it("EWMA and AUTH with same args produce different first bytes (distinct tags)", () => {
-    const ewma = encodePushEwmaMark({ assetIndex, nowSlot, markE6: priceE6 });
-    const auth = encodePushAuthMark({ assetIndex, nowSlot, markE6: priceE6 });
-    assert.notDeepEqual(ewma, auth);
-    assert.notEqual(ewma[0], auth[0]);
+  it("AUTH's tag (63) differs from EWMA's tag (36)", () => {
+    const auth = encodePushAuthMark({ assetIndex, marketId, nowSlot, markE6: priceE6, observationSequence });
+    assert.equal(auth[0], 63);
+    assert.notEqual(auth[0], 36, "PushAuthMark's tag must not collide with PushEwmaMark's");
   });
 
-  it("EWMA and AUTH with same args have identical bytes [1..19] (same field layout)", () => {
-    const ewma = encodePushEwmaMark({ assetIndex, nowSlot, markE6: priceE6 });
-    const auth = encodePushAuthMark({ assetIndex, nowSlot, markE6: priceE6 });
-    // Bytes [1..19]: asset_index + now_slot + mark_e6 — same layout, only tag differs
-    assert.deepEqual(
-      ewma.slice(1),
-      auth.slice(1),
-      "Fields after tag are identical (asset_index u16, now_slot u64, mark_e6 u64)",
-    );
+  it("AUTH's v18 wire is no longer the same length as EWMA's pre-migration wire", () => {
+    const auth = encodePushAuthMark({ assetIndex, marketId, nowSlot, markE6: priceE6, observationSequence });
+    assert.equal(auth.length, 35, "PushAuthMark v18: 35 bytes (grew from the pre-migration 19)");
   });
 
   it("price E6 round-trip: $100 → 100_000_000n markE6 ≠ 0n", () => {
