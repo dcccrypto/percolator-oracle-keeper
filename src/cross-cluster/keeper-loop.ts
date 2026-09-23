@@ -234,7 +234,17 @@ function maybeResetAuthorityLatches(): void {
  * on a hot pool (two-level ±1–2% churn — what drained the CATE LP) never
  * reach the engine as oscillation. See mark-smoother.ts for the full story.
  */
-const markSmoother = createMarkSmoother();
+// The default 180s median window makes the AuthMark lag spot by ~90s — fine for
+// anti-churn resistance, but far too slow for a responsive perp: the mark trails
+// the ticking display price, so slippage-bounded orders get rejected. On the
+// devnet playground (test funds) responsiveness beats the CATE anti-manipulation
+// margin, so run a short window (still a median over several samples, so a single
+// bad pool read never reaches the engine). Env-tunable: CC_MARK_WINDOW_MS.
+// NOTE (mainnet): a real-money deployment should keep a longer window OR move to a
+// pull oracle (Pyth) that prices the trade in-tx — do NOT ship this short window
+// to mainnet without that.
+const MARK_WINDOW_MS = Number(process.env.CC_MARK_WINDOW_MS ?? 15_000);
+const markSmoother = createMarkSmoother({ windowMs: MARK_WINDOW_MS });
 
 function parseCrossClusterPositiveNumberEnv(
   name: string,
