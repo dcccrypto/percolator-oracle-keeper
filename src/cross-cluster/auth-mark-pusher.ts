@@ -600,9 +600,14 @@ async function fetchPushAuthMarkGenerationFields(
   pushes: AuthMarkPushInput[],
 ): Promise<Map<string, { marketId: bigint; observationSequence: bigint }>> {
   const uniqueAddrs = [...new Set(pushes.map((p) => p.marketAddress))];
+  // "processed", not "confirmed" (#Custom19, 2026-09-28): the watermark this
+  // reads is advanced ONLY by this keeper's own pushes, which land ~1-3 slots
+  // before they are confirmed. A confirmed read routinely misses the previous
+  // cycle's push. Reading a higher (even later-dropped-fork) value is always
+  // safe — the nonce only has to be strictly greater, gaps are allowed.
   const infos = await devnetConn.getMultipleAccountsInfo(
     uniqueAddrs.map((a) => new PublicKey(a)),
-    "confirmed",
+    "processed",
   );
   const dataByAddr = new Map<string, Uint8Array>();
   uniqueAddrs.forEach((addr, i) => {
@@ -617,9 +622,86 @@ async function fetchPushAuthMarkGenerationFields(
     const data = dataByAddr.get(p.marketAddress);
     if (!data) continue;
     const fields = parsePushAuthMarkGenerationFields(data, p.assetIndex);
-    if (fields) result.set(key, fields);
+    if (fields) {
+      result.set(key, {
+        marketId: fields.marketId,
+        observationSequence: nextObservationSequence(key, fields.observationSequence),
+      });
+    }
   }
   return result;
+}
+
+// ── Local observation_sequence watermark (Custom(19) self-race, 2026-09-28) ───
+//
+// ROOT CAUSE of the recurring `{"InstructionError":[1,{"Custom":19}]}`
+// (PercolatorError::EngineStale) on PushAuthMark: the keeper raced ITSELF on the
+// OracleObservation nonce. handle_push_auth_mark (percolator-prog v18.2
+// @6377376a, src/v16_program.rs:20568) calls advance_control_sequence_view ->
+// require_newer_control_sequence, which is `if proposed <= current { EngineStale }`.
+// Nothing but this keeper's own PushAuthMark advances that lane (the cranks do
+// not touch it; the slot checks authenticate against Clock, so they cannot fire
+// for a well-formed push).
+//
+// Each cycle (~1.5s ≈ 3-4 slots) read the watermark from chain and proposed
+// current+1, then sent fire-and-forget. The previous cycle's tx routinely had
+// not landed / confirmed yet, so two consecutive cycles proposed the SAME value:
+//   slot 505273955 ok   nowSlot=…951 seq=253915   (cycle N+1)
+//   slot 505273956 ERR  nowSlot=…944 seq=253915   (cycle N, landed late) Custom(19)
+// Depending on which bank the preflight saw, the loser reverted either in
+// preflight (the whole chunk dropped, then every single-market retry failed
+// the same way, accruing quarantine strikes on HEALTHY markets) or on-chain
+// after a clean preflight (a silent revert, logged as "batched push × N").
+// The last chunk of each cycle (eacc/CATE/swordcat) is sent latest, so the next
+// cycle's read was the most likely to miss it — hence their lower push count.
+//
+// Fix: remember the highest sequence this process has SENT per (market, asset)
+// and propose max(chain, lastSent) + 1. The nonce needs only to be strictly
+// increasing (gaps are fine), so this never proposes an invalid value; a
+// restart or another pusher is covered by the max with chain.
+const lastSentObservationSequence = new Map<string, bigint>();
+
+/**
+ * Next nonce for `key`, given `chainNext` (= chain watermark + 1, as
+ * parsePushAuthMarkGenerationFields returns it): strictly above both the chain
+ * watermark and anything this process already sent.
+ */
+function nextObservationSequence(key: string, chainNext: bigint): bigint {
+  const localNext = (lastSentObservationSequence.get(key) ?? 0n) + 1n;
+  return chainNext > localNext ? chainNext : localNext;
+}
+
+function recordSentObservationSequence(p: AuthMarkPushItem): void {
+  const key = pushGenerationKey(p);
+  const prev = lastSentObservationSequence.get(key) ?? 0n;
+  if (p.observationSequence > prev) lastSentObservationSequence.set(key, p.observationSequence);
+}
+
+/** PercolatorError::EngineStale — the wrapper's error for a non-increasing observation_sequence. */
+const ENGINE_STALE_CUSTOM = 19;
+
+/**
+ * Parse a simulate `err` of the real RPC shape `{"InstructionError":[i,{"Custom":n}]}`
+ * into the offending push's position within `chunkLen` pushes (ix 0 is the
+ * ComputeBudget ix, so push k is ix k+1). Returns null for any other shape
+ * (InsufficientFundsForFee, AccountNotFound, a non-push index, …) so the caller
+ * falls back to per-market isolation instead of blaming the wrong market.
+ */
+export function parseFailingPush(
+  simErr: unknown,
+  chunkLen: number,
+): { position: number; custom: number | null } | null {
+  if (typeof simErr !== "object" || simErr === null) return null;
+  const ie = (simErr as { InstructionError?: unknown }).InstructionError;
+  if (!Array.isArray(ie) || ie.length !== 2 || typeof ie[0] !== "number") return null;
+  const position = ie[0] - 1;
+  if (!Number.isInteger(position) || position < 0 || position >= chunkLen) return null;
+  const detail = ie[1] as { Custom?: unknown } | unknown;
+  const custom =
+    typeof detail === "object" && detail !== null && typeof (detail as { Custom?: unknown }).Custom === "number"
+      ? ((detail as { Custom: number }).Custom)
+      : null;
+  return { position, custom };
 }
 
 export async function pushAuthMarkBatch(
@@ -711,102 +793,164 @@ export async function pushAuthMarkBatch(
   const errors: string[] = [];
 
   /**
-   * Send one chunk, preflighting first so an ON-CHAIN revert is visible.
+   * Preflight one tx so an ON-CHAIN revert is visible before we send.
+   * Returns the simulate `err` (null = would execute, or could not validate).
    *
-   * Returns the markets that a revert proves cannot be pushed right now, so the
-   * caller can isolate them. An empty array means the chunk went out clean.
+   * PREFLIGHT (2026-07-27). This used to send with skipPreflight:true and never
+   * await confirmation, so a chunk that REVERTED on-chain was counted as pushed —
+   * the phantom-success problem. PushAuthMark reverts for the whole atomic batch
+   * if ANY market in it is ineligible (`group.header.mode != 0` ->
+   * EngineLockActive, a non-increasing observation_sequence -> EngineStale, or a
+   * junk slab -> Unauthorized), so one bad market silently froze the price for
+   * every market batched with it (the 2026-07-13 outage shape).
    */
-  const sendChunk = async (chunk: AuthMarkPushItem[]): Promise<AuthMarkPushItem[]> => {
+  const preflight = async (chunk: AuthMarkPushItem[]): Promise<unknown> => {
     const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
     tx.sign(keeper);
-
-    // PREFLIGHT (2026-07-27). This used to send with skipPreflight:true and
-    // never await confirmation, so a chunk that REVERTED on-chain was counted
-    // as pushed — the phantom-success problem. Worse, PushAuthMark reverts for
-    // the whole atomic batch if ANY market in it is ineligible
-    // (`group.header.mode != 0` -> EngineLockActive, a slot regression ->
-    // EngineStale, or a junk slab -> Unauthorized). Reproduced: [good] and
-    // [good, good] both land, but [good, junk] reverts entirely, so one bad
-    // market silently freezes the price for every market batched with it. That
-    // is the 2026-07-13 outage shape, and the owner-filter added afterwards
-    // does not cover it (the junk market is owned by the CURRENT wrapper).
     let simErr: unknown = null;
     try {
       const sim = await devnetConn.simulateTransaction(tx);
       simErr = sim.value.err;
-    } catch (err) {
+    } catch {
       // A simulate that cannot even run (RPC hiccup) must not drop the push —
       // fall through and send, which is the old behaviour.
       simErr = null;
     }
-
     // BlockhashNotFound is NOT a program revert. On a load-balanced devnet RPC
     // pool (the padre endpoint) the node that runs simulateTransaction often lags
     // the node that served getLatestBlockhash, so the preflight fails
-    // "BlockhashNotFound" even though the SEND lands fine — sendRawTransaction
-    // forwards to the current leader, which HAS the blockhash (the recovery
-    // cranker recovers on this exact endpoint the same way). Treating that as a
-    // preflight revert needlessly drops the push (~45% of post-priming cycles).
-    // Reclassify it to "couldn't validate" and fall through to the send; the send
-    // failing is just a missed cycle (same as dropping), so this is only-upside.
-    // A genuine program revert still surfaces as Custom(N) below, so the
-    // batch-poisoning isolate/quarantine protection is unaffected.
+    // "BlockhashNotFound" even though the SEND lands fine. Reclassify it to
+    // "couldn't validate" and fall through to the send; a genuine program revert
+    // still surfaces as Custom(N), so isolation/quarantine is unaffected.
     if (simErr && /Blockhash\s*not\s*found/i.test(JSON.stringify(simErr))) {
       simErr = null;
     }
+    return simErr;
+  };
 
-    if (simErr) {
-      // Chunk would revert. If it is a single market we know exactly who is at
-      // fault; otherwise tell the caller to isolate.
-      if (chunk.length === 1) {
-        const bad = chunk[0];
-        const strikes = (quarantineStrikes.get(bad.marketAddress) ?? 0) + 1;
-        quarantineStrikes.set(bad.marketAddress, strikes);
-        if (strikes >= QUARANTINE_AFTER_STRIKES) {
-          quarantinedUntil.set(bad.marketAddress, Date.now() + QUARANTINE_MS);
-          console.error(
-            `[push][QUARANTINE] ${bad.marketAddress.slice(0, 8)}… reverted ${strikes}× ` +
-              `(${JSON.stringify(simErr).slice(0, 80)}) — skipping it for ${QUARANTINE_MS / 60_000}min ` +
-              `so it cannot freeze the other markets' prices. Investigate: is it Live (mode 0)?`,
-          );
-        }
-        errors.push(`${bad.marketAddress.slice(0, 8)}…: ${JSON.stringify(simErr).slice(0, 80)}`);
-        return chunk;
-      }
-      return chunk; // caller re-sends these one at a time
+  /** Record a proven revert against ONE market (strikes -> quarantine). */
+  const strike = (bad: AuthMarkPushItem, simErr: unknown): void => {
+    const strikes = (quarantineStrikes.get(bad.marketAddress) ?? 0) + 1;
+    quarantineStrikes.set(bad.marketAddress, strikes);
+    if (strikes >= QUARANTINE_AFTER_STRIKES) {
+      quarantinedUntil.set(bad.marketAddress, Date.now() + QUARANTINE_MS);
+      console.error(
+        `[push][QUARANTINE] ${bad.marketAddress.slice(0, 8)}… reverted ${strikes}× ` +
+          `(${JSON.stringify(simErr).slice(0, 80)}) — skipping it for ${QUARANTINE_MS / 60_000}min ` +
+          `so it cannot freeze the other markets' prices. Investigate: is it Live (mode 0)?`,
+      );
     }
+    errors.push(`${bad.marketAddress.slice(0, 8)}…: ${JSON.stringify(simErr).slice(0, 80)}`);
+  };
 
-    // Clean preflight → submit. Still fire-and-forget on confirmation (a dropped
-    // tx just retries next cycle) but we now KNOW it would have executed.
+  /** Submit a chunk that preflighted clean. Fire-and-forget on confirmation. */
+  const send = async (chunk: AuthMarkPushItem[]): Promise<void> => {
+    const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
+    tx.sign(keeper);
     try {
       const signature = await devnetConn.sendRawTransaction(tx.serialize(), {
         skipPreflight: true,
         maxRetries: 2,
       });
       firstSig ??= signature;
-      for (const p of chunk) pushedMarkets.push(p.marketAddress);
-      // A clean push clears any accumulated strikes.
-      for (const p of chunk) quarantineStrikes.delete(p.marketAddress);
+      for (const p of chunk) {
+        pushedMarkets.push(p.marketAddress);
+        // A clean push clears any accumulated strikes…
+        quarantineStrikes.delete(p.marketAddress);
+        // …and reserves its nonce, so the NEXT cycle proposes above it even if
+        // this tx has not landed/confirmed by the time that cycle reads chain.
+        recordSentObservationSequence(p);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       errors.push(`${chunk.length} market(s): ${msg.slice(0, 120)}`);
     }
-    return [];
+  };
+
+  /**
+   * Re-read observation_sequence for `items` after an EngineStale preflight and
+   * propose strictly above both the fresh chain value and what we tried. Returns
+   * null if the re-read itself failed (caller then isolates instead).
+   */
+  const refreshSequences = async (items: AuthMarkPushItem[]): Promise<AuthMarkPushItem[] | null> => {
+    try {
+      const fresh = await fetchPushAuthMarkGenerationFields(devnetConn, items);
+      return items.map((p) => {
+        const f = fresh.get(pushGenerationKey(p));
+        const bumped = p.observationSequence + 1n;
+        const seq = f && f.observationSequence > bumped ? f.observationSequence : bumped;
+        return { ...p, observationSequence: seq };
+      });
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * Push one chunk so that ONE failing market can never black out the rest.
+   *
+   * On a preflight revert the real RPC error names the failing instruction
+   * (`{"InstructionError":[i,{"Custom":n}]}`, ix 0 = ComputeBudget, so push i-1).
+   * - Custom(19) EngineStale -> re-read the nonces once and retry the SAME chunk
+   *   (a stale observation_sequence is a keeper-side race, not a bad market, so
+   *   it must not cost the market a cycle or a quarantine strike).
+   * - anything else -> exclude exactly that market (strike it) and re-preflight
+   *   the remainder as ONE tx, in the same cycle.
+   * - an error that does not name a push ix -> fall back to one-at-a-time.
+   */
+  const pushChunk = async (chunk: AuthMarkPushItem[]): Promise<void> => {
+    let pending = chunk;
+    let refreshed = false;
+    // Each non-refresh iteration removes one market, so this is bounded.
+    for (let guard = 0; pending.length > 0 && guard <= chunk.length + 1; guard++) {
+      const simErr = await preflight(pending);
+      if (!simErr) {
+        await send(pending);
+        return;
+      }
+      const failing = parseFailingPush(simErr, pending.length);
+      if (failing === null) {
+        if (pending.length === 1) {
+          strike(pending[0], simErr);
+          return;
+        }
+        console.warn(
+          `[push] chunk of ${pending.length} reverted in preflight (${JSON.stringify(simErr).slice(0, 80)}) ` +
+            `— retrying individually to isolate the bad market`,
+        );
+        for (const single of pending) {
+          const singleErr = await preflight([single]);
+          if (singleErr) strike(single, singleErr);
+          else await send([single]);
+        }
+        return;
+      }
+      const culprit = pending[failing.position];
+      if (failing.custom === ENGINE_STALE_CUSTOM && !refreshed) {
+        refreshed = true;
+        const next = await refreshSequences(pending);
+        if (next) {
+          console.warn(
+            `[push] ${culprit.marketAddress.slice(0, 8)}… observation_sequence stale (Custom(19)) — ` +
+              `re-read nonces, retrying the chunk of ${pending.length}`,
+          );
+          pending = next;
+          continue;
+        }
+      }
+      strike(culprit, simErr);
+      pending = pending.filter((_, i) => i !== failing.position);
+      if (pending.length > 0) {
+        console.warn(
+          `[push] ${culprit.marketAddress.slice(0, 8)}… reverted in preflight ` +
+            `(${JSON.stringify(simErr).slice(0, 80)}) — excluded; re-sending the other ${pending.length}`,
+        );
+      }
+    }
   };
 
   for (const chunk of chunks) {
-    const failed = await sendChunk(chunk);
-    if (failed.length > 1) {
-      // ISOLATE: the batch reverted, but most of these markets are fine. Send
-      // them individually so the healthy ones still get their price and the
-      // offender is identified by name instead of taking the chunk down with it.
-      console.warn(
-        `[push] chunk of ${failed.length} reverted in preflight — retrying individually to isolate the bad market`,
-      );
-      for (const single of failed) {
-        await sendChunk([single]);
-      }
-    }
+    await pushChunk(chunk);
   }
 
   if (errors.length > 0) {
