@@ -127,6 +127,23 @@ export function meteoraWsolPriceToUsdE6(
   return (nativeE12 * solPriceE6) / 1_000_000_000_000n;
 }
 
+/**
+ * #112 — the SDK prices a WSOL-quoted pumpswap pool as
+ * `quotePerBaseE6 * solPriceE6 / 1e6`, truncating the SOL price to whole
+ * micro-SOL first (the trap meteoraWsolPriceToUsdE6 above documents). SOLCAT at
+ * 1.81e-6 SOL read as `1`, so its mark halved (235 -> 117) the moment it crossed
+ * 2e-6 SOL; the breaker refused that phantom 50% drop and the market silently
+ * stopped being pushed. 6 extra base decimals return the price at e12 (WSOL- or
+ * USD-stable-quoted alike); callers divide by 1e6 once, at the end.
+ *
+ * Ceiling: the SDK caps decimals at 24, so a base mint with more than 18
+ * decimals is now rejected and skipped. Every pumpswap market today is 6dp.
+ * Once the SDK multiplies by the SOL price before dividing, this can go.
+ */
+function pumpswapE12Decimals(dec: { base: number; quote: number }): { base: number; quote: number } {
+  return { base: dec.base + 6, quote: dec.quote };
+}
+
 export interface PriceReadResult {
   priceE6: bigint;
   /** Short description of the price source, e.g. "raydium-clmm:8sLbN…". */
@@ -691,13 +708,14 @@ export async function readPoolPriceE6(
 
     let priceE6: bigint;
     try {
-      priceE6 = computeDexSpotPriceE6(
-        "pumpswap",
-        data,
-        { base: baseVaultData, quote: quoteVaultData },
-        dec,
-        solPriceE6,
-      );
+      priceE6 =
+        computeDexSpotPriceE6(
+          "pumpswap",
+          data,
+          { base: baseVaultData, quote: quoteVaultData },
+          pumpswapE12Decimals(dec),
+          solPriceE6,
+        ) / 1_000_000n;
     } catch (err) {
       return {
         priceE6: 0n,
@@ -1064,13 +1082,14 @@ export async function readAllPoolPricesE6(
       }
 
       try {
-        const priceE6 = computeDexSpotPriceE6(
-          "pumpswap",
-          poolData,
-          { base: new Uint8Array(baseVaultInfo.data), quote: new Uint8Array(quoteVaultInfo.data) },
-          dec,
-          solPriceE6,
-        );
+        const priceE6 =
+          computeDexSpotPriceE6(
+            "pumpswap",
+            poolData,
+            { base: new Uint8Array(baseVaultInfo.data), quote: new Uint8Array(quoteVaultInfo.data) },
+            pumpswapE12Decimals(dec),
+            solPriceE6,
+          ) / 1_000_000n;
         if (priceE6 > 0n) out.set(entry.poolAddress, priceE6);
       } catch {
         // e.g. WSOL-quoted but solPriceE6 unavailable this cycle (SOL/USD read
