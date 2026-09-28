@@ -329,14 +329,15 @@ export function splitBreakerCommit(
   return { commitNow, deferred };
 }
 
-function cloneCircuitBreakerState(state: CircuitBreakerState): CircuitBreakerState {
-  return {
-    symbol: state.symbol,
-    lastPrice: state.lastPrice,
-    circuitBreakerTrips: state.circuitBreakerTrips,
-    cbTripPrice: state.cbTripPrice,
-    cbConsecutiveTrips: state.cbConsecutiveTrips,
-  };
+/**
+ * Copies EVERY field. This used to list the fields by hand and was not updated
+ * when #104 (for #82) added cbDriftAnchorPrice/cbDriftAnchorAt, so the anchor was
+ * dropped on every cycle and the cumulative bound degenerated to a per-step
+ * bound. Every field is a primitive, so a shallow spread is a complete copy and
+ * cannot fall behind the interface again.
+ */
+export function cloneCircuitBreakerState(state: CircuitBreakerState): CircuitBreakerState {
+  return { ...state };
 }
 
 // Blockhash cache — a fresh one is valid ~60-90s; refetch every 15s so each
