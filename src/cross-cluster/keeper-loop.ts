@@ -312,6 +312,33 @@ function priceE6ToUsdNumber(priceE6: bigint): number {
 }
 
 /**
+ * #116 — turn the breaker's accepted price into the E6 value to publish.
+ *
+ * When the breaker accepted the smoothed price unchanged, the original E6 is
+ * published bit-for-bit (no float round-trip). When it clamped a relocation to
+ * the cumulative-bound edge, the edge is converted to E6 rounding toward the
+ * old baseline (down for an upward clamp, up for a downward one), so E6
+ * rounding can never carry the published mark past the bound. The returned
+ * `priceUsd` is the exact value of the returned E6, so the breaker baseline
+ * matches what lands on chain.
+ */
+export function acceptedPublishPrice(
+  smoothedE6: bigint,
+  smoothedUsd: number,
+  acceptedUsd: number,
+): { priceE6: bigint; priceUsd: number } {
+  if (acceptedUsd === smoothedUsd) {
+    return { priceE6: smoothedE6, priceUsd: smoothedUsd };
+  }
+  const scaled = acceptedUsd * 1_000_000;
+  // Clamped toward the baseline: an upward clamp sits below the smoothed price
+  // (round down), a downward clamp sits above it (round up).
+  let e6 = BigInt(acceptedUsd < smoothedUsd ? Math.floor(scaled) : Math.ceil(scaled));
+  if (e6 < 1n) e6 = 1n;
+  return { priceE6: e6, priceUsd: priceE6ToUsdNumber(e6) };
+}
+
+/**
  * Split a breaker-accepted candidate into (a) the accounting that MUST be
  * committed immediately and (b) the baseline that may only be committed once
  * the mark is actually published.
@@ -486,12 +513,12 @@ async function runCycle(
       currentCircuitBreakerState,
     );
     const priceUsd = priceE6ToUsdNumber(priceE6);
-    const allowed = checkCircuitBreaker(candidateCircuitBreakerState, priceUsd, {
+    const acceptedUsd = checkCircuitBreaker(candidateCircuitBreakerState, priceUsd, {
       maxMovePct: CROSS_CLUSTER_MAX_MOVE_PCT,
       confirmTrips: CROSS_CLUSTER_CIRCUIT_BREAKER_CONFIRM_TRIPS,
       log: (msg) => console.warn(`[loop] ${msg}`),
     });
-    if (!allowed) {
+    if (acceptedUsd === null) {
       // Keep breaker trip accounting for sustained-relocation detection, but do
       // not advance the accepted baseline. checkCircuitBreaker() does not move
       // lastPrice on a rejected candidate.
@@ -519,16 +546,26 @@ async function runCycle(
     // cycles, plus 3,645 hard timeouts). A spike could then accumulate across
     // dropped cycles and re-baseline the breaker onto a bad price — the exact
     // failure the breaker exists to prevent. Only `lastPrice` may be deferred.
+    //
+    // #116: the breaker may accept a CLAMPED price (a confirmed relocation
+    // rate-limited to the edge of the cumulative bound). Publish exactly what
+    // it accepted — never the smoothed price it was shown — and record that
+    // same value as the pending baseline.
+    const publish = acceptedPublishPrice(priceE6, priceUsd, acceptedUsd);
     const { commitNow, deferred } = splitBreakerCommit(
       currentCircuitBreakerState,
       candidateCircuitBreakerState,
-      priceUsd,
+      publish.priceUsd,
     );
     crossClusterCircuitBreakerStates.set(entry.marketAddress, commitNow);
     pendingCircuitBreakerStates.set(entry.marketAddress, deferred);
 
-    stat.lastPriceE6 = priceE6;
-    pushes.push({ marketAddress: entry.marketAddress, assetIndex: entry.assetIndex, priceE6 });
+    stat.lastPriceE6 = publish.priceE6;
+    pushes.push({
+      marketAddress: entry.marketAddress,
+      assetIndex: entry.assetIndex,
+      priceE6: publish.priceE6,
+    });
   }
   if (pushes.length === 0) return;
 
