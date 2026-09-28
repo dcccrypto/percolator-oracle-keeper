@@ -22,7 +22,7 @@ import type { Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
 import { readAllPoolPricesE6 } from "./price-reader.ts";
 import { createMarkSmoother } from "./mark-smoother.ts";
-import { checkCircuitBreaker } from "../circuit-breaker.ts";
+import { checkCircuitBreaker, recordMarkInForce } from "../circuit-breaker.ts";
 import type { CircuitBreakerState } from "../circuit-breaker.ts";
 import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets } from "./auth-mark-pusher.ts";
 import {
@@ -367,14 +367,42 @@ export function splitBreakerCommit(
 }
 
 /**
+ * #125 — the state to persist once a push of `pending.lastPrice` has LANDED.
+ *
+ * `committed` is the state currently persisted for the market (its lastPrice is
+ * the mark that was in force until this push). The breaker records the mark in
+ * force on every check, but the check runs before the push is sent; recording
+ * the replaced mark again at `landedAtMs` keeps it in the trailing window for
+ * the full window after it actually stopped being the on-chain mark, so the
+ * window cannot be shortened by push latency.
+ */
+export function commitPublishedBreakerState(
+  committed: CircuitBreakerState | undefined,
+  pending: CircuitBreakerState,
+  landedAtMs: number,
+): CircuitBreakerState {
+  const next = cloneCircuitBreakerState(pending);
+  if (committed && committed.lastPrice > 0) {
+    recordMarkInForce(next, committed.lastPrice, landedAtMs);
+  }
+  recordMarkInForce(next, next.lastPrice, landedAtMs);
+  return next;
+}
+
+/**
  * Copies EVERY field. This used to list the fields by hand and was not updated
  * when #104 (for #82) added cbDriftAnchorPrice/cbDriftAnchorAt, so the anchor was
  * dropped on every cycle and the cumulative bound degenerated to a per-step
- * bound. Every field is a primitive, so a shallow spread is a complete copy and
- * cannot fall behind the interface again.
+ * bound. A shallow spread cannot fall behind the interface again. The #125
+ * window deques are arrays, but circuit-breaker.ts never mutates them in place
+ * (every update assigns a fresh array); they are copied here anyway so a future
+ * in-place edit cannot alias the persisted state through a candidate.
  */
 export function cloneCircuitBreakerState(state: CircuitBreakerState): CircuitBreakerState {
-  return { ...state };
+  const copy: CircuitBreakerState = { ...state };
+  if (state.cbWindowMax) copy.cbWindowMax = state.cbWindowMax.slice();
+  if (state.cbWindowMin) copy.cbWindowMin = state.cbWindowMin.slice();
+  return copy;
 }
 
 // Blockhash cache — a fresh one is valid ~60-90s; refetch every 15s so each
@@ -643,7 +671,11 @@ async function runCycle(
         if (pendingCircuitBreakerState) {
           crossClusterCircuitBreakerStates.set(
             p.marketAddress,
-            pendingCircuitBreakerState,
+            commitPublishedBreakerState(
+              crossClusterCircuitBreakerStates.get(p.marketAddress),
+              pendingCircuitBreakerState,
+              stamp,
+            ),
           );
         }
         stat.totalPushes++;

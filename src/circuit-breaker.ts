@@ -10,6 +10,12 @@
  * re-baselined rather than wedging the market permanently until restart.
  */
 
+/** One observation of the published mark: `price` was in force at time `at`. */
+export interface MarkObservation {
+  readonly price: number;
+  readonly at: number;
+}
+
 /** Subset of MarketStats fields that the circuit-breaker needs to read/write. */
 export interface CircuitBreakerState {
   symbol: string;
@@ -20,12 +26,20 @@ export interface CircuitBreakerState {
   /** How many consecutive trips have occurred near cbTripPrice. */
   cbConsecutiveTrips: number;
   /**
-   * #82 — anchor for the cumulative-drift bound: the baseline this market was at
-   * when the current drift window opened, and when that window opened.
-   * Zero/absent means "no window open yet"; the next re-baseline opens one.
+   * #82 / #125 — the trailing-window extremes of the PUBLISHED mark, as two
+   * monotonic deques of (price, last time that price was in force):
+   *   - `cbWindowMax`: prices strictly decreasing front→back; the front is the
+   *     highest mark in force at any time in the trailing window.
+   *   - `cbWindowMin`: prices strictly increasing front→back; the front is the
+   *     lowest.
+   * An entry that a later, more extreme observation dominates can never be the
+   * window max/min again and is dropped, so both stay short in practice.
+   *
+   * Arrays are never mutated in place — every update assigns a fresh array — so
+   * a shallow copy of the state is a complete, independent copy.
    */
-  cbDriftAnchorPrice?: number;
-  cbDriftAnchorAt?: number;
+  cbWindowMax?: readonly MarkObservation[];
+  cbWindowMin?: readonly MarkObservation[];
 }
 
 export interface CircuitBreakerConfig {
@@ -37,13 +51,19 @@ export interface CircuitBreakerConfig {
    */
   confirmTrips: number;
   /**
-   * #82 — maximum CUMULATIVE drift, as a percentage of the anchor price, that
-   * confirmed relocations may accumulate inside `driftWindowMs`.
+   * #82 / #125 — maximum TOTAL movement of the published mark inside any
+   * trailing `driftWindowMs`, as a percentage.
    *
    * `maxMovePct` bounds a single step. It does not bound a sequence of steps:
    * an attacker who holds a manipulated price for `confirmTrips` cycles earns a
-   * re-baseline, and can then repeat from the new baseline indefinitely. Each
-   * step is legal; the walk is not bounded at all.
+   * re-baseline, and can then repeat from the new baseline; and a walk of
+   * sub-`maxMovePct` steps never trips at all.
+   *
+   * The bound: every published price p at time t satisfies, for every mark m
+   * that was in force at any time in [t − driftWindowMs, t],
+   *     m × (1 − maxCumulativeMovePct/100) ≤ p ≤ m × (1 + maxCumulativeMovePct/100).
+   * It applies to in-threshold steps and confirmed relocations alike, and the
+   * window slides with every check, so there is no boundary to straddle.
    *
    * This is a RATE limit, deliberately, not a hard ceiling. A genuine sustained
    * repricing still completes — it just takes more than one window. A hard
@@ -53,7 +73,7 @@ export interface CircuitBreakerConfig {
    * one: it should be set from observed volatility on the markets you list.
    */
   maxCumulativeMovePct?: number;
-  /** Rolling window for the cumulative bound. Defaults to one hour. */
+  /** Trailing window for the cumulative bound. Defaults to one hour. */
   driftWindowMs?: number;
   /** Injectable clock, for tests. Defaults to Date.now. */
   now?: () => number;
@@ -61,44 +81,99 @@ export interface CircuitBreakerConfig {
   log?: (msg: string) => void;
 }
 
-/** The open #82 drift window, or null when none is open at `nowMs`. */
-function openDriftWindow(
-  state: CircuitBreakerState,
-  nowMs: number,
-  windowMs: number,
-): { anchor: number; openedAt: number } | null {
-  if (
-    state.cbDriftAnchorPrice != null &&
-    state.cbDriftAnchorPrice > 0 &&
-    state.cbDriftAnchorAt != null &&
-    nowMs - state.cbDriftAnchorAt < windowMs
-  ) {
-    return { anchor: state.cbDriftAnchorPrice, openedAt: state.cbDriftAnchorAt };
-  }
-  return null;
+const DEFAULT_DRIFT_WINDOW_MS = 3_600_000;
+
+function lastAt(dq: readonly MarkObservation[] | undefined): number {
+  return dq && dq.length > 0 ? dq[dq.length - 1].at : Number.NEGATIVE_INFINITY;
+}
+
+function pushDominating(
+  dq: readonly MarkObservation[] | undefined,
+  obs: MarkObservation,
+  dominates: (newer: number, older: number) => boolean,
+): MarkObservation[] {
+  const out = dq ? dq.slice() : [];
+  while (out.length > 0 && dominates(obs.price, out[out.length - 1].price)) out.pop();
+  out.push(obs);
+  return out;
 }
 
 /**
- * Where `newPrice` may go inside a window anchored at `anchor`:
- *   - `inside`   — within anchor ± maxCumulative: publish newPrice as-is.
- *   - `edge`     — outside, but the bound edge is strictly between the current
- *                  baseline and newPrice: advance to the edge.
- *   - `spent`    — outside, and the baseline is already at (or past) the edge:
- *                  this window has nothing left to give.
+ * #125 — record that `price` was the mark in force at `atMs`.
+ *
+ * The breaker calls this itself for `lastPrice` on every check. The keeper loop
+ * also calls it when a push lands, for the mark being replaced (it was in force
+ * until that moment) and for the new one. Timestamps never go backwards: an
+ * out-of-order `atMs` is lifted to the newest recorded time, which only keeps an
+ * observation in the window longer (the conservative direction).
  */
-function boundTarget(
+export function recordMarkInForce(
+  state: CircuitBreakerState,
+  price: number,
+  atMs: number,
+): void {
+  if (!(price > 0) || !Number.isFinite(price)) return;
+  const at = Math.max(atMs, lastAt(state.cbWindowMax), lastAt(state.cbWindowMin));
+  const obs: MarkObservation = { price, at };
+  state.cbWindowMax = pushDominating(state.cbWindowMax, obs, (n, o) => n >= o);
+  state.cbWindowMin = pushDominating(state.cbWindowMin, obs, (n, o) => n <= o);
+}
+
+/** Drop observations that left the trailing window. `at` exactly at the cutoff stays in. */
+function pruneWindow(state: CircuitBreakerState, nowMs: number, windowMs: number): void {
+  const cutoff = nowMs - windowMs;
+  const prune = (dq: readonly MarkObservation[] | undefined) => {
+    if (!dq) return dq;
+    let i = 0;
+    while (i < dq.length && dq[i].at < cutoff) i++;
+    return i === 0 ? dq : dq.slice(i);
+  };
+  state.cbWindowMax = prune(state.cbWindowMax);
+  state.cbWindowMin = prune(state.cbWindowMin);
+}
+
+/**
+ * The band a price published now must fall in: [max × (1 − B), min × (1 + B)]
+ * over every mark in force during the trailing window. Also returns when the
+ * binding extreme on each side leaves the window (for the log line).
+ */
+export function markWindowBand(
+  state: CircuitBreakerState,
+  maxCumulativePct: number,
+  windowMs: number,
+): { lo: number; hi: number; hiFreesAt: number; loFreesAt: number } | null {
+  const max = state.cbWindowMax?.[0];
+  const min = state.cbWindowMin?.[0];
+  if (!max || !min) return null;
+  const b = maxCumulativePct / 100;
+  return {
+    lo: max.price * (1 - b),
+    hi: min.price * (1 + b),
+    hiFreesAt: min.at + windowMs,
+    loFreesAt: max.at + windowMs,
+  };
+}
+
+/**
+ * Where `newPrice` may go given the band [lo, hi]:
+ *   - `inside` — newPrice is in the band (edges inclusive): publish it as-is.
+ *   - `edge`   — outside, but the band edge is strictly between the current
+ *                baseline and newPrice: advance to the edge.
+ *   - `spent`  — outside, and the baseline is already at (or past) the edge:
+ *                nothing can be published in that direction until the binding
+ *                extreme leaves the window.
+ */
+function bandTarget(
   lastPrice: number,
   newPrice: number,
-  anchor: number,
-  maxCumulative: number,
+  lo: number,
+  hi: number,
 ): { kind: "inside" } | { kind: "edge"; edge: number } | { kind: "spent"; edge: number } {
-  const cumulativePct = Math.abs((newPrice - anchor) / anchor) * 100;
-  if (cumulativePct <= maxCumulative) return { kind: "inside" };
-  const up = newPrice > anchor;
-  const edge = anchor * (1 + (up ? 1 : -1) * (maxCumulative / 100));
+  if (newPrice >= lo && newPrice <= hi) return { kind: "inside" };
+  const up = newPrice > hi;
+  const edge = up ? hi : lo;
   // Only a move TOWARD newPrice counts as progress; never pull the baseline
-  // backwards (in-threshold steps taken before the window opened can leave it
-  // beyond the edge).
+  // backwards (unreachable through this module, but state can be injected).
   const progress = up
     ? edge > lastPrice && edge < newPrice
     : edge < lastPrice && edge > newPrice;
@@ -108,15 +183,16 @@ function boundTarget(
 /**
  * Returns the price to publish, or `null` if nothing should be published.
  *
- * The returned price is `newPrice` itself except when the #82 cumulative bound
- * applies (see below), in which case it is the bound edge. A caller MUST publish
+ * The returned price is `newPrice` itself except when the cumulative bound
+ * applies (see below), in which case it is the band edge. A caller MUST publish
  * the returned value, never `newPrice`, and must not read the result as a
  * boolean "publish newPrice" signal.
  *
- * Mutates `state` to track trip counts, to open the #82 drift window, and to
- * re-baseline lastPrice when a sustained relocation is confirmed (to the
- * returned price). An in-threshold acceptance does not touch lastPrice — the
- * caller advances it once the returned price is actually published.
+ * Mutates `state` to track trip counts, to record the mark in force in the
+ * trailing window, and to re-baseline lastPrice when a sustained relocation is
+ * confirmed (to the returned price). An in-threshold acceptance does not touch
+ * lastPrice — the caller advances it once the returned price is actually
+ * published.
  *
  * Relocation recovery (issue #30):
  *   A one-off spike is blocked every time it arrives (the next push at the
@@ -127,33 +203,32 @@ function boundTarget(
  *   consecutive trips and lastPrice is re-baselined so subsequent pushes at
  *   that new level are no longer blocked.
  *
- * Cumulative bound as a RATE limit (#82, #116):
- *   A confirmed relocation opens a drift window (anchor = the baseline it moved
- *   away from). While the window is open, NOTHING is published outside
- *   anchor ± maxCumulativeMovePct — neither a confirmed relocation nor an
- *   in-threshold step. A price beyond the bound is advanced to the bound edge,
- *   anchor × (1 ± maxCumulativeMovePct); once the baseline sits at the edge the
- *   rest of the window publishes nothing further in that direction. The next
- *   confirmed relocation after the window expires re-anchors at the (advanced)
- *   baseline, so a held +100% move converges over a few windows
- *   (553 → 719 → 935 → 1108) instead of being refused forever.
+ * Cumulative bound as a ROLLING rate limit (#82, #116, #125):
+ *   Every check first records `lastPrice` as "in force now", then computes the
+ *   band [max × (1 − B), min × (1 + B)] over every mark in force during the
+ *   trailing `driftWindowMs`. NOTHING is published outside it — neither a
+ *   confirmed relocation nor an in-threshold step. A price beyond the band is
+ *   advanced to the band edge; once the baseline sits at the edge nothing more
+ *   is published in that direction until the binding extreme ages out.
  *
- *   It used to refuse without advancing lastPrice. Every new window then
- *   re-anchored at the same stale lastPrice and measured the same >bound
- *   distance, so any held move larger than the bound was refused on every
- *   window, permanently — the wedge #30 fixed, reintroduced by #82 (SOLCAT
- *   +50%, KARDASHEV +67–100% sat frozen for hours on 2026-09-28).
+ *   #116 made the bound a rate limit (publish the edge, don't refuse forever),
+ *   but it only existed inside a FIXED window that a confirmed relocation
+ *   opened. #125 showed three ways past it: (1) sub-maxMovePct creep never
+ *   confirms, so never opened a window (1%/cycle walked 100 → ~15,000 in an
+ *   hour); (2) a move straddling a window boundary got the old window's edge
+ *   and then a fresh budget from the new anchor (1.69× in ~63 min); (3) pulses
+ *   timed at each boundary during a crash re-spent a fresh budget per window
+ *   and pushed the mark ABOVE the pre-crash price while the pool sat at 10%.
+ *   A band over the trailing window of published marks has no window to open
+ *   and no boundary to straddle.
  *
  *   Publishing the clamped edge rather than holding the old mark is deliberate.
  *   For a genuine move the edge is strictly between the old mark and the real
  *   price, so the published mark is strictly less wrong than holding. For a
- *   manipulated move the edge is exactly the displacement the bound already
- *   allowed per window, and it still needs the full confirmTrips run of
+ *   manipulated move the edge is exactly the displacement the bound allows per
+ *   trailing window, and a relocation still needs the full confirmTrips run of
  *   consecutive, mutually consistent trips first — a spike that reverts before
  *   confirming moves nothing.
- *
- *   Not covered (unchanged): a walk made only of in-threshold steps never
- *   confirms a relocation, so it never opens a window.
  */
 export function checkCircuitBreaker(
   state: CircuitBreakerState,
@@ -165,10 +240,19 @@ export function checkCircuitBreaker(
   if (state.lastPrice === 0) return newPrice; // First price — always accept.
 
   const nowMs = (cfg.now ?? Date.now)();
-  const windowMs = cfg.driftWindowMs ?? 3_600_000;
+  const windowMs = cfg.driftWindowMs ?? DEFAULT_DRIFT_WINDOW_MS;
   const maxCumulative = cfg.maxCumulativeMovePct ?? cfg.maxMovePct * 3;
-  const retryInS = (openedAt: number) =>
-    Math.max(0, Math.round((openedAt + windowMs - nowMs) / 1000));
+
+  // #125 — the current baseline is the mark in force right now. Recording it on
+  // EVERY check (not only when it was first published) is what makes the window
+  // measure "was in force at any time in the trailing window", so a mark that
+  // was held for an hour stays binding until an hour after it was replaced.
+  pruneWindow(state, nowMs, windowMs);
+  recordMarkInForce(state, state.lastPrice, nowMs);
+  const band = markWindowBand(state, maxCumulative, windowMs);
+  if (!band) return null; // unreachable: lastPrice was just recorded. Fail closed.
+  const retryInS = (up: boolean) =>
+    Math.max(0, Math.round(((up ? band.hiFreesAt : band.loFreesAt) - nowMs) / 1000));
 
   const movePct =
     Math.abs((newPrice - state.lastPrice) / state.lastPrice) * 100;
@@ -194,22 +278,20 @@ export function checkCircuitBreaker(
       state.cbTripPrice = 0;
     }
 
-    // #116 — inside an open window an in-threshold step is bounded too.
-    // Otherwise a relocation clamped to the edge could step a further
-    // maxMovePct past it immediately, and the bound would be edge + one step.
-    const w = openDriftWindow(state, nowMs, windowMs);
-    if (w) {
-      const t = boundTarget(state.lastPrice, newPrice, w.anchor, maxCumulative);
-      if (t.kind === "edge") return t.edge;
-      if (t.kind === "spent") {
-        emit(
-          `🛑 ${state.symbol}: Circuit breaker CUMULATIVE bound — holding ` +
-            `${state.lastPrice.toFixed(2)} (price ${newPrice.toFixed(2)}, edge ` +
-            `${t.edge.toFixed(2)} from anchor ${w.anchor.toFixed(2)} ± ` +
-            `${maxCumulative}%); next step in ~${retryInS(w.openedAt)}s.`,
-        );
-        return null;
-      }
+    // #125 — in-threshold steps are bounded by the same trailing band. Before,
+    // they were bounded only inside a window a confirmed relocation had opened,
+    // so a walk of sub-maxMovePct steps was not bounded at all.
+    const t = bandTarget(state.lastPrice, newPrice, band.lo, band.hi);
+    if (t.kind === "edge") return t.edge;
+    if (t.kind === "spent") {
+      emit(
+        `🛑 ${state.symbol}: Circuit breaker CUMULATIVE bound — holding ` +
+          `${state.lastPrice.toFixed(2)} (price ${newPrice.toFixed(2)}, trailing ` +
+          `band ${band.lo.toFixed(2)}–${band.hi.toFixed(2)} = ±${maxCumulative}% ` +
+          `over ${Math.round(windowMs / 1000)}s); next step in ~` +
+          `${retryInS(newPrice > band.hi)}s.`,
+      );
+      return null;
     }
     return newPrice;
   }
@@ -233,46 +315,38 @@ export function checkCircuitBreaker(
   }
 
   if (state.cbConsecutiveTrips >= cfg.confirmTrips) {
-    // #82 — a confirmed relocation is necessary but not sufficient. Bound the
-    // cumulative drift these re-baselines may accumulate inside a window.
-    let w = openDriftWindow(state, nowMs, windowMs);
-    if (!w) {
-      // Open a fresh window anchored at the baseline we are moving away from.
-      state.cbDriftAnchorPrice = state.lastPrice;
-      state.cbDriftAnchorAt = nowMs;
-      w = { anchor: state.lastPrice, openedAt: nowMs };
-    }
-
-    const t = boundTarget(state.lastPrice, newPrice, w.anchor, maxCumulative);
-    const cumulativePct = Math.abs((newPrice - w.anchor) / w.anchor) * 100;
+    // #82 — a confirmed relocation is necessary but not sufficient: it must
+    // also fit the trailing band.
+    const t = bandTarget(state.lastPrice, newPrice, band.lo, band.hi);
+    const up = newPrice > state.lastPrice;
 
     if (t.kind === "spent") {
-      // This window's budget in this direction is used up. Deliberately does
-      // NOT reset the trip run: the relocation is still being observed, and it
-      // resumes on the first confirmed trip after the window rolls.
+      // The band is exhausted in this direction. Deliberately does NOT reset
+      // the trip run: the relocation is still being observed, and it resumes on
+      // the first confirmed trip after the binding extreme leaves the window.
       emit(
         `🛑 ${state.symbol}: Circuit breaker CUMULATIVE bound — holding ` +
-          `${state.lastPrice.toFixed(2)} (target ${newPrice.toFixed(2)}). ` +
-          `Drift from anchor ${w.anchor.toFixed(2)} would be ` +
-          `${cumulativePct.toFixed(1)}% > ${maxCumulative}%; this window's ` +
-          `budget is spent, next step in ~${retryInS(w.openedAt)}s.`,
+          `${state.lastPrice.toFixed(2)} (target ${newPrice.toFixed(2)}); ` +
+          `trailing band ${band.lo.toFixed(2)}–${band.hi.toFixed(2)} ` +
+          `(±${maxCumulative}% over ${Math.round(windowMs / 1000)}s) is spent, ` +
+          `next step in ~${retryInS(up)}s.`,
       );
       return null;
     }
 
     let accepted = newPrice;
     if (t.kind === "edge") {
-      // #116 — advance to the bound edge instead of refusing forever.
+      // #116 — advance to the band edge instead of refusing forever.
       emit(
         `🟠 ${state.symbol}: Circuit breaker CUMULATIVE bound — rate-limiting ` +
           `relocation ${state.lastPrice.toFixed(2)} → ${newPrice.toFixed(2)} ` +
-          `to the bound edge ${t.edge.toFixed(2)} (anchor ${w.anchor.toFixed(2)} ` +
-          `± ${maxCumulative}%; target is ${cumulativePct.toFixed(1)}% away). ` +
-          `Next step in ~${retryInS(w.openedAt)}s.`,
+          `to the band edge ${t.edge.toFixed(2)} (trailing band ` +
+          `${band.lo.toFixed(2)}–${band.hi.toFixed(2)}, ±${maxCumulative}%). ` +
+          `Next step in ~${retryInS(up)}s.`,
       );
       accepted = t.edge;
     } else {
-      // Sustained relocation confirmed inside the bound: re-baseline and accept.
+      // Sustained relocation confirmed inside the band: re-baseline and accept.
       emit(
         `🟡 ${state.symbol}: Circuit breaker relocation confirmed after ` +
           `${state.cbConsecutiveTrips} trips — re-baselining ` +
