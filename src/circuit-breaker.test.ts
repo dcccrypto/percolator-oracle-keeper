@@ -88,7 +88,7 @@ describe("single spike — must be blocked and NOT re-baseline", () => {
   it("blocks a >threshold spike", () => {
     const s = makeState(100);
     const accepted = checkCircuitBreaker(s, 120, cfg); // 20% spike
-    assert.equal(accepted, false);
+    assert.equal(accepted, null);
   });
 
   it("does NOT update lastPrice on a blocked spike", () => {
@@ -131,8 +131,8 @@ describe("sustained relocation — un-wedge after confirmTrips (issue #30)", () 
     const s = makeState(100);
     const r1 = checkCircuitBreaker(s, 120, cfg);
     const r2 = checkCircuitBreaker(s, 121, cfg);
-    assert.equal(r1, false);
-    assert.equal(r2, false);
+    assert.equal(r1, null);
+    assert.equal(r2, null);
     assert.equal(s.lastPrice, 100); // not yet re-baselined
   });
 
@@ -173,7 +173,7 @@ describe("sustained relocation — un-wedge after confirmTrips (issue #30)", () 
     // confirmTrips = 3, so 2 trips must not confirm
     checkCircuitBreaker(s, 120, cfg);
     const r2 = checkCircuitBreaker(s, 121, cfg);
-    assert.equal(r2, false, "2nd trip must still be blocked (confirmTrips=3 not reached)");
+    assert.equal(r2, null, "2nd trip must still be blocked (confirmTrips=3 not reached)");
     assert.equal(s.lastPrice, 100);
   });
 });
@@ -238,33 +238,42 @@ describe("#76 a republished last-known price must not clear a relocation run", (
 
 describe("#82 cumulative drift bound", () => {
   const base = { maxMovePct: 10, confirmTrips: 2, log: () => {} };
-  const fresh = () => ({
-    symbol: "T", lastPrice: 100, circuitBreakerTrips: 0,
+  const fresh = (lastPrice = 100): CircuitBreakerState => ({
+    symbol: "T", lastPrice, circuitBreakerTrips: 0,
     cbTripPrice: 0, cbConsecutiveTrips: 0,
   });
 
-  /** Walk one confirmed relocation to `to`, returning whether it was accepted. */
-  function relocate(s: any, to: number, cfg: any) {
-    let ok = false;
-    for (let i = 0; i < cfg.confirmTrips; i++) ok = checkCircuitBreaker(s, to, cfg);
-    return ok;
+  /** Walk one confirmed relocation toward `to`; returns the last result. */
+  function relocate(s: CircuitBreakerState, to: number, cfg: typeof base & { now: () => number }) {
+    // Emulates the caller: an accepted price becomes the baseline once pushed.
+    let r: number | null = null;
+    for (let i = 0; i < cfg.confirmTrips; i++) {
+      r = checkCircuitBreaker(s, to, cfg);
+      if (r !== null) s.lastPrice = r;
+    }
+    return r;
   }
+  const close = (a: number | null, b: number) =>
+    assert.ok(a !== null && Math.abs(a - b) < 1e-9, `expected ${b}, got ${a}`);
 
   it("allows a single confirmed relocation inside the bound", () => {
     const s = fresh();
     const cfg = { ...base, maxCumulativeMovePct: 30, now: () => 0 };
-    assert.equal(relocate(s, 115, cfg), true);
+    assert.equal(relocate(s, 115, cfg), 115);
     assert.equal(s.lastPrice, 115);
   });
 
-  it("REFUSES a sustained walk that exceeds the cumulative bound", () => {
+  it("RATE-LIMITS a walk past the bound to the bound edge, then holds for the window", () => {
     const s = fresh();
     const cfg = { ...base, maxCumulativeMovePct: 25, now: () => 0 };
-    assert.equal(relocate(s, 115, cfg), true, "first step is legal");
+    assert.equal(relocate(s, 115, cfg), 115, "first step is legal");
     // second step is legal on its own (115 -> 132 is ~15%) but cumulative from
-    // the anchor 100 would be 32% > 25%
-    assert.equal(relocate(s, 132, cfg), false, "the walk must be refused");
-    assert.equal(s.lastPrice, 115, "baseline must not advance past the bound");
+    // the anchor 100 would be 32% > 25%: advance to the edge 125, not to 132.
+    close(relocate(s, 132, cfg), 125);
+    close(s.lastPrice, 125);
+    // the window's budget is spent — further confirmations are refused
+    assert.equal(relocate(s, 132, cfg), null);
+    close(s.lastPrice, 125);
   });
 
   it("is a RATE limit, not a wedge — the walk completes after the window rolls", () => {
@@ -272,16 +281,113 @@ describe("#82 cumulative drift bound", () => {
     let t = 0;
     const cfg = { ...base, maxCumulativeMovePct: 25, driftWindowMs: 1000, now: () => t };
     relocate(s, 115, cfg);
-    assert.equal(relocate(s, 132, cfg), false);
+    close(relocate(s, 132, cfg), 125);
     t = 2000;                                    // window rolls over
-    assert.equal(relocate(s, 132, cfg), true, "#30's un-wedging must survive");
+    assert.equal(relocate(s, 132, cfg), 132, "#30's un-wedging must survive");
     assert.equal(s.lastPrice, 132);
   });
 
   it("defaults to 3x maxMovePct when unset", () => {
     const s = fresh();
     const cfg = { ...base, now: () => 0 };       // default cumulative = 30%
-    assert.equal(relocate(s, 115, cfg), true);
-    assert.equal(relocate(s, 132, cfg), false, "32% from anchor exceeds the 30% default");
+    assert.equal(relocate(s, 115, cfg), 115);
+    close(relocate(s, 132, cfg), 130);           // 32% from anchor -> clamped to +30%
+  });
+});
+
+describe("#116 held moves past the cumulative bound converge (no re-anchoring wedge)", () => {
+  const HOUR = 3_600_000;
+  const fresh = (lastPrice: number): CircuitBreakerState => ({
+    symbol: "T", lastPrice, circuitBreakerTrips: 0, cbTripPrice: 0, cbConsecutiveTrips: 0,
+  });
+  /** Feed `price` once per `stepMs` for `durMs`; returns every accepted value. */
+  function hold(s: CircuitBreakerState, price: number, clock: { t: number }, durMs: number, stepMs = 1_500) {
+    const cfg = { maxMovePct: 10, confirmTrips: 3, log: () => {}, now: () => clock.t };
+    const accepted: number[] = [];
+    for (const end = clock.t + durMs; clock.t < end; clock.t += stepMs) {
+      const r = checkCircuitBreaker(s, price, cfg);
+      if (r !== null) { accepted.push(r); s.lastPrice = r; }
+    }
+    return accepted;
+  }
+
+  it("a held +100% move (KARDASHEV 553 -> 1108) converges one bound-width per window", () => {
+    const s = fresh(553);
+    const clock = { t: 0 };
+    const first = hold(s, 1108, clock, HOUR - 60_000);
+    assert.equal(first.length, 1, "exactly one step inside the first window");
+    assert.ok(Math.abs(first[0] - 553 * 1.3) < 1e-9, `first step to the +30% edge, got ${first[0]}`);
+    hold(s, 1108, clock, 2 * HOUR);
+    assert.equal(s.lastPrice, 1108, "reaches the real price once the remainder fits the bound");
+  });
+
+  it("the same move was refused FOREVER without the rate limit (documents the wedge)", () => {
+    // Guard against re-introducing it: after 5 hours we must be at the target.
+    const s = fresh(215);
+    const clock = { t: 0 };
+    hold(s, 323, clock, 5 * HOUR);              // SOLCAT +50.2%
+    assert.equal(s.lastPrice, 323);
+  });
+
+  it("clamps downward moves to the lower edge", () => {
+    const s = fresh(100);
+    const clock = { t: 0 };
+    const steps = hold(s, 40, clock, 3 * HOUR);
+    assert.ok(Math.abs(steps[0] - 70) < 1e-9, `first step to -30%, got ${steps[0]}`);
+    assert.ok(Math.abs(steps[1] - 49) < 1e-9, `second window -30% again, got ${steps[1]}`);
+    assert.equal(s.lastPrice, 40);
+  });
+
+  it("never publishes past anchor ± bound inside a window", () => {
+    const s = fresh(100);
+    const clock = { t: 0 };
+    const cfg = { maxMovePct: 10, confirmTrips: 3, log: () => {}, now: () => clock.t };
+    for (; clock.t < HOUR - 1; clock.t += 1_500) {
+      const r = checkCircuitBreaker(s, 1_000, cfg); // attacker holds 10x
+      if (r !== null) s.lastPrice = r;
+      assert.ok(s.lastPrice <= 130 + 1e-9, `mark ${s.lastPrice} escaped the +30% bound`);
+    }
+  });
+
+  it("a held +40% cannot overshoot the edge by one in-threshold step", () => {
+    // After the clamp to 130, 140 is only 7.7% from the baseline — in-threshold.
+    // Without bounding in-threshold steps inside the window the mark would reach
+    // 140 (edge + one step) within seconds.
+    const s = fresh(100);
+    const clock = { t: 0 };
+    const steps = hold(s, 140, clock, 3_600_000 - 60_000);
+    assert.deepEqual(steps.map((x) => Math.round(x * 1e6) / 1e6), [130]);
+    assert.ok(Math.abs(s.lastPrice - 130) < 1e-9);
+    hold(s, 140, clock, 120_000);               // window rolls: in-threshold, accepted
+    assert.equal(s.lastPrice, 140);
+  });
+
+  it("a spike that reverts before confirmTrips moves nothing", () => {
+    const s = fresh(100);
+    const cfg = { maxMovePct: 10, confirmTrips: 3, log: () => {}, now: () => 0 };
+    assert.equal(checkCircuitBreaker(s, 500, cfg), null);
+    assert.equal(checkCircuitBreaker(s, 500, cfg), null);
+    assert.equal(checkCircuitBreaker(s, 101, cfg), 101); // reverts: run cleared
+    assert.equal(checkCircuitBreaker(s, 500, cfg), null);
+    assert.equal(s.lastPrice, 100);
+    assert.equal(s.cbDriftAnchorPrice, undefined, "no relocation ever confirmed");
+  });
+
+  it("does not clamp BACKWARD when in-threshold steps already carried the baseline past the edge", () => {
+    const s = fresh(150);                       // walked here by <10% steps
+    s.cbDriftAnchorPrice = 100;
+    s.cbDriftAnchorAt = 0;
+    const cfg = { maxMovePct: 10, confirmTrips: 1, log: () => {}, now: () => 10 };
+    assert.equal(checkCircuitBreaker(s, 200, cfg), null, "edge 130 is behind 150 — refuse, do not pull back");
+    assert.equal(s.lastPrice, 150);
+  });
+
+  it("a clamped relocation can return to the anchor", () => {
+    const s = fresh(100);
+    const clock = { t: 0 };
+    hold(s, 200, clock, 60_000);
+    assert.ok(Math.abs(s.lastPrice - 130) < 1e-9);
+    hold(s, 100, clock, 60_000);                // 23% back down, 0% from the anchor
+    assert.equal(s.lastPrice, 100);
   });
 });

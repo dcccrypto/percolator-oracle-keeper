@@ -224,7 +224,7 @@ describe("#34 DexScreener tighter circuit-breaker bound", () => {
     const s = makeState(100);
     assert.equal(
       checkCircuitBreaker(s, 107, { maxMovePct: dexMaxPct, confirmTrips, log: silent }),
-      false,
+      null,
       "7% move should be blocked by the tighter 5% DexScreener bound",
     );
   });
