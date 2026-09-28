@@ -6,7 +6,7 @@ Production-grade oracle keeper for [Percolator](https://github.com/dcccrypto/per
 
 - **Multi-source price failover**: Pyth Hermes → Jupiter → DexScreener → mainnet CA lookup
 - **Staleness detection**: alerts if price hasn't updated in configurable threshold (default 30s)
-- **Circuit breaker**: rejects price moves > 10% per update (configurable); a sustained move confirms after 3 consecutive trips, and confirmed moves are rate-limited to 30% per hour from the drift anchor (a larger move advances to the bound edge each window instead of being refused)
+- **Circuit breaker**: rejects price moves > 10% per update (configurable); a sustained move confirms after 3 consecutive trips, and every published mark is rate-limited to ±30% of every mark in force during the trailing hour — sub-threshold steps included (a larger move advances to the band edge and continues as older marks leave the window, instead of being refused)
 - **Health endpoint**: `/health` for Railway/monitoring with per-market stats
 - **Graceful shutdown** with drain on SIGINT/SIGTERM
 - **Supabase auto-discovery**: automatically cranks newly-created markets

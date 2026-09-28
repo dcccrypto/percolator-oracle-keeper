@@ -18,7 +18,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { checkCircuitBreaker } from "./circuit-breaker.ts";
+import { checkCircuitBreaker, recordMarkInForce } from "./circuit-breaker.ts";
 import type { CircuitBreakerState } from "./circuit-breaker.ts";
 
 // ── helpers ──────────────────────────────────────────────────
@@ -370,13 +370,13 @@ describe("#116 held moves past the cumulative bound converge (no re-anchoring we
     assert.equal(checkCircuitBreaker(s, 101, cfg), 101); // reverts: run cleared
     assert.equal(checkCircuitBreaker(s, 500, cfg), null);
     assert.equal(s.lastPrice, 100);
-    assert.equal(s.cbDriftAnchorPrice, undefined, "no relocation ever confirmed");
+    assert.deepEqual(s.cbWindowMax?.map((o) => o.price), [100], "only the real mark was ever in force");
   });
 
-  it("does not clamp BACKWARD when in-threshold steps already carried the baseline past the edge", () => {
-    const s = fresh(150);                       // walked here by <10% steps
-    s.cbDriftAnchorPrice = 100;
-    s.cbDriftAnchorAt = 0;
+  it("does not clamp BACKWARD when injected state already sits past the edge", () => {
+    const s = fresh(150);                       // e.g. restored from an older bound
+    s.cbWindowMax = [{ price: 150, at: 0 }];
+    s.cbWindowMin = [{ price: 100, at: 0 }, { price: 150, at: 0 }];
     const cfg = { maxMovePct: 10, confirmTrips: 1, log: () => {}, now: () => 10 };
     assert.equal(checkCircuitBreaker(s, 200, cfg), null, "edge 130 is behind 150 — refuse, do not pull back");
     assert.equal(s.lastPrice, 150);
@@ -389,5 +389,144 @@ describe("#116 held moves past the cumulative bound converge (no re-anchoring we
     assert.ok(Math.abs(s.lastPrice - 130) < 1e-9);
     hold(s, 100, clock, 60_000);                // 23% back down, 0% from the anchor
     assert.equal(s.lastPrice, 100);
+  });
+});
+
+// ── #125 — the cumulative bound is a ROLLING band over every published mark ──
+//
+// #116 bounded movement only inside a fixed window opened by a confirmed
+// relocation. Three ways past it (reported by @6figpsolseeker in #125): creep
+// made only of sub-threshold steps never opened a window; a move straddling the
+// window boundary got the old window's edge AND a fresh budget from the new
+// anchor; and pulses timed at each boundary during a crash re-spent a fresh
+// budget every window. These drive the breaker the way the keeper does (check,
+// publish what it returned, next cycle) and assert the invariant itself: every
+// published mark is within ±B of every mark in force during the trailing window.
+describe("#125 rolling cumulative bound — no creep, no straddle, no boundary pulses", () => {
+  const MIN = 60_000;
+  const HOUR = 3_600_000;
+  const STEP = 1_500;
+  const B = 0.3;
+  const fresh = (lastPrice: number): CircuitBreakerState => ({
+    symbol: "T", lastPrice, circuitBreakerTrips: 0, cbTripPrice: 0, cbConsecutiveTrips: 0,
+  });
+  /** Drive `pool(t)` every STEP from `from` to `to`; returns the in-force change points. */
+  function drive(s: CircuitBreakerState, pool: (t: number) => number, from: number, to: number) {
+    const marks: Array<[number, number]> = [[from, s.lastPrice]];
+    for (let t = from; t < to; t += STEP) {
+      // Compare against the baseline BEFORE the call: a confirmed relocation
+      // re-baselines lastPrice inside checkCircuitBreaker itself.
+      const before = s.lastPrice;
+      const r = checkCircuitBreaker(s, pool(t), {
+        maxMovePct: 10, confirmTrips: 3, log: () => {}, now: () => t,
+      });
+      if (r !== null) {
+        if (r !== before) marks.push([t, r]);
+        s.lastPrice = r;
+      }
+    }
+    return marks;
+  }
+  /** Every later mark within ±B of every earlier mark that was in force < 1h before it. */
+  function assertTrailingBound(marks: Array<[number, number]>) {
+    for (let j = 1; j < marks.length; j++) {
+      for (let i = j - 1; i >= 0; i--) {
+        const iEnd = marks[i + 1][0];
+        if (marks[j][0] - iEnd > HOUR) break;
+        const [a, b] = [marks[i][1], marks[j][1]];
+        assert.ok(
+          b <= a * (1 + B) + 1e-9 && b >= a * (1 - B) - 1e-9,
+          `mark ${b} at ${(marks[j][0] / MIN).toFixed(1)}m is outside ±30% of ${a}, ` +
+            `in force until ${(iEnd / MIN).toFixed(1)}m`,
+        );
+      }
+    }
+  }
+
+  it("(1) in-threshold creep is bounded — +1%/cycle cannot walk the mark past +30%/h", () => {
+    const s = fresh(100);
+    // Pool rises 1% per cycle for an hour: never a >10% step, so it never trips.
+    const marks = drive(s, (t) => 100 * 1.01 ** Math.floor(t / STEP), 0, HOUR);
+    assertTrailingBound(marks);
+    assert.ok(s.lastPrice <= 130 + 1e-9, `creep reached ${s.lastPrice} inside one hour`);
+    assert.ok(s.lastPrice >= 130 - 1e-9, "…but it does advance all the way to the band edge");
+  });
+
+  it("(2) a move straddling the old window boundary gets no fresh budget", () => {
+    const s = fresh(100);
+    // #125's path, with the last leg at 165 rather than 169: 169 is exactly
+    // 130 × 1.3, which #116's float edge test happened to refuse, hiding the bug.
+    const pool = (t: number) => (t < 1 * MIN ? 100 : t < 57 * MIN ? 115 : t < 63.5 * MIN ? 130 : 165);
+    const marks = drive(s, pool, 0, 3 * HOUR);
+    assertTrailingBound(marks);
+    // #116 published 165 at ~63.5m: 1.65× within ~63 minutes of the 100 mark.
+    const at = (m: number) => [...marks].reverse().find(([t]) => t <= m * MIN)![1];
+    assert.ok(at(66) <= 115 * 1.3 + 1e-9, `mark ${at(66)} at 66m; 115 was in force at 57m`);
+    assert.equal(s.lastPrice, 165, "still a rate limit: the genuine level is reached");
+  });
+
+  it("(3) boundary pulses during a crash cannot lift the mark above the pre-crash price", () => {
+    const s = fresh(100);
+    // True price 10 from 1m on; attacker pumps the pool to 1000 for the last
+    // 5.5 min of every hour (the #125 schedule, aimed at #116's window edges).
+    const pool = (t: number) => {
+      if (t < 1 * MIN) return 100;
+      const k = (t - 2.8 * MIN) % HOUR;
+      return t > 2.8 * MIN && k > HOUR - 5.5 * MIN ? 1000 : 10;
+    };
+    const marks = drive(s, pool, 0, 440 * MIN);
+    assertTrailingBound(marks);
+    const peakAfterCrash = Math.max(...marks.filter(([t]) => t > 2 * MIN).map(([, p]) => p));
+    // #116 published 219.7 at 123m and was still 2-4× the pool at 440m.
+    assert.ok(peakAfterCrash <= 100 + 1e-9, `mark rose to ${peakAfterCrash} while the pool sat at 10`);
+    assert.ok(s.lastPrice < 50, `mark ${s.lastPrice} at 440m is still pinned high`);
+  });
+
+  it("boundary-exact: a price exactly at the edge is accepted unclamped", () => {
+    const s = fresh(100);
+    const cfg = { maxMovePct: 10, confirmTrips: 1, log: () => {}, now: () => 0 };
+    assert.equal(checkCircuitBreaker(s, 130, cfg), 130);   // exactly +30%
+    const d = fresh(100);
+    assert.equal(checkCircuitBreaker(d, 70, cfg), 70);     // exactly −30%
+  });
+
+  it("boundary-exact: a mark in force exactly driftWindowMs ago still binds; 1 ms later it does not", () => {
+    const W = 10_000;
+    const cfg = (t: number) => ({ maxMovePct: 10, confirmTrips: 1, driftWindowMs: W, log: () => {}, now: () => t });
+    const s = fresh(130);
+    recordMarkInForce(s, 100, 0);                           // 100 was the mark until t=0
+    recordMarkInForce(s, 130, 0);
+    assert.equal(checkCircuitBreaker(s, 140, cfg(W)), null, "100 is still in the window at exactly W");
+    assert.equal(checkCircuitBreaker(s, 140, cfg(W + 1)), 140, "…and has left it 1 ms later");
+  });
+
+  it("an in-threshold step past the band is clamped to the edge, not accepted whole", () => {
+    const s = fresh(125);
+    recordMarkInForce(s, 100, 0);
+    recordMarkInForce(s, 125, 0);
+    const cfg = { maxMovePct: 10, confirmTrips: 3, log: () => {}, now: () => 1 };
+    assert.equal(checkCircuitBreaker(s, 135, cfg), 130);    // 8% step, but 35% from 100
+  });
+
+  it("keeps the window deques short on a noisy market", () => {
+    const s = fresh(100);
+    let x = 1;
+    const noise = () => ((x = (x * 48271) % 2147483647) / 2147483647 - 0.5) * 0.04; // ±2%
+    drive(s, () => 100 * (1 + noise()), 0, 6 * HOUR);
+    assert.ok((s.cbWindowMax?.length ?? 0) < 64, `max deque grew to ${s.cbWindowMax?.length}`);
+    assert.ok((s.cbWindowMin?.length ?? 0) < 64, `min deque grew to ${s.cbWindowMin?.length}`);
+  });
+
+  it("never mutates a window array in place (shallow copies stay independent)", () => {
+    const s = fresh(100);
+    const cfg = { maxMovePct: 10, confirmTrips: 3, log: () => {}, now: () => 0 };
+    checkCircuitBreaker(s, 101, cfg);
+    const snapshot = { ...s };
+    const maxRef = s.cbWindowMax;
+    const before = JSON.stringify(maxRef);
+    s.lastPrice = 101;
+    checkCircuitBreaker(s, 102, { ...cfg, now: () => 1 });
+    assert.equal(JSON.stringify(maxRef), before, "the old array was modified");
+    assert.equal(snapshot.cbWindowMax, maxRef);
   });
 });
