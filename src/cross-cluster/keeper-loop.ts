@@ -326,9 +326,20 @@ export function acceptedPublishPrice(
   smoothedE6: bigint,
   smoothedUsd: number,
   acceptedUsd: number,
+  baselineUsd?: number,
 ): { priceE6: bigint; priceUsd: number } {
   if (acceptedUsd === smoothedUsd) {
     return { priceE6: smoothedE6, priceUsd: smoothedUsd };
+  }
+  // #125 follow-up — a cumulative-bound HOLD re-publishes the current baseline.
+  // The baseline is always an exact E6 value (Number(e6) / 1e6), so recover that
+  // E6 exactly. floor/ceil of `baseline * 1e6` is off by one unit for ~1.5% of
+  // E6 values (float noise lands just below/above the integer), which would
+  // ratchet a held mark one unit per republish, every cycle.
+  if (baselineUsd !== undefined && acceptedUsd === baselineUsd) {
+    let e6 = BigInt(Math.round(acceptedUsd * 1_000_000));
+    if (e6 < 1n) e6 = 1n;
+    return { priceE6: e6, priceUsd: priceE6ToUsdNumber(e6) };
   }
   const scaled = acceptedUsd * 1_000_000;
   // Clamped toward the baseline: an upward clamp sits below the smoothed price
@@ -579,7 +590,12 @@ async function runCycle(
     // rate-limited to the edge of the cumulative bound). Publish exactly what
     // it accepted — never the smoothed price it was shown — and record that
     // same value as the pending baseline.
-    const publish = acceptedPublishPrice(priceE6, priceUsd, acceptedUsd);
+    const publish = acceptedPublishPrice(
+      priceE6,
+      priceUsd,
+      acceptedUsd,
+      currentCircuitBreakerState.lastPrice,
+    );
     const { commitNow, deferred } = splitBreakerCommit(
       currentCircuitBreakerState,
       candidateCircuitBreakerState,
