@@ -72,13 +72,28 @@
  *   - Independent interval (crank only needs to run every ~10-30s; the
  *     oracle push runs every ~0.5-7s and must not be slowed down by this).
  *   - Independent errors — a crank failure never touches oracle-push state.
- *   - One instruction per transaction. Multiple crank instructions CANNOT
- *     be batched in a single tx: the first one's `accrue_asset_to_not_atomic`
- *     bumps `oracle_epoch`, which invalidates account health certs for any
- *     subsequent instruction in the same tx (`EngineStale` / Custom(19)). So
- *     unlike `pushAuthMarkBatch`, this sends one tx per market per cycle,
- *     fire-and-forget (no confirm await), same as the push loop's
- *     fire-and-forget style.
+ *   - One transaction per market per cycle, fire-and-forget (no confirm
+ *     await), same as the push loop's style.
+ *
+ * Refreshing positioned portfolios (2026-09-28):
+ *   The accrual crank above moves K/F, and every such move marks the whole
+ *   positioned cohort stale (`stale_account_count_<side> =
+ *   stored_pos_count_<side>`). Until each positioned portfolio is refreshed
+ *   the market reads `loss_stale_active` and risk-increasing trades revert
+ *   Custom(21). The accrual crank only refreshes the account it targets, so a
+ *   market with any third-party position stayed loss-stale forever. Each cycle
+ *   now sends, in ONE transaction:
+ *     [bounded catch-up cranks if behind] -> accrue(LP, observation)
+ *       -> refresh(p) with NO observation for every positioned portfolio p
+ *          (non-LP first, LP last)
+ *   The refreshes must share the accrual's slot: a no-observation crank is
+ *   rejected (Custom(22)) while a mark/funding move is still pending. The
+ *   transaction is simulated first; refreshes the engine rejects (e.g. a side
+ *   the accrual did not re-stale selects NoAction -> Custom(22)) are pruned,
+ *   and the simulated post-state confirms the market ends not loss-stale. See
+ *   positioned-refresh.ts for the engine references. (The older note here
+ *   that crank instructions cannot share a transaction predates the v18
+ *   auto-crank planner; measured on devnet, the sequence above lands clean.)
  */
 import {
   Connection,
@@ -87,6 +102,7 @@ import {
   Transaction,
   TransactionInstruction,
   ComputeBudgetProgram,
+  VersionedTransaction,
 } from "@solana/web3.js";
 import {
   encodePermissionlessCrank,
@@ -98,6 +114,18 @@ import {
 } from "@percolatorct/sdk";
 import type { CrankObservationHint } from "@percolatorct/sdk";
 import type { MarketEntry, Registry } from "./registry.ts";
+import {
+  catchupAllowsRefresh,
+  catchupCrankCount,
+  decodeMarketRefreshState,
+  isAssetLossStale,
+  marketHasPositions,
+  parseInstructionError,
+  planCrankTx,
+  positionedSetMatchesMarket,
+  selectPositionedPortfolios,
+} from "./positioned-refresh.ts";
+import type { CrankPlan, MarketRefreshState, PositionedPortfolio } from "./positioned-refresh.ts";
 
 const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
 const COMPUTE_UNIT_LIMIT = 250_000;
@@ -141,6 +169,14 @@ interface CrankMarketState {
   lastCrankAt: number | null;
   lastSig: string | null;
   lastErrorMsg: string | null;
+  /** Cached portfolios holding a position on asset 0 (refreshed after each accrual). */
+  positioned: PositionedPortfolio[] | null;
+  positionedFetchedAt: number;
+  /** Set when a simulation still ended loss-stale: re-read the positioned set. */
+  positionedDirty: boolean;
+  /** Last refresh summary logged, so steady-state cycles stay quiet. */
+  lastRefreshSummary: string | null;
+  decodeWarned: boolean;
 }
 
 function freshCrankMarketState(): CrankMarketState {
@@ -156,6 +192,11 @@ function freshCrankMarketState(): CrankMarketState {
     lastCrankAt: null,
     lastSig: null,
     lastErrorMsg: null,
+    positioned: null,
+    positionedFetchedAt: 0,
+    positionedDirty: false,
+    lastRefreshSummary: null,
+    decodeWarned: false,
   };
 }
 
@@ -245,17 +286,21 @@ export function isLpVaultPortfolio(data: Uint8Array): boolean {
  * null if none exists yet (e.g. a brand-new market with no LP vault) — the
  * caller should skip cranking that market until discovery succeeds.
  */
-async function findLpPortfolio(
-  conn: Connection,
-  market: PublicKey,
-): Promise<PublicKey | null> {
-  const accounts = await conn.getProgramAccounts(WRAPPER_PROGRAM_ID, {
+function fetchMarketPortfolios(conn: Connection, market: PublicKey) {
+  return conn.getProgramAccounts(WRAPPER_PROGRAM_ID, {
     filters: [
       { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
       { memcmp: { offset: 0, bytes: V17_PORTFOLIO_MAGIC.toString("base64"), encoding: "base64" } },
       { memcmp: { offset: V17_PF_MARKET_OFF, bytes: market.toBase58() } },
     ],
   });
+}
+
+async function findLpPortfolio(
+  conn: Connection,
+  market: PublicKey,
+): Promise<PublicKey | null> {
+  const accounts = await fetchMarketPortfolios(conn, market);
   for (const { pubkey, account } of accounts) {
     if (isLpVaultPortfolio(account.data)) return pubkey;
   }
@@ -344,42 +389,83 @@ async function crankOneMarket(
     }
   }
 
-  const ix = buildCrankIx(keeper.publicKey, market, state.lpPortfolio);
-
-  if (dryRun) {
-    console.log(`[cranker][DRY-RUN] Refresh crank market=${marketAddress.slice(0, 8)}… portfolio=${state.lpPortfolio.toBase58().slice(0, 8)}…`);
-    return;
-  }
+  const lpPortfolio = state.lpPortfolio;
 
   try {
+    // One read gives both the market state and the slot it was read at.
+    const acct = await withRpcRetry(label, () => devnetConn.getAccountInfoAndContext(market, "processed"));
+    if (!acct.value) throw new Error(`market ${marketAddress} could not find account`);
+    let pre: MarketRefreshState | null = null;
+    try {
+      pre = decodeMarketRefreshState(acct.value.data);
+    } catch (err) {
+      // Unknown layout: fall back to the single accrual crank this loop always sent.
+      if (!state.decodeWarned) {
+        state.decodeWarned = true;
+        console.warn(`[cranker] ${label}: market header decode failed (${err instanceof Error ? err.message : String(err)}) — sending accrual crank only`);
+      }
+    }
+    const catchup = pre ? catchupCrankCount(BigInt(acct.context.slot) - pre.slotLast, pre.maxAccrualDtSlots) : 0;
+    const targets = pre && marketHasPositions(pre) && catchupAllowsRefresh(catchup)
+      ? await positionedPortfoliosFor(devnetConn, market, label, pre, state)
+      : [];
+
+    const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan =>
+      planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t });
+
+    if (dryRun) {
+      const plan = build(targets);
+      console.log(
+        `[cranker][DRY-RUN] ${label}: catchup=${catchup} accrue=${lpPortfolio.toBase58().slice(0, 8)}… ` +
+          `refresh=[${plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio.toBase58().slice(0, 8)).join(",")}]`,
+      );
+      return;
+    }
+
     const bh = await withRpcRetry(label, () => devnetConn.getLatestBlockhash("processed"));
-    const tx = new Transaction();
-    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT }));
-    tx.add(ix);
-    tx.recentBlockhash = bh.blockhash;
-    tx.feePayer = keeper.publicKey;
-    tx.sign(keeper);
+    const toTx = (plan: CrankPlan): Transaction => {
+      const tx = new Transaction();
+      tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: plan.computeUnits }));
+      for (const c of plan.cranks) tx.add(c.ix);
+      tx.recentBlockhash = bh.blockhash;
+      tx.feePayer = keeper.publicKey;
+      tx.sign(keeper);
+      return tx;
+    };
 
     // PREFLIGHT FIRST so a reverting crank is VISIBLE instead of being silently
-    // counted as a success. This is the 2026-07-06 root cause: the old path sent
-    // with skipPreflight:true fire-and-forget, so every EngineStale(19) /
-    // EngineLockActive(21) revert was counted as `totalCranks++` and the loop
-    // reported "healthy" while the markets drifted to an UNRECOVERABLE deep-stale
-    // state. A crank that would revert must NOT be sent — and must be alerted on.
-    // Legacy Transaction overload: it's already signed by the keeper with a fresh
-    // blockhash, so a plain simulate reflects exactly what a real send would do.
-    const sim = await withRpcRetry(label, () => devnetConn.simulateTransaction(tx));
-    if (sim.value.err) {
+    // counted as a success (2026-07-06 root cause: skipPreflight fire-and-forget
+    // counted every EngineStale(19)/EngineLockActive(21) revert as progress).
+    // The simulation also prunes refreshes the engine would reject (Custom(22)
+    // for a portfolio this accrual did not re-stale), and returns the market's
+    // post-state so the loop can confirm the market ends not loss-stale.
+    const resolved = await resolveCrankPlan(build, targets, async (plan) => {
+      const tx = toTx(plan);
+      const sim = await withRpcRetry(label, () =>
+        devnetConn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), {
+          sigVerify: false,
+          commitment: "processed",
+          accounts: { encoding: "base64", addresses: [marketAddress] },
+        }),
+      );
+      const acc = sim.value.accounts?.[0];
+      return {
+        err: sim.value.err,
+        logs: sim.value.logs ?? null,
+        marketData: acc ? Buffer.from(acc.data[0], "base64") : null,
+      };
+    });
+
+    if (resolved.sim.err) {
       const code =
-        parseCustomErrorCode(sim.value.err) ?? parseCustomErrorCode(sim.value.logs?.join("\n"));
+        parseCustomErrorCode(resolved.sim.err) ?? parseCustomErrorCode(resolved.sim.logs?.join("\n"));
       state.totalReverts++;
       state.consecutiveReverts++;
       state.lastRevertCode = code;
-      state.lastErrorMsg = `revert ${code != null ? `Custom(${code})` : JSON.stringify(sim.value.err)}`;
+      state.lastErrorMsg = `revert ${code != null ? `Custom(${code})` : JSON.stringify(resolved.sim.err)}`;
       // 19=EngineStale, 21=EngineLockActive = the deep-stale signature. A fresh /
       // lightly-stale market cranks CLEAN (only a rotting one reverts every cycle),
-      // so escalate loudly once it persists — that early warning is exactly what
-      // was missing when these 4 markets drifted past the point of recovery.
+      // so escalate loudly once it persists.
       if (state.consecutiveReverts === 1 || state.consecutiveReverts % REVERT_ALERT_THRESHOLD === 0) {
         const tag = state.consecutiveReverts >= REVERT_ALERT_THRESHOLD ? "[cranker][ALERT]" : "[cranker][REVERT]";
         console.warn(
@@ -390,6 +476,8 @@ async function crankOneMarket(
       return;
     }
 
+    const plan = resolved.plan;
+    const tx = toTx(plan);
     // Clean preflight → submit (skipPreflight because we just simulated). Still
     // fire-and-forget on confirmation, like the push loop — a dropped tx just
     // retries next cycle, but we now KNOW it would have executed.
@@ -407,6 +495,14 @@ async function crankOneMarket(
     }
     state.consecutiveReverts = 0;
     state.lastRevertCode = null;
+
+    reportRefreshOutcome(label, pre, resolved, state);
+    if (plan.overflow.length > 0) {
+      console.warn(
+        `[cranker][ALERT] ${label}: ${plan.overflow.length} positioned portfolio(s) did not fit one transaction and were not refreshed — ` +
+          `the market stays loss-stale until they are (needs multi-tx same-slot refresh or an ALT).`,
+      );
+    }
   } catch (err) {
     state.totalErrors++;
     state.lastErrorMsg = err instanceof Error ? err.message : String(err);
@@ -421,6 +517,142 @@ async function crankOneMarket(
         console.warn(`[cranker][ALERT] ${label}: seeded LP portfolio ${entry.lpPortfolio} not found on-chain — falling back to discovery`);
       }
       state.lpPortfolio = null;
+      state.positioned = null;
+    }
+  }
+}
+
+/** Re-read the positioned set at most this often while it still matches the market. */
+const POSITIONED_MAX_AGE_MS = 5 * 60_000;
+
+/**
+ * The market's positioned portfolios (active leg on asset 0), cached per
+ * market. Re-read when the cached set's leg counts no longer match
+ * `stored_pos_count_long/short` (a position opened or closed), when the last
+ * simulation still ended loss-stale, or after POSITIONED_MAX_AGE_MS. Never
+ * re-read more often than DISCOVERY_RETRY_MS.
+ */
+async function positionedPortfoliosFor(
+  conn: Connection,
+  market: PublicKey,
+  label: string,
+  pre: MarketRefreshState,
+  state: CrankMarketState,
+): Promise<PositionedPortfolio[]> {
+  const now = Date.now();
+  const cached = state.positioned;
+  const stale =
+    cached === null ||
+    state.positionedDirty ||
+    !positionedSetMatchesMarket(cached, pre) ||
+    now - state.positionedFetchedAt > POSITIONED_MAX_AGE_MS;
+  if (!stale || (cached !== null && now - state.positionedFetchedAt < DISCOVERY_RETRY_MS)) {
+    return cached ?? [];
+  }
+  state.positionedFetchedAt = now;
+  try {
+    const accounts = await withRpcRetry(label, () => fetchMarketPortfolios(conn, market));
+    const set = selectPositionedPortfolios(accounts.map((a) => ({ pubkey: a.pubkey, data: a.account.data })));
+    const changed =
+      cached === null ||
+      cached.length !== set.length ||
+      set.some((p) => !cached.some((c) => c.pubkey.equals(p.pubkey)));
+    if (changed) {
+      console.log(
+        `[cranker] ${label}: ${set.length} positioned portfolio(s) to refresh after each accrual: ` +
+          `[${set.map((p) => `${p.pubkey.toBase58().slice(0, 8)}${p.isLp ? "(LP)" : ""}`).join(", ")}]`,
+      );
+    }
+    if (!positionedSetMatchesMarket(set, pre)) {
+      console.warn(
+        `[cranker] ${label}: positioned legs found (${set.reduce((n, p) => n + p.longLegs, 0)}L/${set.reduce((n, p) => n + p.shortLegs, 0)}S) ` +
+          `!= market stored_pos_count (${pre.storedPosLong}L/${pre.storedPosShort}S) — refreshing what was found`,
+      );
+    }
+    state.positioned = set;
+    state.positionedDirty = false;
+    return set;
+  } catch (err) {
+    console.warn(`[cranker] ${label}: positioned-portfolio discovery failed — ${err instanceof Error ? err.message : String(err)}`);
+    return cached ?? [];
+  }
+}
+
+function reportRefreshOutcome(
+  label: string,
+  pre: MarketRefreshState | null,
+  resolved: ResolvedCrankPlan,
+  state: CrankMarketState,
+): void {
+  const refreshed = resolved.plan.cranks.filter((c) => c.kind === "refresh").length;
+  let post: MarketRefreshState | null = null;
+  try {
+    post = resolved.sim.marketData ? decodeMarketRefreshState(resolved.sim.marketData) : null;
+  } catch {
+    post = null;
+  }
+  const postStale = post ? isAssetLossStale(post) || post.lossStaleActive : null;
+  const summary =
+    `refreshed=${refreshed} pruned=${resolved.pruned.length}` +
+    `${resolved.pruned.length ? ` [${resolved.pruned.map((p) => `${p.pubkey.toBase58().slice(0, 8)}:${p.code ?? "?"}`).join(",")}]` : ""}` +
+    ` loss_stale ${pre ? Number(pre.lossStaleActive) : "?"}→${post ? Number(post.lossStaleActive) : "?"}`;
+  if (postStale && pre && marketHasPositions(pre)) {
+    // Something positioned was not refreshed: re-read the set next cycle.
+    state.positionedDirty = true;
+    if (state.lastRefreshSummary !== summary) {
+      console.warn(`[cranker] ${label}: market still loss-stale after crank (${summary}) — re-discovering positioned portfolios`);
+    }
+  } else if (state.lastRefreshSummary !== summary && (refreshed > 0 || resolved.pruned.length > 0)) {
+    console.log(`[cranker] ${label}: accrue + refresh ok (${summary})`);
+  }
+  state.lastRefreshSummary = summary;
+}
+
+export interface SimOutcome {
+  err: unknown;
+  logs: string[] | null;
+  marketData: Uint8Array | null;
+}
+
+export interface ResolvedCrankPlan {
+  plan: CrankPlan;
+  sim: SimOutcome;
+  pruned: { pubkey: PublicKey; code: number | null }[];
+}
+
+/** Refreshes pruned one at a time before giving up on refreshing this cycle. */
+export const MAX_REFRESH_PRUNES = 3;
+
+/**
+ * Simulate the plan and drop refreshes the engine rejects, one per
+ * simulation, until the transaction simulates clean. A failure on a catch-up
+ * or accrual crank is returned as-is for the revert path. After
+ * MAX_REFRESH_PRUNES prunes every remaining refresh is dropped, so the cycle
+ * degrades to the accrual-only crank this loop always sent (at most
+ * MAX_REFRESH_PRUNES + 2 simulations).
+ *
+ * Instruction 0 of every crank transaction is the compute-budget ix, so
+ * simulation index i maps to plan.cranks[i - 1].
+ */
+export async function resolveCrankPlan(
+  build: (targets: ReadonlyArray<PositionedPortfolio>) => CrankPlan,
+  targets: ReadonlyArray<PositionedPortfolio>,
+  simulate: (plan: CrankPlan) => Promise<SimOutcome>,
+): Promise<ResolvedCrankPlan> {
+  let remaining = [...targets];
+  const pruned: { pubkey: PublicKey; code: number | null }[] = [];
+  for (;;) {
+    const plan = build(remaining);
+    const sim = await simulate(plan);
+    if (!sim.err) return { plan, sim, pruned };
+    const ie = parseInstructionError(sim.err);
+    const crank = ie && ie.index >= 1 ? plan.cranks[ie.index - 1] : undefined;
+    if (!crank || crank.kind !== "refresh") return { plan, sim, pruned };
+    pruned.push({ pubkey: crank.portfolio, code: ie?.custom ?? null });
+    remaining = remaining.filter((p) => !p.pubkey.equals(crank.portfolio));
+    if (pruned.length >= MAX_REFRESH_PRUNES && remaining.length > 0) {
+      for (const p of remaining) pruned.push({ pubkey: p.pubkey, code: null });
+      remaining = [];
     }
   }
 }
