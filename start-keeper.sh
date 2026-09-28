@@ -16,6 +16,15 @@ set -euo pipefail
 # launchd gives a minimal PATH; node/npm live in Homebrew.
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
+# Disable tsx's on-disk transpile cache. The keeper runs via `tsx src/…`, and tsx
+# caches transpiled output in $TMPDIR/tsx-<uid>/. That cache is keyed such that a
+# plain restart can re-run STALE code after a source edit (the launchd process's
+# $TMPDIR differs from an interactive shell's, so it's easy to "clear the cache"
+# and still hit the stale one) — this silently cost a whole debugging session
+# once. Boot transpile is ~1-3s and this keeper restarts rarely, so always
+# transpiling fresh is a cheap guarantee that an edit + restart runs the new code.
+export TSX_DISABLE_CACHE=1
+
 cd "$(dirname "$0")"
 
 if [[ ! -f .env ]]; then

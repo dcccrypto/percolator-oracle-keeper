@@ -23,20 +23,27 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { WRAPPER_PROGRAM_ID } from "./auth-mark-pusher.ts";
 
-// Fresh devnet triple — deployed + upgraded 2026-07-17, hash-verified on-chain.
-const FRESH_WRAPPER = "DhSkE7uTb8HBUYYWF1xkxMYBGtLYJEoDq1tfBD7SnHcj";
+// Fresh devnet wrapper — v18 migration deploy 2026-09-22, byte-verified on-chain
+// (a FRESH program id; the SDK's declare_id is a placeholder — PDAs follow the
+// runtime deploy address). This is a deliberate literal pin, NOT a re-import of
+// the SDK constant, so a wrapper cutover forces a conscious update here.
+const FRESH_WRAPPER = "GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ";
 
-// Superseded 2026-06-26 wrapper — still live on devnet with ~152 existing
-// markets, but no longer the SDK default. Must NOT be what this file targets.
-const OLD_WRAPPER = "69VUZ7a2BeXBTpRRManLamF5UWTaNR9B1hy5Se3cdXy9";
+// Superseded wrappers — still resolvable on devnet but no longer the target.
+const OLD_WRAPPER = "69VUZ7a2BeXBTpRRManLamF5UWTaNR9B1hy5Se3cdXy9"; // 2026-06-26
+const OLD_WRAPPER_V17 = "DhSkE7uTb8HBUYYWF1xkxMYBGtLYJEoDq1tfBD7SnHcj"; // 2026-07-17 v17, abandoned at v18
 
-describe("auth-mark-pusher WRAPPER_PROGRAM_ID — fresh triple cutover (2026-07-17)", () => {
+describe("auth-mark-pusher WRAPPER_PROGRAM_ID — v18 cutover (2026-09-22)", () => {
   it("targets the fresh devnet wrapper (literal pin, not a re-import of the SDK constant)", () => {
     assert.equal(WRAPPER_PROGRAM_ID.toBase58(), FRESH_WRAPPER);
   });
 
   it("does NOT target the superseded 2026-06-26 wrapper", () => {
     assert.notEqual(WRAPPER_PROGRAM_ID.toBase58(), OLD_WRAPPER);
+  });
+
+  it("does NOT target the abandoned v17 wrapper", () => {
+    assert.notEqual(WRAPPER_PROGRAM_ID.toBase58(), OLD_WRAPPER_V17);
   });
 });
 

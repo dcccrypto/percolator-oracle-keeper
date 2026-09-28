@@ -740,6 +740,21 @@ export async function pushAuthMarkBatch(
       simErr = null;
     }
 
+    // BlockhashNotFound is NOT a program revert. On a load-balanced devnet RPC
+    // pool (the padre endpoint) the node that runs simulateTransaction often lags
+    // the node that served getLatestBlockhash, so the preflight fails
+    // "BlockhashNotFound" even though the SEND lands fine — sendRawTransaction
+    // forwards to the current leader, which HAS the blockhash (the recovery
+    // cranker recovers on this exact endpoint the same way). Treating that as a
+    // preflight revert needlessly drops the push (~45% of post-priming cycles).
+    // Reclassify it to "couldn't validate" and fall through to the send; the send
+    // failing is just a missed cycle (same as dropping), so this is only-upside.
+    // A genuine program revert still surfaces as Custom(N) below, so the
+    // batch-poisoning isolate/quarantine protection is unaffected.
+    if (simErr && /Blockhash\s*not\s*found/i.test(JSON.stringify(simErr))) {
+      simErr = null;
+    }
+
     if (simErr) {
       // Chunk would revert. If it is a single market we know exactly who is at
       // fault; otherwise tell the caller to isolate.
