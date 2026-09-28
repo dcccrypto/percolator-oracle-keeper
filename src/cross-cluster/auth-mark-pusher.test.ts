@@ -183,7 +183,10 @@ function fakeConn(
         const marketsInTx = pushIxs.map((ix) => ix.keys[1].pubkey.toBase58());
         simulated.push(marketsInTx);
         simulatedData.push(pushIxs.map((ix) => ix.data));
-        const err = marketsInTx.some((m) => badMarkets.has(m)) ? { InstructionError: [1, { Custom: 8 }] } : null;
+        // REAL RPC shape: the index names the FIRST failing ix (ix 0 is the
+        // ComputeBudget ix, so the push at position k is ix k+1).
+        const firstBad = marketsInTx.findIndex((m) => badMarkets.has(m));
+        const err = firstBad >= 0 ? { InstructionError: [firstBad + 1, { Custom: 8 }] } : null;
         return { value: { err } };
       },
       async sendRawTransaction() {
