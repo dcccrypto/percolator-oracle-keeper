@@ -271,8 +271,8 @@ describe("#82 cumulative drift bound", () => {
     // the anchor 100 would be 32% > 25%: advance to the edge 125, not to 132.
     close(relocate(s, 132, cfg), 125);
     close(s.lastPrice, 125);
-    // the window's budget is spent — further confirmations are refused
-    assert.equal(relocate(s, 132, cfg), null);
+    // the band is spent — the mark is HELD: re-published unchanged, not advanced
+    close(relocate(s, 132, cfg), 125);
     close(s.lastPrice, 125);
   });
 
@@ -303,10 +303,13 @@ describe("#116 held moves past the cumulative bound converge (no re-anchoring we
   /** Feed `price` once per `stepMs` for `durMs`; returns every accepted value. */
   function hold(s: CircuitBreakerState, price: number, clock: { t: number }, durMs: number, stepMs = 1_500) {
     const cfg = { maxMovePct: 10, confirmTrips: 3, log: () => {}, now: () => clock.t };
+    // Every CHANGE of the published mark. A band hold re-publishes the current
+    // mark unchanged (#125 follow-up), which is not a step.
     const accepted: number[] = [];
     for (const end = clock.t + durMs; clock.t < end; clock.t += stepMs) {
+      const before = s.lastPrice;
       const r = checkCircuitBreaker(s, price, cfg);
-      if (r !== null) { accepted.push(r); s.lastPrice = r; }
+      if (r !== null) { if (r !== before) accepted.push(r); s.lastPrice = r; }
     }
     return accepted;
   }
@@ -378,7 +381,7 @@ describe("#116 held moves past the cumulative bound converge (no re-anchoring we
     s.cbWindowMax = [{ price: 150, at: 0 }];
     s.cbWindowMin = [{ price: 100, at: 0 }, { price: 150, at: 0 }];
     const cfg = { maxMovePct: 10, confirmTrips: 1, log: () => {}, now: () => 10 };
-    assert.equal(checkCircuitBreaker(s, 200, cfg), null, "edge 130 is behind 150 — refuse, do not pull back");
+    assert.equal(checkCircuitBreaker(s, 200, cfg), 150, "edge 130 is behind 150 — hold 150, do not pull back");
     assert.equal(s.lastPrice, 150);
   });
 
@@ -496,7 +499,7 @@ describe("#125 rolling cumulative bound — no creep, no straddle, no boundary p
     const s = fresh(130);
     recordMarkInForce(s, 100, 0);                           // 100 was the mark until t=0
     recordMarkInForce(s, 130, 0);
-    assert.equal(checkCircuitBreaker(s, 140, cfg(W)), null, "100 is still in the window at exactly W");
+    assert.equal(checkCircuitBreaker(s, 140, cfg(W)), 130, "100 is still in the window at exactly W — hold 130");
     assert.equal(checkCircuitBreaker(s, 140, cfg(W + 1)), 140, "…and has left it 1 ms later");
   });
 
@@ -528,5 +531,53 @@ describe("#125 rolling cumulative bound — no creep, no straddle, no boundary p
     checkCircuitBreaker(s, 102, { ...cfg, now: () => 1 });
     assert.equal(JSON.stringify(maxRef), before, "the old array was modified");
     assert.equal(snapshot.cbWindowMax, maxRef);
+  });
+});
+
+// ── #125 follow-up — a band HOLD re-publishes the held mark instead of going silent ──
+describe("#125 follow-up: a cumulative-bound hold republishes the current mark", () => {
+  const fresh = (lastPrice: number): CircuitBreakerState => ({
+    symbol: "T", lastPrice, circuitBreakerTrips: 0, cbTripPrice: 0, cbConsecutiveTrips: 0,
+  });
+  const cfg = (t: number) => ({ maxMovePct: 10, confirmTrips: 3, log: () => {}, now: () => t });
+
+  it("a held +100% move publishes on EVERY cycle of the window (no hour-long silence)", () => {
+    const s = fresh(553);
+    let silent = 0;
+    let longestSilentMs = 0;
+    for (let t = 0; t < 3_600_000; t += 1_500) {
+      const r = checkCircuitBreaker(s, 1108, cfg(t));
+      if (r === null) { silent += 1_500; longestSilentMs = Math.max(longestSilentMs, silent); continue; }
+      silent = 0;
+      s.lastPrice = r;
+      assert.ok(r <= 553 * 1.3 + 1e-9, `hold published ${r}, past the band edge`);
+    }
+    // only the confirmTrips − 1 unconfirmed trips before the first clamp are withheld
+    assert.ok(longestSilentMs <= 2 * 1_500, `withheld for ${longestSilentMs} ms`);
+    assert.ok(Math.abs(s.lastPrice - 553 * 1.3) < 1e-9);
+  });
+
+  it("an in-threshold hold returns the current mark, not newPrice", () => {
+    const s = fresh(130);
+    recordMarkInForce(s, 100, 0);
+    recordMarkInForce(s, 130, 0);
+    assert.equal(checkCircuitBreaker(s, 135, cfg(1)), 130);
+  });
+
+  it("a hold does not reset the relocation run", () => {
+    const s = fresh(130);
+    recordMarkInForce(s, 100, 0);
+    recordMarkInForce(s, 130, 0);
+    s.cbTripPrice = 200;
+    s.cbConsecutiveTrips = 3;
+    assert.equal(checkCircuitBreaker(s, 200, cfg(1)), 130);
+    assert.equal(s.cbConsecutiveTrips, 4, "run keeps counting through a hold");
+    assert.equal(s.lastPrice, 130);
+  });
+
+  it("an unconfirmed spike is still withheld (null), not republished", () => {
+    const s = fresh(100);
+    assert.equal(checkCircuitBreaker(s, 500, cfg(0)), null);
+    assert.equal(checkCircuitBreaker(s, 500, cfg(1)), null);
   });
 });

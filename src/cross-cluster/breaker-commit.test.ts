@@ -98,8 +98,8 @@ describe("trailing-window bound survives the keeper-loop commit protocol (#82, #
     probe.lastPrice = 130; // pretend we walked up to 130 since
     assert.equal(
       checkCircuitBreaker(probe, 135, { ...CFG, confirmTrips: 1, now: () => W + 1_000 }),
-      null,
-      "100 was in force until 5s — 135 is +35% from it inside the window",
+      130,
+      "100 was in force until 5s — 135 is +35% from it inside the window: hold 130",
     );
     assert.equal(checkCircuitBreaker(probe, 135, { ...CFG, confirmTrips: 1, now: () => W + 5_001 }), 135);
   });
@@ -167,6 +167,25 @@ describe("acceptedPublishPrice — what runCycle publishes (#116)", () => {
     assert.equal(r.priceE6, 388n);
   });
 
+  it("#125 follow-up: re-publishing the held baseline recovers its E6 exactly (no ratchet)", () => {
+    // Every baseline is Number(e6) / 1e6. floor/ceil of baseline * 1e6 is off by
+    // one for ~1.5% of values; a hold republishes every cycle, so an off-by-one
+    // would walk the held mark one unit per cycle.
+    let checked = 0;
+    for (let e6 = 1; e6 < 3_000_000; e6 += 7) {
+      const baseline = e6 / 1e6;
+      for (const smoothedE6 of [BigInt(e6 * 3), BigInt(Math.max(1, Math.floor(e6 / 3)))]) {
+        const smoothedUsd = Number(smoothedE6) / 1e6;
+        if (smoothedUsd === baseline) continue;
+        const r = acceptedPublishPrice(smoothedE6, smoothedUsd, baseline, baseline);
+        assert.equal(r.priceE6, BigInt(e6), `held ${e6} republished as ${r.priceE6}`);
+        assert.equal(r.priceUsd, baseline);
+        checked++;
+      }
+    }
+    assert.ok(checked > 800_000);
+  });
+
   it("never publishes zero", () => {
     assert.equal(acceptedPublishPrice(1n, 0.000001, 0.0000001).priceE6, 1n);
   });
@@ -175,7 +194,7 @@ describe("acceptedPublishPrice — what runCycle publishes (#116)", () => {
     const fs = await import("node:fs/promises");
     const src = await fs.readFile(new URL("./keeper-loop.ts", import.meta.url), "utf8");
     assert.match(src, /acceptedUsd === null/);
-    assert.match(src, /acceptedPublishPrice\(priceE6, priceUsd, acceptedUsd\)/);
+    assert.match(src, /acceptedPublishPrice\(\s*priceE6,\s*priceUsd,\s*acceptedUsd,\s*currentCircuitBreakerState\.lastPrice,?\s*\)/);
     assert.match(src, /splitBreakerCommit\(\s*currentCircuitBreakerState,\s*candidateCircuitBreakerState,\s*publish\.priceUsd,?\s*\)/);
     assert.match(src, /priceE6: publish\.priceE6/);
     assert.match(src, /stat\.lastPriceE6 = publish\.priceE6/);

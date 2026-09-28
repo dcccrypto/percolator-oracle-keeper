@@ -181,7 +181,36 @@ function bandTarget(
 }
 
 /**
+ * #125 follow-up — what a band HOLD publishes: the current mark, unchanged.
+ *
+ * A hold used to return null, so the keeper pushed nothing for that market for
+ * up to a full window (~60 min). Holding the VALUE is the point of the bound;
+ * withholding the PUSH buys nothing on chain and costs liveness:
+ *   - The live auth-mark markets (oracle_mode 3) have no on-chain oracle-age
+ *     gate: permissionless_resolve_stale_slots = 0, and hybrid soft-stale does
+ *     not apply to auth-mark. Trading, liquidation, withdrawals and funding all
+ *     run against the last pushed mark whether or not it is re-pushed, so a
+ *     missing push does not protect anyone on chain — any direct caller trades
+ *     at the frozen mark either way.
+ *   - What a missing push DOES do is let `last_good_oracle_slot` age: the
+ *     playground UI blocks trading AND closing ("Crank behind") once it lags
+ *     > 450 slots (~3 min), and a market that ever enabled permissionless
+ *     resolve (minimum 9,000 slots ≈ 1 h) could be resolved at the tail of a
+ *     full-window hold.
+ * Re-pushing the identical mark refreshes `last_good_oracle_slot` and changes
+ * nothing about the price (PushAuthMark leaves the EWMA untouched when the
+ * value is unchanged). Trip accounting is NOT reset by a hold.
+ */
+function holdMark(state: CircuitBreakerState): number {
+  return state.lastPrice;
+}
+
+/**
  * Returns the price to publish, or `null` if nothing should be published.
+ *
+ * `null` means a not-yet-confirmed trip (a spike is withheld for at most
+ * confirmTrips − 1 cycles). A cumulative-bound HOLD is not null: it returns the
+ * current mark, `lastPrice`, to be re-pushed unchanged (see holdMark).
  *
  * The returned price is `newPrice` itself except when the cumulative bound
  * applies (see below), in which case it is the band edge. A caller MUST publish
@@ -208,8 +237,8 @@ function bandTarget(
  *   band [max × (1 − B), min × (1 + B)] over every mark in force during the
  *   trailing `driftWindowMs`. NOTHING is published outside it — neither a
  *   confirmed relocation nor an in-threshold step. A price beyond the band is
- *   advanced to the band edge; once the baseline sits at the edge nothing more
- *   is published in that direction until the binding extreme ages out.
+ *   advanced to the band edge; once the baseline sits at the edge the mark is
+ *   HELD there (re-published unchanged) until the binding extreme ages out.
  *
  *   #116 made the bound a rate limit (publish the edge, don't refuse forever),
  *   but it only existed inside a FIXED window that a confirmed relocation
@@ -291,7 +320,7 @@ export function checkCircuitBreaker(
           `over ${Math.round(windowMs / 1000)}s); next step in ~` +
           `${retryInS(newPrice > band.hi)}s.`,
       );
-      return null;
+      return holdMark(state);
     }
     return newPrice;
   }
@@ -331,7 +360,7 @@ export function checkCircuitBreaker(
           `(±${maxCumulative}% over ${Math.round(windowMs / 1000)}s) is spent, ` +
           `next step in ~${retryInS(up)}s.`,
       );
-      return null;
+      return holdMark(state);
     }
 
     let accepted = newPrice;
