@@ -93,6 +93,8 @@ import {
   ACCOUNTS_PERMISSIONLESS_CRANK_BASE,
   buildAccountMetas,
   PROGRAM_IDS_V17,
+  V17_PORTFOLIO_ACCOUNT_LEN,
+  parsePortfolioV17,
 } from "@percolatorct/sdk";
 import type { CrankObservationHint } from "@percolatorct/sdk";
 import type { MarketEntry, Registry } from "./registry.ts";
@@ -108,7 +110,6 @@ const COMPUTE_UNIT_LIMIT = 250_000;
 // reads 1 — that's the stable, market-owned account this loop targets.
 const V17_PORTFOLIO_MAGIC = Buffer.from([0x00, 0x36, 0x31, 0x56, 0x43, 0x52, 0x45, 0x50]);
 const V17_PF_MARKET_OFF = 16;
-const PORTFOLIO_MATCHER_CONFIG_LEN = 104;
 
 export interface CrankLoopConfig {
   /** Milliseconds between crank cycle starts. */
@@ -214,12 +215,29 @@ async function withRpcRetry<T>(label: string, fn: () => Promise<T>, maxAttempts 
   }
 }
 
-function readMatcherEnabled(data: Buffer): boolean {
-  if (data.length < PORTFOLIO_MATCHER_CONFIG_LEN) return false;
-  const off = data.length - PORTFOLIO_MATCHER_CONFIG_LEN;
-  // enabled: u64 LE at block offset 96
-  const enabled = data.readBigUInt64LE(off + 96);
-  return enabled === 1n;
+/**
+ * True iff `data` is a v18 portfolio account (exact `V17_PORTFOLIO_ACCOUNT_LEN`)
+ * whose matcher config is enabled — i.e. the market's LP-vault / matcher
+ * counterparty that the recovery crank must target.
+ *
+ * 2026-09-28 root cause of the 6-market engine-clock freeze: the old check
+ * read a raw u64 `== 1` at `len - 104 + 96`. That is the v17 layout; v18
+ * appends a 24-byte identity trailer after the matcher block AND packs the
+ * matcher position epoch into the control word, so on a real LP portfolio it
+ * read the wrong bytes (false), while a 240-byte kind-3 v18 account that
+ * shares the magic + market prefix happens to end in `01 00..00` (true).
+ * Discovery therefore picked that 240-byte account, every crank reverted
+ * `InsufficientFundsForRent`, and no market's engine clock advanced from
+ * 2026-09-25T02:02Z onward. Decode via the SDK instead of hand offsets, and
+ * require the exact portfolio length.
+ */
+export function isLpVaultPortfolio(data: Uint8Array): boolean {
+  if (data.length !== V17_PORTFOLIO_ACCOUNT_LEN) return false;
+  try {
+    return parsePortfolioV17(data).matcherEnabled === true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -233,12 +251,13 @@ async function findLpPortfolio(
 ): Promise<PublicKey | null> {
   const accounts = await conn.getProgramAccounts(WRAPPER_PROGRAM_ID, {
     filters: [
+      { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
       { memcmp: { offset: 0, bytes: V17_PORTFOLIO_MAGIC.toString("base64"), encoding: "base64" } },
       { memcmp: { offset: V17_PF_MARKET_OFF, bytes: market.toBase58() } },
     ],
   });
   for (const { pubkey, account } of accounts) {
-    if (readMatcherEnabled(Buffer.from(account.data))) return pubkey;
+    if (isLpVaultPortfolio(account.data)) return pubkey;
   }
   return null;
 }

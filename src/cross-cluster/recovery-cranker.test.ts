@@ -181,3 +181,29 @@ describe("buildCrankIx — PermissionlessCrank v18 (v16-migration) wire format",
     assert.equal(ix.keys[2].isWritable, true);
   });
 });
+
+// ── 2026-09-28: LP-portfolio discovery must recognise the v18 layout ──
+// Fixtures are verbatim devnet account bytes (wrapper GnwdeQr, SOL market
+// AzagguvrWmRgcBpsKuqomW7Yb1YUUd6UzcrkiRsqdhr):
+//   sol-lp-portfolio-v18      3oDTvjEP… — the real matcher-enabled LP portfolio (9563 B)
+//   sol-trader-portfolio-v18  HyKpWvnu… — an ordinary trader portfolio (9563 B)
+//   sol-kind3-240b-v18        QA6VQNU9… — a 240 B kind-3 account sharing the portfolio
+//                             magic + market prefix; the old check selected it, and every
+//                             crank against it reverted InsufficientFundsForRent.
+import { readFileSync } from "node:fs";
+import { isLpVaultPortfolio } from "./recovery-cranker.ts";
+
+const fixture = (name: string): Buffer =>
+  Buffer.from(readFileSync(new URL(`./__fixtures__/${name}.b64`, import.meta.url), "utf8"), "base64");
+
+describe("isLpVaultPortfolio (v18 layout)", () => {
+  it("accepts the live v18 LP (matcher-enabled) portfolio", () => {
+    assert.equal(isLpVaultPortfolio(fixture("sol-lp-portfolio-v18")), true);
+  });
+  it("rejects an ordinary v18 trader portfolio", () => {
+    assert.equal(isLpVaultPortfolio(fixture("sol-trader-portfolio-v18")), false);
+  });
+  it("rejects the 240-byte kind-3 account that the v17-offset check selected", () => {
+    assert.equal(isLpVaultPortfolio(fixture("sol-kind3-240b-v18")), false);
+  });
+});
