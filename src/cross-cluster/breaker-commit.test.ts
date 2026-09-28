@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { acceptedPublishPrice, cloneCircuitBreakerState, splitBreakerCommit } from "./keeper-loop.ts";
+import {
+  acceptedPublishPrice, cloneCircuitBreakerState, commitPublishedBreakerState, splitBreakerCommit,
+} from "./keeper-loop.ts";
 import { checkCircuitBreaker, type CircuitBreakerState } from "../circuit-breaker.ts";
 
 const CFG = { maxMovePct: 10, confirmTrips: 3, log: () => {} };
@@ -49,40 +51,74 @@ describe("splitBreakerCommit — trip accounting must survive a dropped push", (
   });
 });
 
-// #82 drift anchor through the keeper-loop commit protocol. The breaker's own
-// tests hold one state object across calls, so they cannot see a field that the
-// keeper drops between cycles. These run every price through the same
-// clone -> check -> split -> commit sequence as runCycle().
-describe("drift anchor survives the keeper-loop commit protocol (#82)", () => {
-  const cycle = (persisted: CircuitBreakerState, price: number, now: number, pushLands = true) => {
+// #82 / #125 trailing-window bound through the keeper-loop commit protocol. The
+// breaker's own tests hold one state object across calls, so they cannot see a
+// field that the keeper drops between cycles. These run every price through the
+// same clone -> check -> split -> commit-on-land sequence as runCycle().
+describe("trailing-window bound survives the keeper-loop commit protocol (#82, #125)", () => {
+  const cycle = (persisted: CircuitBreakerState, price: number, now: number, pushLands = true, landMs = 400) => {
     const candidate = cloneCircuitBreakerState(persisted); // runCycle: per market, per cycle
     const accepted = checkCircuitBreaker(candidate, price, { ...CFG, now: () => now });
     if (accepted === null) return { persisted: candidate, ok: false };
     // #116: publish (and re-baseline to) what the breaker ACCEPTED — a clamped
     // relocation accepts the bound edge, not `price`.
     const { commitNow, deferred } = splitBreakerCommit(persisted, candidate, accepted);
-    return { persisted: pushLands ? deferred : commitNow, ok: true };
+    return {
+      persisted: pushLands ? commitPublishedBreakerState(commitNow, deferred, now + landMs) : commitNow,
+      ok: true,
+    };
   };
 
-  it("cloneCircuitBreakerState copies every field", () => {
+  it("cloneCircuitBreakerState copies every field, and does not alias the window arrays", () => {
     const full: Required<CircuitBreakerState> = {
       symbol: "T", lastPrice: 125, circuitBreakerTrips: 7, cbTripPrice: 156,
-      cbConsecutiveTrips: 2, cbDriftAnchorPrice: 100, cbDriftAnchorAt: 1_000,
+      cbConsecutiveTrips: 2,
+      cbWindowMax: [{ price: 125, at: 1_000 }],
+      cbWindowMin: [{ price: 100, at: 900 }, { price: 125, at: 1_000 }],
     };
-    assert.deepEqual(cloneCircuitBreakerState(full), full);
+    const c = cloneCircuitBreakerState(full);
+    assert.deepEqual(c, full);
+    assert.notEqual(c.cbWindowMax, full.cbWindowMax);
+    assert.notEqual(c.cbWindowMin, full.cbWindowMin);
   });
 
-  it("splitBreakerCommit carries the anchor opened by a confirmed relocation", () => {
-    let s = st(100);
-    for (let i = 0; i < 3; i++) s = cycle(s, 125, 1_000 + i).persisted;
-    assert.equal(s.lastPrice, 125, "relocation confirmed and pushed");
-    assert.equal(s.cbDriftAnchorPrice, 100);
-    assert.equal(s.cbDriftAnchorAt, 1_002);
+  it("commitPublishedBreakerState keeps the replaced mark in the window until it actually stopped being in force", () => {
+    // The check runs at t=0; the push lands at t=5s. The old mark 100 was on
+    // chain until 5s, so it must bind until 5s + W — not 0 + W.
+    const W = 3_600_000;
+    const current: CircuitBreakerState = { ...st(100) };
+    const candidate = cloneCircuitBreakerState(current);
+    const accepted = checkCircuitBreaker(candidate, 108, { ...CFG, now: () => 0 });
+    assert.equal(accepted, 108);
+    const { commitNow, deferred } = splitBreakerCommit(current, candidate, 108);
+    const landed = commitPublishedBreakerState(commitNow, deferred, 5_000);
+    assert.equal(landed.lastPrice, 108);
+    // at 0 + W + 1s the check-time record of 100 has expired, the landing-time one has not
+    const probe = cloneCircuitBreakerState(landed);
+    probe.lastPrice = 130; // pretend we walked up to 130 since
+    assert.equal(
+      checkCircuitBreaker(probe, 135, { ...CFG, confirmTrips: 1, now: () => W + 1_000 }),
+      130,
+      "100 was in force until 5s — 135 is +35% from it inside the window: hold 130",
+    );
+    assert.equal(checkCircuitBreaker(probe, 135, { ...CFG, confirmTrips: 1, now: () => W + 5_001 }), 135);
+  });
+
+  it("in-threshold creep is bounded through the protocol, with and without dropped pushes", () => {
+    for (const dropEvery of [0, 5]) {
+      let s = st(100);
+      let n = 0;
+      for (let t = 0; t < 3_600_000; t += 1_500) {
+        const pushLands = dropEvery === 0 || ++n % dropEvery !== 0;
+        s = cycle(s, 100 * 1.01 ** Math.floor(t / 1_500), t, pushLands).persisted;
+        assert.ok(s.lastPrice <= 130 + 1e-9, `creep escaped to ${s.lastPrice} (drop 1/${dropEvery})`);
+      }
+    }
   });
 
   it("a staircase of legal relocations is bounded cumulatively inside the window", () => {
     // 25% steps: each is a legal single relocation (under the 30% default
-    // cumulative bound); the second takes the walk 56% from the anchor.
+    // cumulative bound); the second takes the walk 56% from the start.
     let s = st(100);
     let t = 0;
     const hold = (price: number, cycles: number, pushLands = true) => {
@@ -94,17 +130,15 @@ describe("drift anchor survives the keeper-loop commit protocol (#82)", () => {
       }
       return accepted;
     };
-    // Asserts the BOUND (baseline within 30% of the anchor), not HOW it is
-    // enforced: refusing (current) and clamping to the edge (#2) both satisfy it.
     const EDGE = 100 * 1.3;
     assert.equal(hold(125, 3), true);
     assert.equal(s.lastPrice, 125);
     hold(156, 30);
-    assert.ok(s.lastPrice <= EDGE, `walk re-baselined to ${s.lastPrice}, 56% from the anchor inside one window`);
+    assert.ok(s.lastPrice <= EDGE, `walk re-baselined to ${s.lastPrice}, 56% from 100 inside one window`);
     hold(156, 5, false);
-    assert.ok(s.lastPrice <= EDGE, "a dropped push must not lose the anchor");
-    assert.equal(s.cbDriftAnchorPrice, 100);
-    // Rate limit, not a ceiling: after the window rolls over the same step confirms.
+    assert.ok(s.lastPrice <= EDGE, "a dropped push must not lose the window");
+    assert.equal(s.cbWindowMin?.[0].price, 100);
+    // Rate limit, not a ceiling: once 100 leaves the trailing window the step confirms.
     t += 3_600_000;
     assert.equal(hold(156, 3), true);
     assert.equal(s.lastPrice, 156);
@@ -133,6 +167,25 @@ describe("acceptedPublishPrice — what runCycle publishes (#116)", () => {
     assert.equal(r.priceE6, 388n);
   });
 
+  it("#125 follow-up: re-publishing the held baseline recovers its E6 exactly (no ratchet)", () => {
+    // Every baseline is Number(e6) / 1e6. floor/ceil of baseline * 1e6 is off by
+    // one for ~1.5% of values; a hold republishes every cycle, so an off-by-one
+    // would walk the held mark one unit per cycle.
+    let checked = 0;
+    for (let e6 = 1; e6 < 3_000_000; e6 += 7) {
+      const baseline = e6 / 1e6;
+      for (const smoothedE6 of [BigInt(e6 * 3), BigInt(Math.max(1, Math.floor(e6 / 3)))]) {
+        const smoothedUsd = Number(smoothedE6) / 1e6;
+        if (smoothedUsd === baseline) continue;
+        const r = acceptedPublishPrice(smoothedE6, smoothedUsd, baseline, baseline);
+        assert.equal(r.priceE6, BigInt(e6), `held ${e6} republished as ${r.priceE6}`);
+        assert.equal(r.priceUsd, baseline);
+        checked++;
+      }
+    }
+    assert.ok(checked > 800_000);
+  });
+
   it("never publishes zero", () => {
     assert.equal(acceptedPublishPrice(1n, 0.000001, 0.0000001).priceE6, 1n);
   });
@@ -141,9 +194,11 @@ describe("acceptedPublishPrice — what runCycle publishes (#116)", () => {
     const fs = await import("node:fs/promises");
     const src = await fs.readFile(new URL("./keeper-loop.ts", import.meta.url), "utf8");
     assert.match(src, /acceptedUsd === null/);
-    assert.match(src, /acceptedPublishPrice\(priceE6, priceUsd, acceptedUsd\)/);
+    assert.match(src, /acceptedPublishPrice\(\s*priceE6,\s*priceUsd,\s*acceptedUsd,\s*currentCircuitBreakerState\.lastPrice,?\s*\)/);
     assert.match(src, /splitBreakerCommit\(\s*currentCircuitBreakerState,\s*candidateCircuitBreakerState,\s*publish\.priceUsd,?\s*\)/);
     assert.match(src, /priceE6: publish\.priceE6/);
     assert.match(src, /stat\.lastPriceE6 = publish\.priceE6/);
+    // #125: a landed push commits through commitPublishedBreakerState at the landing stamp.
+    assert.match(src, /commitPublishedBreakerState\(\s*crossClusterCircuitBreakerStates\.get\(p\.marketAddress\),\s*pendingCircuitBreakerState,\s*stamp,?\s*\)/);
   });
 });
