@@ -20,7 +20,8 @@
  *   - computeDexSpotPriceE6 returns 0n (sqrtPrice=0 / binStep=0 / base-amount=0)
  *   - PumpSwap: either vault amount === 0, or the pool is WSOL-quoted and no
  *     SOL/USD price was available this cycle (the reference market's own read
- *     failed/was skipped)
+ *     failed/was skipped), or the quote is neither WSOL nor a USD stable
+ *     (pumpswapQuoteIsNotUsd)
  *
  * RPC error handling:
  *   - HTTP 429 (rate-limit): exponential back-off with 20 % jitter (0.5 → 1 → 2 → 4 s)
@@ -112,6 +113,18 @@ const USD_STABLE_MINTS: ReadonlySet<string> = new Set([
  */
 export function raydiumPriceIsNotUsd(quoteMint: PublicKey): boolean {
   return !USD_STABLE_MINTS.has(quoteMint.toBase58());
+}
+
+/**
+ * True when a pumpswap pool's price cannot be turned into USD.
+ *
+ * The SDK prices pumpswap as quote-per-base and converts only a WSOL quote (via
+ * SOL/USD). Any other non-stable quote (COLLECT's CARDS, Murphy's DOGE-quoted
+ * pool) comes back in QUOTE-TOKEN units — publishing it as USD was ~4.5x/~10x
+ * high. Refused until there is a quote->USD conversion for that token.
+ */
+export function pumpswapQuoteIsNotUsd(quoteMint: PublicKey): boolean {
+  return !quoteMint.equals(WSOL_MINT) && raydiumPriceIsNotUsd(quoteMint);
 }
 
 export function meteoraWsolPriceToUsdE6(
@@ -395,9 +408,12 @@ const MIN_VAULT_LEN = 72;
 export function pumpswapQuoteDepthUsdE6(
   quoteVaultData: Uint8Array,
   quoteDecimals: number,
-  isWsolQuoted: boolean,
+  quoteMint: PublicKey,
   solPriceE6: bigint | undefined,
 ): bigint | null {
+  // A quote that is neither WSOL nor a USD stable has no known USD value.
+  if (pumpswapQuoteIsNotUsd(quoteMint)) return null;
+  const isWsolQuoted = quoteMint.equals(WSOL_MINT);
   if (quoteVaultData.length < MIN_VAULT_LEN) return null;
   const dv = new DataView(
     quoteVaultData.buffer,
@@ -592,6 +608,16 @@ export async function readPoolPriceE6(
         return { priceE6: 0n, source, skipped: true, skipReason: bind.reason };
       }
     }
+    if (pumpswapQuoteIsNotUsd(poolParsed.quoteMint)) {
+      return {
+        priceE6: 0n,
+        source,
+        skipped: true,
+        skipReason:
+          `PumpSwap: quote mint ${poolParsed.quoteMint.toBase58()} is neither WSOL nor a USD stable, ` +
+          `so this pool's price is not USD-denominated (see pumpswapQuoteIsNotUsd)`,
+      };
+    }
     if (!poolParsed.baseVault || !poolParsed.quoteVault) {
       return {
         priceE6: 0n,
@@ -690,7 +716,7 @@ export async function readPoolPriceE6(
       const depth = pumpswapQuoteDepthUsdE6(
         quoteVaultData,
         dec.quote,
-        isWsolQuoted,
+        poolParsed.quoteMint,
         solPriceE6,
       );
       if (depth === null || depth < MIN_POOL_LIQUIDITY_USD_E6) {
@@ -934,6 +960,13 @@ export async function readAllPoolPricesE6(
           );
           continue;
         }
+        if (pumpswapQuoteIsNotUsd(parsed.quoteMint)) {
+          console.error(
+            `[price-reader] ${entry.label}: pumpswap quote mint ${parsed.quoteMint.toBase58()} ` +
+              `is neither WSOL nor a USD stable — price is not USD. Refusing to price it.`,
+          );
+          continue;
+        }
         if (!parsed.baseVault || !parsed.quoteVault) continue;
         pumpswapCandidates.push({
           entry,
@@ -1066,7 +1099,7 @@ export async function readAllPoolPricesE6(
         const depth = pumpswapQuoteDepthUsdE6(
           new Uint8Array(quoteVaultInfo.data),
           dec.quote,
-          pumpswapCandidates[c].quoteMint.equals(WSOL_MINT),
+          pumpswapCandidates[c].quoteMint,
           solPriceE6,
         );
         // null means the depth could NOT be established. Skip — a floor that
