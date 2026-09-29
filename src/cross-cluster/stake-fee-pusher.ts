@@ -27,6 +27,18 @@
  * atoms would still land on the dead shares. They are safest left in the
  * market vault until a real staker exists.
  *
+ * The gate is a RATIO, not "one real share" (security review K-1): booking a
+ * backlog F against supply 1000 + X gives the dead shares F·1000/(1000+X). With
+ * a one-share gate a dust deposit made the keeper book ~99.9% of the backlog
+ * onto dead shares (griefing). So the job pushes only when the dead shares'
+ * cut is at most `maxDeadShareBps` (default 100 bps = 1%, i.e. total supply of
+ * at least 100,000 shares), plus an optional absolute `minRealShares` floor.
+ *
+ * Not closed by the keeper, by design: a backlog that accrued while a pool had
+ * no real stakers goes to whoever is staked when it is pushed, so a large
+ * first depositor captures it (F5 for stakers). Only a program-side change
+ * (P1 F3/F5: route pre-staker backlog to insurance) removes that.
+ *
  * Residual race (documented, not closable client-side): the last real staker
  * can withdraw between this job's read and the transaction landing. The
  * durable fix is the stake-side guard (P1 fee fixes, F3).
@@ -96,6 +108,11 @@ export interface StakeFeeConfig {
    * than MINIMUM_LIQUIDITY + this. Default 0: any real share qualifies.
    */
   minRealShares: bigint;
+  /**
+   * Max share of a push the 1,000 dead shares may take, in bps:
+   * push only if MINIMUM_LIQUIDITY·10_000 ≤ maxDeadShareBps·total_lp_supply.
+   */
+  maxDeadShareBps: bigint;
   /** Do not spend a transaction on less than this many atoms. */
   minPushAtoms: bigint;
   confirm?: ConfirmOptions;
@@ -112,6 +129,11 @@ export function stakeFeeConfigFromEnv(env: Readonly<Record<string, string | unde
     wrapperProgramId: WRAPPER_PROGRAM_ID,
     stakeProgramId: STAKE_PROGRAM_ID,
     minRealShares: big("STAKE_FEE_MIN_REAL_SHARES", 0n),
+    maxDeadShareBps: (() => {
+      const v = big("STAKE_FEE_MAX_DEAD_SHARE_BPS", 100n);
+      if (v <= 0n || v > 10_000n) throw new Error("STAKE_FEE_MAX_DEAD_SHARE_BPS must be in 1..10000");
+      return v;
+    })(),
     minPushAtoms: big("STAKE_FEE_MIN_PUSH_ATOMS", 1n),
   };
 }
@@ -135,7 +157,7 @@ export interface StakeFeeState {
   };
 }
 
-export function decideStakeFeePush(s: StakeFeeState, cfg: Pick<StakeFeeConfig, "minRealShares" | "minPushAtoms" | "wrapperProgramId">): StakeFeeDecision {
+export function decideStakeFeePush(s: StakeFeeState, cfg: Pick<StakeFeeConfig, "minRealShares" | "maxDeadShareBps" | "minPushAtoms" | "wrapperProgramId">): StakeFeeDecision {
   if (s.owed <= 0n) return { action: "nothing", owed: 0n };
   if (s.owed < cfg.minPushAtoms) return { action: "nothing", owed: s.owed };
   if (!s.pool) return { action: "skip", reason: "no stake pool for this market" };
@@ -146,6 +168,13 @@ export function decideStakeFeePush(s: StakeFeeState, cfg: Pick<StakeFeeConfig, "
   }
   if (s.pool.poolMode !== 0) return { action: "skip", reason: `pool mode ${s.pool.poolMode} is not an insurance pool` };
   const realShares = s.pool.totalLpSupply > STAKE_MINIMUM_LIQUIDITY ? s.pool.totalLpSupply - STAKE_MINIMUM_LIQUIDITY : 0n;
+  if (realShares > cfg.minRealShares && STAKE_MINIMUM_LIQUIDITY * 10_000n > cfg.maxDeadShareBps * s.pool.totalLpSupply) {
+    const deadBps = (STAKE_MINIMUM_LIQUIDITY * 10_000n + s.pool.totalLpSupply - 1n) / s.pool.totalLpSupply;
+    return {
+      action: "skip",
+      reason: `too few real stakers: the 1,000 dead shares would take ~${deadBps} bps of the push (max ${cfg.maxDeadShareBps}; total_lp_supply=${s.pool.totalLpSupply}) — ${s.owed} atoms held in the market vault (K-1/F3)`,
+    };
+  }
   if (realShares <= cfg.minRealShares) {
     return {
       action: "skip",

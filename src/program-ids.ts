@@ -20,6 +20,15 @@
  * half-finished cutover, and guessing which one is meant is how a keeper ends
  * up cranking the abandoned program.
  *
+ * Allowlist (security review K-2, mirroring the SDK's #308 guard): an env value
+ * must be one of the program IDs the SDK knows (PROGRAM_IDS devnet/mainnet +
+ * PROGRAM_IDS_V17), unless KEEPER_ALLOW_PROGRAM_ID_OVERRIDE=1. The keeper key
+ * signs and pays fees into whatever program this names, and on devnet that key
+ * is also the upgrade authority (F7), so a poisoned `.env` line must not be
+ * enough on its own. Once the keeper is on SDK 8.0.0 the fresh wrapper ID is
+ * in the SDK tables and needs no flag. Before that, the cutover sets the flag
+ * deliberately, and it is echoed in the boot log.
+ *
  * The stake program ID matters for more than the stake-fee loop: the wrapper
  * PINS it at compile time (`constants::STAKE_PROGRAM_ID`, v16_program.rs:796)
  * and tag 87 re-derives the pool PDA under it. A keeper deriving the pool
@@ -27,7 +36,7 @@
  * so the effective value is printed at boot next to the wrapper's.
  */
 import { PublicKey } from "@solana/web3.js";
-import { PROGRAM_IDS_V17 } from "@percolatorct/sdk";
+import { PROGRAM_IDS, PROGRAM_IDS_V17 } from "@percolatorct/sdk";
 
 export interface ProgramIds {
   /** The Percolator wrapper (market/slab owner). */
@@ -38,6 +47,16 @@ export interface ProgramIds {
   matcher: PublicKey;
   /** Where each value came from, for the boot log. */
   source: { wrapper: string; stake: string; matcher: string };
+  /** Env IDs accepted only because KEEPER_ALLOW_PROGRAM_ID_OVERRIDE=1. */
+  overridden: string[];
+}
+
+/** Every program ID the SDK build knows about. */
+export function sdkKnownProgramIds(): Set<string> {
+  const out = new Set<string>();
+  for (const net of Object.values(PROGRAM_IDS)) for (const v of Object.values(net)) out.add(v);
+  for (const v of Object.values(PROGRAM_IDS_V17)) out.add(v);
+  return out;
 }
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -80,7 +99,30 @@ export function resolveProgramIds(env: Env): ProgramIds {
       ? { v: legacyEnv, s: "env PROGRAM_ID" }
       : { v: PROGRAM_IDS_V17.percolator, s: "sdk PROGRAM_IDS_V17.percolator" };
 
+  const known = sdkKnownProgramIds();
+  const allowOverride = env.KEEPER_ALLOW_PROGRAM_ID_OVERRIDE?.trim() === "1";
+  const overridden: string[] = [];
+  const envValues: Array<[string, string | undefined]> = [
+    ["WRAPPER_PROGRAM_ID", wrapperEnv],
+    ["PROGRAM_ID", wrapperEnv ? undefined : legacyEnv],
+    ["STAKE_PROGRAM_ID", stakeEnv],
+    ["MATCHER_PROGRAM_ID", matcherEnv],
+  ];
+  for (const [name, v] of envValues) {
+    if (!v) continue;
+    parseKey(name, v); // a malformed value is a format error first, not an allowlist miss
+    if (known.has(v.trim())) continue;
+    if (!allowOverride) {
+      throw new Error(
+        `${name}=${v.trim()} is not a program id this SDK build knows. Set KEEPER_ALLOW_PROGRAM_ID_OVERRIDE=1 ` +
+          "to accept it deliberately (e.g. a fresh-ID cutover before the SDK carries the new id)",
+      );
+    }
+    overridden.push(`${name}=${v.trim()}`);
+  }
+
   return {
+    overridden,
     wrapper: parseKey(wrapperSrc.s, wrapperSrc.v),
     stake: parseKey(
       stakeEnv ? "STAKE_PROGRAM_ID" : "sdk PROGRAM_IDS_V17.vault",
@@ -104,14 +146,15 @@ export function resolveProgramIds(env: Env): ProgramIds {
  * `uncaughtException` handler is not installed yet at that point, so the
  * process exits non-zero, which is what a supervisor needs to see.
  */
-export const PROGRAM_IDS: ProgramIds = resolveProgramIds(process.env);
+export const PROGRAM_IDS_RESOLVED: ProgramIds = resolveProgramIds(process.env);
 
-export const WRAPPER_PROGRAM_ID: PublicKey = PROGRAM_IDS.wrapper;
-export const STAKE_PROGRAM_ID: PublicKey = PROGRAM_IDS.stake;
-export const MATCHER_PROGRAM_ID: PublicKey = PROGRAM_IDS.matcher;
+export const WRAPPER_PROGRAM_ID: PublicKey = PROGRAM_IDS_RESOLVED.wrapper;
+export const STAKE_PROGRAM_ID: PublicKey = PROGRAM_IDS_RESOLVED.stake;
+export const MATCHER_PROGRAM_ID: PublicKey = PROGRAM_IDS_RESOLVED.matcher;
 
-export function describeProgramIds(ids: ProgramIds = PROGRAM_IDS): string[] {
+export function describeProgramIds(ids: ProgramIds = PROGRAM_IDS_RESOLVED): string[] {
   return [
+    ...(ids.overridden.length ? [`OVERRIDE (KEEPER_ALLOW_PROGRAM_ID_OVERRIDE=1, not in the SDK tables): ${ids.overridden.join(", ")}`] : []),
     `wrapper=${ids.wrapper.toBase58()} (${ids.source.wrapper})`,
     `stake=${ids.stake.toBase58()} (${ids.source.stake})`,
     `matcher=${ids.matcher.toBase58()} (${ids.source.matcher})`,

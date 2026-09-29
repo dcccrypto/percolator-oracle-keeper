@@ -42,6 +42,7 @@ const CFG: StakeFeeConfig = {
   wrapperProgramId: WRAPPER,
   stakeProgramId: STAKE,
   minRealShares: 0n,
+  maxDeadShareBps: 100n,
   minPushAtoms: 1n,
   confirm: { statusRetries: 1, statusRetryDelayMs: 0 },
 };
@@ -113,13 +114,24 @@ describe("decideStakeFeePush — the real-staker gate (F3)", () => {
     assert.equal(decideStakeFeePush({ market, owed: 5n, pool: pool(0n) }, CFG).action, "skip");
   });
 
-  it("pushes as soon as one real share exists above the floor", () => {
+  it("K-1: a dust deposit (1 real share) does NOT unlock the push — dead shares would take ~99.9%", () => {
     const d = decideStakeFeePush({ market, owed: 5n, pool: pool(STAKE_MINIMUM_LIQUIDITY + 1n) }, CFG);
-    assert.deepEqual(d, { action: "push", owed: 5n, realShares: 1n });
+    assert.equal(d.action, "skip");
+    assert.match((d as { reason: string }).reason, /dead shares would take ~9991 bps/);
+  });
+
+  it("K-1: ratio boundary — 100,000 total shares (dead = 1.00%) pushes, 99,999 does not", () => {
+    assert.deepEqual(decideStakeFeePush({ market, owed: 5n, pool: pool(100_000n) }, CFG), { action: "push", owed: 5n, realShares: 99_000n });
+    assert.equal(decideStakeFeePush({ market, owed: 5n, pool: pool(99_999n) }, CFG).action, "skip");
+  });
+
+  it("STAKE_FEE_MAX_DEAD_SHARE_BPS relaxes or tightens the ratio", () => {
+    assert.equal(decideStakeFeePush({ market, owed: 5n, pool: pool(20_000n) }, { ...CFG, maxDeadShareBps: 500n }).action, "push");
+    assert.equal(decideStakeFeePush({ market, owed: 5n, pool: pool(100_000n) }, { ...CFG, maxDeadShareBps: 50n }).action, "skip");
   });
 
   it("honours STAKE_FEE_MIN_REAL_SHARES", () => {
-    const d = decideStakeFeePush({ market, owed: 5n, pool: pool(STAKE_MINIMUM_LIQUIDITY + 10n) }, { ...CFG, minRealShares: 10n });
+    const d = decideStakeFeePush({ market, owed: 5n, pool: pool(1_000_000n) }, { ...CFG, minRealShares: 999_000n });
     assert.equal(d.action, "skip");
   });
 

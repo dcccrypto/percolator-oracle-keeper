@@ -16,6 +16,7 @@ const CFG = {
   wrapperProgramId: new PublicKey("GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ"),
   stakeProgramId: new PublicKey("GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3"),
   minRealShares: 0n,
+  maxDeadShareBps: 100n,
   minPushAtoms: 1n,
 };
 

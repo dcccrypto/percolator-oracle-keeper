@@ -31,6 +31,15 @@ describe("resolveProgramIds", () => {
     assert.throws(() => resolveProgramIds({ WRAPPER_PROGRAM_ID: "ETDLAdiA0OIl-not-base58" }), /not a valid base58/);
     assert.throws(() => resolveProgramIds({ STAKE_PROGRAM_ID: "abc" }), /not a valid base58/);
   });
+  it("K-2: an id the SDK does not know is refused unless KEEPER_ALLOW_PROGRAM_ID_OVERRIDE=1", () => {
+    const unknown = "11111111111111111111111111111112";
+    assert.throws(() => resolveProgramIds({ WRAPPER_PROGRAM_ID: unknown }), /KEEPER_ALLOW_PROGRAM_ID_OVERRIDE=1/);
+    assert.throws(() => resolveProgramIds({ PROGRAM_ID: unknown }), /not a program id this SDK build knows/);
+    assert.throws(() => resolveProgramIds({ STAKE_PROGRAM_ID: unknown }), /KEEPER_ALLOW/);
+    const ok = resolveProgramIds({ WRAPPER_PROGRAM_ID: unknown, KEEPER_ALLOW_PROGRAM_ID_OVERRIDE: "1" });
+    assert.equal(ok.wrapper.toBase58(), unknown);
+    assert.deepEqual(ok.overridden, [`WRAPPER_PROGRAM_ID=${unknown}`], "recorded for the boot log");
+  });
   it("blank values fall back to the SDK", () => {
     assert.equal(resolveProgramIds({ WRAPPER_PROGRAM_ID: "  " }).wrapper.toBase58(), PROGRAM_IDS_V17.percolator);
   });
