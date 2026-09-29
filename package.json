@@ -1,7 +1,7 @@
 {
   "name": "percolator-oracle-keeper",
   "version": "1.0.0",
-  "description": "Oracle keeper service for Percolator — mirrors price feeds to Percolator devnet markets via PushOraclePrice + KeeperCrank",
+  "description": "Oracle keeper service for Percolator \u2014 mirrors price feeds to Percolator devnet markets via PushOraclePrice + KeeperCrank",
   "private": true,
   "type": "module",
   "scripts": {
@@ -16,7 +16,7 @@
     "rotate-logs": "bash scripts/rotate-keeper-logs.sh"
   },
   "dependencies": {
-    "@percolatorct/sdk": "file:../percolator-sdk",
+    "@percolatorct/sdk": "file:/Users/khubair/percolator-ops/artifacts/sdk-8.0.0/percolatorct-sdk-8.0.0.tgz",
     "@solana/web3.js": "1.98.4",
     "@supabase/supabase-js": "^2.111.0",
     "tsx": "4.19.1"
