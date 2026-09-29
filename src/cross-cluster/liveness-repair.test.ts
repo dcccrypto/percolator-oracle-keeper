@@ -18,7 +18,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Keypair, PublicKey, Transaction, VersionedTransaction } from "@solana/web3.js";
-import { IX_TAG, parseBackingBucketsV17 } from "@percolatorct/sdk";
+import { IX_TAG, PROGRAM_IDS_V17, parseBackingBucketsV17 } from "@percolatorct/sdk";
 import {
   FINALIZE_RESET_SIDE_TAG,
   buildExpireBackingBucketIx,
@@ -205,7 +205,7 @@ describe("crank transaction carries the repairs", () => {
     await run(conn);
     assert.equal(sent.length, 1);
     const tags = sent[0].instructions
-      .filter((ix) => ix.programId.equals(new PublicKey("GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ")))
+      .filter((ix) => ix.programId.equals(new PublicKey(PROGRAM_IDS_V17.percolator)))
       .map((ix) => ix.data[0]);
     assert.equal(tags[0], IX_TAG.ExpireBackingBucket, `first wrapper ix must be the expiry, got tags ${tags.join(",")}`);
     assert.deepEqual([...sent[0].instructions.find((ix) => ix.data[0] === IX_TAG.ExpireBackingBucket)!.data], [89, 1, 0]);
