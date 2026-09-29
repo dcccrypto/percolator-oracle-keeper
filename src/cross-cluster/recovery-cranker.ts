@@ -126,6 +126,8 @@ import {
   selectPositionedPortfolios,
 } from "./positioned-refresh.ts";
 import type { CrankPlan, MarketRefreshState, PositionedPortfolio } from "./positioned-refresh.ts";
+import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
+import type { LivenessRepair } from "./liveness-repair.ts";
 
 const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
 const COMPUTE_UNIT_LIMIT = 250_000;
@@ -410,8 +412,18 @@ async function crankOneMarket(
       ? await positionedPortfoliosFor(devnetConn, market, label, pre, state)
       : [];
 
+    // Liveness repairs (lapsed Fresh backing bucket, side stuck in ResetPending):
+    // states no crank can leave, which revert every crank Custom(19) or every
+    // open Custom(21). Prepended to this cycle's transaction; see liveness-repair.ts.
+    let repairs: LivenessRepair[] = [];
+    try {
+      repairs = planLivenessRepairs(decodeLivenessState(acct.value.data), BigInt(acct.context.slot));
+    } catch {
+      repairs = [];
+    }
+
     const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan =>
-      planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t });
+      planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs });
 
     if (dryRun) {
       const plan = build(targets);
@@ -454,6 +466,8 @@ async function crankOneMarket(
         logs: sim.value.logs ?? null,
         marketData: acc ? Buffer.from(acc.data[0], "base64") : null,
       };
+    }, (r) => {
+      repairs = repairs.filter((x) => x !== r);
     });
 
     if (resolved.sim.err) {
@@ -495,6 +509,18 @@ async function crankOneMarket(
     }
     state.consecutiveReverts = 0;
     state.lastRevertCode = null;
+
+    const landedRepairs = plan.cranks.filter((c) => c.kind === "repair" && c.repair).map((c) => describeRepair(c.repair!));
+    if (landedRepairs.length > 0) {
+      console.log(`[cranker] ${label}: liveness repair sent: ${landedRepairs.join(", ")} sig=${signature.slice(0, 12)}…`);
+    }
+    const rejectedRepairs = resolved.pruned.filter((p) => p.repair);
+    if (rejectedRepairs.length > 0) {
+      console.warn(
+        `[cranker] ${label}: liveness repair rejected in simulation: ` +
+          rejectedRepairs.map((p) => `${describeRepair(p.repair!)}:${p.code ?? "?"}`).join(", "),
+      );
+    }
 
     reportRefreshOutcome(label, pre, resolved, state);
     if (plan.overflow.length > 0) {
@@ -617,11 +643,14 @@ export interface SimOutcome {
 export interface ResolvedCrankPlan {
   plan: CrankPlan;
   sim: SimOutcome;
-  pruned: { pubkey: PublicKey; code: number | null }[];
+  /** Refreshes (and, with `repair` set, liveness repairs) dropped after a simulated rejection. */
+  pruned: { pubkey: PublicKey; code: number | null; repair?: LivenessRepair }[];
 }
 
 /** Refreshes pruned one at a time before giving up on refreshing this cycle. */
 export const MAX_REFRESH_PRUNES = 3;
+/** At most 2 bucket expiries + 2 side finalizes exist per single-asset market. */
+export const MAX_REPAIR_DROPS = 4;
 
 /**
  * Simulate the plan and drop refreshes the engine rejects, one per
@@ -638,15 +667,28 @@ export async function resolveCrankPlan(
   build: (targets: ReadonlyArray<PositionedPortfolio>) => CrankPlan,
   targets: ReadonlyArray<PositionedPortfolio>,
   simulate: (plan: CrankPlan) => Promise<SimOutcome>,
+  /**
+   * Called when a liveness repair is the rejected instruction. The caller must
+   * drop it from what `build` emits; the plan is then re-simulated without it,
+   * so a repair the engine refuses can never block the ordinary crank.
+   */
+  onRepairRejected?: (repair: LivenessRepair) => void,
 ): Promise<ResolvedCrankPlan> {
   let remaining = [...targets];
-  const pruned: { pubkey: PublicKey; code: number | null }[] = [];
+  const pruned: { pubkey: PublicKey; code: number | null; repair?: LivenessRepair }[] = [];
+  let repairDrops = 0;
   for (;;) {
     const plan = build(remaining);
     const sim = await simulate(plan);
     if (!sim.err) return { plan, sim, pruned };
     const ie = parseInstructionError(sim.err);
     const crank = ie && ie.index >= 1 ? plan.cranks[ie.index - 1] : undefined;
+    if (crank && crank.kind === "repair" && crank.repair && onRepairRejected && repairDrops < MAX_REPAIR_DROPS) {
+      repairDrops++;
+      pruned.push({ pubkey: crank.portfolio, code: ie?.custom ?? null, repair: crank.repair });
+      onRepairRejected(crank.repair);
+      continue;
+    }
     if (!crank || crank.kind !== "refresh") return { plan, sim, pruned };
     pruned.push({ pubkey: crank.portfolio, code: ie?.custom ?? null });
     remaining = remaining.filter((p) => !p.pubkey.equals(crank.portfolio));
