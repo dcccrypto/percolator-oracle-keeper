@@ -49,7 +49,6 @@ import {
   encodePermissionlessCrank,
   ACCOUNTS_PERMISSIONLESS_CRANK_BASE,
   buildAccountMetas,
-  PROGRAM_IDS_V17,
   V17_MARKET_GROUP_OFF,
   V17_MARKET_GROUP_LEN,
   V17_PORTFOLIO_ACCOUNT_LEN,
@@ -59,7 +58,7 @@ import {
 import { buildLivenessRepairIx } from "./liveness-repair.ts";
 import type { LivenessRepair } from "./liveness-repair.ts";
 
-const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
+import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 
 /** The asset every registry market trades (single-asset markets). */
 export const REFRESH_ASSET_INDEX = 0;

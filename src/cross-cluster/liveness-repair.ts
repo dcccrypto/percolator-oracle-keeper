@@ -46,14 +46,13 @@
 import { PublicKey, TransactionInstruction } from "@solana/web3.js";
 import {
   ACCOUNTS_EXPIRE_BACKING_BUCKET,
-  PROGRAM_IDS_V17,
   V17_MARKET_GROUP_LEN,
   V17_MARKET_GROUP_OFF,
   buildAccountMetas,
   encodeExpireBackingBucket,
 } from "@percolatorct/sdk";
 
-const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
+import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 
 /** Wrapper instruction tag for FinalizeResetSide (v16_program.rs `45 => Self::FinalizeResetSide`). */
 export const FINALIZE_RESET_SIDE_TAG = 45;

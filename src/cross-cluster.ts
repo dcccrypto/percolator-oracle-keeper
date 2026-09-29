@@ -25,6 +25,17 @@
  *   DRY_RUN               "true" for dry-run (no on-chain writes, default: false)
  *   CRANK_ENABLED          "false" disables the recovery crank loop + crank-on-boot (default: true)
  *   CRANK_INTERVAL_MS       recovery crank cycle interval ms (default: 20000)
+ *   LP_FEE_CRANK_ENABLED    "false" disables the tag 78 LP-fee crank job (default: true)
+ *   STAKE_FEE_PUSH_ENABLED  "false" disables the tag 87 -> stake AccrueFees job (default: true)
+ *   LP_FEE_CRANK_INTERVAL_MS  fee-job loop interval ms (default: 200000)
+ *   STAKE_FEE_MIN_REAL_SHARES real (non-dead) stake shares required above the 1,000 floor (default: 0)
+ *   STAKE_FEE_MIN_PUSH_ATOMS  smallest staker leg worth a transaction (default: 1)
+ *   WRAPPER_PROGRAM_ID / STAKE_PROGRAM_ID / MATCHER_PROGRAM_ID  program ids (default: SDK
+ *                           constants; PROGRAM_ID is a legacy alias for the wrapper) — see program-ids.ts
+ *   DEVNET_RPC_ORIGIN       Origin header for an Origin-restricted devnet RPC key (optional)
+ *   KEEPER_ALERT_WEBHOOK_URL  https webhook for [ALERT] lines (optional; Slack/Discord-compatible `text`)
+ *   ALERT_SLOT_LAG_WARN / ALERT_SLOT_LAG_CRITICAL / ALERT_CRANK_REVERTS / ALERT_ZERO_PUSH_CYCLES /
+ *   ALERT_LAPSED_BUCKET_CYCLES / ALERT_BANKRUPT_CYCLES / ALERT_COOLDOWN_MS  alert thresholds (alerting.ts)
  *   REGISTER_SOURCE_URL     GET endpoint polled for wizard-registered markets (unset = disabled)
  *   REGISTER_POLL_INTERVAL_MS  register-poll interval ms (default: 30000)
  *   REGISTRY_RELOAD_INTERVAL_MS  G6 registry.json hot-reload interval ms (default: 15000)
@@ -42,7 +53,16 @@ import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { MIN_POOL_LIQUIDITY_USD_E6 } from "./cross-cluster/price-reader.ts";
 import { crankAllOnce, startRecoveryCrankLoop } from "./cross-cluster/recovery-cranker.ts";
-import { startLpFeeCrankLoop } from "./cross-cluster/lp-fee-cranker.ts";
+import { makeLpFeeJob } from "./cross-cluster/lp-fee-cranker.ts";
+import { makeStakeFeeJob, stakeFeeConfigFromEnv } from "./cross-cluster/stake-fee-pusher.ts";
+import type { StakeFeeConfig } from "./cross-cluster/stake-fee-pusher.ts";
+import { startFeeJobLoop } from "./cross-cluster/fee-jobs.ts";
+import type { FeeJob } from "./cross-cluster/fee-jobs.ts";
+import { getAlertSink } from "./cross-cluster/alerting.ts";
+import type { AlertSink } from "./cross-cluster/alerting.ts";
+import { describeProgramIds } from "./program-ids.ts";
+import { devnetConnectionConfig } from "./rpc-headers.ts";
+import type { ConnectionConfig } from "@solana/web3.js";
 import { startRegisterPollLoop, pollOnce } from "./cross-cluster/register-poll.ts";
 import { startRegistrationStream, type RegistrationStream } from "./cross-cluster/registration-stream.ts";
 import { startRegistryReloadLoop } from "./cross-cluster/registry-reload.ts";
@@ -129,7 +149,16 @@ if (!DEVNET_RPC) {
 // to its supervisor and simply never push. Config errors must exit 1.
 let MIN_KEEPER_BALANCE_LAMPORTS: number;
 let BALANCE_CHECK_INTERVAL_MS: number;
+let STAKE_FEE_CONFIG: StakeFeeConfig;
+let ALERT_SINK: AlertSink;
+let DEVNET_CONN_CONFIG: ConnectionConfig;
 try {
+  // Ops-track config fails fast with everything else: a malformed alert
+  // threshold, webhook URL or fee-job knob must stop boot, not surface as a
+  // throw inside a background loop hours later.
+  STAKE_FEE_CONFIG = stakeFeeConfigFromEnv(process.env);
+  ALERT_SINK = getAlertSink();
+  DEVNET_CONN_CONFIG = devnetConnectionConfig(process.env);
   MIN_KEEPER_BALANCE_LAMPORTS = parsePositiveLamportsFromSolEnv(
     "MIN_KEEPER_BALANCE_SOL",
     0.05,
@@ -186,6 +215,9 @@ const CRANK_INTERVAL_MS = parseInt(process.env.CRANK_INTERVAL_MS ?? "20000", 10)
 // market with no LP depositors costs no transaction at all.
 const LP_FEE_CRANK_ENABLED = process.env.LP_FEE_CRANK_ENABLED !== "false";
 const LP_FEE_CRANK_INTERVAL_MS = parseInt(process.env.LP_FEE_CRANK_INTERVAL_MS ?? "200000", 10);
+// Stake-fee push (tag 87 -> stake AccrueFees, fee-flow audit F2/F3). Shares the
+// fee-job loop and its interval with the LP-fee crank.
+const STAKE_FEE_PUSH_ENABLED = process.env.STAKE_FEE_PUSH_ENABLED !== "false";
 
 // Registration-poll loop — outbound poll of the Vercel-hosted playground registered-
 // markets blob, so markets created through the create-market wizard after this keeper
@@ -251,16 +283,21 @@ if (registry.markets.length === 0) {
 }
 
 const mainnetConn = new Connection(MAINNET_RPC, "confirmed");
-const devnetConn = new Connection(DEVNET_RPC, "confirmed");
+// DEVNET_RPC_ORIGIN replaces the uncommitted `httpHeaders: { Origin }` edit the
+// live machine carried here (Origin-restricted Helius key; see rpc-headers.ts).
+const devnetConn = new Connection(DEVNET_RPC, DEVNET_CONN_CONFIG);
 
 console.log("[cross-cluster] Boot:");
 console.log(`  keeper:    ${keeper.publicKey.toBase58()}`);
 console.log(`  registry:  ${REGISTRY_PATH} (${registry.markets.length} markets)`);
 console.log(`  mode:      ${DRY_RUN ? "DRY-RUN (no on-chain writes)" : "LIVE"}`);
 console.log(`  interval:  ${CC_INTERVAL_MS}ms`);
+for (const line of describeProgramIds()) console.log(`  program:   ${line}`);
+console.log(`  alerts:    webhook ${process.env.KEEPER_ALERT_WEBHOOK_URL ? "ON" : "off"}; thresholds ${JSON.stringify(ALERT_SINK.thresholds)}`);
 console.log(
   `  cranker:   ${CRANK_ENABLED ? `every ${CRANK_INTERVAL_MS}ms` : "disabled (CRANK_ENABLED=false)"}`,
   `  lp-fee:    ${LP_FEE_CRANK_ENABLED ? `every ${LP_FEE_CRANK_INTERVAL_MS}ms` : "disabled (LP_FEE_CRANK_ENABLED=false)"}`,
+  `  stake-fee: ${STAKE_FEE_PUSH_ENABLED ? `every ${LP_FEE_CRANK_INTERVAL_MS}ms (real stakers only)` : "disabled (STAKE_FEE_PUSH_ENABLED=false)"}`,
 );
 for (const m of registry.markets) {
   console.log(
@@ -301,28 +338,38 @@ if (CRANK_ENABLED) {
   void startRecoveryCrankLoop(devnetConn, keeper, registry, {
     intervalMs: CRANK_INTERVAL_MS,
     dryRun: DRY_RUN,
-  }).catch((err) => {
+  }, ALERT_SINK).catch((err: unknown) => {
     console.error(
       `[cranker] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
     );
   });
 }
 
-// LP-fee distribution loop. Same "concurrent, never awaited, never throws out of
-// scope" pattern. Without this, `lp_fee_accrued_atoms` grows on the slab forever
-// and LP depositors see 0% APY no matter how much the market trades — the fee
-// split is correct, but nothing ever moves the LP's share into the vault.
-// Runs 10x slower than the recovery crank: distribution is not latency-sensitive,
-// and a market with no LP depositors is skipped locally without a transaction.
-if (LP_FEE_CRANK_ENABLED) {
-  void startLpFeeCrankLoop(devnetConn, keeper, registry, {
-    intervalMs: LP_FEE_CRANK_INTERVAL_MS,
-    dryRun: DRY_RUN,
-  }).catch((err) => {
-    console.error(
-      `[lp-fee] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
-    );
-  });
+// Fee-job loop: every "move accrued fee value to its owner" job, in order, per
+// market (fee-jobs.ts). Same "concurrent, never awaited, never throws out of
+// scope" pattern as the crank loop.
+//   lp-fee    tag 78 — the LP leg (48%) into the Earn vault. Without it
+//             `lp_fee_accrued_atoms` grows forever and LPs see 0% APY.
+//   stake-fee tag 87 + stake AccrueFees — the staker leg (16%), only for pools
+//             with real stakers above the 1,000 dead shares (F2/F3).
+// Later phases append jobs here (P3: vault NAV / fee sweeps).
+{
+  const feeJobs: FeeJob[] = [];
+  if (LP_FEE_CRANK_ENABLED) feeJobs.push(makeLpFeeJob());
+  if (STAKE_FEE_PUSH_ENABLED) feeJobs.push(makeStakeFeeJob(STAKE_FEE_CONFIG));
+  if (feeJobs.length > 0) {
+    void startFeeJobLoop(
+      feeJobs,
+      { conn: devnetConn, keeper, dryRun: DRY_RUN },
+      registry,
+      { intervalMs: LP_FEE_CRANK_INTERVAL_MS },
+      ALERT_SINK,
+    ).catch((err: unknown) => {
+      console.error(
+        `[fee-jobs] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
 }
 
 // Registration-poll loop — same "runs concurrently, never awaited, never allowed to

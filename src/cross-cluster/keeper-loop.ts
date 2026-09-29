@@ -25,6 +25,7 @@ import { createMarkSmoother } from "./mark-smoother.ts";
 import { checkCircuitBreaker, recordMarkInForce } from "../circuit-breaker.ts";
 import type { CircuitBreakerState } from "../circuit-breaker.ts";
 import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets } from "./auth-mark-pusher.ts";
+import { evaluatePushCycle, getAlertSink } from "./alerting.ts";
 import {
   type WalletBalanceState,
   createWalletBalanceState,
@@ -96,7 +97,15 @@ interface LoopState {
   lastBatchReadError: string | null;
   /** #71 wallet-balance guard state. */
   wallet: WalletBalanceState;
+  /** Ops track: markets in this cycle's push batch, and how many landed. Reset every cycle. */
+  cycleAttempted: number;
+  cyclePushed: number;
+  /** Consecutive cycles with zero landed pushes (markets registered). */
+  zeroPushStreak: number;
 }
+
+/** Emit the structured push `[health]` line every N cycles. */
+export const PUSH_HEALTH_LINE_EVERY_CYCLES = 10;
 
 /**
  * Health status for the pricing pipeline, separated from the handler so it
@@ -667,7 +676,9 @@ async function runCycle(
 
   // ── 5. One batched PushAuthMark tx, fire-and-forget ─────────────────────────
   try {
+    state.cycleAttempted = pushes.length;
     const res = await pushAuthMarkBatch(devnetConn, keeper, pushes, nowSlot, cachedBlockhash, config.dryRun);
+    state.cyclePushed = config.dryRun ? pushes.length : res.signature ? res.pushedMarkets.length : 0;
     const stamp = Date.now();
     // Record PER MARKET, not per batch. This loop used to stamp every market in
     // `pushes` as freshly pushed whenever the batch reported success — so a
@@ -727,6 +738,31 @@ async function runCycle(
   }
 }
 
+/**
+ * Ops track: pushes landed per cycle. A cycle abandoned by the watchdog, a
+ * paused wallet, or a total mainnet-read failure all count as zero — that is
+ * the frozen-AuthMark condition regardless of which one caused it. Never throws.
+ */
+async function reportPushCycle(state: LoopState, registered: number): Promise<void> {
+  try {
+    const sink = getAlertSink();
+    const sample = {
+      cycle: state.cycleCount,
+      registered,
+      attempted: state.cycleAttempted,
+      pushed: state.cyclePushed,
+    };
+    const ev = evaluatePushCycle(sample, state.zeroPushStreak, sink.thresholds);
+    state.zeroPushStreak = ev.zeroStreak;
+    if (state.cycleCount % PUSH_HEALTH_LINE_EVERY_CYCLES === 0) {
+      sink.health("push", { ...sample, zeroStreak: ev.zeroStreak, timeouts: state.timeoutCount });
+    }
+    await sink.reconcile("push", ev.active);
+  } catch (err) {
+    console.error(`[keeper] push health report failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 // ── D2a: hang detection ───────────────────────────────────────────────────────
 
 const DEFAULT_CYCLE_TIMEOUT_MS = 10_000;
@@ -780,6 +816,9 @@ export async function startKeeperLoop(
     consecutiveBatchReadFailures: 0,
     wallet: createWalletBalanceState(),
     lastBatchReadError: null,
+    cycleAttempted: 0,
+    cyclePushed: 0,
+    zeroPushStreak: 0,
     stats: new Map(
       registry.markets.map((m) => [
         m.marketAddress,
@@ -832,6 +871,8 @@ export async function startKeeperLoop(
   while (!stopping) {
     const cycleStart = Date.now();
     state.cycleCount++;
+    state.cycleAttempted = 0;
+    state.cyclePushed = 0;
     console.log(
       `\n[keeper] === Cycle ${state.cycleCount} ${new Date().toISOString()} ===`,
     );
@@ -860,6 +901,7 @@ export async function startKeeperLoop(
     }
 
     state.lastCycleAt = Date.now();
+    await reportPushCycle(state, registry.markets.length);
     const elapsed = Date.now() - cycleStart;
     const remaining = config.intervalMs - elapsed;
     if (remaining > 0 && !stopping) {

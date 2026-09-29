@@ -58,7 +58,10 @@ import {
 } from "@percolatorct/sdk";
 import { SystemProgram } from "@solana/web3.js";
 import type { Registry } from "./registry.ts";
-import { WRAPPER_PROGRAM_ID } from "./auth-mark-pusher.ts";
+import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
+import { confirmBySignature, customCodeOf } from "./tx-confirm.ts";
+import type { ConfirmOptions } from "./tx-confirm.ts";
+import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
 
 /**
  * Fallback only. v17 vaults are DUAL-DOMAIN: the vault serves both pots of its
@@ -74,13 +77,6 @@ const COMPUTE_UNIT_LIMIT = 120_000;
 /** Engine code for "no new fees to distribute" — expected, not a failure. */
 const NO_FEES_TO_CRANK = 38;
 
-export interface LpFeeCrankConfig {
-  /** Milliseconds between sweeps. */
-  intervalMs: number;
-  /** Build and log, but never send. */
-  dryRun: boolean;
-}
-
 export interface LpFeeCrankResult {
   /** Markets whose fees were actually distributed. */
   cranked: string[];
@@ -93,22 +89,24 @@ export interface LpFeeCrankResult {
 }
 
 function extractErrorCode(err: unknown): number | null {
-  const msg = err instanceof Error ? err.message : String(err);
-  const json = msg.match(/"Custom"\s*:\s*(\d+)/);
-  if (json) return Number(json[1]);
-  const hex = msg.match(/custom program error:\s*0x([0-9a-fA-F]+)/);
-  if (hex) return parseInt(hex[1], 16);
-  return null;
+  return customCodeOf(err instanceof Error ? err.message : err);
 }
+
+/** The Connection surface the LP-fee crank uses (stubbable in tests). */
+export type LpFeeConnection = Pick<
+  Connection,
+  "getMultipleAccountsInfo" | "getLatestBlockhash" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses"
+>;
 
 /**
  * Crank one market's LP fees. Never throws — every outcome is reported.
  */
 export async function crankLpFeesOnce(
-  devnetConn: Connection,
+  devnetConn: LpFeeConnection,
   keeper: Keypair,
   marketAddress: string,
   dryRun: boolean,
+  confirmOpts?: ConfirmOptions,
 ): Promise<"cranked" | "no-fees" | "skipped" | { error: string }> {
   let market: PublicKey;
   try {
@@ -180,8 +178,20 @@ export async function crankLpFeesOnce(
     tx.feePayer = keeper.publicKey;
     tx.sign(keeper);
     const sig = await devnetConn.sendRawTransaction(tx.serialize(), { maxRetries: 2 });
-    await devnetConn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
-    console.log(`[lp-fee] distributed ${marketAddress.slice(0, 8)}… sig=${sig.slice(0, 16)}…`);
+    // F6 (fee-flow audit 2026-09-29): the signature STATUS decides, not whether
+    // confirmTransaction returned before its block-height deadline. SOLCAT
+    // 5xq4yAXH… and ANSEM 4RJv6kJt… were logged as "block height exceeded"
+    // failures but had landed. A confirmation that carries value.err (landed but
+    // failed on chain) is a failure, not a success, too.
+    const c = await confirmBySignature(devnetConn, sig, blockhash, lastValidBlockHeight, confirmOpts);
+    if (c.status === "failed") {
+      if (c.code === NO_FEES_TO_CRANK) return "no-fees";
+      return { error: `landed but failed on chain: ${JSON.stringify(c.err).slice(0, 100)} sig=${sig.slice(0, 16)}…` };
+    }
+    if (c.status === "not-landed") {
+      return { error: `not landed (retry next cycle): ${c.reason} sig=${sig.slice(0, 16)}…` };
+    }
+    console.log(`[lp-fee] distributed ${marketAddress.slice(0, 8)}… sig=${sig.slice(0, 16)}… [${c.via}]`);
     return "cranked";
   } catch (err) {
     if (extractErrorCode(err) === NO_FEES_TO_CRANK) return "no-fees";
@@ -218,44 +228,18 @@ export async function crankAllLpFeesOnce(
 }
 
 /**
- * Periodic LP-fee distribution loop. Mirrors startRecoveryCrankLoop's shape:
- * isolated per-market errors, concurrent sweep, never throws out of scope.
+ * The LP-fee crank as a fee job (see fee-jobs.ts), so it runs in the shared
+ * fee loop next to the stake-fee push and inherits its health/alerting.
  */
-export async function startLpFeeCrankLoop(
-  devnetConn: Connection,
-  keeper: Keypair,
-  registry: Registry,
-  config: LpFeeCrankConfig,
-): Promise<void> {
-  console.log(
-    `[lp-fee] LP fee crank loop starting: ${registry.markets.length} markets,` +
-      ` interval=${config.intervalMs}ms, mode=${config.dryRun ? "DRY-RUN" : "LIVE"}`,
-  );
-
-  let stopping = false;
-  process.on("SIGINT", () => { stopping = true; });
-  process.on("SIGTERM", () => { stopping = true; });
-
-  let cycle = 0;
-  while (!stopping) {
-    const start = Date.now();
-    try {
-      const r = await crankAllLpFeesOnce(devnetConn, keeper, registry, config.dryRun);
-      // Only speak up when something actually moved, or every ~20 cycles, so a
-      // quiet fleet does not fill the log with "nothing happened".
-      if (r.cranked.length > 0 || cycle % 20 === 0) {
-        console.log(
-          `[lp-fee] cycle ${cycle}: ${r.cranked.length} distributed, ` +
-            `${r.noFees.length} no-fees, ${r.skipped.length} no-vault/no-depositors, ` +
-            `${r.failed.length} failed`,
-        );
-      }
-    } catch (err) {
-      // Defense in depth — crankAllLpFeesOnce already swallows per-market errors.
-      console.error(`[lp-fee] sweep error — ${(err as Error).message.slice(0, 140)}`);
-    }
-    cycle++;
-    const elapsed = Date.now() - start;
-    await new Promise((r) => setTimeout(r, Math.max(1000, config.intervalMs - elapsed)));
-  }
+export function makeLpFeeJob(confirmOpts?: ConfirmOptions): FeeJob {
+  return {
+    name: "lp-fee",
+    async run(ctx, m): Promise<FeeJobOutcome> {
+      const o = await crankLpFeesOnce(ctx.conn, ctx.keeper, m.marketAddress, ctx.dryRun, confirmOpts);
+      if (o === "cranked") return { kind: "done", detail: "LP fees distributed into the LP vault" };
+      if (o === "no-fees") return { kind: "nothing", detail: "no new LP fees (Custom(38))" };
+      if (o === "skipped") return { kind: "skipped", reason: "no LP vault, or no depositors yet" };
+      return { kind: "failed", error: o.error };
+    },
+  };
 }

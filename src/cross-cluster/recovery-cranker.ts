@@ -108,7 +108,6 @@ import {
   encodePermissionlessCrank,
   ACCOUNTS_PERMISSIONLESS_CRANK_BASE,
   buildAccountMetas,
-  PROGRAM_IDS_V17,
   V17_PORTFOLIO_ACCOUNT_LEN,
   parsePortfolioV17,
 } from "@percolatorct/sdk";
@@ -129,8 +128,10 @@ import {
 import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
 import type { LivenessRepair } from "./liveness-repair.ts";
+import { crankHealthRecord, evaluateCrankHealth, freshStreaks, getAlertSink } from "./alerting.ts";
+import type { Alert, AlertSink, CrankHealthSample, CrankHealthStreaks } from "./alerting.ts";
 
-const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
+import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 const COMPUTE_UNIT_LIMIT = 250_000;
 
 // ── v17 portfolio account discriminator (verified against live devnet data) ──
@@ -180,6 +181,20 @@ interface CrankMarketState {
   /** Last refresh summary logged, so steady-state cycles stay quiet. */
   lastRefreshSummary: string | null;
   decodeWarned: boolean;
+  /** Ops-track health observation from the latest attempt (null until one read the market). */
+  obs: CrankObservation | null;
+  streaks: CrankHealthStreaks;
+}
+
+/** What one crank attempt saw — feeds alerting.ts. */
+export interface CrankObservation {
+  chainSlot: bigint;
+  engineSlot: bigint | null;
+  crankOk: boolean;
+  crankReverted: boolean;
+  lapsedBuckets: number;
+  bankruptFound: number;
+  bankruptLiquidated: number;
 }
 
 function freshCrankMarketState(): CrankMarketState {
@@ -200,6 +215,8 @@ function freshCrankMarketState(): CrankMarketState {
     positionedDirty: false,
     lastRefreshSummary: null,
     decodeWarned: false,
+    obs: null,
+    streaks: freshStreaks(),
   };
 }
 
@@ -422,6 +439,16 @@ async function crankOneMarket(
     } catch {
       repairs = [];
     }
+    const obs: CrankObservation = {
+      chainSlot: BigInt(acct.context.slot),
+      engineSlot: pre ? pre.currentSlot : null,
+      crankOk: false,
+      crankReverted: false,
+      lapsedBuckets: repairs.filter((r) => r.kind === "expire").length,
+      bankruptFound: 0,
+      bankruptLiquidated: 0,
+    };
+    state.obs = obs;
 
     // Bankrupt positioned portfolios found in a clean simulation's post-state;
     // they get a second crank (the engine's Liquidate step) in the same tx.
@@ -492,6 +519,7 @@ async function crankOneMarket(
         .filter(([, data]) => isBankruptPortfolio(data))
         .map(([pk]) => new PublicKey(pk));
       if (bankrupt.length > 0) {
+        obs.bankruptFound = bankrupt.length;
         liquidateTargets = bankrupt;
         const remaining = targets.filter((t) => !resolved.pruned.some((p) => p.pubkey.equals(t.pubkey)));
         const withLiq = await resolveCrankPlan(build, remaining, simulate, onOptionalRejected);
@@ -504,6 +532,7 @@ async function crankOneMarket(
     }
 
     if (resolved.sim.err) {
+      obs.crankReverted = true;
       const code =
         parseCustomErrorCode(resolved.sim.err) ?? parseCustomErrorCode(resolved.sim.logs?.join("\n"));
       state.totalReverts++;
@@ -532,6 +561,8 @@ async function crankOneMarket(
       devnetConn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 }),
     );
     state.totalCranks++;
+    obs.crankOk = true;
+    obs.bankruptLiquidated = plan.cranks.filter((c) => c.kind === "liquidate").length;
     state.lastCrankAt = Date.now();
     state.lastSig = signature;
     state.lastErrorMsg = null;
@@ -807,6 +838,54 @@ export async function crankAllOnce(
   );
 }
 
+/** Emit the structured `[health]` line every N crank cycles (ops track). */
+export const HEALTH_LINE_EVERY_CYCLES = 3;
+
+export function crankSample(label: string, market: string, st: Pick<CrankMarketState, "obs" | "totalCranks" | "totalReverts" | "consecutiveReverts" | "lastRevertCode">): CrankHealthSample | null {
+  if (!st.obs) return null;
+  return {
+    label,
+    market,
+    ...st.obs,
+    totalOk: st.totalCranks,
+    totalReverts: st.totalReverts,
+    consecutiveReverts: st.consecutiveReverts,
+    lastRevertCode: st.lastRevertCode,
+  };
+}
+
+/**
+ * Evaluate every market's latest observation, reconcile alerts, and every
+ * HEALTH_LINE_EVERY_CYCLES cycles print one `[health]` line. Observations are
+ * consumed (set to null) so a market that did not read its account this
+ * cycle (e.g. discovery pending) is not re-evaluated on stale data.
+ */
+export async function reportCrankHealth(
+  registry: Registry,
+  states: Map<string, CrankMarketState>,
+  cycle: number,
+  sink: AlertSink,
+): Promise<Alert[]> {
+  const active: Alert[] = [];
+  const records: Array<Record<string, string | number | null>> = [];
+  for (const m of registry.markets) {
+    const st = states.get(m.marketAddress);
+    if (!st) continue;
+    const sample = crankSample(m.label, m.marketAddress, st);
+    if (!sample) continue;
+    const ev = evaluateCrankHealth(sample, st.streaks, sink.thresholds);
+    st.streaks = ev.streaks;
+    active.push(...ev.active);
+    records.push(crankHealthRecord(sample));
+    st.obs = null;
+  }
+  if (cycle % HEALTH_LINE_EVERY_CYCLES === 0 && records.length > 0) {
+    sink.health("crank", { cycle, markets: records });
+  }
+  await sink.reconcile("crank", active);
+  return active;
+}
+
 /**
  * Start the periodic recovery/maintenance crank loop. Runs indefinitely on
  * its own interval, completely independent of the oracle push loop — call
@@ -818,6 +897,7 @@ export async function startRecoveryCrankLoop(
   keeper: Keypair,
   registry: Registry,
   config: CrankLoopConfig,
+  sink: AlertSink = getAlertSink(),
 ): Promise<void> {
   const states = new Map<string, CrankMarketState>(
     registry.markets.map((m) => [m.marketAddress, freshCrankMarketState()]),
@@ -864,6 +944,7 @@ export async function startRecoveryCrankLoop(
       }),
     );
     cycleCount++;
+    await reportCrankHealth(registry, states, cycleCount, sink);
     if (cycleCount % HEALTH_SUMMARY_EVERY_CYCLES === 0) {
       const summary = registry.markets
         .map((m) => {

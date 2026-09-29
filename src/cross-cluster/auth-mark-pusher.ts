@@ -46,14 +46,13 @@ import {
   V17_MARKET_ASSET_SLOT_LEN,
   V17_ASSET_ORACLE_PROFILE_LEN,
   V17_ASSET_ORACLE_WRAPPER_LEN,
-  PROGRAM_IDS_V17,
 } from "@percolatorct/sdk";
 import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
 
 /**
- * Wrapper program the auth-mark-pusher targets for PushAuthMark. Sourced
- * directly from the SDK's PROGRAM_IDS_V17 constant (2026-07-17 fresh devnet
- * triple cutover) rather than an env var — see auth-mark-pusher.test.ts for
+ * Wrapper program the auth-mark-pusher targets for PushAuthMark. Resolved by
+ * ../program-ids.ts: env WRAPPER_PROGRAM_ID (or legacy PROGRAM_ID), else the
+ * SDK PROGRAM_IDS_V17 constant — so the fresh-ID relaunch is a config change — see auth-mark-pusher.test.ts for
  * a literal-pinned regression guard against silent drift back to the
  * superseded 2026-06-26 wrapper (69VUZ7a2...).
  *
@@ -61,7 +60,8 @@ import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
  * instead of only re-importing the same SDK constant this file reads from,
  * which would be a vacuous self-check.
  */
-export const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
+export { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
+import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 
 const COMPUTE_UNIT_LIMIT = 200_000;
 
