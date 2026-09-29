@@ -127,6 +127,8 @@ import {
 } from "./positioned-refresh.ts";
 import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
+import { decodeAdlState } from "./adl-state.ts";
+import type { AdlState } from "./adl-state.ts";
 import type { LivenessRepair } from "./liveness-repair.ts";
 import { crankHealthRecord, evaluateCrankHealth, freshStreaks, getAlertSink } from "./alerting.ts";
 import type { Alert, AlertSink, CrankHealthSample, CrankHealthStreaks } from "./alerting.ts";
@@ -195,6 +197,8 @@ export interface CrankObservation {
   lapsedBuckets: number;
   bankruptFound: number;
   bankruptLiquidated: number;
+  /** ADL reduce-only inputs from the pre-crank read (null: not a v18 market header). */
+  adl: AdlState | null;
 }
 
 function freshCrankMarketState(): CrankMarketState {
@@ -439,15 +443,7 @@ async function crankOneMarket(
     } catch {
       repairs = [];
     }
-    const obs: CrankObservation = {
-      chainSlot: BigInt(acct.context.slot),
-      engineSlot: pre ? pre.currentSlot : null,
-      crankOk: false,
-      crankReverted: false,
-      lapsedBuckets: repairs.filter((r) => r.kind === "expire").length,
-      bankruptFound: 0,
-      bankruptLiquidated: 0,
-    };
+    const obs = observeMarket(acct.value.data, BigInt(acct.context.slot), pre, repairs);
     state.obs = obs;
 
     // Bankrupt positioned portfolios found in a clean simulation's post-state;
@@ -836,6 +832,34 @@ export async function crankAllOnce(
     `[cranker][boot] crank-on-boot complete: ${ok} clean, ${notClean} not-clean` +
       `${notClean > 0 ? " (will keep retrying on the recurring crank loop)" : ""}.`,
   );
+}
+
+/**
+ * The ops-track observation for one pre-crank market read. Exported (pure) so
+ * the exact decode the cranker performs is under test, not a hand-built copy.
+ */
+export function observeMarket(
+  data: Uint8Array,
+  chainSlot: bigint,
+  pre: Pick<MarketRefreshState, "currentSlot"> | null,
+  repairs: ReadonlyArray<LivenessRepair>,
+): CrankObservation {
+  let adl: AdlState | null = null;
+  try {
+    adl = decodeAdlState(data);
+  } catch {
+    adl = null;
+  }
+  return {
+    chainSlot,
+    engineSlot: pre ? pre.currentSlot : null,
+    crankOk: false,
+    crankReverted: false,
+    lapsedBuckets: repairs.filter((r) => r.kind === "expire").length,
+    bankruptFound: 0,
+    bankruptLiquidated: 0,
+    adl,
+  };
 }
 
 /** Emit the structured `[health]` line every N crank cycles (ops track). */

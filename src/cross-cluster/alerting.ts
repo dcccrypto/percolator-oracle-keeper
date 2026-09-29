@@ -15,6 +15,10 @@
  *   - lapsed buckets Fresh backing buckets past expiry (block one side)
  *   - bankrupt       positioned accounts with equity <= 0 not liquidated
  *   - fee jobs       fee legs that cannot be pushed (e.g. stake pool unbound)
+ *   - ADL reduce-only  a_long/a_short != ADL_ONE (F-3/R2): opens revert
+ *                    Custom(21) until one whole side exits; reported with the
+ *                    observed duration and both sides' OI so an abandoned
+ *                    position is visible
  *
  * Output:
  *   `[health] {json}`  one line per sample batch, machine-parseable
@@ -39,7 +43,8 @@ export type AlertKind =
   | "lapsed-bucket"
   | "bankrupt-unliquidated"
   | "fee-leg-blocked"
-  | "fee-job-failed";
+  | "fee-job-failed"
+  | "adl-reduce-only";
 
 export interface Alert {
   kind: AlertKind;
@@ -65,6 +70,8 @@ export interface AlertThresholds {
   bankruptCycles: number;
   /** Minimum ms between repeats of the same (kind, subject) alert. */
   cooldownMs: number;
+  /** Slots a market may stay ADL reduce-only before the alert turns critical (R2). */
+  adlReduceOnlyCriticalSlots: number;
 }
 
 export const DEFAULT_THRESHOLDS: AlertThresholds = {
@@ -75,6 +82,7 @@ export const DEFAULT_THRESHOLDS: AlertThresholds = {
   lapsedBucketCycles: 3,
   bankruptCycles: 2,
   cooldownMs: 15 * 60_000,
+  adlReduceOnlyCriticalSlots: 9_000, // ~1 hour
 };
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -99,6 +107,7 @@ export function thresholdsFromEnv(env: Env): AlertThresholds {
     lapsedBucketCycles: envInt(env, "ALERT_LAPSED_BUCKET_CYCLES", DEFAULT_THRESHOLDS.lapsedBucketCycles),
     bankruptCycles: envInt(env, "ALERT_BANKRUPT_CYCLES", DEFAULT_THRESHOLDS.bankruptCycles),
     cooldownMs: envInt(env, "ALERT_COOLDOWN_MS", DEFAULT_THRESHOLDS.cooldownMs),
+    adlReduceOnlyCriticalSlots: envInt(env, "ALERT_ADL_REDUCE_ONLY_CRITICAL_SLOTS", DEFAULT_THRESHOLDS.adlReduceOnlyCriticalSlots),
   };
   if (t.slotLagCritical < t.slotLagWarn) {
     throw new Error("ALERT_SLOT_LAG_CRITICAL must be >= ALERT_SLOT_LAG_WARN");
@@ -130,16 +139,32 @@ export interface CrankHealthSample {
   bankruptFound: number;
   /** ... of which a liquidate crank was included in the landed tx. */
   bankruptLiquidated: number;
+  /** ADL side factors + effective OI (adl-state.ts); null when not a v18 market header. */
+  adl?: { aLong: bigint; aShort: bigint; oiEffLong: bigint; oiEffShort: bigint; reduceOnly: boolean } | null;
 }
 
 /** Streak counters carried between cycles, per market. */
 export interface CrankHealthStreaks {
   lapsedCycles: number;
   bankruptCycles: number;
+  /**
+   * First observation of the current reduce-only episode: chain slot + wall ms.
+   * The chain keeps no "entered reduce-only at", so this is "observed since"
+   * (reset by a keeper restart); `sinceBoot` flags that caveat in the alert.
+   */
+  reduceOnlySince: { slot: bigint; ms: number; sinceBoot: boolean } | null;
+  /** True once any sample with a decoded ADL state was seen for this market. */
+  adlObserved: boolean;
 }
 
 export function freshStreaks(): CrankHealthStreaks {
-  return { lapsedCycles: 0, bankruptCycles: 0 };
+  return { lapsedCycles: 0, bankruptCycles: 0, reduceOnlySince: null, adlObserved: false };
+}
+
+const ADL_ONE_ = 1_000_000_000_000_000n;
+function frac(a: bigint): string {
+  const x = (a * 1_000_000n) / ADL_ONE_;
+  return `${x / 1_000_000n}.${(x % 1_000_000n).toString().padStart(6, "0")}`;
 }
 
 export function slotLag(s: Pick<CrankHealthSample, "chainSlot" | "engineSlot">): number | null {
@@ -156,8 +181,43 @@ export function evaluateCrankHealth(
   s: CrankHealthSample,
   prev: CrankHealthStreaks,
   t: AlertThresholds,
+  nowMs: number = Date.now(),
 ): { active: Alert[]; streaks: CrankHealthStreaks } {
   const active: Alert[] = [];
+  // ADL reduce-only (F-3/R2). Unknown (null/undefined) never alerts and never
+  // resets an episode: a single undecodable read is not evidence it ended.
+  let reduceOnlySince = prev.reduceOnlySince;
+  if (s.adl) {
+    if (!s.adl.reduceOnly) {
+      reduceOnlySince = null;
+    } else {
+      reduceOnlySince = reduceOnlySince ?? { slot: s.chainSlot, ms: nowMs, sinceBoot: !prev.adlObserved };
+      const slots = s.chainSlot > reduceOnlySince.slot ? s.chainSlot - reduceOnlySince.slot : 0n;
+      const minutes = Math.floor((nowMs - reduceOnlySince.ms) / 60_000);
+      const { aLong, aShort, oiEffLong, oiEffShort } = s.adl;
+      const oneSideEmpty = oiEffLong === 0n || oiEffShort === 0n;
+      active.push({
+        kind: "adl-reduce-only",
+        severity: slots >= BigInt(t.adlReduceOnlyCriticalSlots) ? "critical" : "warn",
+        subject: s.label,
+        message:
+          `ADL reduce-only for >= ${slots} slots (~${minutes} min observed${reduceOnlySince.sinceBoot ? ", since keeper boot" : ""}): ` +
+          `a_long=${frac(aLong)} a_short=${frac(aShort)} x ADL_ONE; OI long ${oiEffLong} / short ${oiEffShort}. ` +
+          "Opens revert Custom(21) until one whole side exits; holders exit with tag 44 RebalanceReduce" +
+          (oneSideEmpty ? "." : ". Both sides still hold OI — an abandoned position keeps the market reduce-only (R2)."),
+        data: {
+          market: s.market,
+          aLong: aLong.toString(),
+          aShort: aShort.toString(),
+          oiEffLong: oiEffLong.toString(),
+          oiEffShort: oiEffShort.toString(),
+          reduceOnlySlots: Number(slots),
+          reduceOnlyMinutes: minutes,
+          sinceSlot: reduceOnlySince.slot.toString(),
+        },
+      });
+    }
+  }
   const lag = slotLag(s);
   if (lag !== null && lag >= t.slotLagWarn) {
     active.push({
@@ -200,7 +260,7 @@ export function evaluateCrankHealth(
       data: { bankrupt: s.bankruptFound, liquidated: s.bankruptLiquidated, cycles: bankruptCycles, market: s.market },
     });
   }
-  return { active, streaks: { lapsedCycles, bankruptCycles } };
+  return { active, streaks: { lapsedCycles, bankruptCycles, reduceOnlySince, adlObserved: prev.adlObserved || !!s.adl } };
 }
 
 /** Compact JSON for the `[health]` line. */
@@ -214,6 +274,9 @@ export function crankHealthRecord(s: CrankHealthSample): Record<string, string |
     lapsed: s.lapsedBuckets,
     bankrupt: s.bankruptFound,
     liq: s.bankruptLiquidated,
+    ...(s.adl?.reduceOnly
+      ? { ro: 1, aL: frac(s.adl.aLong), aS: frac(s.adl.aShort), oiL: s.adl.oiEffLong.toString(), oiS: s.adl.oiEffShort.toString() }
+      : {}),
   };
 }
 
