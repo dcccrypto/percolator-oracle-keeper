@@ -117,6 +117,7 @@ import type { MarketEntry, Registry } from "./registry.ts";
 import {
   catchupAllowsRefresh,
   catchupCrankCount,
+  isBankruptPortfolio,
   decodeMarketRefreshState,
   isAssetLossStale,
   marketHasPositions,
@@ -125,7 +126,7 @@ import {
   positionedSetMatchesMarket,
   selectPositionedPortfolios,
 } from "./positioned-refresh.ts";
-import type { CrankPlan, MarketRefreshState, PositionedPortfolio } from "./positioned-refresh.ts";
+import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
 import type { LivenessRepair } from "./liveness-repair.ts";
 
@@ -422,8 +423,12 @@ async function crankOneMarket(
       repairs = [];
     }
 
+    // Bankrupt positioned portfolios found in a clean simulation's post-state;
+    // they get a second crank (the engine's Liquidate step) in the same tx.
+    let liquidateTargets: PublicKey[] = [];
+
     const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan =>
-      planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs });
+      planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs, liquidateTargets });
 
     if (dryRun) {
       const plan = build(targets);
@@ -451,24 +456,52 @@ async function crankOneMarket(
     // The simulation also prunes refreshes the engine would reject (Custom(22)
     // for a portfolio this accrual did not re-stale), and returns the market's
     // post-state so the loop can confirm the market ends not loss-stale.
-    const resolved = await resolveCrankPlan(build, targets, async (plan) => {
+    const simulate = async (plan: CrankPlan): Promise<SimOutcome> => {
       const tx = toTx(plan);
+      const refreshed = plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio.toBase58());
       const sim = await withRpcRetry(label, () =>
         devnetConn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), {
           sigVerify: false,
           commitment: "processed",
-          accounts: { encoding: "base64", addresses: [marketAddress] },
+          accounts: { encoding: "base64", addresses: [marketAddress, ...refreshed] },
         }),
       );
-      const acc = sim.value.accounts?.[0];
+      const accs = sim.value.accounts ?? [];
+      const acc = accs[0];
+      const portfolioData = new Map<string, Uint8Array>();
+      refreshed.forEach((pk, i) => {
+        const a = accs[i + 1];
+        if (a) portfolioData.set(pk, Buffer.from(a.data[0], "base64"));
+      });
       return {
         err: sim.value.err,
         logs: sim.value.logs ?? null,
         marketData: acc ? Buffer.from(acc.data[0], "base64") : null,
+        portfolioData,
       };
-    }, (r) => {
-      repairs = repairs.filter((x) => x !== r);
-    });
+    };
+    const onOptionalRejected = (c: PlannedCrank) => {
+      if (c.kind === "repair") repairs = repairs.filter((x) => x !== c.repair);
+      if (c.kind === "liquidate") liquidateTargets = liquidateTargets.filter((x) => !x.equals(c.portfolio));
+    };
+    let resolved = await resolveCrankPlan(build, targets, simulate, onOptionalRejected);
+    // Bankruptcy pass: a positioned account whose post-refresh equity is <= 0 is
+    // re-planned with a second crank so the engine liquidates it this cycle.
+    if (!resolved.sim.err && resolved.sim.portfolioData) {
+      const bankrupt = [...resolved.sim.portfolioData.entries()]
+        .filter(([, data]) => isBankruptPortfolio(data))
+        .map(([pk]) => new PublicKey(pk));
+      if (bankrupt.length > 0) {
+        liquidateTargets = bankrupt;
+        const remaining = targets.filter((t) => !resolved.pruned.some((p) => p.pubkey.equals(t.pubkey)));
+        const withLiq = await resolveCrankPlan(build, remaining, simulate, onOptionalRejected);
+        if (!withLiq.sim.err) {
+          resolved = { ...withLiq, pruned: [...resolved.pruned, ...withLiq.pruned] };
+        } else {
+          liquidateTargets = [];
+        }
+      }
+    }
 
     if (resolved.sim.err) {
       const code =
@@ -510,6 +543,10 @@ async function crankOneMarket(
     state.consecutiveReverts = 0;
     state.lastRevertCode = null;
 
+    const liquidated = plan.cranks.filter((c) => c.kind === "liquidate").map((c) => c.portfolio.toBase58().slice(0, 8));
+    if (liquidated.length > 0) {
+      console.log(`[cranker] ${label}: bankrupt portfolio(s) liquidated: [${liquidated.join(", ")}] sig=${signature.slice(0, 12)}…`);
+    }
     const landedRepairs = plan.cranks.filter((c) => c.kind === "repair" && c.repair).map((c) => describeRepair(c.repair!));
     if (landedRepairs.length > 0) {
       console.log(`[cranker] ${label}: liveness repair sent: ${landedRepairs.join(", ")} sig=${signature.slice(0, 12)}…`);
@@ -638,6 +675,8 @@ export interface SimOutcome {
   err: unknown;
   logs: string[] | null;
   marketData: Uint8Array | null;
+  /** Post-simulation data of each refreshed portfolio, keyed by base58. */
+  portfolioData?: Map<string, Uint8Array>;
 }
 
 export interface ResolvedCrankPlan {
@@ -649,8 +688,8 @@ export interface ResolvedCrankPlan {
 
 /** Refreshes pruned one at a time before giving up on refreshing this cycle. */
 export const MAX_REFRESH_PRUNES = 3;
-/** At most 2 bucket expiries + 2 side finalizes exist per single-asset market. */
-export const MAX_REPAIR_DROPS = 4;
+/** Optional instructions (<= 2 expiries + 2 finalizes, plus liquidations) dropped before giving up. */
+export const MAX_REPAIR_DROPS = 8;
 
 /**
  * Simulate the plan and drop refreshes the engine rejects, one per
@@ -668,11 +707,11 @@ export async function resolveCrankPlan(
   targets: ReadonlyArray<PositionedPortfolio>,
   simulate: (plan: CrankPlan) => Promise<SimOutcome>,
   /**
-   * Called when a liveness repair is the rejected instruction. The caller must
-   * drop it from what `build` emits; the plan is then re-simulated without it,
+   * Called when a liveness repair or a bankruptcy liquidate crank is the
+   * rejected instruction. The caller must drop it from what `build` emits; the plan is then re-simulated without it,
    * so a repair the engine refuses can never block the ordinary crank.
    */
-  onRepairRejected?: (repair: LivenessRepair) => void,
+  onOptionalRejected?: (crank: PlannedCrank) => void,
 ): Promise<ResolvedCrankPlan> {
   let remaining = [...targets];
   const pruned: { pubkey: PublicKey; code: number | null; repair?: LivenessRepair }[] = [];
@@ -683,10 +722,15 @@ export async function resolveCrankPlan(
     if (!sim.err) return { plan, sim, pruned };
     const ie = parseInstructionError(sim.err);
     const crank = ie && ie.index >= 1 ? plan.cranks[ie.index - 1] : undefined;
-    if (crank && crank.kind === "repair" && crank.repair && onRepairRejected && repairDrops < MAX_REPAIR_DROPS) {
+    if (
+      crank &&
+      (crank.kind === "repair" || crank.kind === "liquidate") &&
+      onOptionalRejected &&
+      repairDrops < MAX_REPAIR_DROPS
+    ) {
       repairDrops++;
-      pruned.push({ pubkey: crank.portfolio, code: ie?.custom ?? null, repair: crank.repair });
-      onRepairRejected(crank.repair);
+      if (crank.kind === "repair") pruned.push({ pubkey: crank.portfolio, code: ie?.custom ?? null, repair: crank.repair });
+      onOptionalRejected(crank);
       continue;
     }
     if (!crank || crank.kind !== "refresh") return { plan, sim, pruned };

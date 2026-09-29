@@ -283,6 +283,26 @@ export const REFRESH_CRANK_CU = 130_000;
 export const MAX_TX_CU = 1_400_000;
 /** ExpireBackingBucket / FinalizeResetSide: one market-only state transition each (well under 40k CU). */
 export const REPAIR_CU = 40_000;
+/** Measured on devnet (ANSEM, 2026-09-29): liquidating a bankrupt leg ~200k CU. */
+export const LIQUIDATE_CRANK_CU = 250_000;
+
+/**
+ * True when a (post-refresh) portfolio holds an active leg and its equity
+ * `capital + pnl` is not positive — bankrupt. The refresh crank alone only
+ * re-certifies such an account; the keeper's next accrual re-stales it, so
+ * without a second crank in the SAME transaction the engine never reaches its
+ * Liquidate step and the loss keeps growing against the counterparty backing
+ * (ANSEM `DcVGSEfZ`, 2026-09-29: capital 0, PnL -88M -> -223M in ~2h while
+ * the Earn vault's backing was consumed).
+ */
+export function isBankruptPortfolio(data: Uint8Array): boolean {
+  try {
+    const p = parsePortfolioV17(data);
+    return p.activeBitmap !== 0n && !p.matcherEnabled && p.capital + p.pnl <= 0n;
+  } catch {
+    return false;
+  }
+}
 /**
  * Most catch-up cranks that still leave room for the accrual + refreshes.
  * A market further behind gets a catch-up-only transaction this cycle: a
@@ -292,7 +312,7 @@ export const MAX_CATCHUP_WITH_REFRESH = 10;
 /** Catch-up-only transaction size (40 x ~19 bytes + ~270 fixed fits 1232 bytes; 40 x 30k CU fits 1.4M). */
 export const MAX_CATCHUP_CRANKS = 40;
 
-export type PlannedCrankKind = "repair" | "catchup" | "accrue" | "refresh";
+export type PlannedCrankKind = "repair" | "catchup" | "accrue" | "refresh" | "liquidate";
 
 export interface PlannedCrank {
   kind: PlannedCrankKind;
@@ -345,6 +365,13 @@ export function planCrankTx(params: {
   refreshTargets: ReadonlyArray<PositionedPortfolio>;
   /** Liveness repairs (liveness-repair.ts) to land BEFORE any crank this cycle. */
   repairs?: ReadonlyArray<LivenessRepair>;
+  /**
+   * Positioned portfolios found bankrupt after their refresh (see
+   * `isBankruptPortfolio`): each gets a SECOND no-observation crank right after
+   * its refresh, which the engine's auto-crank planner resolves to
+   * `AutoCrankPlanV16::Liquidate` once the account is current.
+   */
+  liquidateTargets?: ReadonlyArray<PublicKey>;
 }): CrankPlan {
   const { owner, market, lpPortfolio, catchup, refreshTargets } = params;
   const repairs = params.repairs ?? [];
@@ -374,6 +401,10 @@ export function planCrankTx(params: {
     }
     cranks.push({ kind: "refresh", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
     cu += REFRESH_CRANK_CU;
+    if (!p.isLp && (params.liquidateTargets ?? []).some((t) => t.equals(p.pubkey)) && cu + LIQUIDATE_CRANK_CU <= MAX_TX_CU) {
+      cranks.push({ kind: "liquidate", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
+      cu += LIQUIDATE_CRANK_CU;
+    }
   }
   return { cranks, overflow, computeUnits: Math.min(MAX_TX_CU, cu) };
 }
