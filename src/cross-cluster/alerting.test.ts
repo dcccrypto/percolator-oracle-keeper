@@ -137,7 +137,9 @@ describe("AlertSink", () => {
     assert.equal((await c.sink.reconcile("crank", [LAG])).length, 1, "re-fires after cooldown");
     await c.sink.reconcile("crank", []);
     await c.sink.reconcile("crank", []);
-    assert.equal(c.lines.filter((l) => l.startsWith("[ALERT-RESOLVED]")).length, 1);
+    const resolved = c.lines.filter((l) => l.startsWith("[ALERT-RESOLVED]"));
+    assert.equal(resolved.length, 1);
+    assert.equal(JSON.parse(resolved[0].replace(/^\[ALERT-RESOLVED\] /, "")).severity, "critical", "resolve echoes the alert's severity");
     assert.equal(c.lines.filter((l) => l.startsWith("[ALERT] ")).length, 2);
     assert.equal(c.posts.length, 3, "2 alerts + 1 resolve delivered");
     assert.match(JSON.parse(c.posts[0].body).text, /\[CRITICAL\] percolator-keeper slot-lag SOL/);

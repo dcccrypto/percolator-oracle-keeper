@@ -293,7 +293,8 @@ export function validateWebhookUrl(raw: string | undefined): string | undefined 
 
 export class AlertSink {
   private readonly lastSent = new Map<string, number>();
-  private readonly activeKeys = new Set<string>();
+  /** Active alert key -> the severity it last fired with (echoed on RESOLVED). */
+  private readonly activeKeys = new Map<string, AlertSeverity>();
   private readonly opts: Required<Omit<AlertSinkOptions, "webhookUrl">> & { webhookUrl?: string };
 
   constructor(opts: AlertSinkOptions) {
@@ -335,19 +336,19 @@ export class AlertSink {
         await this.deliver("ALERT", a);
       }
     }
-    for (const key of [...this.activeKeys]) {
+    for (const [key, sev] of [...this.activeKeys]) {
       if (!key.startsWith(`${scope}|`) || activeNow.has(key)) continue;
       this.activeKeys.delete(key);
       this.lastSent.delete(key);
       const [, kind, subject] = key.split("|");
       await this.deliver("ALERT-RESOLVED", {
         kind: kind as AlertKind,
-        severity: "warn",
+        severity: sev,
         subject,
         message: "condition cleared",
       });
     }
-    for (const k of activeNow) this.activeKeys.add(k);
+    for (const a of active) this.activeKeys.set(`${scope}|${a.kind}|${a.subject}`, a.severity);
     return fired;
   }
 
