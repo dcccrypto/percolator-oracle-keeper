@@ -474,6 +474,10 @@ export async function cleanupResolvedPortfolios(
     return c.status === "landed";
   };
 
+  // Order (coordinator, P3 07a1d0eb): every other portfolio first (CloseResolved +
+  // tag 8), THEN the vault LP (tag 101 settle, then its tag 8), so the senior-first
+  // settle of the vault LP sees the other positions already settled.
+  pfs.sort((x, y) => Number(pdaOwnerKind(x.owner, market, cfg) === "lp-registry") - Number(pdaOwnerKind(y.owner, market, cfg) === "lp-registry"));
   const graceLeft = pdaGraceLeft(clock.nowSlot, clock.resolvedSlot, cfg.pdaGraceSlots);
   // Vault LP (tag 101 first): its state names the LP portfolio and junior owner.
   let vaultLp: { key: PublicKey; state: VaultLpState; domain: number } | null = null;

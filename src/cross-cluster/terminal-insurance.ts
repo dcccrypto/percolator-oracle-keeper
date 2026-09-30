@@ -69,6 +69,7 @@ import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
 import type { Alert } from "./alerting.ts";
 import { CleanupState, cleanupResolvedPortfolios } from "./resolved-portfolio-cleanup.ts";
+import { crankLpFeesOnce } from "./lp-fee-cranker.ts";
 import type { CleanupConfig, CleanupConnection, CleanupResult } from "./resolved-portfolio-cleanup.ts";
 import { NFT_PROGRAM_ID } from "../program-ids.ts";
 
@@ -87,13 +88,24 @@ const H_INSURANCE_DOMAIN_BUDGET_REMAINING_TOTAL = 461;
 const H_MATERIALIZED_PORTFOLIO_COUNT = 517;
 /** `resolved_slot` u64 @ group+627 (engine 35ddd692 source): the PDA grace clock. */
 const H_RESOLVED_SLOT = 627;
+/** `c_tot` u128 @ group+317 (engine 35ddd692 source). Terminal-flat = materialized == 0 && c_tot == 0. */
+const H_C_TOT = 317;
+
+/**
+ * P3 07a1d0eb: on a BOUND vault, tag 78 also runs on a Resolved market that is
+ * TERMINAL-FLAT — materialized_portfolio_count == 0 and c_tot == 0 — and the
+ * harvested LP fee leg goes to the senior claim (Earn redeem-lock fix). Pure.
+ */
+export function isTerminalFlat(s: TerminalState | null): boolean {
+  return s !== null && s.kind === "resolved" && s.materializedPortfolios === 0n && s.cTot === 0n;
+}
 const MODE_RESOLVED = 1;
 const TOKEN_PROGRAM = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const COMPUTE_UNIT_LIMIT = 120_000; // stake doc: 47,198 CU with the CPI, 15,809 book-only
 
 export type TerminalState =
   | { kind: "live"; budget: bigint; materializedPortfolios: bigint }
-  | { kind: "resolved"; budget: bigint; materializedPortfolios: bigint; resolvedSlot: bigint }
+  | { kind: "resolved"; budget: bigint; materializedPortfolios: bigint; resolvedSlot: bigint; cTot: bigint }
   | { kind: "closed" };
 
 /** True for a market the engine no longer runs: Resolved, or a CloseSlab tombstone. */
@@ -120,7 +132,13 @@ export function decodeTerminalState(d: Uint8Array): TerminalState | null {
   const budget = u64(d, off) | (u64(d, off + 8) << 64n);
   const materializedPortfolios = u64(d, g + H_MATERIALIZED_PORTFOLIO_COUNT);
   return d[g + H_MODE] === MODE_RESOLVED
-    ? { kind: "resolved", budget, materializedPortfolios, resolvedSlot: u64(d, g + H_RESOLVED_SLOT) }
+    ? {
+        kind: "resolved",
+        budget,
+        materializedPortfolios,
+        resolvedSlot: u64(d, g + H_RESOLVED_SLOT),
+        cTot: u64(d, g + H_C_TOT) | (u64(d, g + H_C_TOT + 8) << 64n),
+      }
     : { kind: "live", budget, materializedPortfolios };
 }
 
@@ -414,6 +432,21 @@ export async function windDownOnce(
       }
     }
   }
+  // P3 07a1d0eb: once terminal-flat, harvest the pending LP fee leg (tag 78) into
+  // the seniors BEFORE tag 29, so bound Earn redemption (77, needs H == 0) unlocks.
+  // Wrappers before 07a1d0eb answer EngineLockActive (21) in preflight -> a quiet
+  // skip; on 6377376a no vault is ever bound, so this never sends there.
+  let harvestNote = "";
+  if (state.kind === "resolved" && isTerminalFlat(state)) {
+    const h = await crankLpFeesOnce(conn, keeper, marketAddress, dryRun, cfg.confirm);
+    harvestNote =
+      h === "cranked" ? " Tag 78 harvested the LP fee leg into the seniors (Earn redemption unlocked)."
+        : h === "no-fees" ? " Tag 78: no LP fees pending."
+          : h === "skipped" ? ""
+            : ` Tag 78 harvest failed: ${h.error}.`;
+    if (h === "cranked") console.log(`[terminal-insurance] ${marketAddress.slice(0, 8)}…: resolved terminal-flat LP fee harvest (tag 78) landed`);
+  }
+
   const cleanupNote = cleanup
     ? ` Cleanup: support=${cleanup.support}, closed ${cleanup.closed}, progressed ${cleanup.progressed}, ${cleanup.remaining.length} left` +
       (cleanup.remaining.length ? ` [${cleanup.remaining.slice(0, 3).map((r) => `${r.portfolio.slice(0, 8)}…: ${r.reason}`).join("; ")}${cleanup.remaining.length > 3 ? "; …" : ""}]` : "") + "."
@@ -506,7 +539,7 @@ export async function windDownOnce(
   }
   const s2 = await call(0n, stray);
   steps.push(s2);
-  const recoveredNote = recovered ? `tag 29 recovered ${budget} atoms of terminal insurance into the stake pool ${recovered.detail}; ` : "";
+  const recoveredNote = (harvestNote ? `${harvestNote.trim()} ` : "") + (recovered ? `tag 29 recovered ${budget} atoms of terminal insurance into the stake pool ${recovered.detail}; ` : "");
   if (s2.outcome === "nothing") {
     // Done ONLY on 31 from the amount-0 step (B14).
     st.done.add(marketAddress);

@@ -62,7 +62,7 @@ import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { confirmBySignature, customCodeOf } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
-import { isTerminalMarket } from "./terminal-insurance.ts";
+import { decodeTerminalState, isTerminalFlat } from "./terminal-insurance.ts";
 import { deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 
 /**
@@ -93,6 +93,8 @@ const COMPUTE_UNIT_LIMIT = 120_000;
 
 /** Engine code for "no new fees to distribute" — expected, not a failure. */
 const NO_FEES_TO_CRANK = 38;
+/** EngineLockActive: what a pre-07a1d0eb wrapper answers to tag 78 on a Resolved market. */
+const RESOLVED_HARVEST_UNSUPPORTED = 21;
 
 export interface LpFeeCrankResult {
   /** Markets whose fees were actually distributed. */
@@ -149,8 +151,12 @@ export async function crankLpFeesOnce(
     return { error: `account read failed: ${(err as Error).message.slice(0, 100)}` };
   }
   const [registryInfo, marketInfo] = infos;
-  // B13: tag 78 is Live-only; a Resolved market / tombstone is never cranked.
-  if (marketInfo && isTerminalMarket(new Uint8Array(marketInfo.data))) return "skipped";
+  // B13: a tombstone is never cranked, and a Resolved market only in the one case
+  // P3 07a1d0eb allows: a BOUND vault on a TERMINAL-FLAT market (checked below).
+  const terminal = marketInfo ? decodeTerminalState(new Uint8Array(marketInfo.data)) : null;
+  if (terminal && terminal.kind === "closed") return "skipped";
+  const resolvedHarvest = terminal !== null && terminal.kind === "resolved";
+  if (resolvedHarvest && !isTerminalFlat(terminal)) return "skipped";
 
   // No vault -> nothing to distribute. Skipping locally keeps a market with no
   // LP vault from costing a transaction every single cycle.
@@ -167,6 +173,8 @@ export async function crankLpFeesOnce(
   } catch (err) {
     return { error: (err as Error).message };
   }
+  // Resolved + terminal-flat is harvestable only through the bound-vault path.
+  if (resolvedHarvest && !bound) return "skipped";
   let domainIdx = LP_VAULT_DOMAIN_FALLBACK;
   try {
     const parsed = parseLpVaultRegistry(new Uint8Array(registryInfo.data));
@@ -225,6 +233,9 @@ export async function crankLpFeesOnce(
     return "cranked";
   } catch (err) {
     if (extractErrorCode(err) === NO_FEES_TO_CRANK) return "no-fees";
+    // Version gate: a wrapper before P3 07a1d0eb refuses tag 78 on a Resolved
+    // market with EngineLockActive (21) — in preflight, so nothing is spent.
+    if (resolvedHarvest && extractErrorCode(err) === RESOLVED_HARVEST_UNSUPPORTED) return "skipped";
     return { error: (err instanceof Error ? err.message : String(err)).slice(0, 140) };
   }
 }
