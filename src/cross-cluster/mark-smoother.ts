@@ -71,7 +71,7 @@ export interface MarkSmootherOptions {
  * so a 160 bps move takes minutes to settle in regardless.
  */
 const DEFAULT_WINDOW_MS = 180_000;
-const DEFAULT_MIN_SAMPLES = 3;
+export const DEFAULT_MIN_SAMPLES = 3;
 /**
  * 5/6 of the window (150s at the 180s default): comfortably beyond 2x the longest
  * observed CATE churn run (70s), matching the reasoning behind DEFAULT_WINDOW_MS,
@@ -84,9 +84,52 @@ const DEFAULT_MIN_SAMPLES = 3;
  * The smoother's own note already accepts ~90s of lag as immaterial, because the
  * engine absorbs only 4 bps/slot.
  */
-const DEFAULT_MIN_SPAN_FRACTION = 5 / 6;
+export const DEFAULT_MIN_SPAN_FRACTION = 5 / 6;
 /** Hard per-pool cap so a misbehaving caller cannot grow memory unbounded. */
 const MAX_SAMPLES_PER_POOL = 64;
+
+/**
+ * Push-cycle cadence vs the smoother window (runbook fresh-id-redeploy-plan §8
+ * "keeper cadence footgun"). Samples older than `windowMs` are evicted, so with
+ * a push period p the largest span the window can hold is floor(W / p) * p, and
+ * it holds floor(W / p) + 1 samples. The smoother publishes only when the span
+ * reaches floor(W * 5/6) AND there are >= 3 samples. With the default 15 s
+ * window, CC_INTERVAL_MS of 4 s or 6 s tops out at a 12 s span (< 12.5 s):
+ * the keeper NEVER pushes. 5 s only works with zero jitter — a 5.001 s cycle
+ * already drops to a 10 s span.
+ *
+ *   never   — cannot publish even at the exact configured period (refuse to boot)
+ *   fragile — publishes at the exact period but not if cycles run 2% slower (warn)
+ *   ok      — robust to that jitter
+ */
+export type CadenceVerdict = "ok" | "fragile" | "never";
+
+export function markCadenceCheck(
+  intervalMs: number,
+  windowMs: number,
+  opts: { minSpanFraction?: number; minSamples?: number; jitterFraction?: number } = {},
+): { verdict: CadenceVerdict; detail: string } {
+  const frac = opts.minSpanFraction ?? DEFAULT_MIN_SPAN_FRACTION;
+  const minSamples = opts.minSamples ?? DEFAULT_MIN_SAMPLES;
+  const jitter = opts.jitterFraction ?? 0.02;
+  const minSpan = Math.floor(windowMs * frac);
+  const reach = (p: number) => {
+    const k = Math.floor(windowMs / p);
+    return { span: k * p, samples: k + 1 };
+  };
+  const works = (p: number) => {
+    const r = reach(p);
+    return r.span >= minSpan && r.samples >= minSamples;
+  };
+  const exact = reach(intervalMs);
+  const slow = reach(intervalMs * (1 + jitter));
+  const detail =
+    `CC_INTERVAL_MS=${intervalMs} with CC_MARK_WINDOW_MS=${windowMs}: max span ${exact.span} ms / ${exact.samples} samples ` +
+    `(needs >= ${minSpan} ms and >= ${minSamples}); at +${Math.round(jitter * 100)}% cycle time ${Math.round(slow.span)} ms / ${slow.samples}`;
+  if (!works(intervalMs)) return { verdict: "never", detail };
+  if (!works(intervalMs * (1 + jitter))) return { verdict: "fragile", detail };
+  return { verdict: "ok", detail };
+}
 
 export interface MarkSmoother {
   /**

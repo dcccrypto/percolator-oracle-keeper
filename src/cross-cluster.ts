@@ -54,6 +54,7 @@ import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-u
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { MIN_POOL_LIQUIDITY_USD_E6 } from "./cross-cluster/price-reader.ts";
+import { markCadenceCheck } from "./cross-cluster/mark-smoother.ts";
 import { crankAllOnce, startRecoveryCrankLoop } from "./cross-cluster/recovery-cranker.ts";
 import { makeLpFeeJob } from "./cross-cluster/lp-fee-cranker.ts";
 import { makeStakeFeeJob, stakeFeeConfigFromEnv } from "./cross-cluster/stake-fee-pusher.ts";
@@ -204,6 +205,23 @@ const DRY_RUN =
   process.env.DRY_RUN === "true" || process.argv.includes("--dry-run");
 
 const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "7000", 10);
+
+// Cadence footgun (runbook fresh-id-redeploy-plan §8): the mark smoother only
+// publishes once its window SPANS 5/6 of CC_MARK_WINDOW_MS, and samples older
+// than the window are evicted — so some interval/window pairs can never push
+// (default 15 s window with CC_INTERVAL_MS 4–6 s). Same default as keeper-loop.ts.
+// `never` refuses to boot (a keeper that never pushes looks alive and prices
+// nothing); `fragile` warns. Skipped in dry-run, which never pushes anyway.
+{
+  const windowMs = Number(process.env.CC_MARK_WINDOW_MS ?? 15_000);
+  const c = markCadenceCheck(CC_INTERVAL_MS, windowMs);
+  if (c.verdict === "never" && !(process.env.DRY_RUN === "true" || process.argv.includes("--dry-run"))) {
+    console.error(`[fatal] this cadence can never publish a mark — the keeper would never push. ${c.detail}. Use e.g. 1500 / 8000 (the live pair).`);
+    process.exit(1);
+  }
+  if (c.verdict === "never") console.warn(`[warn] cadence can never publish (dry-run, continuing): ${c.detail}`);
+  if (c.verdict === "fragile") console.warn(`[warn] cadence publishes only if every cycle is exactly on time: ${c.detail}`);
+}
 const CC_HEALTH_PORT = parseInt(process.env.CC_HEALTH_PORT ?? "3001", 10);
 const CC_HEALTH_BIND = process.env.CC_HEALTH_BIND ?? "0.0.0.0";
 // D2a — see cross-cluster/keeper-loop.ts's hang-detection doc comment.

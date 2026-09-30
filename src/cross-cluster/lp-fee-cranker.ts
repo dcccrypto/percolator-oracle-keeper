@@ -63,6 +63,22 @@ import { confirmBySignature, customCodeOf } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
 import { isTerminalMarket } from "./terminal-insurance.ts";
+import { deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
+
+/**
+ * P3 bound-vault flag: `LpVaultRegistryV16._reserved[VAULT_LP_REGISTRY_BOUND_FLAG_IDX = 0]`
+ * (struct offset 144 => absolute 160; layout identical on v18.2 6377376a and P3 b2b2559e).
+ * 0 = unbound, 1 = bound; any other byte is InvalidAccountData on-chain
+ * (`registry_vault_lp_bound`, b2b2559e v16_program.rs:5733), so it is reported, not guessed.
+ */
+export const LP_VAULT_REGISTRY_BOUND_FLAG_OFF = 16 + 144;
+export function lpVaultRegistryBound(data: Uint8Array): boolean {
+  if (data.length <= LP_VAULT_REGISTRY_BOUND_FLAG_OFF) return false;
+  const b = data[LP_VAULT_REGISTRY_BOUND_FLAG_OFF];
+  if (b === 0) return false;
+  if (b === 1) return true;
+  throw new Error(`LP-vault registry bound flag is ${b} (only 0/1 are valid)`);
+}
 
 /**
  * Fallback only. v17 vaults are DUAL-DOMAIN: the vault serves both pots of its
@@ -140,6 +156,17 @@ export async function crankLpFeesOnce(
   // LP vault from costing a transaction every single cycle.
   if (!registryInfo) return "skipped";
 
+  // P3 (ported from rehearsal/p0a-feeloop-sdk8@5b5d14a, re-implemented without SDK 8):
+  // on a vault-owned-LP market tag 78 REQUIRES the bound-vault tail [6] vault_lp_state
+  // (writable) — handle_lp_vault_crank_fees -> load_bound_vault_lp_tail(idx 6, need_lp =
+  // false), b2b2559e. Without it every cycle fails NotEnoughAccountKeys and the LP fee leg
+  // never reaches senior NAV. Unbound vaults (all v18.2 markets) are unchanged.
+  let bound: boolean;
+  try {
+    bound = lpVaultRegistryBound(new Uint8Array(registryInfo.data));
+  } catch (err) {
+    return { error: (err as Error).message };
+  }
   let domainIdx = LP_VAULT_DOMAIN_FALLBACK;
   try {
     const parsed = parseLpVaultRegistry(new Uint8Array(registryInfo.data));
@@ -170,7 +197,7 @@ export async function crankLpFeesOnce(
         ledger,
         siblingLedger,
         systemProgram: SystemProgram.programId,
-      }),
+      }).concat(bound ? [{ pubkey: deriveVaultLpState(WRAPPER_PROGRAM_ID, market), isSigner: false, isWritable: true }] : []),
       data: Buffer.from(encodeLpVaultCrankFees({ domain: domainIdx })),
     }),
   );
