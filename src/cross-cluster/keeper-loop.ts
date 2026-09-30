@@ -102,6 +102,16 @@ interface LoopState {
   cyclePushed: number;
   /** Consecutive cycles with zero landed pushes (markets registered). */
   zeroPushStreak: number;
+  /** B20: markets last seen Resolved/closed — excluded from the zero-push health count. */
+  terminalMarkets: Set<string>;
+}
+
+/**
+ * B20: markets the push loop can actually push — registered minus those last
+ * seen Resolved/closed. A board of only terminal markets is not a pricing outage.
+ */
+export function countPushableMarkets(markets: ReadonlyArray<{ marketAddress: string }>, terminal: ReadonlySet<string>): number {
+  return markets.filter((m) => !terminal.has(m.marketAddress)).length;
 }
 
 /** Emit the structured push `[health]` line every N cycles. */
@@ -676,9 +686,10 @@ async function runCycle(
 
   // ── 5. One batched PushAuthMark tx, fire-and-forget ─────────────────────────
   try {
-    state.cycleAttempted = pushes.length;
+    state.cycleAttempted = pushes.length; // adjusted below for terminal markets
     const res = await pushAuthMarkBatch(devnetConn, keeper, pushes, nowSlot, cachedBlockhash, config.dryRun);
-    state.cyclePushed = config.dryRun ? pushes.length : res.signature ? res.pushedMarkets.length : 0;
+    state.cycleAttempted = pushes.length - (res.terminalMarkets?.length ?? 0);
+    state.cyclePushed = config.dryRun ? state.cycleAttempted : res.signature ? res.pushedMarkets.length : 0;
     const stamp = Date.now();
     // Record PER MARKET, not per batch. This loop used to stamp every market in
     // `pushes` as freshly pushed whenever the batch reported success — so a
@@ -686,7 +697,10 @@ async function runCycle(
     // lastPushAt and a rising totalPushes on /health. That made a frozen price
     // look healthy, which is how a stuck market goes unnoticed for days.
     const pushedSet = new Set(res.pushedMarkets);
+    const terminalSet = new Set(res.terminalMarkets ?? []);
+    state.terminalMarkets = terminalSet;
     for (const p of pushes) {
+      if (terminalSet.has(p.marketAddress)) continue; // B20: Resolved/closed — not an error
       const stat = state.stats.get(p.marketAddress)!;
       stat.authorityMismatch = false;
       if (config.dryRun) {
@@ -819,6 +833,7 @@ export async function startKeeperLoop(
     cycleAttempted: 0,
     cyclePushed: 0,
     zeroPushStreak: 0,
+    terminalMarkets: new Set(),
     stats: new Map(
       registry.markets.map((m) => [
         m.marketAddress,
@@ -901,7 +916,8 @@ export async function startKeeperLoop(
     }
 
     state.lastCycleAt = Date.now();
-    await reportPushCycle(state, registry.markets.length);
+    // B20: terminal markets can never be pushed; a board of only terminal markets is not an outage.
+    await reportPushCycle(state, countPushableMarkets(registry.markets, state.terminalMarkets));
     const elapsed = Date.now() - cycleStart;
     const remaining = config.intervalMs - elapsed;
     if (remaining > 0 && !stopping) {

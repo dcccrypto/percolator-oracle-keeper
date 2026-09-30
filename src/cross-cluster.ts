@@ -354,9 +354,9 @@ if (!REGISTER_SOURCE_URL && !DRY_RUN) {
 // this resolves in a small, bounded number of RPC calls regardless of registry
 // size. See cross-cluster/recovery-cranker.ts's crankAllOnce() doc comment for
 // exactly why this closes the SOL/JUP/TRUMP boot-gap.
-if (CRANK_ENABLED) {
-  await crankAllOnce(devnetConn, keeper, registry, DRY_RUN);
-}
+// B7: the boot states go to the loop, so its first cycle does not re-crank a
+// market in the slot the boot crank already covered (a benign Custom(22)).
+const bootCrankStates = CRANK_ENABLED ? await crankAllOnce(devnetConn, keeper, registry, DRY_RUN) : undefined;
 
 // Recovery crank loop runs concurrently on its own interval — deliberately
 // NOT awaited, and deliberately never allowed to throw out of this scope, so
@@ -365,7 +365,7 @@ if (CRANK_ENABLED) {
   void startRecoveryCrankLoop(devnetConn, keeper, registry, {
     intervalMs: CRANK_INTERVAL_MS,
     dryRun: DRY_RUN,
-  }, ALERT_SINK).catch((err: unknown) => {
+  }, ALERT_SINK, bootCrankStates).catch((err: unknown) => {
     console.error(
       `[cranker] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
     );

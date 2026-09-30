@@ -81,7 +81,7 @@ import { parseInstructionError } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
-import { isTerminalMarket } from "./terminal-insurance.ts";
+import { isTerminalMarket } from "./market-state.ts";
 
 /** percolator-stake `state::MINIMUM_LIQUIDITY` — the dead-share floor (state.rs:25 @ e62aa4a). */
 export const STAKE_MINIMUM_LIQUIDITY = 1_000n;

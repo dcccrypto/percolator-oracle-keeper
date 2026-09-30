@@ -62,7 +62,7 @@ import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { confirmBySignature, customCodeOf } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
-import { decodeTerminalState, isTerminalFlat } from "./terminal-insurance.ts";
+import { decodeTerminalState, isTerminalFlat } from "./market-state.ts";
 import { deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 
 /**

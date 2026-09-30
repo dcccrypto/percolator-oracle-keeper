@@ -128,7 +128,7 @@ import {
 import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
 import { decodeAdlState } from "./adl-state.ts";
-import { isTerminalMarket } from "./terminal-insurance.ts";
+import { isTerminalMarket } from "./market-state.ts";
 import type { AdlState } from "./adl-state.ts";
 import type { LivenessRepair } from "./liveness-repair.ts";
 import { crankHealthRecord, evaluateCrankHealth, freshStreaks, getAlertSink } from "./alerting.ts";
@@ -189,6 +189,10 @@ interface CrankMarketState {
   streaks: CrankHealthStreaks;
   /** B13: last read showed a Resolved market or tombstone — not cranked, no alerts. */
   terminal: boolean;
+  /** B7: chain slot of the read behind this market's last landed crank (dedupe within a slot). */
+  lastCrankSlot: bigint | null;
+  /** B7: benign "no progress this slot" Custom(22) results (not reverts). */
+  benignNoProgress: number;
 }
 
 /** What one crank attempt saw — feeds alerting.ts. */
@@ -225,6 +229,8 @@ export function freshCrankMarketState(): CrankMarketState {
     obs: null,
     streaks: freshStreaks(),
     terminal: false,
+    lastCrankSlot: null,
+    benignNoProgress: 0,
   };
 }
 
@@ -439,6 +445,10 @@ export async function crankOneMarket(
       return;
     }
     state.terminal = false;
+    // B7: this market was already cranked (by us) at this slot or later — e.g. the
+    // boot crank, then the loop's first cycle in the same slot. A second crank can
+    // only return Custom(22) EngineNonProgress; skip it instead of counting a revert.
+    if (state.lastCrankSlot !== null && BigInt(acct.context.slot) <= state.lastCrankSlot) return;
     let pre: MarketRefreshState | null = null;
     try {
       pre = decodeMarketRefreshState(acct.value.data);
@@ -547,6 +557,16 @@ export async function crankOneMarket(
       }
     }
 
+    if (resolved.sim.err && isBenignNoProgress(resolved.sim.err, resolved.plan, pre, BigInt(acct.context.slot))) {
+      // B7: EngineNonProgress on the accrual crank while the engine clock is already
+      // current = nothing to accrue this slot (a duplicate crank). Not a revert, not
+      // progress: counters untouched. A stuck clock is caught by the slot-lag alert.
+      state.benignNoProgress++;
+      if (state.benignNoProgress === 1) {
+        console.log(`[cranker] ${label}: no progress this slot (Custom(22), engine clock current) — expected after a same-slot crank, not counted as a revert`);
+      }
+      return;
+    }
     if (resolved.sim.err) {
       obs.crankReverted = true;
       const code =
@@ -577,6 +597,7 @@ export async function crankOneMarket(
       devnetConn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 }),
     );
     state.totalCranks++;
+    state.lastCrankSlot = BigInt(acct.context.slot);
     obs.crankOk = true;
     obs.bankruptLiquidated = plan.cranks.filter((c) => c.kind === "liquidate").length;
     state.lastCrankAt = Date.now();
@@ -814,17 +835,19 @@ export async function crankAllOnce(
   keeper: Keypair,
   registry: Registry,
   dryRun: boolean,
-): Promise<void> {
+): Promise<Map<string, CrankMarketState>> {
+  const bootStates = new Map<string, CrankMarketState>();
   const seeded = registry.markets.filter((m) => !!m.lpPortfolio);
   if (seeded.length === 0) {
     console.log("[cranker][boot] no seeded (lpPortfolio-known) markets in registry.json — skipping crank-on-boot");
-    return;
+    return bootStates;
   }
   console.log(`[cranker][boot] cranking ${seeded.length} seeded market(s) once before starting the recurring loops…`);
 
   const results = await Promise.allSettled(
     seeded.map(async (m) => {
       const state = freshCrankMarketState();
+      bootStates.set(m.marketAddress, state);
       await crankOneMarket(devnetConn, keeper, m, state, dryRun);
       return { market: m, state };
     }),
@@ -852,6 +875,8 @@ export async function crankAllOnce(
     `[cranker][boot] crank-on-boot complete: ${ok} clean, ${notClean} not-clean` +
       `${notClean > 0 ? " (will keep retrying on the recurring crank loop)" : ""}.`,
   );
+  // B7: handed to startRecoveryCrankLoop so its first cycle knows what boot cranked.
+  return bootStates;
 }
 
 /**
@@ -880,6 +905,32 @@ export function observeMarket(
     bankruptLiquidated: 0,
     adl,
   };
+}
+
+/** Engine EngineNonProgress (enum position 22, 6377376a / b2b2559e). */
+export const ENGINE_NON_PROGRESS = 22;
+/** Slots the engine clock may trail the read slot and still count as "current". */
+export const NO_PROGRESS_CURRENT_SLOTS = 2n;
+
+/**
+ * B7 (E2E 2026-09-30): Custom(22) on the ACCRUAL (or catch-up) crank while the
+ * engine clock is already current (read slot − current_slot ≤ 2) means there is
+ * nothing to accrue in this slot — a duplicate crank, e.g. the boot crank then
+ * the loop's first cycle. Anything else (another code, a repair/liquidate/refresh
+ * instruction, a clock that is behind) stays a real revert.
+ */
+export function isBenignNoProgress(
+  err: unknown,
+  plan: Pick<CrankPlan, "cranks">,
+  pre: Pick<MarketRefreshState, "currentSlot"> | null,
+  readSlot: bigint,
+): boolean {
+  const ie = parseInstructionError(err);
+  if (!ie || ie.custom !== ENGINE_NON_PROGRESS || ie.index < 1) return false;
+  const crank = plan.cranks[ie.index - 1];
+  if (!crank || (crank.kind !== "accrue" && crank.kind !== "catchup")) return false;
+  if (!pre) return false;
+  return readSlot <= pre.currentSlot + NO_PROGRESS_CURRENT_SLOTS;
 }
 
 /** Emit the structured `[health]` line every N crank cycles (ops track). */
@@ -942,9 +993,10 @@ export async function startRecoveryCrankLoop(
   registry: Registry,
   config: CrankLoopConfig,
   sink: AlertSink = getAlertSink(),
+  bootStates?: Map<string, CrankMarketState>,
 ): Promise<void> {
   const states = new Map<string, CrankMarketState>(
-    registry.markets.map((m) => [m.marketAddress, freshCrankMarketState()]),
+    registry.markets.map((m) => [m.marketAddress, bootStates?.get(m.marketAddress) ?? freshCrankMarketState()]),
   );
 
   console.log(
