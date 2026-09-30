@@ -157,6 +157,25 @@ export function buildCloseResolvedIx(p: {
   });
 }
 
+/**
+ * Account offset of `PortfolioAccountV16Account.resolved_payout_receipt` (HEADER_LEN 16 +
+ * rustc `offset_of!` = 9369; pinned by the SDK parity fixture at 5544302a, SDK 8.0.0 a9e65c6
+ * RESOLVED_RECEIPT_ACCOUNT_OFF_P3). 66 bytes: 4 × u128, then `present` @+64, `finalized` @+65.
+ */
+export const RESOLVED_RECEIPT_OFF = 9369;
+/**
+ * A PARTIAL resolved receipt: `present && !finalized` (5544302a: a CloseResolved that ran before
+ * the vault LP's 101 leaves one; only a later tag 46 ClaimResolvedPayoutTopup finalises it).
+ */
+export function receiptOpen(d: Uint8Array): boolean {
+  return d.length >= RESOLVED_RECEIPT_OFF + 66 && d[RESOLVED_RECEIPT_OFF + 64] !== 0 && d[RESOLVED_RECEIPT_OFF + 65] === 0;
+}
+/** Tag 46 ClaimResolvedPayoutTopup, permissionless: the CloseResolved account list (owner unsigned, [7] nft_registry), data [46]. */
+export function buildClaimResolvedPayoutTopupIx(p: Parameters<typeof buildCloseResolvedIx>[0]): TransactionInstruction {
+  const ix = buildCloseResolvedIx(p);
+  return new TransactionInstruction({ programId: ix.programId, keys: ix.keys, data: Buffer.from([46]) });
+}
+
 /** `["nft_registry", market_group]` under the wrapper (b2b2559e derive_nft_registry :5981). */
 export function deriveNftRegistry(wrapperProgramId: PublicKey, market: PublicKey): PublicKey {
   return PublicKey.findProgramAddressSync([Buffer.from("nft_registry"), market.toBuffer()], wrapperProgramId)[0];
@@ -372,6 +391,8 @@ export interface CleanupResult {
    * pending senior draw when both pot ledgers are writable) — the caller alerts on them.
    */
   seniorDrawLogs: string[];
+  /** Resolved-receipt revisit (5e4c15ff): portfolios revisited this pass (tag 46, or a repeat CloseResolved). */
+  topupSwept: string[];
 }
 
 interface Pf {
@@ -414,7 +435,7 @@ export async function cleanupResolvedPortfolios(
   /** Chain slot now, and the market's engine resolved_slot (grace clock for PDA owners). */
   clock: { nowSlot: bigint; resolvedSlot: bigint | null } = { nowSlot: 0n, resolvedSlot: null },
 ): Promise<CleanupResult> {
-  const out: CleanupResult = { support: "unknown", closed: 0, progressed: 0, remaining: [], pdaClosed: [], vaultLpClosed: [], waitingOnHolder: [], vaultLpSettled: 0, seniorDrawLogs: [] };
+  const out: CleanupResult = { support: "unknown", closed: 0, progressed: 0, remaining: [], pdaClosed: [], vaultLpClosed: [], waitingOnHolder: [], vaultLpSettled: 0, seniorDrawLogs: [], topupSwept: [] };
   let pfs: Pf[];
   try {
     const accs = await conn.getProgramAccounts(cfg.wrapperProgramId, {
@@ -728,6 +749,70 @@ export async function cleanupResolvedPortfolios(
       out.remaining.push({ portfolio: p.pubkey.toBase58(), reason: why(ra.err, ra.logs, idx(2)) });
     } catch (err) {
       out.remaining.push({ portfolio: p.pubkey.toBase58(), reason: (err instanceof Error ? err.message : String(err)).slice(0, 120) });
+    }
+  }
+
+  // ── Resolved-receipt revisit (5e4c15ff rule), after the claimants' closes and the vault LP's 101 ──
+  // Dilution comes from ANY claimant whose pot-backed claim is still unreceipted: every portfolio
+  // whose receipt is present && !finalized gets a tag 46, or — if 46 is refused — a repeat
+  // CloseResolved, EVERY cycle until all are finalised; a portfolio is closed (tag 8) only once its
+  // receipt is finalised. Until then the market is not terminal-flat and the seniors' 77 fails with
+  // 21. Runs once the vault LP is settled (closed this pass, or no registry-owned portfolio left).
+  // Fresh reads each cycle. Escrowed owners are reported: only the holder can sign.
+  const lpPending = pfs.some((q) => pdaOwnerKind(q.owner, market, cfg) === "lp-registry") && out.vaultLpClosed.length === 0;
+  if (!lpPending) {
+    const cands = pfs.filter((q) => pdaOwnerKind(q.owner, market, cfg) !== "lp-registry");
+    let infos: Array<{ data: Buffer | Uint8Array } | null> = [];
+    try {
+      infos = cands.length ? await conn.getMultipleAccountsInfo(cands.map((q) => q.pubkey), "confirmed") : [];
+    } catch {
+      infos = [];
+    }
+    let sends = 0;
+    for (let k = 0; k < cands.length; k++) {
+      const q = cands[k];
+      const info = infos[k];
+      if (!info || !receiptOpen(new Uint8Array(info.data))) continue;
+      if (pdaOwnerKind(q.owner, market, cfg) === "nft-escrow") {
+        out.remaining.push({ portfolio: q.pubkey.toBase58(), reason: "open (partial) resolved receipt on an NFT-escrowed portfolio: the holder must sign tag 46" });
+        continue;
+      }
+      if (sends >= cfg.maxPerCycle) {
+        out.remaining.push({ portfolio: q.pubkey.toBase58(), reason: `open resolved receipt: tag-46 sweep over the ${cfg.maxPerCycle}-per-cycle bound; next cycle` });
+        continue;
+      }
+      try {
+        // 46 first; if refused, a repeat CloseResolved (both permissionless).
+        let t = mk([buildClaimResolvedPayoutTopupIx({ wrapperProgramId: cfg.wrapperProgramId, owner: q.owner, market, portfolio: q.pubkey, collateralMint })]);
+        let rt = await sim(t);
+        let kind = "46";
+        if (rt.err) {
+          const t30 = mk([resolvedIx(q)]);
+          const r30 = await sim(t30);
+          if (r30.err) {
+            out.remaining.push({ portfolio: q.pubkey.toBase58(), reason: `open resolved receipt: tag 46 ${why(rt.err, rt.logs, { 1: "ClaimResolvedPayoutTopup" })}; repeat CloseResolved ${why(r30.err, r30.logs, { 1: "CloseResolved" })} — revisit next cycle` });
+            continue;
+          }
+          t = t30; rt = r30; kind = "30";
+        }
+        sends++;
+        if (!(await send(t))) {
+          out.remaining.push({ portfolio: q.pubkey.toBase58(), reason: `receipt revisit (${kind}) tx did not land; retry next cycle` });
+          continue;
+        }
+        out.topupSwept.push(q.pubkey.toBase58());
+        // Close only once the receipt is finalised (tag 8 refuses otherwise); else revisit next cycle.
+        const c8 = mk([closeIx(q)]);
+        if (!(await sim(c8)).err && (await send(c8))) {
+          out.closed++;
+          const at = out.remaining.findIndex((x) => x.portfolio === q.pubkey.toBase58());
+          if (at >= 0) out.remaining.splice(at, 1);
+        } else {
+          out.remaining.push({ portfolio: q.pubkey.toBase58(), reason: `receipt revisited (${kind}), not yet finalised — revisit next cycle` });
+        }
+      } catch (err) {
+        out.remaining.push({ portfolio: q.pubkey.toBase58(), reason: (err instanceof Error ? err.message : String(err)).slice(0, 120) });
+      }
     }
   }
   return out;
