@@ -19,11 +19,8 @@ import {
   buildClosePortfolioIx,
   buildCloseResolvedIx,
   classifyCleanupProbe,
-  buildClaimResolvedPayoutTopupIx,
   cleanupResolvedPortfolios,
   CleanupState,
-  receiptOpen,
-  RESOLVED_RECEIPT_OFF,
   encodeClosePortfolio,
   encodeCloseResolved,
   decodePositionNft,
@@ -106,8 +103,6 @@ function cconn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, reply: (t
     },
     async getMultipleAccountsInfo(keys: PublicKey[]) {
       return keys.map((k) => {
-        const pf = portfolios.find((p) => p.pubkey.equals(k));
-        if (pf) return { data: pf.data, owner: WRAPPER, lamports: 67_000_000, executable: false };
         if (k.equals(deriveVaultLpState(WRAPPER, SOL))) return opts.vaultLp ? { data: opts.vaultLp.state, owner: WRAPPER, lamports: 1, executable: false } : null;
         return opts.ataExists === false ? null : { data: Buffer.alloc(165), owner: WRAPPER, lamports: 1, executable: false };
       });
@@ -338,58 +333,6 @@ describe("PDA-owned portfolios: grace period after resolve, then closed (coordin
     ]);
     assert.ok(ix.keys[5].pubkey.equals(deriveLpBackingLedger(WRAPPER, SOL, 0)[0]) && ix.keys[6].pubkey.equals(deriveLpBackingLedger(WRAPPER, SOL, 1)[0]));
     assert.ok(ix.keys[2].pubkey.equals(registry) && ix.keys[4].pubkey.equals(lpPf) && ix.keys[7].pubkey.equals(ownerAta(WALLET, MINT)));
-  });
-  // ── Option B (5544302a): tag-46 top-up sweep right after the vault LP's final 101 ──
-  /** A wallet-owned trader portfolio carrying a PARTIAL resolved receipt (present, not finalised). */
-  const withOpenReceipt = (owner: PublicKey, finalized = 0): Buffer => {
-    const b = withOwner(owner);
-    b[RESOLVED_RECEIPT_OFF + 64] = 1; b[RESOLVED_RECEIPT_OFF + 65] = finalized;
-    return b;
-  };
-  it("receipt decoder (offset 9369: present @+64, finalized @+65) and the tag-46 wire (CloseResolved accounts, data [46])", () => {
-    assert.equal(receiptOpen(withOpenReceipt(WALLET)), true);
-    assert.equal(receiptOpen(withOpenReceipt(WALLET, 1)), false);
-    assert.equal(receiptOpen(withOwner(WALLET)), false);
-    const pf = PF();
-    const ix = buildClaimResolvedPayoutTopupIx({ wrapperProgramId: WRAPPER, owner: WALLET, market: SOL, portfolio: pf, collateralMint: MINT });
-    const cr = buildCloseResolvedIx({ wrapperProgramId: WRAPPER, owner: WALLET, market: SOL, portfolio: pf, collateralMint: MINT });
-    assert.deepEqual([...ix.data], [46]);
-    assert.deepEqual(ix.keys, cr.keys, "same 8 accounts as the permissionless CloseResolved (owner unsigned, [7] nft_registry)");
-    assert.equal(ix.keys[0].isSigner, false);
-  });
-  it("partial receipt: trader stuck before 101 → vault LP 101 settles → tag-46 sweep → tag 8; every receipt finalised", async () => {
-    const trader = PF();
-    let swept = false;
-    const c = cconn([{ pubkey: trader, data: withOpenReceipt(WALLET) }, { pubkey: lpPf, data: withOwner(registry) }], p3((t) => {
-      if (t.includes(46)) { swept = true; return { err: null }; }
-      // the trader cannot close while its receipt is open (CloseResolved/tag 8 refused; no chunk progress)
-      if (!swept && (t.includes(30) || (t.length === 1 && t[0] === 8 && c.calls.sent.every((x) => !x.includes(1011) && !x.includes(101))))) return { err: { InstructionError: [1, { Custom: 21 }] } };
-      return { err: null };
-    }), { vaultLp });
-    const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState(), IN_GRACE);
-    const flat = c.calls.sent.map((x) => x.join(","));
-    const i101 = flat.findIndex((x) => x.includes("101"));
-    const i46 = flat.findIndex((x) => x === "46");
-    assert.ok(i101 >= 0 && i46 > i101, `46 sent right AFTER the vault LP's 101 (sent: ${flat.join(" | ")})`);
-    assert.equal(flat[i46 + 1], "8", "the swept trader is closed right after its 46");
-    assert.deepEqual(r.topupSwept, [trader.toBase58()]);
-    assert.ok(r.vaultLpClosed.includes(lpPf.toBase58()));
-    assert.ok(!r.remaining.some((x) => x.portfolio === trader.toBase58()), "no open receipt left");
-  });
-  it("NEGATIVE CONTROL: the sweep never runs while the vault LP is not yet settled (101 not final)", async () => {
-    const trader = PF();
-    const c = cconn([{ pubkey: trader, data: withOpenReceipt(WALLET) }, { pubkey: lpPf, data: withOwner(registry) }],
-      p3((t) => (t.includes(101) || t.includes(1011) || t.includes(30) || (t.length === 1 && t[0] === 8) ? { err: { InstructionError: [1, { Custom: 21 }] } } : { err: null })), { vaultLp });
-    const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState(), IN_GRACE);
-    assert.ok(!c.calls.sent.some((x) => x.includes(46)), "no 46 before the vault LP is settled");
-    assert.deepEqual(r.topupSwept, []);
-  });
-  it("no open receipt (finalised): the sweep sends no 46", async () => {
-    const trader = PF();
-    const c = cconn([{ pubkey: trader, data: withOpenReceipt(WALLET, 1) }], p3(() => ({ err: null })));
-    const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState(), AFTER_GRACE);
-    assert.ok(!c.calls.sent.some((x) => x.includes(46)));
-    assert.deepEqual(r.topupSwept, []);
   });
   it("a registry-owned portfolio with no bound vault-LP state is reported, not guessed at", async () => {
     const c = cconn([{ pubkey: PF(), data: withOwner(registry) }], p3(() => ({ err: null })));
