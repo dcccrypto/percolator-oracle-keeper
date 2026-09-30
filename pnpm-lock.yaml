@@ -187,7 +187,7 @@ packages:
     engines: {node: ^14.21.3 || >=16}
 
   '@percolatorct/sdk@file:../../percolator-ops/artifacts/sdk-8.0.0/percolatorct-sdk-8.0.0.tgz':
-    resolution: {integrity: sha512-wlG9U26wyyebi7NnyhKqehjlWSje9Hob86YBrfO7kozFlIiZLduIwUIBwMEWP9GQSm32NNOmmBEoNVbM9NThMA==, tarball: file:../../percolator-ops/artifacts/sdk-8.0.0/percolatorct-sdk-8.0.0.tgz}
+    resolution: {integrity: sha512-YmH7SQozib4162jb24iL9EFCNjFiJWtrFkxz+OANyTioU2QbTpNIAkoCWlIc3dVsm1io9ytCGoKusHsO6/vLBg==, tarball: file:../../percolator-ops/artifacts/sdk-8.0.0/percolatorct-sdk-8.0.0.tgz}
     version: 8.0.0
     engines: {node: '>=20.0.0'}
 
