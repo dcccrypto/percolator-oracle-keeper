@@ -62,6 +62,7 @@ import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { confirmBySignature, customCodeOf } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
+import { isTerminalMarket } from "./terminal-insurance.ts";
 
 /**
  * Fallback only. v17 vaults are DUAL-DOMAIN: the vault serves both pots of its
@@ -125,13 +126,15 @@ export async function crankLpFeesOnce(
   // checks (it rejects LpVaultZeroSharesMinted when no share can claim the atoms).
   let infos: Array<{ data: Buffer } | null>;
   try {
-    infos = (await devnetConn.getMultipleAccountsInfo([registry], "confirmed")) as Array<
+    infos = (await devnetConn.getMultipleAccountsInfo([registry, market], "confirmed")) as Array<
       { data: Buffer } | null
     >;
   } catch (err) {
     return { error: `account read failed: ${(err as Error).message.slice(0, 100)}` };
   }
-  const [registryInfo] = infos;
+  const [registryInfo, marketInfo] = infos;
+  // B13: tag 78 is Live-only; a Resolved market / tombstone is never cranked.
+  if (marketInfo && isTerminalMarket(new Uint8Array(marketInfo.data))) return "skipped";
 
   // No vault -> nothing to distribute. Skipping locally keeps a market with no
   // LP vault from costing a transaction every single cycle.

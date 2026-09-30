@@ -128,6 +128,7 @@ import {
 import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
 import { decodeAdlState } from "./adl-state.ts";
+import { isTerminalMarket } from "./terminal-insurance.ts";
 import type { AdlState } from "./adl-state.ts";
 import type { LivenessRepair } from "./liveness-repair.ts";
 import { crankHealthRecord, evaluateCrankHealth, freshStreaks, getAlertSink } from "./alerting.ts";
@@ -186,6 +187,8 @@ interface CrankMarketState {
   /** Ops-track health observation from the latest attempt (null until one read the market). */
   obs: CrankObservation | null;
   streaks: CrankHealthStreaks;
+  /** B13: last read showed a Resolved market or tombstone — not cranked, no alerts. */
+  terminal: boolean;
 }
 
 /** What one crank attempt saw — feeds alerting.ts. */
@@ -201,7 +204,7 @@ export interface CrankObservation {
   adl: AdlState | null;
 }
 
-function freshCrankMarketState(): CrankMarketState {
+export function freshCrankMarketState(): CrankMarketState {
   return {
     lpPortfolio: null,
     seedRejected: false,
@@ -221,6 +224,7 @@ function freshCrankMarketState(): CrankMarketState {
     decodeWarned: false,
     obs: null,
     streaks: freshStreaks(),
+    terminal: false,
   };
 }
 
@@ -369,13 +373,16 @@ export function buildCrankIx(owner: PublicKey, market: PublicKey, portfolio: Pub
   });
 }
 
-async function crankOneMarket(
+export async function crankOneMarket(
   devnetConn: Connection,
   keeper: Keypair,
   entry: Pick<MarketEntry, "marketAddress" | "label" | "lpPortfolio">,
   state: CrankMarketState,
   dryRun: boolean,
 ): Promise<void> {
+  // B13: a market seen Resolved/closed stays that way (resolution is one-way,
+  // a tombstone is final), so it costs no RPC and no alert from here on.
+  if (state.terminal) return;
   const marketAddress = entry.marketAddress;
   const label = entry.label;
   const market = new PublicKey(marketAddress);
@@ -419,6 +426,19 @@ async function crankOneMarket(
     // One read gives both the market state and the slot it was read at.
     const acct = await withRpcRetry(label, () => devnetConn.getAccountInfoAndContext(market, "processed"));
     if (!acct.value) throw new Error(`market ${marketAddress} could not find account`);
+    // B13 (E2E 2026-09-30): a Resolved market / CloseSlab tombstone is never
+    // cranked again. The engine refuses it, and cranking only produced critical
+    // crank-reverts + slot-lag alert noise. No observation is recorded, so any
+    // open crank alert for it resolves on the next health report.
+    if (isTerminalMarket(acct.value.data)) {
+      if (!state.terminal) console.log(`[cranker] ${label}: market is Resolved/closed — no longer cranked (wind-down is the terminal-insurance job's)`);
+      state.terminal = true;
+      state.obs = null;
+      state.consecutiveReverts = 0;
+      state.lastRevertCode = null;
+      return;
+    }
+    state.terminal = false;
     let pre: MarketRefreshState | null = null;
     try {
       pre = decodeMarketRefreshState(acct.value.data);

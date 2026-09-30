@@ -45,7 +45,8 @@ export type AlertKind =
   | "fee-leg-blocked"
   | "fee-job-failed"
   | "adl-reduce-only"
-  | "terminal-budget-unbooked";
+  | "terminal-budget-unbooked"
+  | "terminal-recovery-blocked-portfolios";
 
 export interface Alert {
   kind: AlertKind;

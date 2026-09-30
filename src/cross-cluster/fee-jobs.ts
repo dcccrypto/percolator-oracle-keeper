@@ -123,7 +123,7 @@ export class FeeJobFailureTracker {
     for (const b of r.blocked) {
       alerts.push({
         kind: b.alertKind ?? "fee-leg-blocked",
-        severity: b.alertKind === "terminal-budget-unbooked" ? "critical" : "warn",
+        severity: b.alertKind === "terminal-budget-unbooked" || b.alertKind === "terminal-recovery-blocked-portfolios" ? "critical" : "warn",
         subject: b.label,
         message: `${r.job} cannot move this market's fee leg: ${b.reason}`,
         data: { job: r.job, market: b.market },

@@ -130,6 +130,11 @@ export async function drainFeeLegsBeforeResolve(
   if (terminalCfg && deps.inspectTerminal) {
     const t = await deps.inspectTerminal(conn, keeper, marketAddress, terminalCfg, new TerminalInsuranceState());
     terminal = { stakeBound: t.stakeBound, budget: t.budget, support: t.support };
+    if (t.stakeBound && t.budget !== null && t.budget > 0n && t.state && t.state.kind !== "closed" && t.state.materializedPortfolios > 0n) {
+      warnings.push(
+        `stake-bound insurance budget ${t.budget} atoms: tag 29 can only recover it once ALL ${t.state.materializedPortfolios} materialized portfolio(s) are closed by their owners (wrapper tag 41 needs 0 after resolve; E2E B12) — get owners to close, or recover while Live (tag 23 → 24)`,
+      );
+    }
     if (t.stakeBound && t.budget !== null && t.budget > 0n) {
       if (t.support === "supported") {
         warnings.push(`stake-bound insurance budget ${t.budget} atoms: after resolve, run this again to wind down (stake tag 29 RecoverTerminalInsurance)`);

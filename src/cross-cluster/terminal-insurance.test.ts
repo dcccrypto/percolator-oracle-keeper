@@ -41,9 +41,12 @@ const BUDGET_ABS = 592 + 461;
 const KEEPER = Keypair.generate();
 const DEPLOYED_PRE_F9_ERR = { InstructionError: [1, "InvalidInstructionData"] }; // exactly what live devnet returned 2026-09-30
 
-function resolved(name = "textit", budget?: bigint): Buffer {
+const PORTFOLIOS_ABS = 592 + 517;
+/** Resolved copy of a real market; `portfolios` overrides materialized_portfolio_count (u64 @ group+517). */
+function resolved(name = "textit", budget?: bigint, portfolios?: bigint): Buffer {
   const b = Buffer.from(fx(`${name}-market-v18-fees`));
   b[MODE_ABS] = 1;
+  if (portfolios !== undefined) b.writeBigUInt64LE(portfolios, PORTFOLIOS_ABS);
   if (budget !== undefined) {
     b.writeBigUInt64LE(budget & 0xffff_ffff_ffff_ffffn, BUDGET_ABS);
     b.writeBigUInt64LE(budget >> 64n, BUDGET_ABS + 8);
@@ -100,6 +103,10 @@ describe("decodeTerminalState (real TEXTIT bytes)", () => {
     const s = decodeTerminalState(new Uint8Array(fx("textit-market-v18-fees")));
     assert.equal(s?.kind, "live");
     assert.ok(s && s.kind === "live" && s.budget > 0n, "TEXTIT carries a domain budget");
+  });
+  it("materialized_portfolio_count @ group+517 matches devnet (TEXTIT 5 = its 5 portfolio accounts, read 2026-09-30)", () => {
+    assert.equal((decodeTerminalState(new Uint8Array(fx("textit-market-v18-fees"))) as { materializedPortfolios: bigint }).materializedPortfolios, 5n);
+    assert.equal((decodeTerminalState(new Uint8Array(fx("sol-market-v18-fees"))) as { materializedPortfolios: bigint }).materializedPortfolios, 8n);
   });
   it("mode byte 1 at abs 1218 = resolved, keeping the budget", () => {
     const live = decodeTerminalState(new Uint8Array(fx("textit-market-v18-fees")));
@@ -177,16 +184,53 @@ describe("windDownOnce — resolved stake-bound market", () => {
 
   it("supported: step 1 sends tag 29 with amount = the asset-0 insurance budget", async () => {
     const budget = (decodeTerminalState(new Uint8Array(resolved())) as { budget: bigint }).budget;
-    const s = stub(resolved(), TEXTIT, "textit", probeOk(-1n, () => ({ err: null })));
+    const s = stub(resolved("textit", undefined, 0n), TEXTIT, "textit", probeOk(-1n, () => ({ err: null })));
     const r = await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
     assert.equal(r.outcome.kind, "done", JSON.stringify(r.outcome));
     assert.equal(s.calls.sims[1].amount, budget);
-    assert.equal(s.calls.sends, 1);
   });
 
-  it("Custom(21) on step 1 = cooldown: retried later, never a failure; alerts only after N cycles", async () => {
+  it("B14: after tag 29(budget) lands it ALWAYS runs tag 29(0), and marks done only on 31", async () => {
     const st = new TerminalInsuranceState();
-    const s = stub(resolved(), TEXTIT, "textit", probeOk(-1n, (a) => (a > 0n ? { err: { InstructionError: [1, { Custom: 21 }] } } : { err: null })));
+    const budget = (decodeTerminalState(new Uint8Array(resolved())) as { budget: bigint }).budget;
+    // tag 29(0) books something this pass (a third-party tag-41 push) -> sent, NOT done yet.
+    const s = stub(resolved("textit", undefined, 0n), TEXTIT, "textit", probeOk(-1n, () => ({ err: null })));
+    const r1 = await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, st);
+    assert.deepEqual(s.calls.sims.map((c) => c.amount), [0n, budget, 0n], "probe, step 1, step 2");
+    assert.equal(s.calls.sends, 2, "both steps sent");
+    assert.equal(r1.outcome.kind, "done");
+    assert.equal(st.done.has(TEXTIT.toBase58()), false, "not done: step 2 did not return 31");
+    // next cycle (budget now 0 on chain): step 2 -> 31 -> done.
+    const s2 = stub(resolved("textit", 0n, 0n), TEXTIT, "textit", () => ({ err: { InstructionError: [1, { Custom: 31 }] } }));
+    await windDownOnce(s2.conn, KEEPER, TEXTIT.toBase58(), false, CFG, st);
+    assert.equal(st.done.has(TEXTIT.toBase58()), true);
+  });
+
+  it("B14: tag 29(budget) lands and tag 29(0) returns 31 in the same pass -> done", async () => {
+    const st = new TerminalInsuranceState();
+    const s = stub(resolved("textit", undefined, 0n), TEXTIT, "textit", probeOk(-1n, (a) => (a === 0n ? { err: { InstructionError: [1, { Custom: 31 }] } } : { err: null })));
+    const r = await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, st);
+    assert.equal(r.outcome.kind, "done");
+    assert.match((r.outcome as { detail: string }).detail, /recovered .* Custom\(31\): wind-down complete/);
+    assert.equal(st.done.has(TEXTIT.toBase58()), true);
+  });
+
+  it("B12: tag 29 -> 21 with materialized portfolios is a CRITICAL blocked alert at once, naming the count", async () => {
+    const s = stub(resolved("textit", undefined, 5n), TEXTIT, "textit", probeOk(-1n, (a) => (a > 0n ? { err: { InstructionError: [1, { Custom: 21 }] } } : { err: null })));
+    const r = await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "blocked");
+    const o = r.outcome as { alertKind?: string; reason: string };
+    assert.equal(o.alertKind, "terminal-recovery-blocked-portfolios");
+    assert.match(o.reason, /5 materialized portfolio\(s\) remain/);
+    assert.equal(s.calls.sends, 0);
+    const a = new FeeJobFailureTracker().alertsFor({ job: "terminal-insurance", done: [], nothing: 0, skipped: [], failed: [], blocked: [{ market: "T", label: "TEXTIT", reason: o.reason, alertKind: "terminal-recovery-blocked-portfolios" }] });
+    assert.equal(a[0].severity, "critical");
+    assert.match(a[0].message, /5 materialized portfolio/);
+  });
+
+  it("Custom(21) on step 1 with 0 portfolios = cooldown: retried later, never a failure; alerts only after N cycles", async () => {
+    const st = new TerminalInsuranceState();
+    const s = stub(resolved("textit", undefined, 0n), TEXTIT, "textit", probeOk(-1n, (a) => (a > 0n ? { err: { InstructionError: [1, { Custom: 21 }] } } : { err: null })));
     const kinds: string[] = [];
     for (let i = 0; i < 3; i++) kinds.push((await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, st)).outcome.kind);
     assert.deepEqual(kinds, ["skipped", "skipped", "blocked"]);
@@ -274,6 +318,7 @@ describe("alerting + pre-resolve integration", () => {
       { ...noLegs, inspectTerminal: (await import("./terminal-insurance.ts")).inspectStakeBoundBudget }, CFG);
     assert.ok(!r.blockers.some((b) => /STRANDED/.test(b)));
     assert.ok(r.warnings.some((w) => /tag 29 RecoverTerminalInsurance/.test(w)));
+    assert.ok(r.warnings.some((w) => /ALL 5 materialized portfolio\(s\) are closed by their owners/.test(w)), "B12 heads-up names the live count");
   });
   it("windDownAfterResolve: complete only when no stake-bound budget is left unbooked", async () => {
     const pre = stub(resolved(), TEXTIT, "textit", () => ({ err: DEPLOYED_PRE_F9_ERR }));

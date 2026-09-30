@@ -79,14 +79,22 @@ const KIND_MARKET = 1;
 const KIND_CLOSED_MARKET = 8;
 const H_MODE = 626;
 const H_INSURANCE_DOMAIN_BUDGET_REMAINING_TOTAL = 461;
+/** `materialized_portfolio_count` u64 @ group+517 (engine 35ddd692 source). Wrapper tag 41 on a Resolved market requires it to be 0. */
+const H_MATERIALIZED_PORTFOLIO_COUNT = 517;
 const MODE_RESOLVED = 1;
 const TOKEN_PROGRAM = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const COMPUTE_UNIT_LIMIT = 120_000; // stake doc: 47,198 CU with the CPI, 15,809 book-only
 
 export type TerminalState =
-  | { kind: "live"; budget: bigint }
-  | { kind: "resolved"; budget: bigint }
+  | { kind: "live"; budget: bigint; materializedPortfolios: bigint }
+  | { kind: "resolved"; budget: bigint; materializedPortfolios: bigint }
   | { kind: "closed" };
+
+/** True for a market the engine no longer runs: Resolved, or a CloseSlab tombstone. */
+export function isTerminalMarket(d: Uint8Array): boolean {
+  const s = decodeTerminalState(d);
+  return s !== null && s.kind !== "live";
+}
 
 function u64(d: Uint8Array, off: number): bigint {
   return new DataView(d.buffer, d.byteOffset, d.byteLength).getBigUint64(off, true);
@@ -104,7 +112,8 @@ export function decodeTerminalState(d: Uint8Array): TerminalState | null {
   if (d.length < g + V17_MARKET_GROUP_LEN) return null;
   const off = g + H_INSURANCE_DOMAIN_BUDGET_REMAINING_TOTAL;
   const budget = u64(d, off) | (u64(d, off + 8) << 64n);
-  return d[g + H_MODE] === MODE_RESOLVED ? { kind: "resolved", budget } : { kind: "live", budget };
+  const materializedPortfolios = u64(d, g + H_MATERIALIZED_PORTFOLIO_COUNT);
+  return d[g + H_MODE] === MODE_RESOLVED ? { kind: "resolved", budget, materializedPortfolios } : { kind: "live", budget, materializedPortfolios };
 }
 
 /** Asset-0 insurance authority, via the VERSION-gated profile offset. null if unreadable. */
@@ -359,14 +368,28 @@ export async function windDownOnce(
   };
 
   // Step 1: recover the budget (Resolved only).
+  let recovered: WindDownStep | null = null;
   if (budget > 0n) {
     const s1 = await call(budget);
     steps.push(s1);
     if (s1.outcome === "sent") {
+      // B14: never stop here — step 2 (amount 0) still has to book any
+      // third-party tag-41 push / stray account. Done is decided by 31 only.
       st.unbookedStreak.delete(marketAddress);
-      return res({ kind: "done", detail: `tag 29 recovered ${budget} atoms of terminal insurance into the stake pool ${s1.detail}` }, { state, budget, stakeBound, support });
-    }
-    if (s1.outcome !== "nothing") {
+      recovered = s1;
+    } else if (s1.outcome === "cooldown" && state.kind === "resolved" && state.materializedPortfolios > 0n) {
+      // B12: wrapper tag 41 on a Resolved market needs materialized_portfolio_count == 0.
+      // CloseResolved empties a portfolio without dematerializing it and only the
+      // owner can ClosePortfolio (tag 8), so this 21 is not a cooldown: it lasts
+      // until every owner closes, or the P3 wrapper fix lands.
+      return res({
+        kind: "blocked",
+        alertKind: "terminal-recovery-blocked-portfolios",
+        reason:
+          `stake tag 29(${budget}) -> Custom(21): ${state.materializedPortfolios} materialized portfolio(s) remain on this Resolved market; ` +
+          "wrapper tag 41 requires 0 (each owner must ClosePortfolio, tag 8). The stakers' terminal budget is stranded until they do or the P3 permissionless dematerialize lands (E2E B12)",
+      }, { state, budget, stakeBound, support });
+    } else if (s1.outcome !== "nothing") {
       return res(unbookedAlert(s1.detail) ?? (s1.outcome === "failed" ? { kind: "failed", error: `tag 29(${budget}): ${s1.detail}` } : { kind: "skipped", reason: `tag 29(${budget}): ${s1.detail}` }), { state, budget, stakeBound, support });
     }
   }
@@ -381,12 +404,24 @@ export async function windDownOnce(
   }
   const s2 = await call(0n, stray);
   steps.push(s2);
+  const recoveredNote = recovered ? `tag 29 recovered ${budget} atoms of terminal insurance into the stake pool ${recovered.detail}; ` : "";
   if (s2.outcome === "nothing") {
-    if (budget === 0n && !stray) st.done.add(marketAddress);
-    return res({ kind: "nothing", detail: "Custom(31): nothing left to book — wind-down complete" }, { state, budget, stakeBound, support });
+    // Done ONLY on 31 from the amount-0 step (B14).
+    st.done.add(marketAddress);
+    return res(
+      recovered
+        ? { kind: "done", detail: `${recoveredNote}tag 29(0) -> Custom(31): wind-down complete` }
+        : { kind: "nothing", detail: "Custom(31): nothing left to book — wind-down complete" },
+      { state, budget, stakeBound, support },
+    );
   }
   if (s2.outcome === "sent") {
-    return res({ kind: "done", detail: `tag 29(0) booked pushed/stray insurance into the stake pool${stray ? ` (swept ${stray.toBase58().slice(0, 8)}…)` : ""} ${s2.detail}` }, { state, budget, stakeBound, support });
+    return res({ kind: "done", detail: `${recoveredNote}tag 29(0) booked pushed/stray insurance into the stake pool${stray ? ` (swept ${stray.toBase58().slice(0, 8)}…)` : ""} ${s2.detail}` }, { state, budget, stakeBound, support });
+  }
+  if (recovered) {
+    // The budget landed; the booking step did not finish this pass. Report the
+    // recovery, and let the next cycle run step 2 again (not marked done).
+    return res({ kind: "done", detail: `${recoveredNote}tag 29(0) not finished (${s2.outcome}: ${s2.detail}) — retried next cycle` }, { state, budget, stakeBound, support });
   }
   if (s2.outcome === "dry-run") return res({ kind: "skipped", reason: `DRY-RUN: tag 29(0) would book${stray ? " + sweep" : ""}` }, { state, budget, stakeBound, support });
   return res(s2.outcome === "failed" ? { kind: "failed", error: `tag 29(0): ${s2.detail}` } : { kind: "skipped", reason: `tag 29(0): ${s2.detail}` }, { state, budget, stakeBound, support });
