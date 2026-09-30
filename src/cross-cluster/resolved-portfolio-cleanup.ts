@@ -46,6 +46,12 @@
  *     last_holder @167, 199 B, nft db4aa09 state_v16.rs) and claim size. An
  *     accepted devnet limitation. (Devnet 2026-09-30: 6 such portfolios exist.)
  *
+ * F-14 (P3 WIP 31efd250): tag 101 moves NO SPL — the whole vault-LP payout goes back
+ * into the vault's own backing pot; the junior is paid only by its own tag 102 after
+ * the seniors' 77 (watched by vault-lp-junior-watch.ts). The keeper passes the junior
+ * dest [7] (and ensures that ATA exists) only because 101 still requires and verifies
+ * it; nothing here assumes 101 pays the junior.
+ *
  * Tag 101 accounts (:26676): [caller s,w] [market w] [registry] [vault_lp state
  * w] [lp portfolio w] [own ledger w] [sibling ledger] [junior dest w = token
  * account of state.junior_owner] [vault token w] [vault authority] [token]

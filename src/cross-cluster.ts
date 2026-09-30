@@ -62,6 +62,9 @@ import { makeTerminalInsuranceJob, terminalInsuranceConfigFromEnv } from "./cros
 import type { TerminalInsuranceConfig } from "./cross-cluster/terminal-insurance.ts";
 import type { StakeFeeConfig } from "./cross-cluster/stake-fee-pusher.ts";
 import { startFeeJobLoop } from "./cross-cluster/fee-jobs.ts";
+import { juniorWatchConfigFromEnv, makeJuniorWatchJob } from "./cross-cluster/vault-lp-junior-watch.ts";
+import type { JuniorWatchConfig } from "./cross-cluster/vault-lp-junior-watch.ts";
+import { WRAPPER_PROGRAM_ID as CFG_WRAPPER_PROGRAM_ID } from "./program-ids.ts";
 import type { FeeJob } from "./cross-cluster/fee-jobs.ts";
 import { getAlertSink } from "./cross-cluster/alerting.ts";
 import type { AlertSink } from "./cross-cluster/alerting.ts";
@@ -156,6 +159,7 @@ let MIN_KEEPER_BALANCE_LAMPORTS: number;
 let BALANCE_CHECK_INTERVAL_MS: number;
 let STAKE_FEE_CONFIG: StakeFeeConfig;
 let TERMINAL_CONFIG: TerminalInsuranceConfig;
+let JUNIOR_WATCH_CONFIG: JuniorWatchConfig;
 let ALERT_SINK: AlertSink;
 let DEVNET_CONN_CONFIG: ConnectionConfig;
 try {
@@ -164,6 +168,7 @@ try {
   // throw inside a background loop hours later.
   STAKE_FEE_CONFIG = stakeFeeConfigFromEnv(process.env);
   TERMINAL_CONFIG = terminalInsuranceConfigFromEnv(process.env);
+  JUNIOR_WATCH_CONFIG = juniorWatchConfigFromEnv(process.env, CFG_WRAPPER_PROGRAM_ID);
   ALERT_SINK = getAlertSink();
   DEVNET_CONN_CONFIG = devnetConnectionConfig(process.env);
   MIN_KEEPER_BALANCE_LAMPORTS = parsePositiveLamportsFromSolEnv(
@@ -385,6 +390,8 @@ if (CRANK_ENABLED) {
   if (LP_FEE_CRANK_ENABLED) feeJobs.push(makeLpFeeJob());
   if (STAKE_FEE_PUSH_ENABLED) feeJobs.push(makeStakeFeeJob(STAKE_FEE_CONFIG));
   if (TERMINAL_INSURANCE_ENABLED) feeJobs.push(makeTerminalInsuranceJob(TERMINAL_CONFIG));
+  // Read-only: alerts when a bound vault's seniors are done but the junior's tag 102 has not run.
+  if (process.env.JUNIOR_WATCH_ENABLED !== "false") feeJobs.push(makeJuniorWatchJob(JUNIOR_WATCH_CONFIG));
   if (feeJobs.length > 0) {
     void startFeeJobLoop(
       feeJobs,

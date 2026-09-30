@@ -48,7 +48,8 @@ export type AlertKind =
   | "terminal-budget-unbooked"
   | "terminal-recovery-blocked-portfolios"
   | "terminal-pda-portfolio-closed"
-  | "terminal-waiting-nft-holder";
+  | "terminal-waiting-nft-holder"
+  | "vault-lp-junior-release-pending";
 
 export interface Alert {
   kind: AlertKind;
