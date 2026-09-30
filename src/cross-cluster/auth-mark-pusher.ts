@@ -48,7 +48,7 @@ import {
   V17_ASSET_ORACLE_WRAPPER_LEN,
 } from "@percolatorct/sdk";
 import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
-import { isTerminalMarket } from "./market-state.ts";
+import { isLiveMarket, isTerminalMarket } from "./market-state.ts";
 
 /**
  * B20 (E2E 2026-09-30): Resolved markets and CloseSlab tombstones are never
@@ -57,6 +57,10 @@ import { isTerminalMarket } from "./market-state.ts";
  * the batch before it is built and logged once per market.
  */
 const terminalLogged = new Set<string>();
+/** A decodable kind-1 market whose mode is not Live (i.e. Recovery; Resolved is caught by isTerminalMarket). */
+function marketModeIsNotLive(data: Uint8Array): boolean {
+  return !isLiveMarket(data) && !isTerminalMarket(data) && data.length > 16 && data[10] === 1;
+}
 export function resetTerminalPushLogForTests(): void {
   terminalLogged.clear();
 }
@@ -634,7 +638,9 @@ async function fetchPushAuthMarkGenerationFields(
     if (result.has(key)) continue;
     const data = dataByAddr.get(p.marketAddress);
     if (!data) continue;
-    if (isTerminalMarket(data)) {
+    // B20 + Recovery: push only LIVE markets. A market the expired-close valve moved to
+    // Recovery is refused (21) like a Resolved one; it is cranked, not priced.
+    if (isTerminalMarket(data) || marketModeIsNotLive(data)) {
       terminal.add(p.marketAddress);
       continue;
     }
@@ -776,7 +782,7 @@ export async function pushAuthMarkBatch(
   for (const m of terminal) {
     if (!terminalLogged.has(m)) {
       terminalLogged.add(m);
-      console.log(`[push] ${m.slice(0, 8)}… is Resolved/closed — no longer pushed (B20)`);
+      console.log(`[push] ${m.slice(0, 8)}… is not Live (Recovery/Resolved/closed) — not pushed (B20)`);
     }
   }
   const terminalMarkets = [...terminal];

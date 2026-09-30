@@ -63,6 +63,8 @@ import type { TerminalInsuranceConfig } from "./cross-cluster/terminal-insurance
 import type { StakeFeeConfig } from "./cross-cluster/stake-fee-pusher.ts";
 import { startFeeJobLoop } from "./cross-cluster/fee-jobs.ts";
 import { juniorWatchConfigFromEnv, makeJuniorWatchJob } from "./cross-cluster/vault-lp-junior-watch.ts";
+import { bankruptCloseWatchConfigFromEnv, makeBankruptCloseWatchJob } from "./cross-cluster/bankrupt-close-watch.ts";
+import type { BankruptCloseWatchConfig } from "./cross-cluster/bankrupt-close-watch.ts";
 import type { JuniorWatchConfig } from "./cross-cluster/vault-lp-junior-watch.ts";
 import { WRAPPER_PROGRAM_ID as CFG_WRAPPER_PROGRAM_ID } from "./program-ids.ts";
 import type { FeeJob } from "./cross-cluster/fee-jobs.ts";
@@ -160,6 +162,7 @@ let BALANCE_CHECK_INTERVAL_MS: number;
 let STAKE_FEE_CONFIG: StakeFeeConfig;
 let TERMINAL_CONFIG: TerminalInsuranceConfig;
 let JUNIOR_WATCH_CONFIG: JuniorWatchConfig;
+let BANKRUPT_CLOSE_CONFIG: BankruptCloseWatchConfig;
 let ALERT_SINK: AlertSink;
 let DEVNET_CONN_CONFIG: ConnectionConfig;
 try {
@@ -169,6 +172,7 @@ try {
   STAKE_FEE_CONFIG = stakeFeeConfigFromEnv(process.env);
   TERMINAL_CONFIG = terminalInsuranceConfigFromEnv(process.env);
   JUNIOR_WATCH_CONFIG = juniorWatchConfigFromEnv(process.env, CFG_WRAPPER_PROGRAM_ID);
+  BANKRUPT_CLOSE_CONFIG = bankruptCloseWatchConfigFromEnv(process.env, CFG_WRAPPER_PROGRAM_ID);
   ALERT_SINK = getAlertSink();
   DEVNET_CONN_CONFIG = devnetConnectionConfig(process.env);
   MIN_KEEPER_BALANCE_LAMPORTS = parsePositiveLamportsFromSolEnv(
@@ -392,6 +396,8 @@ if (CRANK_ENABLED) {
   if (TERMINAL_INSURANCE_ENABLED) feeJobs.push(makeTerminalInsuranceJob(TERMINAL_CONFIG));
   // Read-only: alerts when a bound vault's seniors are done but the junior's tag 102 has not run.
   if (process.env.JUNIOR_WATCH_ENABLED !== "false") feeJobs.push(makeJuniorWatchJob(JUNIOR_WATCH_CONFIG));
+  // Read-only: warn / critical when a Live market's bankrupt close nears / passes max_close_slot with residual.
+  if (process.env.BANKRUPT_CLOSE_WATCH_ENABLED !== "false") feeJobs.push(makeBankruptCloseWatchJob(BANKRUPT_CLOSE_CONFIG));
   if (feeJobs.length > 0) {
     void startFeeJobLoop(
       feeJobs,

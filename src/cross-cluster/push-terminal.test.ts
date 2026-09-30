@@ -16,6 +16,7 @@ import { DEFAULT_THRESHOLDS, evaluatePushCycle } from "./alerting.ts";
 const here = dirname(fileURLToPath(import.meta.url));
 const SOL_BYTES = Buffer.from(readFileSync(join(here, "__fixtures__", "sol-market-v18-fees.b64"), "utf8").trim(), "base64");
 const resolved = (): Buffer => { const b = Buffer.from(SOL_BYTES); b[592 + 626] = 1; return b; };
+const recovery = (): Buffer => { const b = Buffer.from(SOL_BYTES); b[592 + 626] = 2; return b; };
 const tombstone = (): Buffer => { const b = Buffer.from(SOL_BYTES.subarray(0, 64)); b[10] = 8; return b; };
 const BLOCKHASH = { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 };
 const mk = () => Keypair.generate().publicKey.toBase58();
@@ -71,5 +72,16 @@ describe("B20: push health does not count terminal markets", () => {
   it("a live market that stops pushing still alerts (control)", () => {
     const [a, b] = [mk(), mk()];
     assert.equal(countPushableMarkets([{ marketAddress: a }, { marketAddress: b }], new Set([a])), 1);
+  });
+});
+
+describe("Recovery (expired-close valve): not pushed", () => {
+  it("a market in Recovery (mode 2) is dropped before the batch like a Resolved one", async () => {
+    resetTerminalPushLogForTests();
+    const [live, rec] = [mk(), mk()];
+    const c = conn(new Map([[live, SOL_BYTES], [rec, recovery()]]));
+    const out = await pushAuthMarkBatch(c.conn as never, Keypair.generate(), [live, rec].map((m) => ({ marketAddress: m, assetIndex: 0, priceE6: 1_000_000n })), 100n, BLOCKHASH, false);
+    assert.deepEqual(c.simulated.flat(), [live]);
+    assert.deepEqual(out.terminalMarkets, [rec]);
   });
 });

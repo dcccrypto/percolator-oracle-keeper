@@ -47,6 +47,7 @@ import {
   Transaction,
   TransactionInstruction,
   ComputeBudgetProgram,
+  VersionedTransaction,
 } from "@solana/web3.js";
 import {
   encodeLpVaultCrankFees,
@@ -62,7 +63,7 @@ import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { confirmBySignature, customCodeOf } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
-import { decodeTerminalState, isTerminalFlat } from "./market-state.ts";
+import { decodeTerminalState, isTerminalFlat, marketMode } from "./market-state.ts";
 import { deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 
 /**
@@ -114,7 +115,7 @@ function extractErrorCode(err: unknown): number | null {
 /** The Connection surface the LP-fee crank uses (stubbable in tests). */
 export type LpFeeConnection = Pick<
   Connection,
-  "getMultipleAccountsInfo" | "getLatestBlockhash" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses"
+  "getMultipleAccountsInfo" | "getLatestBlockhash" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses" | "simulateTransaction"
 >;
 
 /**
@@ -155,6 +156,8 @@ export async function crankLpFeesOnce(
   // P3 07a1d0eb allows: a BOUND vault on a TERMINAL-FLAT market (checked below).
   const terminal = marketInfo ? decodeTerminalState(new Uint8Array(marketInfo.data)) : null;
   if (terminal && terminal.kind === "closed") return "skipped";
+  // Recovery (mode 2; e.g. after the expired-bankrupt-close valve): tag 78 is refused there.
+  if (marketInfo && marketMode(new Uint8Array(marketInfo.data)) === 2) return "skipped";
   const resolvedHarvest = terminal !== null && terminal.kind === "resolved";
   if (resolvedHarvest && !isTerminalFlat(terminal)) return "skipped";
 
@@ -179,7 +182,10 @@ export async function crankLpFeesOnce(
   try {
     const parsed = parseLpVaultRegistry(new Uint8Array(registryInfo.data));
     domainIdx = Number(parsed.domain);
-    if (parsed.totalLpSharesOutstanding === 0n) return "skipped";
+    // Live: no share can claim the atoms (the program refuses LpVaultZeroSharesMinted). On a
+    // terminal Resolved harvest 78 can still absorb the claim-free residual for the junior (102),
+    // so it is not skipped there — the simulation gate below decides.
+    if (parsed.totalLpSharesOutstanding === 0n && !resolvedHarvest) return "skipped";
   } catch {
     // Unparseable registry: fall back rather than skip, so a layout change does
     // not silently stop fee cranking on every market at once.
@@ -215,7 +221,17 @@ export async function crankLpFeesOnce(
     tx.recentBlockhash = blockhash;
     tx.feePayer = keeper.publicKey;
     tx.sign(keeper);
-    const sig = await devnetConn.sendRawTransaction(tx.serialize(), { maxRetries: 2 });
+    if (resolvedHarvest) {
+      // P3 FINAL 58e379f1: a terminal harvest with nothing pending is a no-op SUCCESS (no
+      // longer Custom(38)), and what it may absorb (the claim-free terminal residual) is
+      // computed inside the engine. So simulate and send only if the market or the vault's
+      // own ledger would change; otherwise this would spend a tx every cycle forever.
+      const gate = await resolvedHarvestChangesState(devnetConn, tx, market, ledger);
+      if (gate === "unsupported") return "skipped";
+      if (gate === "no-change") return "no-fees";
+      if (typeof gate === "object") return { error: gate.error };
+    }
+    const sig = await devnetConn.sendRawTransaction(tx.serialize(), { maxRetries: 2, skipPreflight: resolvedHarvest });
     // F6 (fee-flow audit 2026-09-29): the signature STATUS decides, not whether
     // confirmTransaction returned before its block-height deadline. SOLCAT
     // 5xq4yAXH… and ANSEM 4RJv6kJt… were logged as "block height exceeded"
@@ -266,6 +282,42 @@ export async function crankAllLpFeesOnce(
     );
   }
   return result;
+}
+
+/**
+ * Simulate the resolved-harvest tx and compare the market + own-ledger bytes with
+ * their current state. "changes" = worth sending. Never throws.
+ */
+export async function resolvedHarvestChangesState(
+  conn: Pick<LpFeeConnection, "simulateTransaction" | "getMultipleAccountsInfo">,
+  tx: Transaction,
+  market: PublicKey,
+  ledger: PublicKey,
+): Promise<"changes" | "no-change" | "unsupported" | { error: string }> {
+  try {
+    const [pre] = [await conn.getMultipleAccountsInfo([market, ledger], "confirmed")];
+    const sim = await conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), {
+      sigVerify: false,
+      commitment: "confirmed",
+      accounts: { encoding: "base64", addresses: [market.toBase58(), ledger.toBase58()] },
+    });
+    if (sim.value.err) {
+      const code = extractErrorCode(JSON.stringify(sim.value.err));
+      if (code === RESOLVED_HARVEST_UNSUPPORTED) return "unsupported";
+      if (code === NO_FEES_TO_CRANK) return "no-change";
+      return { error: `resolved harvest sim: ${JSON.stringify(sim.value.err).slice(0, 100)}` };
+    }
+    const post = sim.value.accounts ?? [];
+    const same = (i: number): boolean => {
+      const a = pre[i];
+      const b = post[i];
+      if (!a || !b) return !a && !b;
+      return Buffer.from(b.data[0], "base64").equals(Buffer.from(a.data));
+    };
+    return same(0) && same(1) ? "no-change" : "changes";
+  } catch (err) {
+    return { error: `resolved harvest sim failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}` };
+  }
 }
 
 /**

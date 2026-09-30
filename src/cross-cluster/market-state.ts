@@ -70,3 +70,23 @@ export function decodeTerminalState(d: Uint8Array): TerminalState | null {
     : { kind: "live", budget, materializedPortfolios };
 }
 
+
+/** Engine market mode byte (0 Live, 1 Resolved, 2 Recovery) of a VERSION-18 kind-1 market; null otherwise. */
+export function marketMode(d: Uint8Array): number | null {
+  if (d.length < V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN) return null;
+  const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
+  if (v.getBigUint64(0, true) !== WRAPPER_MAGIC || v.getUint16(8, true) !== 18 || d[10] !== KIND_MARKET) return null;
+  return d[V17_MARKET_GROUP_OFF + H_MODE];
+}
+
+/**
+ * True only for a LIVE market. Recovery (mode 2) is not Live: PushAuthMark and the
+ * Live-only fee legs (78 unbound, 87) are refused there with EngineLockActive. The
+ * expired-bankrupt-close valve (P3 FINAL 58e379f1, upstream 13b3a8b2) moves a Live
+ * market to Recovery on ANY crank, and Recovery's own bounded crank step reaches
+ * Resolved — so the crank loop keeps cranking Recovery, everything else skips it.
+ * An undecodable account is not reported as Live.
+ */
+export function isLiveMarket(d: Uint8Array): boolean {
+  return marketMode(d) === 0;
+}

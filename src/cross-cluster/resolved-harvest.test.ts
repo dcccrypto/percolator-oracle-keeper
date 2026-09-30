@@ -39,12 +39,26 @@ function market(name: string, o: { mode?: number; materialized?: bigint; cTot?: 
 const flat = (name = "sol") => market(name, { mode: 1, materialized: 0n, cTot: 0n });
 const registry = (boundFlag: number): Buffer => { const b = Buffer.from(fx("solcat-lp-vault-registry-v18")); b[160] = boundFlag; return b; };
 
-function lpConn(reg: Buffer, mkt: Buffer, sendError?: Error) {
+/** sim: "changes" (post-state differs), "same" (a no-op: post == pre), or an error object. */
+function lpConn(reg: Buffer, mkt: Buffer, sendError?: Error, sim: "changes" | "same" | { err: unknown } = "changes") {
   const sent: Transaction[] = [];
+  const LEDGER_PRE = Buffer.alloc(240, 7);
+  let sims = 0;
   return {
     sent,
+    sims: () => sims,
     conn: {
-      async getMultipleAccountsInfo() { return [{ data: reg }, { data: mkt }]; },
+      async getMultipleAccountsInfo(keys: PublicKey[]) {
+        // [registry, market] for the first read; [market, ledger] for the harvest gate
+        if (keys.length === 2 && keys[0].toBase58() === SOL) return [{ data: mkt }, { data: LEDGER_PRE }];
+        return [{ data: reg }, { data: mkt }];
+      },
+      async simulateTransaction() {
+        sims++;
+        if (typeof sim === "object") return { value: { err: sim.err, accounts: null } };
+        const ledgerPost = sim === "same" ? LEDGER_PRE : Buffer.alloc(240, 9);
+        return { value: { err: null, accounts: [{ data: [mkt.toString("base64"), "base64"] }, { data: [ledgerPost.toString("base64"), "base64"] }] } };
+      },
       async getLatestBlockhash() { return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 }; },
       async sendRawTransaction(raw: Buffer) { if (sendError) throw sendError; sent.push(Transaction.from(raw)); return "sig"; },
       async confirmTransaction() { return { value: { err: null } }; },
@@ -90,9 +104,31 @@ describe("B13 exception: tag 78 on a Resolved market", () => {
     assert.equal(await crankLpFeesOnce(c.conn as never, KEEPER, SOL, false), "skipped");
     assert.equal(c.sent.length, 0);
   });
-  it("version gate: a pre-07a1d0eb wrapper answers 21 in preflight -> skipped, not a failure", async () => {
-    const c = lpConn(registry(1), flat(), new Error("Simulation failed. Error processing Instruction 1: custom program error: 0x15"));
+  it("version gate: a pre-07a1d0eb wrapper answers 21 in the simulation -> skipped, nothing sent", async () => {
+    const c = lpConn(registry(1), flat(), undefined, { err: { InstructionError: [1, { Custom: 21 }] } });
     assert.equal(await crankLpFeesOnce(c.conn as never, KEEPER, SOL, false), "skipped");
+    assert.equal(c.sent.length, 0);
+  });
+  it("P3 FINAL: a terminal harvest that would change nothing (no-op success) is NOT sent", async () => {
+    const c = lpConn(registry(1), flat(), undefined, "same");
+    assert.equal(await crankLpFeesOnce(c.conn as never, KEEPER, SOL, false), "no-fees");
+    assert.equal(c.sims(), 1);
+    assert.equal(c.sent.length, 0, "no tx every cycle forever");
+  });
+  it("P3 FINAL: a terminal harvest with seniors all redeemed (0 shares) still runs — 78 can absorb the residual for the junior", async () => {
+    const zero = registry(1); zero.fill(0, 16 + 64, 16 + 80);
+    const c = lpConn(zero, flat(), undefined, "changes");
+    assert.equal(await crankLpFeesOnce(c.conn as never, KEEPER, SOL, false), "cranked");
+  });
+  it("0 shares on a LIVE market is still skipped (control)", async () => {
+    const zero = registry(1); zero.fill(0, 16 + 64, 16 + 80);
+    const c = lpConn(zero, fx("sol-market-v18-fees"));
+    assert.equal(await crankLpFeesOnce(c.conn as never, KEEPER, SOL, false), "skipped");
+  });
+  it("Recovery (mode 2, e.g. after the expired-close valve): skipped, nothing sent", async () => {
+    const c = lpConn(registry(1), market("sol", { mode: 2 }));
+    assert.equal(await crankLpFeesOnce(c.conn as never, KEEPER, SOL, false), "skipped");
+    assert.equal(c.sent.length, 0);
   });
   it("a 21 on a LIVE market is still a real failure (the gate is Resolved-only)", async () => {
     const c = lpConn(registry(1), fx("sol-market-v18-fees"), new Error("custom program error: 0x15"));

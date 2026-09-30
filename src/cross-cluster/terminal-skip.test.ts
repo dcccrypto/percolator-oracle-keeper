@@ -22,6 +22,7 @@ const STAKE = new PublicKey("GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3");
 const SOL = "AzagguvrWmRgcBpsKuqomW7Yb1YUUd6UzcrkiRsqdhr";
 const KEEPER = Keypair.generate();
 const resolvedSol = (): Buffer => { const b = Buffer.from(fx("sol-market-v18-fees")); b[592 + 626] = 1; return b; };
+const recoverySol = (): Buffer => { const b = Buffer.from(fx("sol-market-v18-fees")); b[592 + 626] = 2; return b; };
 const tombstoneSol = (): Buffer => { const b = Buffer.from(fx("sol-market-v18-fees").subarray(0, 64)); b[10] = 8; return b; };
 
 function crankConn(data: Buffer) {
@@ -104,5 +105,40 @@ describe("B13 — Live-only fee jobs skip terminal markets locally", () => {
     };
     assert.equal(await crankLpFeesOnce(conn as never, KEEPER, SOL, false), "skipped");
     assert.equal(sends, 0);
+  });
+});
+
+describe("Recovery (mode 2, expired-close valve)", () => {
+  it("the crank loop KEEPS cranking a Recovery market (its bounded step is the path to Resolved)", async () => {
+    const c = crankConn(recoverySol());
+    const st = freshCrankMarketState();
+    await crankOneMarket(c.conn as never, KEEPER, entry, st, false);
+    assert.ok(c.calls.tx > 0, "cranked");
+    assert.equal(st.terminal, false);
+  });
+  it("a market that turns Resolved between cycles is skipped from the next cycle on", async () => {
+    let data = recoverySol();
+    const calls = { tx: 0 };
+    const conn2 = {
+      async getAccountInfoAndContext() { return { context: { slot: 505_700_000 }, value: { data, owner: WRAPPER, lamports: 1, executable: false } }; },
+      async getLatestBlockhash() { calls.tx++; return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 }; },
+      async simulateTransaction() { calls.tx++; return { context: { slot: 1 }, value: { err: null, logs: [], accounts: [] } }; },
+      async sendRawTransaction() { calls.tx++; data = resolvedSol(); return "sig"; }, // this crank moved it Recovery -> Resolved
+      async getProgramAccounts() { return []; },
+    };
+    const st = freshCrankMarketState();
+    await crankOneMarket(conn2 as never, KEEPER, entry, st, false);
+    const after = calls.tx;
+    assert.ok(after > 0);
+    await crankOneMarket(conn2 as never, KEEPER, { ...entry }, { ...st, lastCrankSlot: null }, false);
+    assert.equal(calls.tx, after, "no crank on the now-Resolved market");
+  });
+  it("stake-fee (tag 87) skips a Recovery market", async () => {
+    const conn3 = {
+      async getMultipleAccountsInfo() { return [{ data: recoverySol(), owner: WRAPPER, lamports: 1, executable: false }, { data: fx("sol-stake-pool-v18"), owner: STAKE, lamports: 1, executable: false }]; },
+      async simulateTransaction() { throw new Error("must not simulate"); },
+    };
+    const o = await pushStakeFeesOnce(conn3 as never, KEEPER, SOL, false, { wrapperProgramId: WRAPPER, stakeProgramId: STAKE, minRealShares: 0n, maxDeadShareBps: 100n, minPushAtoms: 1n });
+    assert.equal(o.kind, "skipped");
   });
 });

@@ -81,7 +81,7 @@ import { parseInstructionError } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
-import { isTerminalMarket } from "./market-state.ts";
+import { isLiveMarket } from "./market-state.ts";
 
 /** percolator-stake `state::MINIMUM_LIQUIDITY` — the dead-share floor (state.rs:25 @ e62aa4a). */
 export const STAKE_MINIMUM_LIQUIDITY = 1_000n;
@@ -288,7 +288,7 @@ export async function pushStakeFeesOnce(
     marketData = new Uint8Array(mi.data);
     // B13: tag 87 is Live-only. A Resolved market / tombstone is the
     // terminal-insurance job's; skip locally (a tombstone does not even parse).
-    if (isTerminalMarket(marketData)) return { kind: "skipped", reason: "market Resolved/closed — tag 87 is Live-only (see terminal-insurance job)" };
+    if (!isLiveMarket(marketData)) return { kind: "skipped", reason: "market not Live (Recovery/Resolved/closed) — tag 87 is Live-only (see terminal-insurance job)" };
     const wc = parseWrapperConfigV17(marketData);
     collateralMint = wc.collateralMint;
     const owed = wc.insuranceReserveAccruedAtoms - wc.insuranceReserveWithdrawnAtoms;
