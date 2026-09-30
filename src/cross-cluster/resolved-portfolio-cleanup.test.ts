@@ -23,9 +23,13 @@ import {
   CleanupState,
   encodeClosePortfolio,
   encodeCloseResolved,
+  decodePositionNft,
+  deriveNftRegistry,
+  deriveVaultLpState,
   nftEscrowAuthority,
   ownerAta,
-  pdaOwnerSkipReason,
+  pdaGraceLeft,
+  pdaOwnerKind,
 } from "./resolved-portfolio-cleanup.ts";
 import type { CleanupConfig, CleanupConnection } from "./resolved-portfolio-cleanup.ts";
 import { TerminalInsuranceState, windDownOnce } from "./terminal-insurance.ts";
@@ -42,8 +46,31 @@ const MINT = parseWrapperConfigV17(new Uint8Array(fx("sol-market-v18-fees"))).co
 const TRADER = parsePortfolioV17(new Uint8Array(fx("sol-trader-portfolio-v18")));
 /** A wallet (on-curve) owner for the ordinary closable case. The raw SOL trader fixture is NFT-escrowed. */
 const WALLET = Keypair.generate().publicKey;
-const CUCFG: CleanupConfig = { wrapperProgramId: WRAPPER, nftProgramId: NFT, maxPerCycle: 8, maxAtaCreatesPerCycle: 4, probeTtlMs: 3_600_000, confirm: { statusRetries: 1, statusRetryDelayMs: 0 }, now: () => 0 };
+const GRACE = 216_000n;
+const RESOLVED_AT = 500_000_000n;
+const IN_GRACE = { nowSlot: RESOLVED_AT + GRACE - 1n, resolvedSlot: RESOLVED_AT };
+const AFTER_GRACE = { nowSlot: RESOLVED_AT + GRACE, resolvedSlot: RESOLVED_AT };
+const CUCFG: CleanupConfig = { wrapperProgramId: WRAPPER, nftProgramId: NFT, maxPerCycle: 8, maxAtaCreatesPerCycle: 4, pdaGraceSlots: GRACE, probeTtlMs: 3_600_000, confirm: { statusRetries: 1, statusRetryDelayMs: 0 }, now: () => 0 };
 
+/**
+ * An EMPTY portfolio derived from real bytes: the real CATE flat portfolio (no
+ * legs, pnl 0) with its capital zeroed where the SDK decoder reads it; owner set.
+ */
+function emptyPortfolio(owner: PublicKey): Buffer {
+  const b = Buffer.from(fx("cate-flat-portfolio-v18"));
+  // capital u128 @ 148 = the SDK decoder's PF_CAPITAL_OFF (header 16 + provenance 100 + 32).
+  assert.ok(parsePortfolioV17(new Uint8Array(b)).capital > 0n);
+  b.fill(0, 148, 164);
+  owner.toBuffer().copy(b, 80);
+  owner.toBuffer().copy(b, 116);
+  const p = parsePortfolioV17(new Uint8Array(b));
+  assert.equal(p.capital, 0n); assert.equal(p.pnl, 0n); assert.equal(p.activeBitmap, 0n); assert.ok(p.owner.equals(owner));
+  return b;
+}
+const ESCROWED_CLAIM_PF = new PublicKey("2TRPacVc3N4fbJfqP1WFzLyNFwhkDuxP6CusEh12nj8N"); // real devnet, 2026-09-30
+/** Literal values read from live devnet 2026-09-30 for record 4rHXEHHD… (independent of the decoder under test). */
+const ESCROW_NFT_MINT = "2Zf7YvBLvy5qCVpKJtXjRdhpy1CmTuLdDBfCQCuCpGiM";
+const ESCROW_NFT_HOLDER = "G6RtYRnVc1XjwY7ncQoFuTcZCbYPCgm3yh1ZrW5fh1sE";
 /** The trader portfolio with its owner (both copies, @80 and @116) replaced. */
 function withOwner(owner: PublicKey): Buffer {
   const b = Buffer.from(fx("sol-trader-portfolio-v18"));
@@ -53,16 +80,27 @@ function withOwner(owner: PublicKey): Buffer {
 }
 
 type Sim = { err: unknown; logs?: string[] };
-function cconn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, reply: (tags: number[]) => Sim, opts: { ataExists?: boolean } = {}) {
+function cconn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, reply: (tags: number[]) => Sim, opts: { ataExists?: boolean; vaultLp?: { state: Buffer; registry: Buffer }; nftRecords?: Array<{ pubkey: PublicKey; data: Buffer }> } = {}) {
   const calls = { sims: [] as number[][], sent: [] as number[][], simKeys: [] as string[][], sentTag8: [] as Buffer[] };
   const tagsOf = (tx: VersionedTransaction): number[] =>
     tx.message.compiledInstructions.slice(1).map((ix) => {
       const pid = tx.message.staticAccountKeys[ix.programIdIndex].toBase58();
-      return pid === WRAPPER.toBase58() ? ix.data[0] : pid.startsWith("ATok") ? -1 : -2;
+      if (pid === WRAPPER.toBase58()) return ix.data[0] === 101 ? (ix.data[1] === 1 ? 1011 : 101) : ix.data[0];
+      return pid.startsWith("ATok") ? -1 : -2;
+      // 101 = VaultLpSettleResolved; -1 = ATA create
     });
   const conn = {
-    async getProgramAccounts() { return portfolios.map((p) => ({ pubkey: p.pubkey, account: { data: p.data, owner: WRAPPER, lamports: 1, executable: false } })); },
-    async getMultipleAccountsInfo(keys: PublicKey[]) { return keys.map(() => (opts.ataExists === false ? null : { data: Buffer.alloc(165), owner: WRAPPER, lamports: 1, executable: false })); },
+    async getProgramAccounts(program: PublicKey) {
+      if (program.equals(NFT)) return (opts.nftRecords ?? []).map((r) => ({ pubkey: r.pubkey, account: { data: r.data, owner: NFT, lamports: 1, executable: false } }));
+      return portfolios.map((p) => ({ pubkey: p.pubkey, account: { data: p.data, owner: WRAPPER, lamports: 67_000_000, executable: false } }));
+    },
+    async getMultipleAccountsInfo(keys: PublicKey[]) {
+      return keys.map((k) => {
+        if (k.equals(deriveVaultLpState(WRAPPER, SOL))) return opts.vaultLp ? { data: opts.vaultLp.state, owner: WRAPPER, lamports: 1, executable: false } : null;
+        return opts.ataExists === false ? null : { data: Buffer.alloc(165), owner: WRAPPER, lamports: 1, executable: false };
+      });
+    },
+    async getAccountInfo() { return opts.vaultLp ? { data: opts.vaultLp.registry, owner: WRAPPER, lamports: 1, executable: false } : null; },
     async getLatestBlockhash() { return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 9 }; },
     async simulateTransaction(tx: VersionedTransaction) {
       const t = tagsOf(tx); calls.sims.push(t);
@@ -107,7 +145,7 @@ describe("wire and accounts, checked against b2b2559e", () => {
       [KEEPER.publicKey.toBase58(), true, true], [SOL.toBase58(), false, true], [pf.toBase58(), false, true], [TRADER.owner.toBase58(), false, true],
     ]);
   });
-  it("CloseResolved accounts: [owner unsigned] [market w] [portfolio w] [owner ATA w] [wrapper vault w] [vault auth] [token]", () => {
+  it("CloseResolved accounts: [owner unsigned] [market w] [portfolio w] [owner ATA w] [wrapper vault w] [vault auth] [token] [nft_registry PDA] (GH#496)", () => {
     const pf = PF();
     const ix = buildCloseResolvedIx({ wrapperProgramId: WRAPPER, owner: TRADER.owner, market: SOL, portfolio: pf, collateralMint: MINT });
     const v = deriveMarketVaultAccounts(WRAPPER, SOL, MINT);
@@ -115,7 +153,9 @@ describe("wire and accounts, checked against b2b2559e", () => {
       [TRADER.owner.toBase58(), false, false], [SOL.toBase58(), false, true], [pf.toBase58(), false, true],
       [ownerAta(TRADER.owner, MINT).toBase58(), false, true], [v.vaultToken.toBase58(), false, true],
       [v.vaultAuthority.toBase58(), false, false], [v.tokenProgram.toBase58(), false, false],
+      [deriveNftRegistry(WRAPPER, SOL).toBase58(), false, false],
     ]);
+    assert.ok(deriveNftRegistry(WRAPPER, SOL).equals(PublicKey.findProgramAddressSync([Buffer.from("nft_registry"), SOL.toBuffer()], WRAPPER)[0]));
   });
 });
 
@@ -185,34 +225,108 @@ describe("cleanup on P3", () => {
   });
 });
 
-describe("security B12 review: PDA-owned portfolios are never closed (rent would be stranded)", () => {
+/** A VaultLpStateV18 account (kind 9, version 1) naming `lp` and `junior`. */
+function vaultLpStateBuf(registry: PublicKey, lp: PublicKey, junior: PublicKey): Buffer {
+  const b = Buffer.alloc(16 + 256);
+  b.writeBigUInt64LE(0x5045_5243_5631_3600n, 0); b.writeUInt16LE(18, 8); b[10] = 9;
+  SOL.toBuffer().copy(b, 16); registry.toBuffer().copy(b, 16 + 32); lp.toBuffer().copy(b, 16 + 64); junior.toBuffer().copy(b, 16 + 96);
+  b[16 + 214] = 1;
+  return b;
+}
+/** An LpVaultRegistry the SDK parses (v18 header, kind 5), domain 0. */
+function registryBuf(): Buffer {
+  const b = Buffer.alloc(176);
+  b.writeBigUInt64LE(0x5045_5243_5631_3600n, 0); b.writeUInt16LE(18, 8); b[10] = 5;
+  return b;
+}
+
+describe("PDA-owned portfolios: grace period after resolve, then closed (coordinator correction + security B12 review)", () => {
   const escrow = nftEscrowAuthority(NFT);
   const registry = deriveLpVaultRegistry(WRAPPER, SOL)[0];
   it("the NFT escrow PDA is find_program_address([\"mint_authority\"], nft) (wrapper derive_nft_mint_authority)", () => {
     assert.ok(escrow.equals(PublicKey.findProgramAddressSync([Buffer.from("mint_authority")], NFT)[0]));
     assert.ok(!PublicKey.isOnCurve(escrow.toBytes()));
   });
-  for (const [name, owner] of [["NFT escrow PDA", escrow], ["LP-vault registry PDA", registry]] as const) {
-    it(`${name}: skipped before ANY close is simulated or sent`, async () => {
-      const pf = PF();
-      const c = cconn([{ pubkey: pf, data: withOwner(owner) }, { pubkey: PF(), data: withOwner(WALLET) }], p3(() => ({ err: null })));
-      const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState());
-      assert.equal(r.closed, 1, "only the wallet-owned portfolio");
-      assert.ok(!c.calls.simKeys.slice(1).some((ks) => ks.includes(pf.toBase58())), "no close tx ever names the PDA-owned portfolio");
-      assert.match(r.remaining.find((x) => x.portfolio === pf.toBase58())!.reason, /rent would be stranded/);
+  it("pdaOwnerKind / pdaGraceLeft", () => {
+    assert.equal(pdaOwnerKind(escrow, SOL, CUCFG), "nft-escrow");
+    assert.equal(pdaOwnerKind(registry, SOL, CUCFG), "lp-registry");
+    assert.equal(pdaOwnerKind(WALLET, SOL, CUCFG), null);
+    assert.equal(pdaGraceLeft(IN_GRACE.nowSlot, RESOLVED_AT, GRACE), 1n);
+    assert.equal(pdaGraceLeft(AFTER_GRACE.nowSlot, RESOLVED_AT, GRACE), 0n);
+    assert.equal(pdaGraceLeft(1n, null, GRACE), GRACE, "unknown resolve slot = full grace (fail safe for the holder)");
+  });
+
+  it("EMPTY NFT-escrowed, WITHIN grace: skipped — no close tx ever names it", async () => {
+    const pf = PF();
+    const c = cconn([{ pubkey: pf, data: emptyPortfolio(escrow) }, { pubkey: PF(), data: withOwner(WALLET) }], p3(() => ({ err: null })));
+    const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState(), IN_GRACE);
+    assert.equal(r.closed, 1, "only the wallet-owned portfolio");
+    assert.ok(!c.calls.simKeys.slice(1).some((ks) => ks.includes(pf.toBase58())));
+    assert.match(r.remaining.find((x) => x.portfolio === pf.toBase58())!.reason, /grace period, 1 slots left/);
+    assert.deepEqual(r.pdaClosed, []);
+  });
+  it("EMPTY NFT-escrowed, AFTER grace: tag 8 ALONE with [3] = escrow PDA (no CloseResolved), reported", async () => {
+    const pf = PF();
+    const c = cconn([{ pubkey: pf, data: emptyPortfolio(escrow) }], p3(() => ({ err: null })));
+    const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState(), AFTER_GRACE);
+    assert.equal(r.closed, 1);
+    assert.deepEqual(c.calls.sent, [[8]]);
+    assert.ok(c.calls.simKeys[c.calls.simKeys.length - 1].includes(escrow.toBase58()), "escrow PDA passed as [3]");
+    assert.deepEqual(r.pdaClosed, [{ portfolio: pf.toBase58(), owner: escrow.toBase58(), kind: "nft-escrow", rentLamports: 67_000_000 }]);
+  });
+  for (const [when, clock] of [["within", IN_GRACE], ["after", AFTER_GRACE]] as const) {
+    it(`REAL escrowed portfolio WITH a claim (${when} grace): never attempted; reported as waiting on the NFT holder with mint + claim`, async () => {
+      const rec = fx("escrowed-position-nft-record");
+      const d = decodePositionNft(new Uint8Array(rec))!;
+      assert.ok(d.portfolio.equals(ESCROWED_CLAIM_PF), "real record points at the real portfolio (offset 10)");
+      const c = cconn([{ pubkey: ESCROWED_CLAIM_PF, data: fx("escrowed-claim-portfolio-v18") }], p3(() => ({ err: null })), {
+        nftRecords: [{ pubkey: new PublicKey("4rHXEHHDGqrZrYdibKVkVmvo2gdwQqgfmsKTfdBQNqiR"), data: rec }],
+      });
+      const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState(), clock);
+      assert.equal(c.calls.sent.length, 0, "no tx: GH#496, holder-only");
+      assert.equal(c.calls.sims.length, 1, "only the capability probe");
+      assert.deepEqual(r.waitingOnHolder, [{
+        portfolio: ESCROWED_CLAIM_PF.toBase58(), nftMint: ESCROW_NFT_MINT, holder: ESCROW_NFT_HOLDER,
+        capital: 498_677_477n, pnl: 0n, reservedPnl: 0n, activeLegs: 1,
+      }]);
+      assert.match(r.remaining[0].reason, /waiting on NFT holder/);
     });
   }
-  it("a wallet owner is closable", () => {
-    assert.equal(pdaOwnerSkipReason(WALLET, SOL, CUCFG), null);
+
+  const lpPf = PF();
+  const vaultLp = { state: vaultLpStateBuf(registry, lpPf, WALLET), registry: registryBuf() };
+  it("vault LP (registry PDA): 101 topup=0 -> 101 topup=1 -> tag 8 with [3] = registry, immediately (no grace)", async () => {
+    const c = cconn([{ pubkey: lpPf, data: withOwner(registry) }], p3(() => ({ err: null })), { vaultLp });
+    const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState(), IN_GRACE);
+    assert.deepEqual(c.calls.sent, [[-1, 101], [1011], [8]]);
+    assert.equal(r.closed, 1);
+    assert.deepEqual(r.vaultLpClosed, [lpPf.toBase58()]);
+    assert.deepEqual(r.pdaClosed, [], "rent to the registry is expected: logged, not alerted");
+    const closeKeys = c.calls.simKeys[c.calls.simKeys.length - 1];
+    assert.ok(closeKeys.includes(registry.toBase58()), "registry PDA as [3]");
   });
-  it("REAL bytes: the live SOL trader portfolio is NFT-escrowed (owner = mint_authority PDA HbCNkGon…) and is skipped as-is", async () => {
-    assert.ok(TRADER.owner.equals(escrow), "fixture owner is the escrow PDA");
-    const pf = PF();
-    const c = cconn([{ pubkey: pf, data: fx("sol-trader-portfolio-v18") }], p3(() => ({ err: null })));
-    const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState());
-    assert.equal(r.closed, 0);
+  it("vault LP: a 21 on 101 topup=1 (nothing pending) is harmless — tag 8 still runs", async () => {
+    const c = cconn([{ pubkey: lpPf, data: withOwner(registry) }], p3((t) => (t.includes(1011) ? { err: { InstructionError: [1, { Custom: 21 }] } } : { err: null })), { vaultLp });
+    const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState(), AFTER_GRACE);
+    assert.deepEqual(c.calls.sent, [[-1, 101], [8]]);
+    assert.equal(r.closed, 1);
+  });
+  it("tag 101 wire: [101][topup] and the 12 accounts in the b2b2559e order", async () => {
+    const { buildVaultLpSettleResolvedIx } = await import("./resolved-portfolio-cleanup.ts");
+    const st = { registry, lpPortfolio: lpPf, juniorOwner: WALLET };
+    const ix = buildVaultLpSettleResolvedIx({ wrapperProgramId: WRAPPER, caller: KEEPER.publicKey, market: SOL, vaultLpState: deriveVaultLpState(WRAPPER, SOL), state: st, registryDomain: 0, collateralMint: MINT, topup: 1 });
+    assert.deepEqual([...ix.data], [101, 1]);
+    assert.equal(ix.keys.length, 12);
+    assert.deepEqual(ix.keys.map((k) => [k.isSigner, k.isWritable]), [
+      [true, true], [false, true], [false, false], [false, true], [false, true], [false, true], [false, false], [false, true], [false, true], [false, false], [false, false], [false, false],
+    ]);
+    assert.ok(ix.keys[2].pubkey.equals(registry) && ix.keys[4].pubkey.equals(lpPf) && ix.keys[7].pubkey.equals(ownerAta(WALLET, MINT)));
+  });
+  it("a registry-owned portfolio with no bound vault-LP state is reported, not guessed at", async () => {
+    const c = cconn([{ pubkey: PF(), data: withOwner(registry) }], p3(() => ({ err: null })));
+    const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState(), AFTER_GRACE);
     assert.equal(c.calls.sent.length, 0);
-    assert.match(r.remaining[0].reason, /NFT escrow PDA/);
+    assert.match(r.remaining[0].reason, /no bound vault-LP state/);
   });
 });
 
@@ -223,12 +337,13 @@ describe("wind-down: cleanup runs before stake tag 29", () => {
     const b = Buffer.from(fx("textit-market-v18-fees"));
     b[MODE_ABS] = 1;
     b.writeBigUInt64LE(count, COUNT_ABS);
+    b.writeBigUInt64LE(RESOLVED_AT, 592 + 627); // resolved_slot
     return b;
   };
   const TEXTIT = new PublicKey("DnFhDdWzcWkBDxN9JJcmFmtiqqKo56w9JwQEtRKNdjcG");
   const TCFG: TerminalInsuranceConfig = { wrapperProgramId: WRAPPER, stakeProgramId: STAKE, unbookedAlertCycles: 3, probeTtlMs: 3_600_000, confirm: CUCFG.confirm, now: () => 0, cleanup: CUCFG };
 
-  function wconn(afterCleanupCount: bigint, cleanupProbe: Sim, budgetCallAnswers21 = false) {
+  function wconn(afterCleanupCount: bigint, cleanupProbe: Sim, budgetCallAnswers21 = false, pfData: Buffer = withOwner(WALLET), nowSlot: bigint = AFTER_GRACE.nowSlot, pfKey: PublicKey = PF()) {
     let marketReads = 0;
     let reReads = 0;
     const order: string[] = [];
@@ -243,7 +358,9 @@ describe("wind-down: cleanup runs before stake tag 29", () => {
         if (keys.length === 1 && keys[0].equals(TEXTIT)) return [{ data: resolvedTextit(afterCleanupCount), owner: WRAPPER, lamports: 1, executable: false }];
         return keys.map(() => ({ data: Buffer.alloc(165), owner: WRAPPER, lamports: 1, executable: false }));
       },
-      async getProgramAccounts() { return [{ pubkey: PF(), account: { data: withOwner(WALLET), owner: WRAPPER, lamports: 1, executable: false } }]; },
+      async getProgramAccounts() { return [{ pubkey: pfKey, account: { data: pfData, owner: WRAPPER, lamports: 67_000_000, executable: false } }]; },
+      async getSlot() { return Number(nowSlot); },
+      async getAccountInfo() { return null; },
       async getTokenAccountsByOwner() { return { context: { slot: 1 }, value: [] }; },
       async getLatestBlockhash() { return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 9 }; },
       async simulateTransaction(tx: VersionedTransaction) {
@@ -273,6 +390,40 @@ describe("wind-down: cleanup runs before stake tag 29", () => {
     assert.ok(firstClose >= 0 && firstClose < firstStakeSim, `cleanup before tag 29: ${w.order.join(" ")}`);
     assert.equal(w.reReads(), 1, "market re-read after the cleanup closed something");
     assert.equal(r.outcome.kind, "done", JSON.stringify(r.outcome));
+  });
+
+  it("EMPTY escrowed portfolio after grace: closed, count reaches 0, tag 29 recovers, and a PDA-close event is raised", async () => {
+    const w = wconn(0n, { err: { InstructionError: [1, { Custom: 61 }] } }, false, emptyPortfolio(nftEscrowAuthority(NFT)), AFTER_GRACE.nowSlot);
+    const r = await windDownOnce(w.conn, KEEPER, TEXTIT.toBase58(), false, TCFG, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "done", JSON.stringify(r.outcome));
+    assert.equal(w.reReads(), 1);
+    assert.ok(w.order.some((o) => o.startsWith("stake29(") && o !== "stake29(0)"), "tag 29 with the budget ran after the cleanup");
+    const ev = r.outcome.events ?? [];
+    assert.equal(ev.length, 1);
+    assert.equal(ev[0].kind, "terminal-pda-portfolio-closed");
+    assert.match(ev[0].message, /EMPTY NFT-escrowed portfolio .* 67000000 lamports of rent went to its PDA owner/);
+  });
+  it("REAL escrowed portfolio WITH a claim: tag 29 blocked -> terminal-waiting-nft-holder names holder, mint, claim", async () => {
+    const w = wconn(1n, { err: { InstructionError: [1, { Custom: 61 }] } }, true, fx("escrowed-claim-portfolio-v18"), AFTER_GRACE.nowSlot, ESCROWED_CLAIM_PF);
+    const d = decodePositionNft(new Uint8Array(fx("escrowed-position-nft-record")))!;
+    const base = w.conn.getProgramAccounts.bind(w.conn);
+    (w.conn as unknown as { getProgramAccounts: (p: PublicKey) => Promise<unknown> }).getProgramAccounts = async (prog: PublicKey) =>
+      prog.equals(NFT) ? [{ pubkey: PF(), account: { data: fx("escrowed-position-nft-record"), owner: NFT, lamports: 1, executable: false } }] : base(prog as never);
+    const r = await windDownOnce(w.conn, KEEPER, TEXTIT.toBase58(), false, TCFG, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "blocked");
+    const o = r.outcome as { alertKind?: string; reason: string };
+    assert.equal(o.alertKind, "terminal-waiting-nft-holder");
+    assert.ok(o.reason.includes(ESCROW_NFT_HOLDER) && o.reason.includes(ESCROW_NFT_MINT), o.reason);
+    void d;
+    assert.match(o.reason, /claim capital 498677477/);
+    assert.ok(!w.order.includes("SEND"));
+  });
+  it("EMPTY escrowed WITHIN grace: not closed, tag 29 still blocked (21) -> B12 alert says why", async () => {
+    const w = wconn(1n, { err: { InstructionError: [1, { Custom: 61 }] } }, true, emptyPortfolio(nftEscrowAuthority(NFT)), IN_GRACE.nowSlot);
+    const r = await windDownOnce(w.conn, KEEPER, TEXTIT.toBase58(), false, TCFG, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "blocked");
+    assert.match((r.outcome as { reason: string }).reason, /closed 0.*grace period, 1 slots left/);
+    assert.deepEqual(r.outcome.events ?? [], []);
   });
 
   it("6377376a: cleanup is a no-op and the B12 alert names the count and the reason", async () => {

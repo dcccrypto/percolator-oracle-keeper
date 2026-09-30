@@ -223,7 +223,7 @@ describe("windDownOnce — resolved stake-bound market", () => {
     assert.equal(o.alertKind, "terminal-recovery-blocked-portfolios");
     assert.match(o.reason, /5 materialized portfolio\(s\) remain/);
     assert.equal(s.calls.sends, 0);
-    const a = new FeeJobFailureTracker().alertsFor({ job: "terminal-insurance", done: [], nothing: 0, skipped: [], failed: [], blocked: [{ market: "T", label: "TEXTIT", reason: o.reason, alertKind: "terminal-recovery-blocked-portfolios" }] });
+    const a = new FeeJobFailureTracker().alertsFor({ job: "terminal-insurance", done: [], nothing: 0, skipped: [], failed: [], events: [], blocked: [{ market: "T", label: "TEXTIT", reason: o.reason, alertKind: "terminal-recovery-blocked-portfolios" }] });
     assert.equal(a[0].severity, "critical");
     assert.match(a[0].message, /5 materialized portfolio/);
   });

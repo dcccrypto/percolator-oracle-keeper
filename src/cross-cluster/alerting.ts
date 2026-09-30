@@ -46,7 +46,9 @@ export type AlertKind =
   | "fee-job-failed"
   | "adl-reduce-only"
   | "terminal-budget-unbooked"
-  | "terminal-recovery-blocked-portfolios";
+  | "terminal-recovery-blocked-portfolios"
+  | "terminal-pda-portfolio-closed"
+  | "terminal-waiting-nft-holder";
 
 export interface Alert {
   kind: AlertKind;

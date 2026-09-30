@@ -21,12 +21,16 @@ import type { Connection, Keypair } from "@solana/web3.js";
 import type { MarketEntry, Registry } from "./registry.ts";
 import type { Alert, AlertKind, AlertSink } from "./alerting.ts";
 
-export type FeeJobOutcome =
+export type FeeJobOutcome = (
   | { kind: "done"; detail: string; signature?: string }
   | { kind: "nothing"; detail?: string }
   | { kind: "skipped"; reason: string }
   | { kind: "blocked"; reason: string; alertKind?: AlertKind }
-  | { kind: "failed"; error: string };
+  | { kind: "failed"; error: string }
+) & {
+  /** One-shot events worth an alert whatever the outcome (e.g. a PDA-owned portfolio was closed). */
+  events?: Alert[];
+};
 
 export interface FeeJobContext {
   conn: Connection;
@@ -47,6 +51,8 @@ export interface FeeJobSweepResult {
   skipped: Array<{ market: string; label: string; reason: string }>;
   blocked: Array<{ market: string; label: string; reason: string; alertKind?: AlertKind }>;
   failed: Array<{ market: string; label: string; error: string }>;
+  /** One-shot event alerts raised by the job this sweep. */
+  events: Alert[];
 }
 
 /** Markets processed in parallel per job — keeps a 19+ market sweep off the RPC rate limit. */
@@ -74,7 +80,7 @@ export async function runFeeJobSweep(
   markets: ReadonlyArray<Pick<MarketEntry, "marketAddress" | "label">>,
   concurrency = FEE_JOB_CONCURRENCY,
 ): Promise<FeeJobSweepResult> {
-  const r: FeeJobSweepResult = { job: job.name, done: [], nothing: 0, skipped: [], blocked: [], failed: [] };
+  const r: FeeJobSweepResult = { job: job.name, done: [], nothing: 0, skipped: [], blocked: [], failed: [], events: [] };
   await mapLimited(markets, concurrency, async (m) => {
     let o: FeeJobOutcome;
     try {
@@ -83,6 +89,7 @@ export async function runFeeJobSweep(
       o = { kind: "failed", error: err instanceof Error ? err.message : String(err) };
     }
     const base = { market: m.marketAddress, label: m.label };
+    for (const e of o.events ?? []) r.events.push({ ...e, subject: e.subject || m.label });
     switch (o.kind) {
       case "done": r.done.push({ ...base, detail: o.detail }); break;
       case "nothing": r.nothing++; break;
@@ -123,7 +130,7 @@ export class FeeJobFailureTracker {
     for (const b of r.blocked) {
       alerts.push({
         kind: b.alertKind ?? "fee-leg-blocked",
-        severity: b.alertKind === "terminal-budget-unbooked" || b.alertKind === "terminal-recovery-blocked-portfolios" ? "critical" : "warn",
+        severity: b.alertKind === "terminal-budget-unbooked" || b.alertKind === "terminal-recovery-blocked-portfolios" ? "critical" : "warn", // waiting-nft-holder: warn (accepted devnet limitation)
         subject: b.label,
         message: `${r.job} cannot move this market's fee leg: ${b.reason}`,
         data: { job: r.job, market: b.market },
@@ -194,6 +201,7 @@ export async function startFeeJobLoop(
           failedMarkets: r.failed.map((f) => f.label),
         });
         await sink.reconcile(`fee-jobs:${job.name}`, trackers.get(job.name)!.alertsFor(r));
+        for (const e of r.events) await sink.fire(`fee-jobs:${job.name}:events`, e);
       } catch (err) {
         console.error(`[${job.name}] sweep error — ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`);
       }

@@ -67,6 +67,7 @@ import { parseInstructionError } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
+import type { Alert } from "./alerting.ts";
 import { CleanupState, cleanupResolvedPortfolios } from "./resolved-portfolio-cleanup.ts";
 import type { CleanupConfig, CleanupConnection, CleanupResult } from "./resolved-portfolio-cleanup.ts";
 import { NFT_PROGRAM_ID } from "../program-ids.ts";
@@ -84,13 +85,15 @@ const H_MODE = 626;
 const H_INSURANCE_DOMAIN_BUDGET_REMAINING_TOTAL = 461;
 /** `materialized_portfolio_count` u64 @ group+517 (engine 35ddd692 source). Wrapper tag 41 on a Resolved market requires it to be 0. */
 const H_MATERIALIZED_PORTFOLIO_COUNT = 517;
+/** `resolved_slot` u64 @ group+627 (engine 35ddd692 source): the PDA grace clock. */
+const H_RESOLVED_SLOT = 627;
 const MODE_RESOLVED = 1;
 const TOKEN_PROGRAM = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const COMPUTE_UNIT_LIMIT = 120_000; // stake doc: 47,198 CU with the CPI, 15,809 book-only
 
 export type TerminalState =
   | { kind: "live"; budget: bigint; materializedPortfolios: bigint }
-  | { kind: "resolved"; budget: bigint; materializedPortfolios: bigint }
+  | { kind: "resolved"; budget: bigint; materializedPortfolios: bigint; resolvedSlot: bigint }
   | { kind: "closed" };
 
 /** True for a market the engine no longer runs: Resolved, or a CloseSlab tombstone. */
@@ -116,7 +119,9 @@ export function decodeTerminalState(d: Uint8Array): TerminalState | null {
   const off = g + H_INSURANCE_DOMAIN_BUDGET_REMAINING_TOTAL;
   const budget = u64(d, off) | (u64(d, off + 8) << 64n);
   const materializedPortfolios = u64(d, g + H_MATERIALIZED_PORTFOLIO_COUNT);
-  return d[g + H_MODE] === MODE_RESOLVED ? { kind: "resolved", budget, materializedPortfolios } : { kind: "live", budget, materializedPortfolios };
+  return d[g + H_MODE] === MODE_RESOLVED
+    ? { kind: "resolved", budget, materializedPortfolios, resolvedSlot: u64(d, g + H_RESOLVED_SLOT) }
+    : { kind: "live", budget, materializedPortfolios };
 }
 
 /** Asset-0 insurance authority, via the VERSION-gated profile offset. null if unreadable. */
@@ -203,13 +208,25 @@ export function terminalInsuranceConfigFromEnv(env: Readonly<Record<string, stri
   const n = raw === undefined || raw.trim() === "" ? 3 : Number(raw);
   if (!Number.isInteger(n) || n <= 0) throw new Error(`ALERT_TERMINAL_BUDGET_CYCLES="${raw}" must be a positive integer`);
   const cleanupOn = env.TERMINAL_CLEANUP_ENABLED !== "false";
+  const graceRaw = env.TERMINAL_PDA_GRACE_SLOTS;
+  if (graceRaw !== undefined && graceRaw.trim() !== "" && !/^\d+$/.test(graceRaw.trim())) {
+    throw new Error(`TERMINAL_PDA_GRACE_SLOTS="${graceRaw}" must be a non-negative integer`);
+  }
+  const graceSlots = graceRaw === undefined || graceRaw.trim() === "" ? 216_000n : BigInt(graceRaw.trim());
   return {
     wrapperProgramId: WRAPPER_PROGRAM_ID,
     stakeProgramId: STAKE_PROGRAM_ID,
     unbookedAlertCycles: n,
     probeTtlMs: 60 * 60_000,
     cleanup: cleanupOn
-      ? { wrapperProgramId: WRAPPER_PROGRAM_ID, nftProgramId: NFT_PROGRAM_ID, maxPerCycle: 8, maxAtaCreatesPerCycle: 4, probeTtlMs: 60 * 60_000 }
+      ? {
+          wrapperProgramId: WRAPPER_PROGRAM_ID,
+          nftProgramId: NFT_PROGRAM_ID,
+          maxPerCycle: 8,
+          maxAtaCreatesPerCycle: 4,
+          pdaGraceSlots: graceSlots,
+          probeTtlMs: 60 * 60_000,
+        }
       : undefined,
   };
 }
@@ -224,6 +241,8 @@ export type TerminalConnection = Pick<
   | "getSignatureStatuses"
   | "getTokenAccountsByOwner"
   | "getProgramAccounts"
+  | "getAccountInfo"
+  | "getSlot"
 >;
 
 /** Per-process state: probe cache, finished markets, unbooked-budget streaks. */
@@ -290,8 +309,10 @@ export async function windDownOnce(
   st: TerminalInsuranceState,
 ): Promise<{ outcome: FeeJobOutcome; steps: WindDownStep[]; state: TerminalState | null; budget: bigint | null; stakeBound: boolean; support: Tag29Support | null }> {
   const steps: WindDownStep[] = [];
+  const events: Alert[] = [];
   const res = (outcome: FeeJobOutcome, extra: Partial<{ state: TerminalState | null; budget: bigint | null; stakeBound: boolean; support: Tag29Support | null }> = {}) => ({
-    outcome, steps, state: null, budget: null, stakeBound: false, support: null, ...extra,
+    outcome: events.length ? { ...outcome, events: [...(outcome.events ?? []), ...events] } : outcome,
+    steps, state: null, budget: null, stakeBound: false, support: null, ...extra,
   });
   if (st.done.has(marketAddress)) return res({ kind: "nothing", detail: "wind-down already complete" });
 
@@ -352,7 +373,34 @@ export async function windDownOnce(
   // budget. Gated on the wrapper supporting it (no-op on 6377376a).
   let cleanup: CleanupResult | null = null;
   if (cfg.cleanup && state.kind === "resolved" && state.materializedPortfolios > 0n) {
-    cleanup = await cleanupResolvedPortfolios(conn as CleanupConnection, keeper, market, collateralMint, dryRun, cfg.cleanup, st.cleanup);
+    let nowSlot = 0n;
+    try {
+      nowSlot = BigInt(await conn.getSlot("confirmed"));
+    } catch {
+      nowSlot = 0n; // unknown clock => pdaGraceLeft keeps the full grace (fail safe for holders)
+    }
+    cleanup = await cleanupResolvedPortfolios(conn as CleanupConnection, keeper, market, collateralMint, dryRun, cfg.cleanup, st.cleanup, {
+      nowSlot,
+      resolvedSlot: state.resolvedSlot,
+    });
+    for (const v of cleanup.vaultLpClosed) {
+      console.log(`[terminal-insurance] ${marketAddress.slice(0, 8)}…: closed vault-LP portfolio ${v} (tag 101 then tag 8; rent to the LP-vault registry, expected)`);
+    }
+    for (const c of cleanup.pdaClosed) {
+      events.push({
+        kind: "terminal-pda-portfolio-closed",
+        severity: "warn",
+        subject: marketAddress,
+        message:
+          `closed EMPTY NFT-escrowed portfolio ${c.portfolio} after the ${cfg.cleanup!.pdaGraceSlots}-slot grace period so stake tag 29 can recover the insurance budget; ` +
+          `${c.rentLamports} lamports of rent went to its PDA owner ${c.owner}`,
+        data: { portfolio: c.portfolio, owner: c.owner, pdaKind: c.kind, rentLamports: c.rentLamports },
+      });
+      console.warn(
+        `[terminal-insurance] ${marketAddress.slice(0, 8)}…: closed ${c.kind} PDA-owned portfolio ${c.portfolio} after the grace period — ` +
+          `${c.rentLamports} lamports of rent went to its PDA owner ${c.owner}`,
+      );
+    }
     if (cleanup.closed > 0 && !dryRun) {
       try {
         const [mi2] = await conn.getMultipleAccountsInfo([market], "confirmed");
@@ -423,6 +471,18 @@ export async function windDownOnce(
       // CloseResolved empties a portfolio without dematerializing it and only the
       // owner can ClosePortfolio (tag 8), so this 21 is not a cooldown: it lasts
       // until every owner closes, or the P3 wrapper fix lands.
+      if (cleanup && cleanup.waitingOnHolder.length > 0) {
+        const w = cleanup.waitingOnHolder;
+        return res({
+          kind: "blocked",
+          alertKind: "terminal-waiting-nft-holder",
+          reason:
+            `stake insurance recovery (tag 29, ${budget} atoms) is waiting on NFT holder(s): ` +
+            w.map((x) => `${x.holder ?? "?"} (portfolio ${x.portfolio}, NFT mint ${x.nftMint ?? "?"}, claim capital ${x.capital} / pnl ${x.pnl} / reserved ${x.reservedPnl}, ${x.activeLegs} leg(s))`).join("; ") +
+            `. Only the holder can settle an escrowed payout (GH#496) — accepted devnet limitation; ${state.materializedPortfolios} materialized portfolio(s) remain.` +
+            cleanupNote,
+        }, { state, budget, stakeBound, support });
+      }
       return res({
         kind: "blocked",
         alertKind: "terminal-recovery-blocked-portfolios",
