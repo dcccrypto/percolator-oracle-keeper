@@ -80,8 +80,15 @@ function withOwner(owner: PublicKey): Buffer {
 }
 
 type Sim = { err: unknown; logs?: string[] };
-function cconn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, reply: (tags: number[]) => Sim, opts: { ataExists?: boolean; vaultLp?: { state: Buffer; registry: Buffer }; nftRecords?: Array<{ pubkey: PublicKey; data: Buffer }> } = {}) {
-  const calls = { sims: [] as number[][], sent: [] as number[][], simKeys: [] as string[][], sentTag8: [] as Buffer[] };
+/**
+ * `chunks`: how many chunk calls (a lone CloseResolved, or VaultLpSettleResolved(0)) make
+ * progress before the close is fully advanced. A chunk simulation returns the watched
+ * portfolio's post-state: a new value per landed chunk, then unchanged (= no progress).
+ */
+function cconn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, reply: (tags: number[]) => Sim, opts: { ataExists?: boolean; vaultLp?: { state: Buffer; registry: Buffer }; nftRecords?: Array<{ pubkey: PublicKey; data: Buffer }>; chunks?: number } = {}) {
+  const calls = { sims: [] as number[][], sent: [] as number[][], simKeys: [] as string[][], sentTag8: [] as Buffer[], chunkSends: 0 };
+  const totalChunks = opts.chunks ?? 1;
+  const isChunk = (t: number[]) => (t.includes(30) && !t.includes(8)) || t.includes(101);
   const tagsOf = (tx: VersionedTransaction): number[] =>
     tx.message.compiledInstructions.slice(1).map((ix) => {
       const pid = tx.message.staticAccountKeys[ix.programIdIndex].toBase58();
@@ -102,15 +109,19 @@ function cconn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, reply: (t
     },
     async getAccountInfo() { return opts.vaultLp ? { data: opts.vaultLp.registry, owner: WRAPPER, lamports: 1, executable: false } : null; },
     async getLatestBlockhash() { return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 9 }; },
-    async simulateTransaction(tx: VersionedTransaction) {
+    async simulateTransaction(tx: VersionedTransaction, o?: { accounts?: { addresses: string[] } }) {
       const t = tagsOf(tx); calls.sims.push(t);
       calls.simKeys.push(tx.message.staticAccountKeys.map((k) => k.toBase58()));
       const r = reply(t);
-      return { context: { slot: 1 }, value: { err: r.err, logs: r.logs ?? [] } };
+      const accounts = o?.accounts
+        ? o.accounts.addresses.map(() => ({ data: [Buffer.alloc(64, Math.min(calls.chunkSends + 1, totalChunks)).toString("base64"), "base64"] }))
+        : undefined;
+      return { context: { slot: 1 }, value: { err: r.err, logs: r.logs ?? [], accounts } };
     },
     async sendRawTransaction(raw: Buffer) {
       const tx = VersionedTransaction.deserialize(raw);
       calls.sent.push(tagsOf(tx));
+      if (isChunk(tagsOf(tx))) calls.chunkSends++;
       for (const ix of tx.message.compiledInstructions) if (ix.data[0] === 8 && ix.data.length === 25) calls.sentTag8.push(Buffer.from(ix.data));
       return "5ig1111111111111111111111111111111111111111111111111111111111111"; },
     async confirmTransaction() { return { context: { slot: 2 }, value: { err: null } }; },
@@ -426,6 +437,22 @@ describe("wind-down: cleanup runs before stake tag 29", () => {
     assert.deepEqual(r.outcome.events ?? [], []);
   });
 
+  it("C-7: a chunked close that progressed but is not done -> 'in progress' (skipped), NOT the B12 blocked alert", async () => {
+    const w = wconn(1n, { err: { InstructionError: [1, { Custom: 61 }] } }, true);
+    const base = w.conn.simulateTransaction.bind(w.conn);
+    let n = 0;
+    (w.conn as unknown as { simulateTransaction: (tx: VersionedTransaction, o?: { accounts?: { addresses: string[] } }) => Promise<unknown> }).simulateTransaction = async (tx, o) => {
+      const tags = tx.message.compiledInstructions.map((ix) => (tx.message.staticAccountKeys[ix.programIdIndex].equals(WRAPPER) ? ix.data[0] : -1));
+      if (tags.includes(8)) return { context: { slot: 1 }, value: { err: { InstructionError: [tags.indexOf(8), { Custom: 21 }] }, logs: [] } };
+      if (o?.accounts) return { context: { slot: 1 }, value: { err: null, logs: [], accounts: [{ data: [Buffer.alloc(64, ++n).toString("base64"), "base64"] }] } };
+      return base(tx as never, o as never);
+    };
+    const cfg = { ...TCFG, cleanup: { ...TCFG.cleanup!, maxChunkCallsPerCycle: 3 } };
+    const r = await windDownOnce(w.conn, KEEPER, TEXTIT.toBase58(), false, cfg, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "skipped", JSON.stringify(r.outcome));
+    assert.match((r.outcome as { reason: string }).reason, /cleanup in progress \(3 chunk call\(s\) this cycle/);
+  });
+
   it("6377376a: cleanup is a no-op and the B12 alert names the count and the reason", async () => {
     // tag 29(budget) on a market that still has a portfolio answers 21
     const w = wconn(1n, { err: { InstructionError: [1, { Custom: 8 }] } }, true);
@@ -435,5 +462,77 @@ describe("wind-down: cleanup runs before stake tag 29", () => {
     assert.match(reason, /1 materialized portfolio\(s\) remain/);
     assert.match(reason, /Cleanup: support=unsupported, closed 0/);
     assert.ok(!w.order.includes("SEND"), "nothing sent on 6377376a");
+  });
+});
+
+describe("C-7: chunked resolved closes (CloseResolved / tag 101 advance one chunk per call)", () => {
+  const onlyCloseRefused = (t: number[]): Sim => (t.includes(8) && t.includes(30) ? { err: { InstructionError: [2, { Custom: 21 }] } } : { err: null });
+
+  it("CloseResolved over 5 chunks, then tag 8: closed in ONE cycle, each chunk a distinct transaction", async () => {
+    const pf = PF();
+    let chunkDone = 0;
+    const c = cconn([{ pubkey: pf, data: withOwner(WALLET) }], p3((t) => {
+      if (t.length === 1 && t[0] === 8) return chunkDone >= 5 ? { err: null } : { err: { InstructionError: [1, { Custom: 21 }] } }; // tag 8 only once flat
+      return onlyCloseRefused(t);
+    }), { chunks: 5 });
+    const origSend = c.conn.sendRawTransaction.bind(c.conn);
+    const sigs = new Set<string>();
+    (c.conn as unknown as { sendRawTransaction: (raw: Buffer) => Promise<string> }).sendRawTransaction = async (raw: Buffer) => {
+      sigs.add(Buffer.from(VersionedTransaction.deserialize(raw).signatures[0]).toString("hex"));
+      const r = await origSend(raw as never);
+      if (c.calls.sent[c.calls.sent.length - 1].join() === "30") chunkDone++;
+      return r;
+    };
+    const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState());
+    assert.equal(r.closed, 1);
+    assert.equal(r.progressed, 5);
+    assert.deepEqual(c.calls.sent, [[30], [30], [30], [30], [30], [8]]);
+    assert.equal(sigs.size, 6, "no duplicate signatures across chunk calls");
+  });
+
+  it("per-cycle cap: a close that needs more chunks stops at the cap and reports 'progress, not done' (not a failure)", async () => {
+    const c = cconn([{ pubkey: PF(), data: withOwner(WALLET) }], p3((t) => (t.includes(8) ? { err: { InstructionError: [1, { Custom: 21 }] } } : { err: null })), { chunks: 100 });
+    const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, { ...CUCFG, maxChunkCallsPerCycle: 4 }, new CleanupState());
+    assert.equal(r.progressed, 4);
+    assert.equal(c.calls.sent.filter((t) => t.join() === "30").length, 4);
+    assert.equal(r.closed, 0);
+    assert.match(r.remaining[0].reason, /made progress \(4 chunk call\(s\)\), not done — continues next cycle \(per-cycle cap/);
+  });
+
+  it("no progress: a chunk that would change nothing is never sent (never spins)", async () => {
+    const real = withOwner(WALLET);
+    const c = cconn([{ pubkey: PF(), data: real }], p3((t) => (t.includes(8) ? { err: { InstructionError: [1, { Custom: 21 }] } } : { err: null })));
+    // the chunk simulation reports the portfolio unchanged
+    const base = c.conn.simulateTransaction.bind(c.conn);
+    (c.conn as unknown as { simulateTransaction: (tx: VersionedTransaction, o?: { accounts?: { addresses: string[] } }) => Promise<unknown> }).simulateTransaction = async (tx, o) => {
+      const res = (await base(tx as never, o as never)) as { value: { accounts?: unknown[] } };
+      if (o?.accounts) res.value.accounts = [{ data: [real.toString("base64"), "base64"] }];
+      return res;
+    };
+    const out = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState());
+    assert.equal(c.calls.sent.length, 0, "nothing sent");
+    assert.equal(out.progressed, 0);
+    assert.match(out.remaining[0].reason, /would make no progress/);
+  });
+
+  it("vault LP: 101(0) over 3 chunks (junior ATA ensured on the first), then 101(1), then tag 8", async () => {
+    const reg = deriveLpVaultRegistry(WRAPPER, SOL)[0];
+    const lp = PF();
+    const state = vaultLpStateBuf(reg, lp, WALLET);
+    let settled = 0;
+    const c = cconn([{ pubkey: lp, data: withOwner(reg) }], p3((t) => {
+      if (t.length === 1 && t[0] === 8) return settled >= 3 ? { err: null } : { err: { InstructionError: [1, { Custom: 21 }] } };
+      if (t.includes(1011)) return settled >= 3 ? { err: null } : { err: { InstructionError: [1, { Custom: 21 }] } };
+      return { err: null };
+    }), { vaultLp: { state, registry: registryBuf() }, chunks: 3 });
+    const origSend = c.conn.sendRawTransaction.bind(c.conn);
+    (c.conn as unknown as { sendRawTransaction: (raw: Buffer) => Promise<string> }).sendRawTransaction = async (raw: Buffer) => {
+      const r = await origSend(raw as never);
+      if (c.calls.sent[c.calls.sent.length - 1].includes(101)) settled++;
+      return r;
+    };
+    const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState(), AFTER_GRACE);
+    assert.deepEqual(c.calls.sent, [[-1, 101], [101], [101], [1011], [8]]);
+    assert.equal(r.closed, 1);
   });
 });

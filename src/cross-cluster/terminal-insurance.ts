@@ -449,6 +449,14 @@ export async function windDownOnce(
       // CloseResolved empties a portfolio without dematerializing it and only the
       // owner can ClosePortfolio (tag 8), so this 21 is not a cooldown: it lasts
       // until every owner closes, or the P3 wrapper fix lands.
+      // C-7: the chunked wind-down made progress this cycle but is not done — continue next
+      // cycle; that is not the B12 "blocked" condition (which is: nothing can make progress).
+      if (cleanup && cleanup.progressed > 0 && cleanup.waitingOnHolder.length === 0) {
+        return res({
+          kind: "skipped",
+          reason: `resolved-portfolio cleanup in progress (${cleanup.progressed} chunk call(s) this cycle, ${state.materializedPortfolios} portfolio(s) still materialized); continues next cycle.` + cleanupNote,
+        }, { state, budget, stakeBound, support });
+      }
       if (cleanup && cleanup.waitingOnHolder.length > 0) {
         const w = cleanup.waitingOnHolder;
         return res({

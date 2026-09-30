@@ -192,8 +192,13 @@ describe("wind-down on a bound market: cleanup -> 101 -> tag 8 (vault LP) -> tag
       async getTokenAccountsByOwner() { return { context: { slot: 1 }, value: [] }; },
       async getSlot() { return 600_000_000; },
       async getLatestBlockhash() { return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 9 }; },
-      async simulateTransaction(tx: VersionedTransaction) {
+      async simulateTransaction(tx: VersionedTransaction, o?: { accounts?: { addresses: string[] } }) {
         const t = tags(tx);
+        // chunk calls (101(0) / lone CloseResolved): one chunk of progress, then unchanged
+        if (o?.accounts && (t.includes("101(0)") || (t.includes("w30") && !t.includes("w8")))) {
+          const sent101 = order.filter((x) => x.includes("101(0)")).length;
+          return { context: { slot: 1 }, value: { err: null, logs: [], accounts: [{ data: [Buffer.alloc(64, sent101 === 0 ? 1 : 1).toString("base64"), "base64"] }] } };
+        }
         if (n++ === 0) return { context: { slot: 1 }, value: { err: { InstructionError: [1, { Custom: 61 }] }, logs: [] } }; // cleanup probe (P3)
         if (t[0] === "stake29(0)" && !order.some((o) => o.startsWith("stake29"))) {
           order.push("probe29");

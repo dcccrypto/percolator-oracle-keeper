@@ -320,6 +320,12 @@ export interface CleanupConfig {
   maxAtaCreatesPerCycle: number;
   /** Slots after resolve during which PDA-owned portfolios are left for their holders (default 216,000 ≈ 24 h). */
   pdaGraceSlots: bigint;
+  /**
+   * C-7: CloseResolved (30) and VaultLpSettleResolved (101) advance a bankrupt close by ONE
+   * chunk per call. Max chunk calls per portfolio per cycle (default 16); a portfolio that
+   * made progress but is not done continues next cycle.
+   */
+  maxChunkCallsPerCycle?: number;
   probeTtlMs: number;
   confirm?: ConfirmOptions;
   now?: () => number;
@@ -353,6 +359,8 @@ export interface CleanupResult {
 interface Pf {
   pubkey: PublicKey;
   lamports: number;
+  /** Raw account bytes as read: the baseline for the chunk-progress check. */
+  data: Uint8Array;
   /** capital / pnl / reservedPnl / active legs / cancel-deposit escrow: anything the owner still has to claim. */
   claim: { capital: bigint; pnl: bigint; reservedPnl: bigint; activeLegs: number; cancelDepositEscrow: bigint };
   owner: PublicKey;
@@ -401,7 +409,7 @@ export async function cleanupResolvedPortfolios(
     pfs = accs.map((a) => {
       const p = parsePortfolioV17(new Uint8Array(a.account.data));
       const claim = { capital: p.capital, pnl: p.pnl, reservedPnl: p.reservedPnl, activeLegs: p.legs.filter((l) => l.active).length, cancelDepositEscrow: p.cancelDepositEscrow };
-      return { pubkey: a.pubkey, lamports: a.account.lamports, claim, owner: p.owner, portfolioId: p.portfolioId, matcherSequence: p.matcherSequence, positionEpoch: p.matcherPositionEpoch };
+      return { pubkey: a.pubkey, lamports: a.account.lamports, data: new Uint8Array(a.account.data), claim, owner: p.owner, portfolioId: p.portfolioId, matcherSequence: p.matcherSequence, positionEpoch: p.matcherPositionEpoch };
     });
   } catch (err) {
     out.remaining.push({ portfolio: "*", reason: `portfolio discovery failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}` });
@@ -433,6 +441,57 @@ export async function cleanupResolvedPortfolios(
   const sim = async (tx: Transaction) => {
     const r = await conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), { sigVerify: false, commitment: "confirmed" });
     return { err: r.value.err, logs: r.value.logs ?? null };
+  };
+  /** Chunk tx `n`: a distinct compute-unit limit per call so repeated chunks never share a signature. */
+  const mkChunk = (ixs: TransactionInstruction[], n: number): Transaction => {
+    const tx = new Transaction();
+    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT - n }));
+    for (const ix of ixs) tx.add(ix);
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = keeper.publicKey;
+    tx.sign(keeper);
+    return tx;
+  };
+  /** Simulate and return the post-state of `watch` (null if the RPC returned none). */
+  const simWatch = async (tx: Transaction, watch: PublicKey) => {
+    const r = await conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), {
+      sigVerify: false,
+      commitment: "confirmed",
+      accounts: { encoding: "base64", addresses: [watch.toBase58()] },
+    });
+    const a = r.value.accounts?.[0];
+    return { err: r.value.err, logs: r.value.logs ?? null, post: a ? new Uint8Array(Buffer.from(a.data[0], "base64")) : null };
+  };
+  const chunkCap = cfg.maxChunkCallsPerCycle ?? 16;
+  /**
+   * C-7 chunk loop: repeat `chunk()` while it keeps changing the portfolio, trying `finish()`
+   * (the close) before every chunk. Stops on: finish() closing it, a chunk error, a chunk that
+   * would change nothing (no progress — never spins), a tx that did not land, or the cap.
+   */
+  const runChunks = async (
+    p: Pf,
+    chunk: (n: number) => TransactionInstruction[],
+    finish: () => Promise<boolean>,
+    label: string,
+    /** false: run at least one chunk before the first finish attempt (vault LP: 101(0) always first). */
+    finishFirst = true,
+  ): Promise<{ closed: boolean; calls: number; stop: string }> => {
+    let current = p.data;
+    let calls = 0;
+    for (;;) {
+      if ((finishFirst || calls > 0) && (await finish())) return { closed: true, calls, stop: "closed" };
+      if (calls >= chunkCap) return { closed: false, calls, stop: `per-cycle cap of ${chunkCap} ${label} chunk calls reached` };
+      const tx = mkChunk(chunk(calls), calls);
+      const r = await simWatch(tx, p.pubkey);
+      if (r.err) return { closed: false, calls, stop: why(r.err, r.logs, { 1: label }) };
+      if (!r.post || Buffer.from(r.post).equals(Buffer.from(current))) {
+        return { closed: false, calls, stop: `${label} would make no progress` };
+      }
+      if (!(await send(tx))) return { closed: false, calls, stop: `${label} chunk tx did not land` };
+      calls++;
+      out.progressed++;
+      current = r.post;
+    }
   };
 
   // Gate (cached).
@@ -520,21 +579,36 @@ export async function cleanupResolvedPortfolios(
         continue;
       }
       try {
-        const settle0 = mk([buildCreateAtaIdempotentIx(keeper.publicKey, vaultLp.state.juniorOwner, collateralMint), settleIx(0)]);
-        const r0 = await sim(settle0);
-        if (!r0.err && (await send(settle0))) out.vaultLpSettled++;
-        const settle1 = mk([settleIx(1)]);
-        const r1 = await sim(settle1);
-        if (!r1.err && (await send(settle1))) out.vaultLpSettled++;
-        const close = mk([closeIx(p)]);
-        const rc = await sim(close);
-        if (!rc.err && (await send(close))) {
+        // C-7: 101(0) advances the vault LP's resolved close one chunk per call — loop it.
+        // Between chunks try the finish: 101(1) (a 21 = nothing pending, harmless) then tag 8.
+        const vlp = vaultLp;
+        const finish = async (): Promise<boolean> => {
+          const t1 = mk([settleIx(1)]);
+          if (!(await sim(t1)).err && (await send(t1))) out.vaultLpSettled++;
+          const close = mk([closeIx(p)]);
+          return !(await sim(close)).err && (await send(close));
+        };
+        const r: { closed: boolean; calls: number; stop: string } = await runChunks(
+          p,
+          (n) => (n === 0 ? [buildCreateAtaIdempotentIx(keeper.publicKey, vlp.state.juniorOwner, collateralMint), settleIx(0)] : [settleIx(0)]),
+          finish,
+          "VaultLpSettleResolved(0)",
+          false,
+        );
+        // 101(0) stopped (no further progress, an error such as "already settled", or the cap)
+        // without closing: try the finish once more — the settle may have completed in an
+        // earlier cycle or with this cycle's last chunk.
+        if (!r.closed && (await finish())) r.closed = true;
+        out.vaultLpSettled += r.calls;
+        if (r.closed) {
           out.closed++;
           out.vaultLpClosed.push(p.pubkey.toBase58());
         } else {
           out.remaining.push({
             portfolio: p.pubkey.toBase58(),
-            reason: `vault LP: tag 101(0) ${r0.err ? why(r0.err, r0.logs, { 2: "VaultLpSettleResolved(0)" }) : "ok"}; tag 8 ${rc.err ? why(rc.err, rc.logs, { 1: "ClosePortfolio" }) : "did not land"}`,
+            reason: r.calls > 0
+              ? `vault LP: tag 101 made progress (${r.calls} chunk call(s)), not done — continues next cycle (${r.stop})`
+              : `vault LP: not closable this cycle (${r.stop})`,
           });
         }
       } catch (err) {
@@ -609,15 +683,27 @@ export async function cleanupResolvedPortfolios(
         else out.remaining.push({ portfolio: p.pubkey.toBase58(), reason: "close tx did not land; retry next cycle" });
         continue;
       }
-      // (c) Progress-only CloseResolved (the close needs more calls).
-      const c = mk([...pre, resolvedIx(p)]);
-      const rc = await sim(c);
-      if (!rc.err) {
-        if (await send(c)) {
-          out.progressed++;
-          if (pre.length) ataCreates++;
+      // (c) C-7: CloseResolved advances a bankrupt close one chunk per call — loop it, trying
+      // tag 8 alone before every chunk, until the portfolio closes, stops progressing, or the cap.
+      const closeOnly = async (): Promise<boolean> => {
+        const t = mk([closeIx(p)]);
+        return !(await sim(t)).err && (await send(t));
+      };
+      const firstChunk = mkChunk([...pre, resolvedIx(p)], 0);
+      const probeChunk = await simWatch(firstChunk, p.pubkey);
+      if (!probeChunk.err) {
+        const r = await runChunks(p, (n) => (n === 0 ? [...pre, resolvedIx(p)] : [resolvedIx(p)]), async () => false, "CloseResolved");
+        if (r.calls > 0 && pre.length) ataCreates++;
+        if (r.calls > 0 && (await closeOnly())) {
+          out.closed++;
+          continue;
         }
-        out.remaining.push({ portfolio: p.pubkey.toBase58(), reason: "CloseResolved made progress; not yet closable" });
+        out.remaining.push({
+          portfolio: p.pubkey.toBase58(),
+          reason: r.calls > 0
+            ? `CloseResolved made progress (${r.calls} chunk call(s)), not done — continues next cycle (${r.stop})`
+            : `CloseResolved: ${r.stop}`,
+        });
         continue;
       }
       out.remaining.push({ portfolio: p.pubkey.toBase58(), reason: why(ra.err, ra.logs, idx(2)) });
