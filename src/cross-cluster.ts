@@ -30,6 +30,8 @@
  *   LP_FEE_CRANK_INTERVAL_MS  fee-job loop interval ms (default: 200000)
  *   STAKE_FEE_MIN_REAL_SHARES real (non-dead) stake shares required above the 1,000 floor (default: 0)
  *   STAKE_FEE_MIN_PUSH_ATOMS  smallest staker leg worth a transaction (default: 1)
+ *   TERMINAL_INSURANCE_ENABLED "false" disables the post-resolve stake tag-29 wind-down job (default: true)
+ *   ALERT_TERMINAL_BUDGET_CYCLES cycles a resolved stake-bound market may hold a budget before alerting (default: 3)
  *   WRAPPER_PROGRAM_ID / STAKE_PROGRAM_ID / MATCHER_PROGRAM_ID  program ids (default: SDK
  *                           constants; PROGRAM_ID is a legacy alias for the wrapper) — see program-ids.ts
  *   DEVNET_RPC_ORIGIN       Origin header for an Origin-restricted devnet RPC key (optional)
@@ -55,6 +57,8 @@ import { MIN_POOL_LIQUIDITY_USD_E6 } from "./cross-cluster/price-reader.ts";
 import { crankAllOnce, startRecoveryCrankLoop } from "./cross-cluster/recovery-cranker.ts";
 import { makeLpFeeJob } from "./cross-cluster/lp-fee-cranker.ts";
 import { makeStakeFeeJob, stakeFeeConfigFromEnv } from "./cross-cluster/stake-fee-pusher.ts";
+import { makeTerminalInsuranceJob, terminalInsuranceConfigFromEnv } from "./cross-cluster/terminal-insurance.ts";
+import type { TerminalInsuranceConfig } from "./cross-cluster/terminal-insurance.ts";
 import type { StakeFeeConfig } from "./cross-cluster/stake-fee-pusher.ts";
 import { startFeeJobLoop } from "./cross-cluster/fee-jobs.ts";
 import type { FeeJob } from "./cross-cluster/fee-jobs.ts";
@@ -150,6 +154,7 @@ if (!DEVNET_RPC) {
 let MIN_KEEPER_BALANCE_LAMPORTS: number;
 let BALANCE_CHECK_INTERVAL_MS: number;
 let STAKE_FEE_CONFIG: StakeFeeConfig;
+let TERMINAL_CONFIG: TerminalInsuranceConfig;
 let ALERT_SINK: AlertSink;
 let DEVNET_CONN_CONFIG: ConnectionConfig;
 try {
@@ -157,6 +162,7 @@ try {
   // threshold, webhook URL or fee-job knob must stop boot, not surface as a
   // throw inside a background loop hours later.
   STAKE_FEE_CONFIG = stakeFeeConfigFromEnv(process.env);
+  TERMINAL_CONFIG = terminalInsuranceConfigFromEnv(process.env);
   ALERT_SINK = getAlertSink();
   DEVNET_CONN_CONFIG = devnetConnectionConfig(process.env);
   MIN_KEEPER_BALANCE_LAMPORTS = parsePositiveLamportsFromSolEnv(
@@ -218,6 +224,9 @@ const LP_FEE_CRANK_INTERVAL_MS = parseInt(process.env.LP_FEE_CRANK_INTERVAL_MS ?
 // Stake-fee push (tag 87 -> stake AccrueFees, fee-flow audit F2/F3). Shares the
 // fee-job loop and its interval with the LP-fee crank.
 const STAKE_FEE_PUSH_ENABLED = process.env.STAKE_FEE_PUSH_ENABLED !== "false";
+// Post-resolve wind-down for stake-bound markets (stake F-9 tag 29). A no-op
+// until the deployed stake program supports tag 29 (probed, cached 1 h).
+const TERMINAL_INSURANCE_ENABLED = process.env.TERMINAL_INSURANCE_ENABLED !== "false";
 
 // Registration-poll loop — outbound poll of the Vercel-hosted playground registered-
 // markets blob, so markets created through the create-market wizard after this keeper
@@ -357,6 +366,7 @@ if (CRANK_ENABLED) {
   const feeJobs: FeeJob[] = [];
   if (LP_FEE_CRANK_ENABLED) feeJobs.push(makeLpFeeJob());
   if (STAKE_FEE_PUSH_ENABLED) feeJobs.push(makeStakeFeeJob(STAKE_FEE_CONFIG));
+  if (TERMINAL_INSURANCE_ENABLED) feeJobs.push(makeTerminalInsuranceJob(TERMINAL_CONFIG));
   if (feeJobs.length > 0) {
     void startFeeJobLoop(
       feeJobs,

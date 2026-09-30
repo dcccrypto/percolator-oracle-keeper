@@ -44,7 +44,8 @@ export type AlertKind =
   | "bankrupt-unliquidated"
   | "fee-leg-blocked"
   | "fee-job-failed"
-  | "adl-reduce-only";
+  | "adl-reduce-only"
+  | "terminal-budget-unbooked";
 
 export interface Alert {
   kind: AlertKind;

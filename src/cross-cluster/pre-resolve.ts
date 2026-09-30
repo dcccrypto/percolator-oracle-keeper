@@ -25,6 +25,8 @@ import { pushStakeFeesOnce } from "./stake-fee-pusher.ts";
 import type { StakeFeeConfig, StakeFeeConnection } from "./stake-fee-pusher.ts";
 import type { FeeJobOutcome } from "./fee-jobs.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
+import { inspectStakeBoundBudget, TerminalInsuranceState, windDownOnce } from "./terminal-insurance.ts";
+import type { TerminalConnection, TerminalInsuranceConfig, WindDownStep } from "./terminal-insurance.ts";
 
 export interface PreResolveReport {
   market: string;
@@ -37,16 +39,32 @@ export interface PreResolveReport {
   /** Claimable after resolve, but burned by CloseSlab if not claimed first. */
   warnings: string[];
   safeToResolve: boolean;
+  /** Stake-bound insurance budget (F-9): what tag 29 must recover after resolve. */
+  terminal?: { stakeBound: boolean; budget: bigint | null; support: string | null };
 }
 
-export type PreResolveConnection = StakeFeeConnection & Pick<Connection, "getAccountInfo">;
+/** After resolve: the stake tag-29 wind-down result (F-9). */
+export interface WindDownReport {
+  market: string;
+  state: string;
+  stakeBound: boolean;
+  budget: bigint | null;
+  support: string | null;
+  steps: WindDownStep[];
+  outcome: string;
+  /** True when no stake-bound budget remains unbooked. */
+  complete: boolean;
+}
+
+export type PreResolveConnection = StakeFeeConnection & TerminalConnection & Pick<Connection, "getAccountInfo">;
 
 export interface PreResolveDeps {
   crankLp: typeof crankLpFeesOnce;
   pushStake: typeof pushStakeFeesOnce;
+  inspectTerminal?: typeof inspectStakeBoundBudget;
 }
 
-const defaultDeps: PreResolveDeps = { crankLp: crankLpFeesOnce, pushStake: pushStakeFeesOnce };
+const defaultDeps: PreResolveDeps = { crankLp: crankLpFeesOnce, pushStake: pushStakeFeesOnce, inspectTerminal: inspectStakeBoundBudget };
 
 async function legsOf(conn: PreResolveConnection, market: PublicKey): Promise<FeeLegs> {
   const info = await conn.getAccountInfo(market, "confirmed");
@@ -66,6 +84,7 @@ export async function drainFeeLegsBeforeResolve(
   stakeCfg: StakeFeeConfig,
   confirmOpts?: ConfirmOptions,
   deps: PreResolveDeps = defaultDeps,
+  terminalCfg?: TerminalInsuranceConfig,
 ): Promise<PreResolveReport> {
   const market = new PublicKey(marketAddress);
   const before = await legsOf(conn, market);
@@ -104,5 +123,46 @@ export async function drainFeeLegsBeforeResolve(
   if (after.creatorClaimable === null) {
     warnings.push("creator leg unreadable (unknown account VERSION) — check it by hand before CloseSlab");
   }
-  return { market: marketAddress, before, after, lp, stake, blockers, warnings, safeToResolve: blockers.length === 0 };
+  // F-9: a stake-bound market's insurance budget can only leave through stake
+  // tag 29 after resolve. Without tag 29 in the deployed stake, resolving
+  // strands it (and CloseSlab then refuses with 21).
+  let terminal: PreResolveReport["terminal"];
+  if (terminalCfg && deps.inspectTerminal) {
+    const t = await deps.inspectTerminal(conn, keeper, marketAddress, terminalCfg, new TerminalInsuranceState());
+    terminal = { stakeBound: t.stakeBound, budget: t.budget, support: t.support };
+    if (t.stakeBound && t.budget !== null && t.budget > 0n) {
+      if (t.support === "supported") {
+        warnings.push(`stake-bound insurance budget ${t.budget} atoms: after resolve, run this again to wind down (stake tag 29 RecoverTerminalInsurance)`);
+      } else {
+        blockers.push(
+          `stake-bound insurance budget ${t.budget} atoms would be STRANDED at resolve: the deployed stake program ` +
+            `${t.support === "unsupported" ? "has no tag 29 (pre-F-9)" : "could not be probed for tag 29"} — recover it while Live (stake tag 23, then 24) or upgrade stake first`,
+        );
+      }
+    }
+  }
+  return { market: marketAddress, before, after, lp, stake, blockers, warnings, safeToResolve: blockers.length === 0, terminal };
+}
+
+/** Run the post-resolve stake tag-29 wind-down once (the CLI does this on a Resolved/Closed market). */
+export async function windDownAfterResolve(
+  conn: PreResolveConnection,
+  keeper: Keypair,
+  marketAddress: string,
+  dryRun: boolean,
+  cfg: TerminalInsuranceConfig,
+  run: typeof windDownOnce = windDownOnce,
+): Promise<WindDownReport> {
+  const r = await run(conn, keeper, marketAddress, dryRun, cfg, new TerminalInsuranceState());
+  const budgetLeft = r.stakeBound && r.budget !== null && r.budget > 0n && r.outcome.kind !== "done";
+  return {
+    market: marketAddress,
+    state: r.state?.kind ?? "unknown",
+    stakeBound: r.stakeBound,
+    budget: r.budget,
+    support: r.support,
+    steps: r.steps,
+    outcome: JSON.stringify(r.outcome),
+    complete: !budgetLeft && r.outcome.kind !== "failed",
+  };
 }

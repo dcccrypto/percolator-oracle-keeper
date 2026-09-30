@@ -19,13 +19,13 @@
  */
 import type { Connection, Keypair } from "@solana/web3.js";
 import type { MarketEntry, Registry } from "./registry.ts";
-import type { Alert, AlertSink } from "./alerting.ts";
+import type { Alert, AlertKind, AlertSink } from "./alerting.ts";
 
 export type FeeJobOutcome =
   | { kind: "done"; detail: string; signature?: string }
   | { kind: "nothing"; detail?: string }
   | { kind: "skipped"; reason: string }
-  | { kind: "blocked"; reason: string }
+  | { kind: "blocked"; reason: string; alertKind?: AlertKind }
   | { kind: "failed"; error: string };
 
 export interface FeeJobContext {
@@ -45,7 +45,7 @@ export interface FeeJobSweepResult {
   done: Array<{ market: string; label: string; detail: string }>;
   nothing: number;
   skipped: Array<{ market: string; label: string; reason: string }>;
-  blocked: Array<{ market: string; label: string; reason: string }>;
+  blocked: Array<{ market: string; label: string; reason: string; alertKind?: AlertKind }>;
   failed: Array<{ market: string; label: string; error: string }>;
 }
 
@@ -87,7 +87,7 @@ export async function runFeeJobSweep(
       case "done": r.done.push({ ...base, detail: o.detail }); break;
       case "nothing": r.nothing++; break;
       case "skipped": r.skipped.push({ ...base, reason: o.reason }); break;
-      case "blocked": r.blocked.push({ ...base, reason: o.reason }); break;
+      case "blocked": r.blocked.push({ ...base, reason: o.reason, alertKind: o.alertKind }); break;
       case "failed": r.failed.push({ ...base, error: o.error }); break;
     }
   });
@@ -122,8 +122,8 @@ export class FeeJobFailureTracker {
     }
     for (const b of r.blocked) {
       alerts.push({
-        kind: "fee-leg-blocked",
-        severity: "warn",
+        kind: b.alertKind ?? "fee-leg-blocked",
+        severity: b.alertKind === "terminal-budget-unbooked" ? "critical" : "warn",
         subject: b.label,
         message: `${r.job} cannot move this market's fee leg: ${b.reason}`,
         data: { job: r.job, market: b.market },
