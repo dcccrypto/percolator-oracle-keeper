@@ -67,6 +67,9 @@ import { parseInstructionError } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
+import { CleanupState, cleanupResolvedPortfolios } from "./resolved-portfolio-cleanup.ts";
+import type { CleanupConfig, CleanupConnection, CleanupResult } from "./resolved-portfolio-cleanup.ts";
+import { NFT_PROGRAM_ID } from "../program-ids.ts";
 
 export const STAKE_TAG_RECOVER_TERMINAL_INSURANCE = 29;
 export const STAKE_ERR_MARKET_NOT_TERMINAL = 30;
@@ -191,13 +194,24 @@ export interface TerminalInsuranceConfig {
   probeTtlMs: number;
   confirm?: ConfirmOptions;
   now?: () => number;
+  /** B12 cleanup (P3 b2b2559e permissionless CloseResolved + ClosePortfolio); undefined = off. */
+  cleanup?: CleanupConfig;
 }
 
 export function terminalInsuranceConfigFromEnv(env: Readonly<Record<string, string | undefined>>): TerminalInsuranceConfig {
   const raw = env.ALERT_TERMINAL_BUDGET_CYCLES;
   const n = raw === undefined || raw.trim() === "" ? 3 : Number(raw);
   if (!Number.isInteger(n) || n <= 0) throw new Error(`ALERT_TERMINAL_BUDGET_CYCLES="${raw}" must be a positive integer`);
-  return { wrapperProgramId: WRAPPER_PROGRAM_ID, stakeProgramId: STAKE_PROGRAM_ID, unbookedAlertCycles: n, probeTtlMs: 60 * 60_000 };
+  const cleanupOn = env.TERMINAL_CLEANUP_ENABLED !== "false";
+  return {
+    wrapperProgramId: WRAPPER_PROGRAM_ID,
+    stakeProgramId: STAKE_PROGRAM_ID,
+    unbookedAlertCycles: n,
+    probeTtlMs: 60 * 60_000,
+    cleanup: cleanupOn
+      ? { wrapperProgramId: WRAPPER_PROGRAM_ID, nftProgramId: NFT_PROGRAM_ID, maxPerCycle: 8, maxAtaCreatesPerCycle: 4, probeTtlMs: 60 * 60_000 }
+      : undefined,
+  };
 }
 
 export type TerminalConnection = Pick<
@@ -209,6 +223,7 @@ export type TerminalConnection = Pick<
   | "confirmTransaction"
   | "getSignatureStatuses"
   | "getTokenAccountsByOwner"
+  | "getProgramAccounts"
 >;
 
 /** Per-process state: probe cache, finished markets, unbooked-budget streaks. */
@@ -216,6 +231,7 @@ export class TerminalInsuranceState {
   support: { value: Tag29Support; at: number } | null = null;
   readonly done = new Set<string>();
   readonly unbookedStreak = new Map<string, number>();
+  readonly cleanup = new CleanupState();
 }
 
 function mkTx(keeper: Keypair, blockhash: string, ix: TransactionInstruction): Transaction {
@@ -299,7 +315,7 @@ export async function windDownOnce(
     return res({ kind: "failed", error: `account read failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}` });
   }
 
-  const state = decodeTerminalState(data);
+  let state = decodeTerminalState(data);
   if (!state) return res({ kind: "skipped", reason: "not a v18 market header" });
   if (state.kind === "live") {
     st.unbookedStreak.delete(marketAddress);
@@ -311,7 +327,7 @@ export async function windDownOnce(
   const [vaultAuth] = deriveStakeVaultAuth(pool, cfg.stakeProgramId);
   // A tombstone has no profile left; the pool binding above stands in for it.
   const stakeBound = state.kind === "closed" ? true : !!asset0InsuranceAuthority(data)?.equals(vaultAuth);
-  const budget = state.kind === "resolved" ? state.budget : 0n;
+  let budget = state.kind === "resolved" ? state.budget : 0n;
   if (!stakeBound) {
     return res({ kind: "skipped", reason: "asset-0 insurance authority is not this pool's vault_auth (not stake-bound)" }, { state, budget });
   }
@@ -330,6 +346,31 @@ export async function windDownOnce(
       : null;
 
   const collateralMint = parseWrapperConfigV17(data).collateralMint;
+
+  // B12 cleanup before tag 29: close every materialized portfolio (payout and
+  // rent to each owner; PDA owners skipped) so wrapper tag 41 can release the
+  // budget. Gated on the wrapper supporting it (no-op on 6377376a).
+  let cleanup: CleanupResult | null = null;
+  if (cfg.cleanup && state.kind === "resolved" && state.materializedPortfolios > 0n) {
+    cleanup = await cleanupResolvedPortfolios(conn as CleanupConnection, keeper, market, collateralMint, dryRun, cfg.cleanup, st.cleanup);
+    if (cleanup.closed > 0 && !dryRun) {
+      try {
+        const [mi2] = await conn.getMultipleAccountsInfo([market], "confirmed");
+        const s2 = mi2 ? decodeTerminalState(new Uint8Array(mi2.data)) : null;
+        if (s2 && s2.kind === "resolved") {
+          state = s2;
+          budget = s2.budget;
+        }
+      } catch {
+        // keep the pre-cleanup view; tag 29 decides
+      }
+    }
+  }
+  const cleanupNote = cleanup
+    ? ` Cleanup: support=${cleanup.support}, closed ${cleanup.closed}, progressed ${cleanup.progressed}, ${cleanup.remaining.length} left` +
+      (cleanup.remaining.length ? ` [${cleanup.remaining.slice(0, 3).map((r) => `${r.portfolio.slice(0, 8)}…: ${r.reason}`).join("; ")}${cleanup.remaining.length > 3 ? "; …" : ""}]` : "") + "."
+    : "";
+
   const build = (amount: bigint, stray?: PublicKey) =>
     buildRecoverTerminalInsuranceIx({
       stakeProgramId: cfg.stakeProgramId, wrapperProgramId: cfg.wrapperProgramId, caller: keeper.publicKey,
@@ -387,7 +428,8 @@ export async function windDownOnce(
         alertKind: "terminal-recovery-blocked-portfolios",
         reason:
           `stake tag 29(${budget}) -> Custom(21): ${state.materializedPortfolios} materialized portfolio(s) remain on this Resolved market; ` +
-          "wrapper tag 41 requires 0 (each owner must ClosePortfolio, tag 8). The stakers' terminal budget is stranded until they do or the P3 permissionless dematerialize lands (E2E B12)",
+          "wrapper tag 41 requires 0. The keeper closes them permissionlessly on the P3 wrapper (b2b2559e); what is left needs the owner or its own path (E2E B12)." +
+          cleanupNote,
       }, { state, budget, stakeBound, support });
     } else if (s1.outcome !== "nothing") {
       return res(unbookedAlert(s1.detail) ?? (s1.outcome === "failed" ? { kind: "failed", error: `tag 29(${budget}): ${s1.detail}` } : { kind: "skipped", reason: `tag 29(${budget}): ${s1.detail}` }), { state, budget, stakeBound, support });

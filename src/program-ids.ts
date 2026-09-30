@@ -45,8 +45,10 @@ export interface ProgramIds {
   stake: PublicKey;
   /** percolator-match (matcher). Not sent to by the keeper today; recorded for P2. */
   matcher: PublicKey;
+  /** percolator-nft. Its `["mint_authority"]` PDA is the owner of NFT-escrowed portfolios. */
+  nft: PublicKey;
   /** Where each value came from, for the boot log. */
-  source: { wrapper: string; stake: string; matcher: string };
+  source: { wrapper: string; stake: string; matcher: string; nft: string };
   /** Env IDs accepted only because KEEPER_ALLOW_PROGRAM_ID_OVERRIDE=1. */
   overridden: string[];
 }
@@ -92,6 +94,7 @@ export function resolveProgramIds(env: Env): ProgramIds {
   }
   const stakeEnv = nonEmpty(env.STAKE_PROGRAM_ID);
   const matcherEnv = nonEmpty(env.MATCHER_PROGRAM_ID);
+  const nftEnv = nonEmpty(env.NFT_PROGRAM_ID);
 
   const wrapperSrc = wrapperEnv
     ? { v: wrapperEnv, s: "env WRAPPER_PROGRAM_ID" }
@@ -107,6 +110,7 @@ export function resolveProgramIds(env: Env): ProgramIds {
     ["PROGRAM_ID", wrapperEnv ? undefined : legacyEnv],
     ["STAKE_PROGRAM_ID", stakeEnv],
     ["MATCHER_PROGRAM_ID", matcherEnv],
+    ["NFT_PROGRAM_ID", nftEnv],
   ];
   for (const [name, v] of envValues) {
     if (!v) continue;
@@ -132,7 +136,9 @@ export function resolveProgramIds(env: Env): ProgramIds {
       matcherEnv ? "MATCHER_PROGRAM_ID" : "sdk PROGRAM_IDS_V17.matcher",
       matcherEnv ?? PROGRAM_IDS_V17.matcher,
     ),
+    nft: parseKey(nftEnv ? "NFT_PROGRAM_ID" : "sdk PROGRAM_IDS_V17.nft", nftEnv ?? PROGRAM_IDS_V17.nft),
     source: {
+      nft: nftEnv ? "env NFT_PROGRAM_ID" : "sdk PROGRAM_IDS_V17.nft",
       wrapper: wrapperSrc.s,
       stake: stakeEnv ? "env STAKE_PROGRAM_ID" : "sdk PROGRAM_IDS_V17.vault",
       matcher: matcherEnv ? "env MATCHER_PROGRAM_ID" : "sdk PROGRAM_IDS_V17.matcher",
@@ -151,6 +157,7 @@ export const PROGRAM_IDS_RESOLVED: ProgramIds = resolveProgramIds(process.env);
 export const WRAPPER_PROGRAM_ID: PublicKey = PROGRAM_IDS_RESOLVED.wrapper;
 export const STAKE_PROGRAM_ID: PublicKey = PROGRAM_IDS_RESOLVED.stake;
 export const MATCHER_PROGRAM_ID: PublicKey = PROGRAM_IDS_RESOLVED.matcher;
+export const NFT_PROGRAM_ID: PublicKey = PROGRAM_IDS_RESOLVED.nft;
 
 export function describeProgramIds(ids: ProgramIds = PROGRAM_IDS_RESOLVED): string[] {
   return [
@@ -158,5 +165,6 @@ export function describeProgramIds(ids: ProgramIds = PROGRAM_IDS_RESOLVED): stri
     `wrapper=${ids.wrapper.toBase58()} (${ids.source.wrapper})`,
     `stake=${ids.stake.toBase58()} (${ids.source.stake})`,
     `matcher=${ids.matcher.toBase58()} (${ids.source.matcher})`,
+    `nft=${ids.nft.toBase58()} (${ids.source.nft})`,
   ];
 }
