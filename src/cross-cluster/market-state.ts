@@ -90,3 +90,34 @@ export function marketMode(d: Uint8Array): number | null {
 export function isLiveMarket(d: Uint8Array): boolean {
   return marketMode(d) === 0;
 }
+
+/**
+ * Permissionless stale-resolve window (tag 39, ResolveStalePermissionless). The program
+ * (d119eebd `oracle_v16::permissionless_stale_matured`) resolves a LIVE market only when
+ *   permissionless_resolve_stale_slots != 0
+ *   && now_slot - last_good_oracle_slot >= permissionless_resolve_stale_slots
+ * (and now_slot >= the engine clock). `last_good_oracle_slot` is advanced by every
+ * accepted mark push (handle_push_ewma_mark), so the window only runs while nobody pushes.
+ * WrapperConfigV16 sits at abs 16 (check_header, then read_wrapper_config_from_bytes):
+ * permissionless_resolve_stale_slots @16+136, last_good_oracle_slot @16+152 — verified on
+ * the live SOL/JUP/PENGU v18 bytes (collateral mint @16+32 = DJ54k4wH…, trade fee 30 bps
+ * @16+128, last_good_oracle_slot within ~3k slots of the engine clock).
+ */
+export const CONFIG_OFF = 16;
+export const CFG_PERMISSIONLESS_RESOLVE_STALE_SLOTS = 136;
+export const CFG_LAST_GOOD_ORACLE_SLOT = 152;
+
+export type StaleResolveWindow =
+  | { enabled: false; lastGoodOracleSlot: bigint }
+  | { enabled: true; staleSlots: bigint; lastGoodOracleSlot: bigint; remaining: bigint; matured: boolean };
+
+/** Where a v18 LIVE market stands against tag 39 at `chainSlot`; null when not a Live v18 market. */
+export function staleResolveWindow(d: Uint8Array, chainSlot: bigint): StaleResolveWindow | null {
+  if (!isLiveMarket(d)) return null;
+  const staleSlots = u64(d, CONFIG_OFF + CFG_PERMISSIONLESS_RESOLVE_STALE_SLOTS);
+  const lastGoodOracleSlot = u64(d, CONFIG_OFF + CFG_LAST_GOOD_ORACLE_SLOT);
+  if (staleSlots === 0n) return { enabled: false, lastGoodOracleSlot };
+  const elapsed = chainSlot > lastGoodOracleSlot ? chainSlot - lastGoodOracleSlot : 0n;
+  const remaining = elapsed >= staleSlots ? 0n : staleSlots - elapsed;
+  return { enabled: true, staleSlots, lastGoodOracleSlot, remaining, matured: remaining === 0n };
+}

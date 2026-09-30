@@ -40,6 +40,7 @@
  * recovery-cranker.ts is: independent interval, isolated errors, and one
  * instruction per transaction.
  */
+import { parseSeniorDrawLogs, seniorDrawAlerts } from "./vault-lp-crank.ts";
 import {
   Connection,
   Keypair,
@@ -127,6 +128,8 @@ export async function crankLpFeesOnce(
   marketAddress: string,
   dryRun: boolean,
   confirmOpts?: ConfirmOptions,
+  /** Receives the `p3_senior_draw*` log lines of the simulated send (bound vaults only). */
+  observe?: { seniorDrawLogs: string[] },
 ): Promise<"cranked" | "no-fees" | "skipped" | { error: string }> {
   let market: PublicKey;
   try {
@@ -185,7 +188,10 @@ export async function crankLpFeesOnce(
     // Live: no share can claim the atoms (the program refuses LpVaultZeroSharesMinted). On a
     // terminal Resolved harvest 78 can still absorb the claim-free residual for the junior (102),
     // so it is not skipped there — the simulation gate below decides.
-    if (parsed.totalLpSharesOutstanding === 0n && !resolvedHarvest) return "skipped";
+    // d119eebd: a BOUND vault is not skipped at 0 shares — tag 78 there still books a
+    // pending senior draw (P3-L1: the junior is the claimant), and preflight answers 38
+    // for free when there is nothing to do.
+    if (parsed.totalLpSharesOutstanding === 0n && !resolvedHarvest && !bound) return "skipped";
   } catch {
     // Unparseable registry: fall back rather than skip, so a layout change does
     // not silently stop fee cranking on every market at once.
@@ -226,10 +232,17 @@ export async function crankLpFeesOnce(
       // longer Custom(38)), and what it may absorb (the claim-free terminal residual) is
       // computed inside the engine. So simulate and send only if the market or the vault's
       // own ledger would change; otherwise this would spend a tx every cycle forever.
-      const gate = await resolvedHarvestChangesState(devnetConn, tx, market, ledger);
+      const gate = await resolvedHarvestChangesState(devnetConn, tx, market, ledger, observe);
       if (gate === "unsupported") return "skipped";
       if (gate === "no-change") return "no-fees";
       if (typeof gate === "object") return { error: gate.error };
+    } else if (bound && observe) {
+      // P3 senior draw (d119eebd): on a bound vault tag 78 BOOKS any pending senior draw
+      // into C before the harvest (vault_lp_draw_then_book, both ledgers writable). The
+      // send's own logs are not returned, so simulate first to see the booking lines.
+      const sim = await devnetConn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), { sigVerify: false, commitment: "confirmed" });
+      for (const l of sim.value.logs ?? []) if (l.includes("p3_senior_draw")) observe.seniorDrawLogs.push(l);
+      if (sim.value.err && extractErrorCode(JSON.stringify(sim.value.err)) === NO_FEES_TO_CRANK) return "no-fees";
     }
     const sig = await devnetConn.sendRawTransaction(tx.serialize(), { maxRetries: 2, skipPreflight: resolvedHarvest });
     // F6 (fee-flow audit 2026-09-29): the signature STATUS decides, not whether
@@ -293,6 +306,7 @@ export async function resolvedHarvestChangesState(
   tx: Transaction,
   market: PublicKey,
   ledger: PublicKey,
+  observe?: { seniorDrawLogs: string[] },
 ): Promise<"changes" | "no-change" | "unsupported" | { error: string }> {
   try {
     const [pre] = [await conn.getMultipleAccountsInfo([market, ledger], "confirmed")];
@@ -301,6 +315,7 @@ export async function resolvedHarvestChangesState(
       commitment: "confirmed",
       accounts: { encoding: "base64", addresses: [market.toBase58(), ledger.toBase58()] },
     });
+    if (observe && !sim.value.err) for (const l of sim.value.logs ?? []) if (l.includes("p3_senior_draw")) observe.seniorDrawLogs.push(l);
     if (sim.value.err) {
       const code = extractErrorCode(JSON.stringify(sim.value.err));
       if (code === RESOLVED_HARVEST_UNSUPPORTED) return "unsupported";
@@ -328,8 +343,11 @@ export function makeLpFeeJob(confirmOpts?: ConfirmOptions): FeeJob {
   return {
     name: "lp-fee",
     async run(ctx, m): Promise<FeeJobOutcome> {
-      const o = await crankLpFeesOnce(ctx.conn, ctx.keeper, m.marketAddress, ctx.dryRun, confirmOpts);
-      if (o === "cranked") return { kind: "done", detail: "LP fees distributed into the LP vault" };
+      const observe = { seniorDrawLogs: [] as string[] };
+      const o = await crankLpFeesOnce(ctx.conn, ctx.keeper, m.marketAddress, ctx.dryRun, confirmOpts, observe);
+      // "Earn absorbed X": only a booking that LANDED (the tx was sent and confirmed).
+      const events = o === "cranked" ? seniorDrawAlerts(m.marketAddress, m.label, parseSeniorDrawLogs(observe.seniorDrawLogs)) : [];
+      if (o === "cranked") return { kind: "done", detail: "LP fees distributed into the LP vault", ...(events.length ? { events } : {}) };
       if (o === "no-fees") return { kind: "nothing", detail: "no new LP fees (Custom(38))" };
       if (o === "skipped") return { kind: "skipped", reason: "no LP vault, or no depositors yet" };
       return { kind: "failed", error: o.error };

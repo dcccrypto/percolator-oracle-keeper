@@ -64,6 +64,8 @@ import type { StakeFeeConfig } from "./cross-cluster/stake-fee-pusher.ts";
 import { startFeeJobLoop } from "./cross-cluster/fee-jobs.ts";
 import { juniorWatchConfigFromEnv, makeJuniorWatchJob } from "./cross-cluster/vault-lp-junior-watch.ts";
 import { bankruptCloseWatchConfigFromEnv, makeBankruptCloseWatchJob } from "./cross-cluster/bankrupt-close-watch.ts";
+import { VaultLpCranker } from "./cross-cluster/vault-lp-crank.ts";
+import { getExhaustedRegistry, makeExhaustedResolveJob } from "./cross-cluster/p3-exhausted-resolve.ts";
 import type { BankruptCloseWatchConfig } from "./cross-cluster/bankrupt-close-watch.ts";
 import type { JuniorWatchConfig } from "./cross-cluster/vault-lp-junior-watch.ts";
 import { WRAPPER_PROGRAM_ID as CFG_WRAPPER_PROGRAM_ID } from "./program-ids.ts";
@@ -381,6 +383,20 @@ if (CRANK_ENABLED) {
   });
 }
 
+// P3 senior draw (d119eebd): crank each bound market's vault LP after every landed mark
+// move, so its deficit is drawn from the vault's pots (junior, then Earn seniors) BEFORE
+// the engine can liquidate it. Markets without a vault-LP state are a cached no-op.
+const P3_EXHAUSTED_WITHHOLD_PUSHES = process.env.P3_EXHAUSTED_WITHHOLD_PUSHES !== "false";
+const vaultLpCranker =
+  process.env.VAULT_LP_MARK_CRANK_ENABLED === "false" || DRY_RUN
+    ? null
+    : new VaultLpCranker(devnetConn, keeper, ALERT_SINK, {
+        wrapperProgramId: CFG_WRAPPER_PROGRAM_ID,
+        lookupTtlMs: 10 * 60_000,
+        withholdPushes: P3_EXHAUSTED_WITHHOLD_PUSHES,
+        registry: getExhaustedRegistry(),
+      });
+
 // Fee-job loop: every "move accrued fee value to its owner" job, in order, per
 // market (fee-jobs.ts). Same "concurrent, never awaited, never throws out of
 // scope" pattern as the crank loop.
@@ -398,6 +414,18 @@ if (CRANK_ENABLED) {
   if (process.env.JUNIOR_WATCH_ENABLED !== "false") feeJobs.push(makeJuniorWatchJob(JUNIOR_WATCH_CONFIG));
   // Read-only: warn / critical when a Live market's bankrupt close nears / passes max_close_slot with residual.
   if (process.env.BANKRUPT_CLOSE_WATCH_ENABLED !== "false") feeJobs.push(makeBankruptCloseWatchJob(BANKRUPT_CLOSE_CONFIG));
+  // P3 senior backing exhausted: critical alert with the tag 39 window, push withholding,
+  // and tag 39 sent by the keeper once the stale window has matured.
+  if (process.env.P3_EXHAUSTED_RESOLVE_ENABLED !== "false") {
+    feeJobs.push(
+      makeExhaustedResolveJob({
+        wrapperProgramId: CFG_WRAPPER_PROGRAM_ID,
+        registry: getExhaustedRegistry(),
+        vaultLpFor: vaultLpCranker ? (m) => vaultLpCranker.vaultLpFor(m) : undefined,
+        withholdPushes: P3_EXHAUSTED_WITHHOLD_PUSHES,
+      }),
+    );
+  }
   if (feeJobs.length > 0) {
     void startFeeJobLoop(
       feeJobs,
@@ -503,6 +531,12 @@ if (MIN_POOL_LIQUIDITY_USD_E6 === 0n) {
 }
 
 await startKeeperLoop(mainnetConn, devnetConn, keeper, registry, {
+  withholdPush: (m) => getExhaustedRegistry().shouldWithholdPush(m, P3_EXHAUSTED_WITHHOLD_PUSHES),
+  onPushLanded: vaultLpCranker
+    ? (m, px, label) => {
+        void vaultLpCranker.onPushLanded(m, px, label);
+      }
+    : undefined,
   intervalMs: CC_INTERVAL_MS,
   healthPort: CC_HEALTH_PORT,
   healthBind: CC_HEALTH_BIND,

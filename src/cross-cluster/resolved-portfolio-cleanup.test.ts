@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
-import { deriveLpVaultRegistry, deriveMarketVaultAccounts, deriveStakePool, parsePortfolioV17, parseWrapperConfigV17 } from "@percolatorct/sdk";
+import { deriveLpBackingLedger, deriveLpVaultRegistry, deriveMarketVaultAccounts, deriveStakePool, parsePortfolioV17, parseWrapperConfigV17 } from "@percolatorct/sdk";
 import {
   buildClosePortfolioIx,
   buildCloseResolvedIx,
@@ -322,15 +322,16 @@ describe("PDA-owned portfolios: grace period after resolve, then closed (coordin
     assert.deepEqual(c.calls.sent, [[-1, 101], [8]]);
     assert.equal(r.closed, 1);
   });
-  it("tag 101 wire: [101][topup] and the 12 accounts in the b2b2559e order", async () => {
+  it("tag 101 wire: [101][topup], the 12 accounts in the b2b2559e order, BOTH pot ledgers writable (d119eebd books a pending senior draw)", async () => {
     const { buildVaultLpSettleResolvedIx } = await import("./resolved-portfolio-cleanup.ts");
-    const st = { registry, lpPortfolio: lpPf, juniorOwner: WALLET };
+    const st = { registry, lpPortfolio: lpPf, juniorOwner: WALLET, seniorDrawnAtoms: 0n, seniorDrawOutstandingAtoms: 0n };
     const ix = buildVaultLpSettleResolvedIx({ wrapperProgramId: WRAPPER, caller: KEEPER.publicKey, market: SOL, vaultLpState: deriveVaultLpState(WRAPPER, SOL), state: st, registryDomain: 0, collateralMint: MINT, topup: 1 });
     assert.deepEqual([...ix.data], [101, 1]);
     assert.equal(ix.keys.length, 12);
     assert.deepEqual(ix.keys.map((k) => [k.isSigner, k.isWritable]), [
-      [true, true], [false, true], [false, false], [false, true], [false, true], [false, true], [false, false], [false, true], [false, true], [false, false], [false, false], [false, false],
+      [true, true], [false, true], [false, false], [false, true], [false, true], [false, true], [false, true], [false, true], [false, true], [false, false], [false, false], [false, false],
     ]);
+    assert.ok(ix.keys[5].pubkey.equals(deriveLpBackingLedger(WRAPPER, SOL, 0)[0]) && ix.keys[6].pubkey.equals(deriveLpBackingLedger(WRAPPER, SOL, 1)[0]));
     assert.ok(ix.keys[2].pubkey.equals(registry) && ix.keys[4].pubkey.equals(lpPf) && ix.keys[7].pubkey.equals(ownerAta(WALLET, MINT)));
   });
   it("a registry-owned portfolio with no bound vault-LP state is reported, not guessed at", async () => {

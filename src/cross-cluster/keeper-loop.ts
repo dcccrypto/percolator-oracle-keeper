@@ -60,6 +60,17 @@ export interface LoopConfig {
   minKeeperBalanceLamports: number;
   /** How often to re-read the keeper's balance. */
   balanceCheckIntervalMs: number;
+  /**
+   * P3 senior draw (d119eebd): called for every market whose push LANDED, with the
+   * pushed mark. The vault-LP cranker cranks a bound market's vault LP on a real move.
+   * Fire-and-forget: never awaited by the push cycle.
+   */
+  onPushLanded?: (marketAddress: string, priceE6: bigint, label: string) => void;
+  /**
+   * P3 senior backing exhausted (p3-exhausted-resolve.ts): true = do not push this market,
+   * so `last_good_oracle_slot` stops advancing and the tag 39 stale window can run.
+   */
+  withholdPush?: (marketAddress: string) => boolean;
 }
 
 interface MarketStat {
@@ -110,6 +121,31 @@ interface LoopState {
  * B20: markets the push loop can actually push — registered minus those last
  * seen Resolved/closed. A board of only terminal markets is not a pricing outage.
  */
+/**
+ * The pushes of a batch that actually went out (in the batch's pushed set, with a
+ * signature, not terminal) — what the P3 vault-LP crank hook runs on. A market dropped
+ * from the batch (preflight revert / quarantine) or terminal did NOT move its mark.
+ */
+export function landedPushes<T extends { marketAddress: string; priceE6: bigint }>(
+  pushes: ReadonlyArray<T>,
+  res: { pushedMarkets: ReadonlyArray<string>; terminalMarkets?: ReadonlyArray<string>; signature?: string | null },
+): T[] {
+  if (!res.signature) return [];
+  const pushed = new Set(res.pushedMarkets);
+  const terminal = new Set(res.terminalMarkets ?? []);
+  return pushes.filter((p) => pushed.has(p.marketAddress) && !terminal.has(p.marketAddress));
+}
+
+/** P3 exhausted-backing gate: skip the push when the hook says to withhold it. */
+export function withheldFromPush(market: string, withholdPush: ((m: string) => boolean) | undefined): boolean {
+  if (!withholdPush) return false;
+  try {
+    return withholdPush(market);
+  } catch {
+    return false; // a failing gate never stops pushes
+  }
+}
+
 export function countPushableMarkets(markets: ReadonlyArray<{ marketAddress: string }>, terminal: ReadonlySet<string>): number {
   return markets.filter((m) => !terminal.has(m.marketAddress)).length;
 }
@@ -544,6 +580,11 @@ async function runCycle(
   const pendingCircuitBreakerStates = new Map<string, CircuitBreakerState>();
   for (const entry of registry.markets) {
     if (notPushable.has(entry.marketAddress)) continue;
+    if (withheldFromPush(entry.marketAddress, config.withholdPush)) {
+      const ws = state.stats.get(entry.marketAddress);
+      if (ws) ws.lastErrorMsg = "push withheld: P3 senior backing exhausted, waiting for the tag 39 stale window";
+      continue;
+    }
     const rawPriceE6 = prices.get(entry.poolAddress);
     const stat = state.stats.get(entry.marketAddress)!;
     if (rawPriceE6 === undefined || rawPriceE6 <= 0n) {
@@ -725,6 +766,15 @@ async function runCycle(
       } else {
         stat.totalErrors++;
         stat.lastErrorMsg = "dropped from batch (reverted in preflight or quarantined)";
+      }
+    }
+    if (config.onPushLanded && !config.dryRun) {
+      for (const p of landedPushes(pushes, res)) {
+        try {
+          config.onPushLanded(p.marketAddress, p.priceE6, state.stats.get(p.marketAddress)?.label ?? p.marketAddress);
+        } catch {
+          // never let the vault-LP hook disturb the push loop
+        }
       }
     }
     if (res.pushed && res.signature) {

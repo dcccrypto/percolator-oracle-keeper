@@ -42,6 +42,7 @@
  * 5 wrapper vault (w), 6 wrapper vault authority, 7 SPL Token,
  * 8 wrapper program, 9 optional stray (w).
  */
+import { parseSeniorDrawLogs, seniorDrawAlerts } from "./vault-lp-crank.ts";
 import {
   ComputeBudgetProgram,
   PublicKey,
@@ -346,6 +347,7 @@ export async function windDownOnce(
       nowSlot,
       resolvedSlot: state.resolvedSlot,
     });
+    for (const a of seniorDrawAlerts(marketAddress, marketAddress, parseSeniorDrawLogs(cleanup.seniorDrawLogs))) events.push(a);
     for (const v of cleanup.vaultLpClosed) {
       console.log(`[terminal-insurance] ${marketAddress.slice(0, 8)}…: closed vault-LP portfolio ${v} (tag 101 then tag 8; rent to the LP-vault registry, expected)`);
     }

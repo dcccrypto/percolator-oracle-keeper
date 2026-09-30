@@ -175,9 +175,18 @@ export interface VaultLpState {
   registry: PublicKey;
   lpPortfolio: PublicKey;
   juniorOwner: PublicKey;
+  /** d119eebd: cumulative senior backing moved into the vault LP (booked draws). @16+224 u128. */
+  seniorDrawnAtoms: bigint;
+  /** d119eebd: senior loss still outstanding; while > 0, 97 / 102 / risk-increasing fills halt. @16+240 u128. */
+  seniorDrawOutstandingAtoms: bigint;
 }
 
-/** VaultLpStateV18 at HEADER_LEN (b2b2559e :5647). null unless kind 9 / version 1 / long enough. */
+function u128le(d: Uint8Array, o: number): bigint {
+  const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
+  return v.getBigUint64(o, true) | (v.getBigUint64(o + 8, true) << 64n);
+}
+
+/** VaultLpStateV18 at HEADER_LEN (b2b2559e :5647; 256 B at d119eebd :5678, senior-draw fields @224/@240). null unless kind 9 / version 1 / long enough. */
 export function decodeVaultLpState(d: Uint8Array): VaultLpState | null {
   const H = 16;
   if (d.length < H + 256 || d[10] !== KIND_VAULT_LP_STATE || d[H + 214] !== VAULT_LP_STATE_VERSION) return null;
@@ -185,6 +194,8 @@ export function decodeVaultLpState(d: Uint8Array): VaultLpState | null {
     registry: new PublicKey(d.subarray(H + 32, H + 64)),
     lpPortfolio: new PublicKey(d.subarray(H + 64, H + 96)),
     juniorOwner: new PublicKey(d.subarray(H + 96, H + 128)),
+    seniorDrawnAtoms: u128le(d, H + 224),
+    seniorDrawOutstandingAtoms: u128le(d, H + 240),
   };
 }
 
@@ -211,7 +222,9 @@ export function buildVaultLpSettleResolvedIx(p: {
       { pubkey: p.vaultLpState, isSigner: false, isWritable: true },
       { pubkey: p.state.lpPortfolio, isSigner: false, isWritable: true },
       { pubkey: own, isSigner: false, isWritable: true },
-      { pubkey: sib, isSigner: false, isWritable: false },
+      // d119eebd vault_lp_draw_then_book: 101 books a pending senior draw only when the
+      // ledger of EVERY pot drawn from is writable (else it defers, require_booking=false).
+      { pubkey: sib, isSigner: false, isWritable: true },
       { pubkey: ownerAta(p.state.juniorOwner, p.collateralMint), isSigner: false, isWritable: true },
       { pubkey: v.vaultToken, isSigner: false, isWritable: true },
       { pubkey: v.vaultAuthority, isSigner: false, isWritable: false },
@@ -354,6 +367,11 @@ export interface CleanupResult {
   waitingOnHolder: Array<{ portfolio: string; nftMint: string | null; holder: string | null; capital: bigint; pnl: bigint; reservedPnl: bigint; activeLegs: number }>;
   /** Vault-LP settles (tag 101) sent this pass. */
   vaultLpSettled: number;
+  /**
+   * `p3_senior_draw*` log lines from the sends' simulations (d119eebd: tag 101 books a
+   * pending senior draw when both pot ledgers are writable) — the caller alerts on them.
+   */
+  seniorDrawLogs: string[];
 }
 
 interface Pf {
@@ -396,7 +414,7 @@ export async function cleanupResolvedPortfolios(
   /** Chain slot now, and the market's engine resolved_slot (grace clock for PDA owners). */
   clock: { nowSlot: bigint; resolvedSlot: bigint | null } = { nowSlot: 0n, resolvedSlot: null },
 ): Promise<CleanupResult> {
-  const out: CleanupResult = { support: "unknown", closed: 0, progressed: 0, remaining: [], pdaClosed: [], vaultLpClosed: [], waitingOnHolder: [], vaultLpSettled: 0 };
+  const out: CleanupResult = { support: "unknown", closed: 0, progressed: 0, remaining: [], pdaClosed: [], vaultLpClosed: [], waitingOnHolder: [], vaultLpSettled: 0, seniorDrawLogs: [] };
   let pfs: Pf[];
   try {
     const accs = await conn.getProgramAccounts(cfg.wrapperProgramId, {
@@ -488,6 +506,7 @@ export async function cleanupResolvedPortfolios(
         return { closed: false, calls, stop: `${label} would make no progress` };
       }
       if (!(await send(tx))) return { closed: false, calls, stop: `${label} chunk tx did not land` };
+      for (const l of r.logs ?? []) if (l.includes("p3_senior_draw")) out.seniorDrawLogs.push(l);
       calls++;
       out.progressed++;
       current = r.post;

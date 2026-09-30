@@ -120,10 +120,17 @@ describe("B13 exception: tag 78 on a Resolved market", () => {
     const c = lpConn(zero, flat(), undefined, "changes");
     assert.equal(await crankLpFeesOnce(c.conn as never, KEEPER, SOL, false), "cranked");
   });
-  it("0 shares on a LIVE market is still skipped (control)", async () => {
-    const zero = registry(1); zero.fill(0, 16 + 64, 16 + 80);
+  it("0 shares on a LIVE market: UNBOUND is still skipped (control)", async () => {
+    const zero = registry(0); zero.fill(0, 16 + 64, 16 + 80);
     const c = lpConn(zero, fx("sol-market-v18-fees"));
     assert.equal(await crankLpFeesOnce(c.conn as never, KEEPER, SOL, false), "skipped");
+    assert.equal(c.sent.length, 0);
+  });
+  it("0 shares on a LIVE market: BOUND is sent (d119eebd: 78 books a pending senior draw; P3-L1 junior is the claimant)", async () => {
+    const zero = registry(1); zero.fill(0, 16 + 64, 16 + 80);
+    const c = lpConn(zero, fx("sol-market-v18-fees"));
+    assert.equal(await crankLpFeesOnce(c.conn as never, KEEPER, SOL, false), "cranked");
+    assert.equal(c.sent.length, 1);
   });
   it("Recovery (mode 2, e.g. after the expired-close valve): skipped, nothing sent", async () => {
     const c = lpConn(registry(1), market("sol", { mode: 2 }));

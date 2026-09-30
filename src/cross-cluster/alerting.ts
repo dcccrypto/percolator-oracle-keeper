@@ -50,7 +50,9 @@ export type AlertKind =
   | "terminal-pda-portfolio-closed"
   | "terminal-waiting-nft-holder"
   | "vault-lp-junior-release-pending"
-  | "bankrupt-close-expiring";
+  | "bankrupt-close-expiring"
+  | "p3-senior-draw"
+  | "p3-senior-backing-exhausted";
 
 export interface Alert {
   kind: AlertKind;
@@ -59,6 +61,11 @@ export interface Alert {
   subject: string;
   message: string;
   data?: Record<string, string | number | boolean | null>;
+  /**
+   * Distinguishes one-shot events that must not be swallowed by the fire() cooldown
+   * (e.g. two separate senior-draw bookings on the same market within the cooldown).
+   */
+  dedupe?: string;
 }
 
 export interface AlertThresholds {
@@ -423,7 +430,7 @@ export class AlertSink {
 
   /** Fire a one-off alert immediately (still subject to the cooldown). */
   async fire(scope: string, a: Alert): Promise<boolean> {
-    const key = `${scope}|${a.kind}|${a.subject}`;
+    const key = `${scope}|${a.kind}|${a.subject}|${a.dedupe ?? ""}`;
     const now = this.opts.now();
     const last = this.lastSent.get(key);
     if (last !== undefined && now - last < this.opts.thresholds.cooldownMs) return false;

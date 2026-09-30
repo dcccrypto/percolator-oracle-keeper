@@ -129,6 +129,7 @@ import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio }
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
 import { decodeAdlState } from "./adl-state.ts";
 import { isTerminalMarket } from "./market-state.ts";
+import { reportSeniorDraw } from "./vault-lp-crank.ts";
 import type { AdlState } from "./adl-state.ts";
 import type { LivenessRepair } from "./liveness-repair.ts";
 import { crankHealthRecord, evaluateCrankHealth, freshStreaks, getAlertSink } from "./alerting.ts";
@@ -598,6 +599,8 @@ export async function crankOneMarket(
     );
     state.totalCranks++;
     state.lastCrankSlot = BigInt(acct.context.slot);
+    // P3 senior draw: the accrual crank on a vault-LP market can draw its deficit too.
+    void reportSeniorDraw(getAlertSink(), marketAddress, label, resolved.sim.logs);
     obs.crankOk = true;
     obs.bankruptLiquidated = plan.cranks.filter((c) => c.kind === "liquidate").length;
     state.lastCrankAt = Date.now();
