@@ -52,6 +52,8 @@ import {
   encodeLpVaultCrankFees,
   ACCOUNTS_LP_VAULT_CRANK_FEES,
   buildAccountMetas,
+  isLpVaultRegistryBoundP3,
+  deriveVaultLpStateP3,
   deriveLpVaultRegistry,
   deriveLpBackingLedger,
   parseLpVaultRegistry,
@@ -137,6 +139,9 @@ export async function crankLpFeesOnce(
   // LP vault from costing a transaction every single cycle.
   if (!registryInfo) return "skipped";
 
+  // P3: on a vault-owned-LP market (registry _reserved[0] == 1) tag 78 REQUIRES the bound-vault
+  // tail [6] vault_lp_state (w); without it the program fails NotEnoughAccountKeys.
+  const bound = isLpVaultRegistryBoundP3(new Uint8Array(registryInfo.data));
   let domainIdx = LP_VAULT_DOMAIN_FALLBACK;
   try {
     const parsed = parseLpVaultRegistry(new Uint8Array(registryInfo.data));
@@ -167,7 +172,7 @@ export async function crankLpFeesOnce(
         ledger,
         siblingLedger,
         systemProgram: SystemProgram.programId,
-      }),
+      }).concat(bound ? [{ pubkey: deriveVaultLpStateP3(WRAPPER_PROGRAM_ID, market)[0], isSigner: false, isWritable: true }] : []),
       data: Buffer.from(encodeLpVaultCrankFees({ domain: domainIdx })),
     }),
   );
