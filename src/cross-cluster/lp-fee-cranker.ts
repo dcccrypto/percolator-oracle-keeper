@@ -91,7 +91,9 @@ export function lpVaultRegistryBound(data: Uint8Array): boolean {
  */
 const LP_VAULT_DOMAIN_FALLBACK = 0;
 
-const COMPUTE_UNIT_LIMIT = 120_000;
+// P3: tag 78 also books any pending senior draw into both pot ledgers; 120k is not enough
+// headroom once a draw is pending (security review of dfa4559b measured +1.3k..20k CU per ix).
+const COMPUTE_UNIT_LIMIT = 400_000;
 
 /** Engine code for "no new fees to distribute" — expected, not a failure. */
 const NO_FEES_TO_CRANK = 38;
