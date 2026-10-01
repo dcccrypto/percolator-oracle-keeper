@@ -77,7 +77,10 @@ import {
   deriveLpVaultRegistry,
   deriveMarketVaultAccounts,
   parseLpVaultRegistry,
+  decodeResolvedPayoutReceiptP3,
   parsePortfolioV17,
+  RESOLVED_RECEIPT_ACCOUNT_OFF_P3,
+  RESOLVED_RECEIPT_LEN_P3,
   V17_PORTFOLIO_ACCOUNT_LEN,
 } from "@percolatorct/sdk";
 import { parseInstructionError } from "./positioned-refresh.ts";
@@ -158,17 +161,19 @@ export function buildCloseResolvedIx(p: {
 }
 
 /**
- * Account offset of `PortfolioAccountV16Account.resolved_payout_receipt` (HEADER_LEN 16 +
- * rustc `offset_of!` = 9369; pinned by the SDK parity fixture at 5544302a, SDK 8.0.0 a9e65c6
- * RESOLVED_RECEIPT_ACCOUNT_OFF_P3). 66 bytes: 4 × u128, then `present` @+64, `finalized` @+65.
+ * Account offset of `PortfolioAccountV16Account.resolved_payout_receipt` — re-exported from the
+ * SDK (`RESOLVED_RECEIPT_ACCOUNT_OFF_P3` = 9369, rustc `offset_of!` + HEADER_LEN 16, pinned by the
+ * SDK parity fixture). 66 bytes (`RESOLVED_RECEIPT_LEN_P3`): 4 × u128, `present` @+64, `finalized` @+65.
  */
-export const RESOLVED_RECEIPT_OFF = 9369;
+export const RESOLVED_RECEIPT_OFF: number = RESOLVED_RECEIPT_ACCOUNT_OFF_P3;
 /**
  * A PARTIAL resolved receipt: `present && !finalized` (5544302a: a CloseResolved that ran before
  * the vault LP's 101 leaves one; only a later tag 46 ClaimResolvedPayoutTopup finalises it).
+ * Decoded by the SDK's `decodeResolvedPayoutReceiptP3`; data too short to carry a receipt → false.
  */
 export function receiptOpen(d: Uint8Array): boolean {
-  return d.length >= RESOLVED_RECEIPT_OFF + 66 && d[RESOLVED_RECEIPT_OFF + 64] !== 0 && d[RESOLVED_RECEIPT_OFF + 65] === 0;
+  if (d.length < RESOLVED_RECEIPT_ACCOUNT_OFF_P3 + RESOLVED_RECEIPT_LEN_P3) return false;
+  return decodeResolvedPayoutReceiptP3(d).open;
 }
 /** Tag 46 ClaimResolvedPayoutTopup, permissionless: the CloseResolved account list (owner unsigned, [7] nft_registry), data [46]. */
 export function buildClaimResolvedPayoutTopupIx(p: Parameters<typeof buildCloseResolvedIx>[0]): TransactionInstruction {
