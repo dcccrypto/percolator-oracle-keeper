@@ -49,14 +49,16 @@ import {
   encodePermissionlessCrank,
   ACCOUNTS_PERMISSIONLESS_CRANK_BASE,
   buildAccountMetas,
-  PROGRAM_IDS_V17,
   V17_MARKET_GROUP_OFF,
   V17_MARKET_GROUP_LEN,
   V17_PORTFOLIO_ACCOUNT_LEN,
   parsePortfolioV17,
 } from "@percolatorct/sdk";
 
-const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
+import { buildLivenessRepairIx } from "./liveness-repair.ts";
+import type { LivenessRepair } from "./liveness-repair.ts";
+
+import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 
 /** The asset every registry market trades (single-asset markets). */
 export const REFRESH_ASSET_INDEX = 0;
@@ -278,6 +280,28 @@ export const CATCHUP_CRANK_CU = 30_000;
 export const ACCRUE_CRANK_CU = 150_000;
 export const REFRESH_CRANK_CU = 130_000;
 export const MAX_TX_CU = 1_400_000;
+/** ExpireBackingBucket / FinalizeResetSide: one market-only state transition each (well under 40k CU). */
+export const REPAIR_CU = 40_000;
+/** Measured on devnet (ANSEM, 2026-09-29): liquidating a bankrupt leg ~200k CU. */
+export const LIQUIDATE_CRANK_CU = 250_000;
+
+/**
+ * True when a (post-refresh) portfolio holds an active leg and its equity
+ * `capital + pnl` is not positive — bankrupt. The refresh crank alone only
+ * re-certifies such an account; the keeper's next accrual re-stales it, so
+ * without a second crank in the SAME transaction the engine never reaches its
+ * Liquidate step and the loss keeps growing against the counterparty backing
+ * (ANSEM `DcVGSEfZ`, 2026-09-29: capital 0, PnL -88M -> -223M in ~2h while
+ * the Earn vault's backing was consumed).
+ */
+export function isBankruptPortfolio(data: Uint8Array): boolean {
+  try {
+    const p = parsePortfolioV17(data);
+    return p.activeBitmap !== 0n && !p.matcherEnabled && p.capital + p.pnl <= 0n;
+  } catch {
+    return false;
+  }
+}
 /**
  * Most catch-up cranks that still leave room for the accrual + refreshes.
  * A market further behind gets a catch-up-only transaction this cycle: a
@@ -287,12 +311,15 @@ export const MAX_CATCHUP_WITH_REFRESH = 10;
 /** Catch-up-only transaction size (40 x ~19 bytes + ~270 fixed fits 1232 bytes; 40 x 30k CU fits 1.4M). */
 export const MAX_CATCHUP_CRANKS = 40;
 
-export type PlannedCrankKind = "catchup" | "accrue" | "refresh";
+export type PlannedCrankKind = "repair" | "catchup" | "accrue" | "refresh" | "liquidate";
 
 export interface PlannedCrank {
   kind: PlannedCrankKind;
+  /** The crank's target portfolio; for a "repair" (market-only instruction) the market itself. */
   portfolio: PublicKey;
   ix: TransactionInstruction;
+  /** Set on "repair" entries: which liveness repair this is. */
+  repair?: LivenessRepair;
 }
 
 export interface CrankPlan {
@@ -335,18 +362,34 @@ export function planCrankTx(params: {
   lpPortfolio: PublicKey;
   catchup: number;
   refreshTargets: ReadonlyArray<PositionedPortfolio>;
+  /** Liveness repairs (liveness-repair.ts) to land BEFORE any crank this cycle. */
+  repairs?: ReadonlyArray<LivenessRepair>;
+  /**
+   * Positioned portfolios found bankrupt after their refresh (see
+   * `isBankruptPortfolio`): each gets a SECOND no-observation crank right after
+   * its refresh, which the engine's auto-crank planner resolves to
+   * `AutoCrankPlanV16::Liquidate` once the account is current.
+   */
+  liquidateTargets?: ReadonlyArray<PublicKey>;
 }): CrankPlan {
   const { owner, market, lpPortfolio, catchup, refreshTargets } = params;
-  const cranks: PlannedCrank[] = [];
+  const repairs = params.repairs ?? [];
+  const cranks: PlannedCrank[] = repairs.map((r) => ({
+    kind: "repair" as const,
+    portfolio: market,
+    ix: buildLivenessRepairIx(market, r),
+    repair: r,
+  }));
+  const repairCu = repairs.length * REPAIR_CU;
   for (let i = 0; i < catchup; i++) {
     cranks.push({ kind: "catchup", portfolio: lpPortfolio, ix: buildObservationCrankIx(owner, market, lpPortfolio) });
   }
   if (!catchupAllowsRefresh(catchup)) {
     // Too far behind to finish this cycle: catch-up cranks only.
-    return { cranks, overflow: [], computeUnits: Math.min(MAX_TX_CU, catchup * CATCHUP_CRANK_CU) };
+    return { cranks, overflow: [], computeUnits: Math.min(MAX_TX_CU, repairCu + catchup * CATCHUP_CRANK_CU) };
   }
   cranks.push({ kind: "accrue", portfolio: lpPortfolio, ix: buildObservationCrankIx(owner, market, lpPortfolio) });
-  let cu = catchup * CATCHUP_CRANK_CU + ACCRUE_CRANK_CU;
+  let cu = repairCu + catchup * CATCHUP_CRANK_CU + ACCRUE_CRANK_CU;
 
   const ordered = [...refreshTargets].sort((x, y) => Number(x.isLp) - Number(y.isLp));
   const overflow: PublicKey[] = [];
@@ -357,6 +400,10 @@ export function planCrankTx(params: {
     }
     cranks.push({ kind: "refresh", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
     cu += REFRESH_CRANK_CU;
+    if (!p.isLp && (params.liquidateTargets ?? []).some((t) => t.equals(p.pubkey)) && cu + LIQUIDATE_CRANK_CU <= MAX_TX_CU) {
+      cranks.push({ kind: "liquidate", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
+      cu += LIQUIDATE_CRANK_CU;
+    }
   }
   return { cranks, overflow, computeUnits: Math.min(MAX_TX_CU, cu) };
 }

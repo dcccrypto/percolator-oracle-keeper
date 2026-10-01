@@ -25,6 +25,7 @@ import { createMarkSmoother } from "./mark-smoother.ts";
 import { checkCircuitBreaker, recordMarkInForce } from "../circuit-breaker.ts";
 import type { CircuitBreakerState } from "../circuit-breaker.ts";
 import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets } from "./auth-mark-pusher.ts";
+import { evaluatePushCycle, getAlertSink } from "./alerting.ts";
 import {
   type WalletBalanceState,
   createWalletBalanceState,
@@ -59,6 +60,17 @@ export interface LoopConfig {
   minKeeperBalanceLamports: number;
   /** How often to re-read the keeper's balance. */
   balanceCheckIntervalMs: number;
+  /**
+   * P3 senior draw (d119eebd): called for every market whose push LANDED, with the
+   * pushed mark. The vault-LP cranker cranks a bound market's vault LP on a real move.
+   * Fire-and-forget: never awaited by the push cycle.
+   */
+  onPushLanded?: (marketAddress: string, priceE6: bigint, label: string) => void;
+  /**
+   * P3 senior backing exhausted (p3-exhausted-resolve.ts): true = do not push this market,
+   * so `last_good_oracle_slot` stops advancing and the tag 39 stale window can run.
+   */
+  withholdPush?: (marketAddress: string) => boolean;
 }
 
 interface MarketStat {
@@ -75,6 +87,34 @@ interface MarketStat {
   lastErrorMsg: string | null;
   /** True if the last attempt found oracle_authority != keeper. */
   authorityMismatch: boolean;
+}
+
+/**
+ * Record a push that LANDED for one market, and clear its last error.
+ *
+ * `lastErrorMsg` used to be sticky: a transient cold-start condition (the mark
+ * smoother withholding its first few cycles until minSamples) stayed on
+ * /health as `lastError` for the life of the process, even while the market
+ * pushed every cycle. On 2026-10-01 that stale "mark smoother re-priming"
+ * label on two healthy, current markets read as the cause of a trading outage.
+ * A landed push supersedes every earlier error; a later failure sets it again.
+ *
+ * @param stat - The market's /health stat record (mutated).
+ * @param stamp - Unix ms the push was confirmed landed.
+ * @param signature - The batch transaction signature that carried it.
+ * @returns Nothing; mutates `stat`.
+ * @example
+ * recordLandedPush(stat, Date.now(), res.signature); // stat.lastErrorMsg === null
+ */
+export function recordLandedPush(
+  stat: Pick<MarketStat, "totalPushes" | "lastPushAt" | "lastSig" | "lastErrorMsg">,
+  stamp: number,
+  signature: string,
+): void {
+  stat.totalPushes++;
+  stat.lastPushAt = stamp;
+  stat.lastSig = signature;
+  stat.lastErrorMsg = null;
 }
 
 interface LoopState {
@@ -96,7 +136,50 @@ interface LoopState {
   lastBatchReadError: string | null;
   /** #71 wallet-balance guard state. */
   wallet: WalletBalanceState;
+  /** Ops track: markets in this cycle's push batch, and how many landed. Reset every cycle. */
+  cycleAttempted: number;
+  cyclePushed: number;
+  /** Consecutive cycles with zero landed pushes (markets registered). */
+  zeroPushStreak: number;
+  /** B20: markets last seen Resolved/closed — excluded from the zero-push health count. */
+  terminalMarkets: Set<string>;
 }
+
+/**
+ * B20: markets the push loop can actually push — registered minus those last
+ * seen Resolved/closed. A board of only terminal markets is not a pricing outage.
+ */
+/**
+ * The pushes of a batch that actually went out (in the batch's pushed set, with a
+ * signature, not terminal) — what the P3 vault-LP crank hook runs on. A market dropped
+ * from the batch (preflight revert / quarantine) or terminal did NOT move its mark.
+ */
+export function landedPushes<T extends { marketAddress: string; priceE6: bigint }>(
+  pushes: ReadonlyArray<T>,
+  res: { pushedMarkets: ReadonlyArray<string>; terminalMarkets?: ReadonlyArray<string>; signature?: string | null },
+): T[] {
+  if (!res.signature) return [];
+  const pushed = new Set(res.pushedMarkets);
+  const terminal = new Set(res.terminalMarkets ?? []);
+  return pushes.filter((p) => pushed.has(p.marketAddress) && !terminal.has(p.marketAddress));
+}
+
+/** P3 exhausted-backing gate: skip the push when the hook says to withhold it. */
+export function withheldFromPush(market: string, withholdPush: ((m: string) => boolean) | undefined): boolean {
+  if (!withholdPush) return false;
+  try {
+    return withholdPush(market);
+  } catch {
+    return false; // a failing gate never stops pushes
+  }
+}
+
+export function countPushableMarkets(markets: ReadonlyArray<{ marketAddress: string }>, terminal: ReadonlySet<string>): number {
+  return markets.filter((m) => !terminal.has(m.marketAddress)).length;
+}
+
+/** Emit the structured push `[health]` line every N cycles. */
+export const PUSH_HEALTH_LINE_EVERY_CYCLES = 10;
 
 /**
  * Health status for the pricing pipeline, separated from the handler so it
@@ -525,6 +608,11 @@ async function runCycle(
   const pendingCircuitBreakerStates = new Map<string, CircuitBreakerState>();
   for (const entry of registry.markets) {
     if (notPushable.has(entry.marketAddress)) continue;
+    if (withheldFromPush(entry.marketAddress, config.withholdPush)) {
+      const ws = state.stats.get(entry.marketAddress);
+      if (ws) ws.lastErrorMsg = "push withheld: P3 senior backing exhausted, waiting for the tag 39 stale window";
+      continue;
+    }
     const rawPriceE6 = prices.get(entry.poolAddress);
     const stat = state.stats.get(entry.marketAddress)!;
     if (rawPriceE6 === undefined || rawPriceE6 <= 0n) {
@@ -667,7 +755,10 @@ async function runCycle(
 
   // ── 5. One batched PushAuthMark tx, fire-and-forget ─────────────────────────
   try {
+    state.cycleAttempted = pushes.length; // adjusted below for terminal markets
     const res = await pushAuthMarkBatch(devnetConn, keeper, pushes, nowSlot, cachedBlockhash, config.dryRun);
+    state.cycleAttempted = pushes.length - (res.terminalMarkets?.length ?? 0);
+    state.cyclePushed = config.dryRun ? state.cycleAttempted : res.signature ? res.pushedMarkets.length : 0;
     const stamp = Date.now();
     // Record PER MARKET, not per batch. This loop used to stamp every market in
     // `pushes` as freshly pushed whenever the batch reported success — so a
@@ -675,7 +766,10 @@ async function runCycle(
     // lastPushAt and a rising totalPushes on /health. That made a frozen price
     // look healthy, which is how a stuck market goes unnoticed for days.
     const pushedSet = new Set(res.pushedMarkets);
+    const terminalSet = new Set(res.terminalMarkets ?? []);
+    state.terminalMarkets = terminalSet;
     for (const p of pushes) {
+      if (terminalSet.has(p.marketAddress)) continue; // B20: Resolved/closed — not an error
       const stat = state.stats.get(p.marketAddress)!;
       stat.authorityMismatch = false;
       if (config.dryRun) {
@@ -694,12 +788,19 @@ async function runCycle(
             ),
           );
         }
-        stat.totalPushes++;
-        stat.lastPushAt = stamp;
-        stat.lastSig = res.signature;
+        recordLandedPush(stat, stamp, res.signature);
       } else {
         stat.totalErrors++;
         stat.lastErrorMsg = "dropped from batch (reverted in preflight or quarantined)";
+      }
+    }
+    if (config.onPushLanded && !config.dryRun) {
+      for (const p of landedPushes(pushes, res)) {
+        try {
+          config.onPushLanded(p.marketAddress, p.priceE6, state.stats.get(p.marketAddress)?.label ?? p.marketAddress);
+        } catch {
+          // never let the vault-LP hook disturb the push loop
+        }
       }
     }
     if (res.pushed && res.signature) {
@@ -724,6 +825,31 @@ async function runCycle(
       s.totalErrors++;
       s.lastErrorMsg = msg;
     }
+  }
+}
+
+/**
+ * Ops track: pushes landed per cycle. A cycle abandoned by the watchdog, a
+ * paused wallet, or a total mainnet-read failure all count as zero — that is
+ * the frozen-AuthMark condition regardless of which one caused it. Never throws.
+ */
+async function reportPushCycle(state: LoopState, registered: number): Promise<void> {
+  try {
+    const sink = getAlertSink();
+    const sample = {
+      cycle: state.cycleCount,
+      registered,
+      attempted: state.cycleAttempted,
+      pushed: state.cyclePushed,
+    };
+    const ev = evaluatePushCycle(sample, state.zeroPushStreak, sink.thresholds);
+    state.zeroPushStreak = ev.zeroStreak;
+    if (state.cycleCount % PUSH_HEALTH_LINE_EVERY_CYCLES === 0) {
+      sink.health("push", { ...sample, zeroStreak: ev.zeroStreak, timeouts: state.timeoutCount });
+    }
+    await sink.reconcile("push", ev.active);
+  } catch (err) {
+    console.error(`[keeper] push health report failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -780,6 +906,10 @@ export async function startKeeperLoop(
     consecutiveBatchReadFailures: 0,
     wallet: createWalletBalanceState(),
     lastBatchReadError: null,
+    cycleAttempted: 0,
+    cyclePushed: 0,
+    zeroPushStreak: 0,
+    terminalMarkets: new Set(),
     stats: new Map(
       registry.markets.map((m) => [
         m.marketAddress,
@@ -832,6 +962,8 @@ export async function startKeeperLoop(
   while (!stopping) {
     const cycleStart = Date.now();
     state.cycleCount++;
+    state.cycleAttempted = 0;
+    state.cyclePushed = 0;
     console.log(
       `\n[keeper] === Cycle ${state.cycleCount} ${new Date().toISOString()} ===`,
     );
@@ -860,6 +992,8 @@ export async function startKeeperLoop(
     }
 
     state.lastCycleAt = Date.now();
+    // B20: terminal markets can never be pushed; a board of only terminal markets is not an outage.
+    await reportPushCycle(state, countPushableMarkets(registry.markets, state.terminalMarkets));
     const elapsed = Date.now() - cycleStart;
     const remaining = config.intervalMs - elapsed;
     if (remaining > 0 && !stopping) {

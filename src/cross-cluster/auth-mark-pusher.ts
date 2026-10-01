@@ -46,14 +46,29 @@ import {
   V17_MARKET_ASSET_SLOT_LEN,
   V17_ASSET_ORACLE_PROFILE_LEN,
   V17_ASSET_ORACLE_WRAPPER_LEN,
-  PROGRAM_IDS_V17,
 } from "@percolatorct/sdk";
 import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
+import { isLiveMarket, isTerminalMarket } from "./market-state.ts";
 
 /**
- * Wrapper program the auth-mark-pusher targets for PushAuthMark. Sourced
- * directly from the SDK's PROGRAM_IDS_V17 constant (2026-07-17 fresh devnet
- * triple cutover) rather than an env var — see auth-mark-pusher.test.ts for
+ * B20 (E2E 2026-09-30): Resolved markets and CloseSlab tombstones are never
+ * pushed. PushAuthMark on them reverts Custom(21) in preflight every cycle —
+ * pure log/alert noise — and resolution is one-way, so they are dropped from
+ * the batch before it is built and logged once per market.
+ */
+const terminalLogged = new Set<string>();
+/** A decodable kind-1 market whose mode is not Live (i.e. Recovery; Resolved is caught by isTerminalMarket). */
+function marketModeIsNotLive(data: Uint8Array): boolean {
+  return !isLiveMarket(data) && !isTerminalMarket(data) && data.length > 16 && data[10] === 1;
+}
+export function resetTerminalPushLogForTests(): void {
+  terminalLogged.clear();
+}
+
+/**
+ * Wrapper program the auth-mark-pusher targets for PushAuthMark. Resolved by
+ * ../program-ids.ts: env WRAPPER_PROGRAM_ID (or legacy PROGRAM_ID), else the
+ * SDK PROGRAM_IDS_V17 constant — so the fresh-ID relaunch is a config change — see auth-mark-pusher.test.ts for
  * a literal-pinned regression guard against silent drift back to the
  * superseded 2026-06-26 wrapper (69VUZ7a2...).
  *
@@ -61,7 +76,8 @@ import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
  * instead of only re-importing the same SDK constant this file reads from,
  * which would be a vacuous self-check.
  */
-export const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
+export { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
+import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 
 const COMPUTE_UNIT_LIMIT = 200_000;
 
@@ -598,6 +614,7 @@ function pushGenerationKey(p: { marketAddress: string; assetIndex: number }): st
 async function fetchPushAuthMarkGenerationFields(
   devnetConn: Connection,
   pushes: AuthMarkPushInput[],
+  terminal: Set<string>,
 ): Promise<Map<string, { marketId: bigint; observationSequence: bigint }>> {
   const uniqueAddrs = [...new Set(pushes.map((p) => p.marketAddress))];
   // "processed", not "confirmed" (#Custom19, 2026-09-28): the watermark this
@@ -621,6 +638,12 @@ async function fetchPushAuthMarkGenerationFields(
     if (result.has(key)) continue;
     const data = dataByAddr.get(p.marketAddress);
     if (!data) continue;
+    // B20 + Recovery: push only LIVE markets. A market the expired-close valve moved to
+    // Recovery is refused (21) like a Resolved one; it is cranked, not priced.
+    if (isTerminalMarket(data) || marketModeIsNotLive(data)) {
+      terminal.add(p.marketAddress);
+      continue;
+    }
     const fields = parsePushAuthMarkGenerationFields(data, p.assetIndex);
     if (fields) {
       result.set(key, {
@@ -719,6 +742,8 @@ export async function pushAuthMarkBatch(
   pushedMarkets: string[];
   /** Markets dropped this cycle (reverted in preflight, or quarantined). */
   skippedMarkets: string[];
+  /** B20: Resolved / tombstoned markets, not pushed and not counted as drops. */
+  terminalMarkets?: string[];
 }> {
   if (pushes.length === 0) {
     return { pushed: false, count: 0, pushedMarkets: [], skippedMarkets: [] };
@@ -752,10 +777,19 @@ export async function pushAuthMarkBatch(
   // rejects a push whose proposed value is not STRICTLY GREATER than the
   // value it last stored, so reusing a stale/cached sequence across pushes
   // would make every push after the first one revert.
-  const generationFields = await fetchPushAuthMarkGenerationFields(devnetConn, eligible);
+  const terminal = new Set<string>();
+  const generationFields = await fetchPushAuthMarkGenerationFields(devnetConn, eligible, terminal);
+  for (const m of terminal) {
+    if (!terminalLogged.has(m)) {
+      terminalLogged.add(m);
+      console.log(`[push] ${m.slice(0, 8)}… is not Live (Recovery/Resolved/closed) — not pushed (B20)`);
+    }
+  }
+  const terminalMarkets = [...terminal];
   const pushable: AuthMarkPushItem[] = [];
   const missingGeneration: string[] = [];
   for (const p of eligible) {
+    if (terminal.has(p.marketAddress)) continue;
     const fields = generationFields.get(pushGenerationKey(p));
     if (!fields) {
       missingGeneration.push(p.marketAddress);
@@ -770,7 +804,13 @@ export async function pushAuthMarkBatch(
     );
   }
   if (pushable.length === 0) {
-    return { pushed: false, count: 0, pushedMarkets: [], skippedMarkets: pushes.map((p) => p.marketAddress) };
+    return {
+      pushed: false,
+      count: 0,
+      pushedMarkets: [],
+      skippedMarkets: pushes.map((p) => p.marketAddress).filter((m) => !terminal.has(m)),
+      terminalMarkets,
+    };
   }
 
   const chunks = chunkPushes(keeper, pushable, nowSlot, blockhash);
@@ -785,6 +825,7 @@ export async function pushAuthMarkBatch(
       count: pushable.length,
       pushedMarkets: pushable.map((p) => p.marketAddress),
       skippedMarkets: missingGeneration,
+      terminalMarkets,
     };
   }
 
@@ -874,7 +915,7 @@ export async function pushAuthMarkBatch(
    */
   const refreshSequences = async (items: AuthMarkPushItem[]): Promise<AuthMarkPushItem[] | null> => {
     try {
-      const fresh = await fetchPushAuthMarkGenerationFields(devnetConn, items);
+      const fresh = await fetchPushAuthMarkGenerationFields(devnetConn, items, terminal);
       return items.map((p) => {
         const f = fresh.get(pushGenerationKey(p));
         const bumped = p.observationSequence + 1n;
@@ -965,6 +1006,7 @@ export async function pushAuthMarkBatch(
     pushedMarkets,
     // Everything asked for that did NOT go out — quarantined or reverting. The
     // caller must not stamp these as freshly pushed (that was the /health lie).
-    skippedMarkets: pushes.map((p) => p.marketAddress).filter((m) => !pushedSet.has(m)),
+    skippedMarkets: pushes.map((p) => p.marketAddress).filter((m) => !pushedSet.has(m) && !terminal.has(m)),
+    terminalMarkets,
   };
 }

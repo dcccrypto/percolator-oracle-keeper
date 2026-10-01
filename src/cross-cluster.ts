@@ -25,6 +25,19 @@
  *   DRY_RUN               "true" for dry-run (no on-chain writes, default: false)
  *   CRANK_ENABLED          "false" disables the recovery crank loop + crank-on-boot (default: true)
  *   CRANK_INTERVAL_MS       recovery crank cycle interval ms (default: 20000)
+ *   LP_FEE_CRANK_ENABLED    "false" disables the tag 78 LP-fee crank job (default: true)
+ *   STAKE_FEE_PUSH_ENABLED  "false" disables the tag 87 -> stake AccrueFees job (default: true)
+ *   LP_FEE_CRANK_INTERVAL_MS  fee-job loop interval ms (default: 200000)
+ *   STAKE_FEE_MIN_REAL_SHARES real (non-dead) stake shares required above the 1,000 floor (default: 0)
+ *   STAKE_FEE_MIN_PUSH_ATOMS  smallest staker leg worth a transaction (default: 1)
+ *   TERMINAL_INSURANCE_ENABLED "false" disables the post-resolve stake tag-29 wind-down job (default: true)
+ *   ALERT_TERMINAL_BUDGET_CYCLES cycles a resolved stake-bound market may hold a budget before alerting (default: 3)
+ *   WRAPPER_PROGRAM_ID / STAKE_PROGRAM_ID / MATCHER_PROGRAM_ID  program ids (default: SDK
+ *                           constants; PROGRAM_ID is a legacy alias for the wrapper) — see program-ids.ts
+ *   DEVNET_RPC_ORIGIN       Origin header for an Origin-restricted devnet RPC key (optional)
+ *   KEEPER_ALERT_WEBHOOK_URL  https webhook for [ALERT] lines (optional; Slack/Discord-compatible `text`)
+ *   ALERT_SLOT_LAG_WARN / ALERT_SLOT_LAG_CRITICAL / ALERT_CRANK_REVERTS / ALERT_ZERO_PUSH_CYCLES /
+ *   ALERT_LAPSED_BUCKET_CYCLES / ALERT_BANKRUPT_CYCLES / ALERT_COOLDOWN_MS  alert thresholds (alerting.ts)
  *   REGISTER_SOURCE_URL     GET endpoint polled for wizard-registered markets (unset = disabled)
  *   REGISTER_POLL_INTERVAL_MS  register-poll interval ms (default: 30000)
  *   REGISTRY_RELOAD_INTERVAL_MS  G6 registry.json hot-reload interval ms (default: 15000)
@@ -41,8 +54,27 @@ import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-u
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { MIN_POOL_LIQUIDITY_USD_E6 } from "./cross-cluster/price-reader.ts";
+import { markCadenceCheck } from "./cross-cluster/mark-smoother.ts";
 import { crankAllOnce, startRecoveryCrankLoop } from "./cross-cluster/recovery-cranker.ts";
-import { startLpFeeCrankLoop } from "./cross-cluster/lp-fee-cranker.ts";
+import { makeLpFeeJob } from "./cross-cluster/lp-fee-cranker.ts";
+import { makeStakeFeeJob, stakeFeeConfigFromEnv } from "./cross-cluster/stake-fee-pusher.ts";
+import { makeTerminalInsuranceJob, terminalInsuranceConfigFromEnv } from "./cross-cluster/terminal-insurance.ts";
+import type { TerminalInsuranceConfig } from "./cross-cluster/terminal-insurance.ts";
+import type { StakeFeeConfig } from "./cross-cluster/stake-fee-pusher.ts";
+import { startFeeJobLoop } from "./cross-cluster/fee-jobs.ts";
+import { juniorWatchConfigFromEnv, makeJuniorWatchJob } from "./cross-cluster/vault-lp-junior-watch.ts";
+import { bankruptCloseWatchConfigFromEnv, makeBankruptCloseWatchJob } from "./cross-cluster/bankrupt-close-watch.ts";
+import { VaultLpCranker } from "./cross-cluster/vault-lp-crank.ts";
+import { getExhaustedRegistry, makeExhaustedResolveJob } from "./cross-cluster/p3-exhausted-resolve.ts";
+import type { BankruptCloseWatchConfig } from "./cross-cluster/bankrupt-close-watch.ts";
+import type { JuniorWatchConfig } from "./cross-cluster/vault-lp-junior-watch.ts";
+import { WRAPPER_PROGRAM_ID as CFG_WRAPPER_PROGRAM_ID } from "./program-ids.ts";
+import type { FeeJob } from "./cross-cluster/fee-jobs.ts";
+import { getAlertSink } from "./cross-cluster/alerting.ts";
+import type { AlertSink } from "./cross-cluster/alerting.ts";
+import { describeProgramIds } from "./program-ids.ts";
+import { devnetConnectionConfig } from "./rpc-headers.ts";
+import type { ConnectionConfig } from "@solana/web3.js";
 import { startRegisterPollLoop, pollOnce } from "./cross-cluster/register-poll.ts";
 import { startRegistrationStream, type RegistrationStream } from "./cross-cluster/registration-stream.ts";
 import { startRegistryReloadLoop } from "./cross-cluster/registry-reload.ts";
@@ -129,7 +161,22 @@ if (!DEVNET_RPC) {
 // to its supervisor and simply never push. Config errors must exit 1.
 let MIN_KEEPER_BALANCE_LAMPORTS: number;
 let BALANCE_CHECK_INTERVAL_MS: number;
+let STAKE_FEE_CONFIG: StakeFeeConfig;
+let TERMINAL_CONFIG: TerminalInsuranceConfig;
+let JUNIOR_WATCH_CONFIG: JuniorWatchConfig;
+let BANKRUPT_CLOSE_CONFIG: BankruptCloseWatchConfig;
+let ALERT_SINK: AlertSink;
+let DEVNET_CONN_CONFIG: ConnectionConfig;
 try {
+  // Ops-track config fails fast with everything else: a malformed alert
+  // threshold, webhook URL or fee-job knob must stop boot, not surface as a
+  // throw inside a background loop hours later.
+  STAKE_FEE_CONFIG = stakeFeeConfigFromEnv(process.env);
+  TERMINAL_CONFIG = terminalInsuranceConfigFromEnv(process.env);
+  JUNIOR_WATCH_CONFIG = juniorWatchConfigFromEnv(process.env, CFG_WRAPPER_PROGRAM_ID);
+  BANKRUPT_CLOSE_CONFIG = bankruptCloseWatchConfigFromEnv(process.env, CFG_WRAPPER_PROGRAM_ID);
+  ALERT_SINK = getAlertSink();
+  DEVNET_CONN_CONFIG = devnetConnectionConfig(process.env);
   MIN_KEEPER_BALANCE_LAMPORTS = parsePositiveLamportsFromSolEnv(
     "MIN_KEEPER_BALANCE_SOL",
     0.05,
@@ -169,6 +216,23 @@ const DRY_RUN =
   process.env.DRY_RUN === "true" || process.argv.includes("--dry-run");
 
 const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "7000", 10);
+
+// Cadence footgun (runbook fresh-id-redeploy-plan §8): the mark smoother only
+// publishes once its window SPANS 5/6 of CC_MARK_WINDOW_MS, and samples older
+// than the window are evicted — so some interval/window pairs can never push
+// (default 15 s window with CC_INTERVAL_MS 4–6 s). Same default as keeper-loop.ts.
+// `never` refuses to boot (a keeper that never pushes looks alive and prices
+// nothing); `fragile` warns. Skipped in dry-run, which never pushes anyway.
+{
+  const windowMs = Number(process.env.CC_MARK_WINDOW_MS ?? 15_000);
+  const c = markCadenceCheck(CC_INTERVAL_MS, windowMs);
+  if (c.verdict === "never" && !(process.env.DRY_RUN === "true" || process.argv.includes("--dry-run"))) {
+    console.error(`[fatal] this cadence can never publish a mark — the keeper would never push. ${c.detail}. Use e.g. 1500 / 8000 (the live pair).`);
+    process.exit(1);
+  }
+  if (c.verdict === "never") console.warn(`[warn] cadence can never publish (dry-run, continuing): ${c.detail}`);
+  if (c.verdict === "fragile") console.warn(`[warn] cadence publishes only if every cycle is exactly on time: ${c.detail}`);
+}
 const CC_HEALTH_PORT = parseInt(process.env.CC_HEALTH_PORT ?? "3001", 10);
 const CC_HEALTH_BIND = process.env.CC_HEALTH_BIND ?? "0.0.0.0";
 // D2a — see cross-cluster/keeper-loop.ts's hang-detection doc comment.
@@ -186,6 +250,12 @@ const CRANK_INTERVAL_MS = parseInt(process.env.CRANK_INTERVAL_MS ?? "20000", 10)
 // market with no LP depositors costs no transaction at all.
 const LP_FEE_CRANK_ENABLED = process.env.LP_FEE_CRANK_ENABLED !== "false";
 const LP_FEE_CRANK_INTERVAL_MS = parseInt(process.env.LP_FEE_CRANK_INTERVAL_MS ?? "200000", 10);
+// Stake-fee push (tag 87 -> stake AccrueFees, fee-flow audit F2/F3). Shares the
+// fee-job loop and its interval with the LP-fee crank.
+const STAKE_FEE_PUSH_ENABLED = process.env.STAKE_FEE_PUSH_ENABLED !== "false";
+// Post-resolve wind-down for stake-bound markets (stake F-9 tag 29). A no-op
+// until the deployed stake program supports tag 29 (probed, cached 1 h).
+const TERMINAL_INSURANCE_ENABLED = process.env.TERMINAL_INSURANCE_ENABLED !== "false";
 
 // Registration-poll loop — outbound poll of the Vercel-hosted playground registered-
 // markets blob, so markets created through the create-market wizard after this keeper
@@ -251,16 +321,21 @@ if (registry.markets.length === 0) {
 }
 
 const mainnetConn = new Connection(MAINNET_RPC, "confirmed");
-const devnetConn = new Connection(DEVNET_RPC, "confirmed");
+// DEVNET_RPC_ORIGIN replaces the uncommitted `httpHeaders: { Origin }` edit the
+// live machine carried here (Origin-restricted Helius key; see rpc-headers.ts).
+const devnetConn = new Connection(DEVNET_RPC, DEVNET_CONN_CONFIG);
 
 console.log("[cross-cluster] Boot:");
 console.log(`  keeper:    ${keeper.publicKey.toBase58()}`);
 console.log(`  registry:  ${REGISTRY_PATH} (${registry.markets.length} markets)`);
 console.log(`  mode:      ${DRY_RUN ? "DRY-RUN (no on-chain writes)" : "LIVE"}`);
 console.log(`  interval:  ${CC_INTERVAL_MS}ms`);
+for (const line of describeProgramIds()) console.log(`  program:   ${line}`);
+console.log(`  alerts:    webhook ${process.env.KEEPER_ALERT_WEBHOOK_URL ? "ON" : "off"}; thresholds ${JSON.stringify(ALERT_SINK.thresholds)}`);
 console.log(
   `  cranker:   ${CRANK_ENABLED ? `every ${CRANK_INTERVAL_MS}ms` : "disabled (CRANK_ENABLED=false)"}`,
   `  lp-fee:    ${LP_FEE_CRANK_ENABLED ? `every ${LP_FEE_CRANK_INTERVAL_MS}ms` : "disabled (LP_FEE_CRANK_ENABLED=false)"}`,
+  `  stake-fee: ${STAKE_FEE_PUSH_ENABLED ? `every ${LP_FEE_CRANK_INTERVAL_MS}ms (real stakers only)` : "disabled (STAKE_FEE_PUSH_ENABLED=false)"}`,
 );
 for (const m of registry.markets) {
   console.log(
@@ -290,39 +365,96 @@ if (!REGISTER_SOURCE_URL && !DRY_RUN) {
 // this resolves in a small, bounded number of RPC calls regardless of registry
 // size. See cross-cluster/recovery-cranker.ts's crankAllOnce() doc comment for
 // exactly why this closes the SOL/JUP/TRUMP boot-gap.
-if (CRANK_ENABLED) {
-  await crankAllOnce(devnetConn, keeper, registry, DRY_RUN);
-}
+// B7: the boot states go to the loop, so its first cycle does not re-crank a
+// market in the slot the boot crank already covered (a benign Custom(22)).
+const bootCrankStates = CRANK_ENABLED ? await crankAllOnce(devnetConn, keeper, registry, DRY_RUN) : undefined;
 
 // Recovery crank loop runs concurrently on its own interval — deliberately
 // NOT awaited, and deliberately never allowed to throw out of this scope, so
 // it can never delay or take down the oracle push loop below.
 if (CRANK_ENABLED) {
-  void startRecoveryCrankLoop(devnetConn, keeper, registry, {
-    intervalMs: CRANK_INTERVAL_MS,
-    dryRun: DRY_RUN,
-  }).catch((err) => {
-    console.error(
-      `[cranker] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
-    );
-  });
+  // Supervised: a crash used to kill the cranker for the life of the process (2026-10-01:
+  // "Cannot read properties of undefined (reading 'consecutiveReverts')" after a run of
+  // cycle timeouts froze every market's engine clock for ~1h while /health said ok).
+  // Restart with backoff; boot states are only valid for the first run.
+  void (async () => {
+    let states = bootCrankStates;
+    let backoffMs = 5_000;
+    for (;;) {
+      try {
+        await startRecoveryCrankLoop(devnetConn, keeper, registry, {
+          intervalMs: CRANK_INTERVAL_MS,
+          dryRun: DRY_RUN,
+        }, ALERT_SINK, states);
+        console.error("[cranker] loop exited unexpectedly — restarting");
+      } catch (err: unknown) {
+        console.error(
+          `[cranker] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.stack ?? err.message : String(err)} — restarting in ${backoffMs}ms`,
+        );
+      }
+      states = undefined;
+      await new Promise((r) => setTimeout(r, backoffMs));
+      backoffMs = Math.min(backoffMs * 2, 60_000);
+    }
+  })();
 }
 
-// LP-fee distribution loop. Same "concurrent, never awaited, never throws out of
-// scope" pattern. Without this, `lp_fee_accrued_atoms` grows on the slab forever
-// and LP depositors see 0% APY no matter how much the market trades — the fee
-// split is correct, but nothing ever moves the LP's share into the vault.
-// Runs 10x slower than the recovery crank: distribution is not latency-sensitive,
-// and a market with no LP depositors is skipped locally without a transaction.
-if (LP_FEE_CRANK_ENABLED) {
-  void startLpFeeCrankLoop(devnetConn, keeper, registry, {
-    intervalMs: LP_FEE_CRANK_INTERVAL_MS,
-    dryRun: DRY_RUN,
-  }).catch((err) => {
-    console.error(
-      `[lp-fee] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
+// P3 senior draw (d119eebd): crank each bound market's vault LP after every landed mark
+// move, so its deficit is drawn from the vault's pots (junior, then Earn seniors) BEFORE
+// the engine can liquidate it. Markets without a vault-LP state are a cached no-op.
+const P3_EXHAUSTED_WITHHOLD_PUSHES = process.env.P3_EXHAUSTED_WITHHOLD_PUSHES !== "false";
+const vaultLpCranker =
+  process.env.VAULT_LP_MARK_CRANK_ENABLED === "false" || DRY_RUN
+    ? null
+    : new VaultLpCranker(devnetConn, keeper, ALERT_SINK, {
+        wrapperProgramId: CFG_WRAPPER_PROGRAM_ID,
+        lookupTtlMs: 10 * 60_000,
+        withholdPushes: P3_EXHAUSTED_WITHHOLD_PUSHES,
+        registry: getExhaustedRegistry(),
+      });
+
+// Fee-job loop: every "move accrued fee value to its owner" job, in order, per
+// market (fee-jobs.ts). Same "concurrent, never awaited, never throws out of
+// scope" pattern as the crank loop.
+//   lp-fee    tag 78 — the LP leg (48%) into the Earn vault. Without it
+//             `lp_fee_accrued_atoms` grows forever and LPs see 0% APY.
+//   stake-fee tag 87 + stake AccrueFees — the staker leg (16%), only for pools
+//             with real stakers above the 1,000 dead shares (F2/F3).
+// Later phases append jobs here (P3: vault NAV / fee sweeps).
+{
+  const feeJobs: FeeJob[] = [];
+  if (LP_FEE_CRANK_ENABLED) feeJobs.push(makeLpFeeJob());
+  if (STAKE_FEE_PUSH_ENABLED) feeJobs.push(makeStakeFeeJob(STAKE_FEE_CONFIG));
+  if (TERMINAL_INSURANCE_ENABLED) feeJobs.push(makeTerminalInsuranceJob(TERMINAL_CONFIG));
+  // Read-only: alerts when a bound vault's seniors are done but the junior's tag 102 has not run.
+  if (process.env.JUNIOR_WATCH_ENABLED !== "false") feeJobs.push(makeJuniorWatchJob(JUNIOR_WATCH_CONFIG));
+  // Read-only: warn / critical when a Live market's bankrupt close nears / passes max_close_slot with residual.
+  if (process.env.BANKRUPT_CLOSE_WATCH_ENABLED !== "false") feeJobs.push(makeBankruptCloseWatchJob(BANKRUPT_CLOSE_CONFIG));
+  // P3 senior backing exhausted: critical alert with the tag 39 window, push withholding,
+  // and tag 39 sent by the keeper once the stale window has matured.
+  if (process.env.P3_EXHAUSTED_RESOLVE_ENABLED !== "false") {
+    feeJobs.push(
+      makeExhaustedResolveJob({
+        wrapperProgramId: CFG_WRAPPER_PROGRAM_ID,
+        registry: getExhaustedRegistry(),
+        vaultLpFor: vaultLpCranker ? (m) => vaultLpCranker.vaultLpFor(m) : undefined,
+        withholdPushes: P3_EXHAUSTED_WITHHOLD_PUSHES,
+      }),
     );
-  });
+  }
+  if (feeJobs.length > 0) {
+    void startFeeJobLoop(
+      feeJobs,
+      { conn: devnetConn, keeper, dryRun: DRY_RUN },
+      registry,
+      { intervalMs: LP_FEE_CRANK_INTERVAL_MS },
+      ALERT_SINK,
+    ).catch((err: unknown) => {
+      console.error(
+        `[fee-jobs] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
 }
 
 // Registration-poll loop — same "runs concurrently, never awaited, never allowed to
@@ -415,6 +547,12 @@ if (MIN_POOL_LIQUIDITY_USD_E6 === 0n) {
 }
 
 await startKeeperLoop(mainnetConn, devnetConn, keeper, registry, {
+  withholdPush: (m) => getExhaustedRegistry().shouldWithholdPush(m, P3_EXHAUSTED_WITHHOLD_PUSHES),
+  onPushLanded: vaultLpCranker
+    ? (m, px, label) => {
+        void vaultLpCranker.onPushLanded(m, px, label);
+      }
+    : undefined,
   intervalMs: CC_INTERVAL_MS,
   healthPort: CC_HEALTH_PORT,
   healthBind: CC_HEALTH_BIND,

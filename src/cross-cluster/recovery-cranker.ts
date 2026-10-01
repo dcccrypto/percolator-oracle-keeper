@@ -108,7 +108,6 @@ import {
   encodePermissionlessCrank,
   ACCOUNTS_PERMISSIONLESS_CRANK_BASE,
   buildAccountMetas,
-  PROGRAM_IDS_V17,
   V17_PORTFOLIO_ACCOUNT_LEN,
   parsePortfolioV17,
 } from "@percolatorct/sdk";
@@ -117,6 +116,7 @@ import type { MarketEntry, Registry } from "./registry.ts";
 import {
   catchupAllowsRefresh,
   catchupCrankCount,
+  isBankruptPortfolio,
   decodeMarketRefreshState,
   isAssetLossStale,
   marketHasPositions,
@@ -125,9 +125,17 @@ import {
   positionedSetMatchesMarket,
   selectPositionedPortfolios,
 } from "./positioned-refresh.ts";
-import type { CrankPlan, MarketRefreshState, PositionedPortfolio } from "./positioned-refresh.ts";
+import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
+import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
+import { decodeAdlState } from "./adl-state.ts";
+import { isTerminalMarket } from "./market-state.ts";
+import { reportSeniorDraw } from "./vault-lp-crank.ts";
+import type { AdlState } from "./adl-state.ts";
+import type { LivenessRepair } from "./liveness-repair.ts";
+import { crankHealthRecord, evaluateCrankHealth, freshStreaks, getAlertSink } from "./alerting.ts";
+import type { Alert, AlertSink, CrankHealthSample, CrankHealthStreaks } from "./alerting.ts";
 
-const WRAPPER_PROGRAM_ID = new PublicKey(PROGRAM_IDS_V17.percolator);
+import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 const COMPUTE_UNIT_LIMIT = 250_000;
 
 // ── v17 portfolio account discriminator (verified against live devnet data) ──
@@ -177,9 +185,31 @@ interface CrankMarketState {
   /** Last refresh summary logged, so steady-state cycles stay quiet. */
   lastRefreshSummary: string | null;
   decodeWarned: boolean;
+  /** Ops-track health observation from the latest attempt (null until one read the market). */
+  obs: CrankObservation | null;
+  streaks: CrankHealthStreaks;
+  /** B13: last read showed a Resolved market or tombstone — not cranked, no alerts. */
+  terminal: boolean;
+  /** B7: chain slot of the read behind this market's last landed crank (dedupe within a slot). */
+  lastCrankSlot: bigint | null;
+  /** B7: benign "no progress this slot" Custom(22) results (not reverts). */
+  benignNoProgress: number;
 }
 
-function freshCrankMarketState(): CrankMarketState {
+/** What one crank attempt saw — feeds alerting.ts. */
+export interface CrankObservation {
+  chainSlot: bigint;
+  engineSlot: bigint | null;
+  crankOk: boolean;
+  crankReverted: boolean;
+  lapsedBuckets: number;
+  bankruptFound: number;
+  bankruptLiquidated: number;
+  /** ADL reduce-only inputs from the pre-crank read (null: not a v18 market header). */
+  adl: AdlState | null;
+}
+
+export function freshCrankMarketState(): CrankMarketState {
   return {
     lpPortfolio: null,
     seedRejected: false,
@@ -197,6 +227,11 @@ function freshCrankMarketState(): CrankMarketState {
     positionedDirty: false,
     lastRefreshSummary: null,
     decodeWarned: false,
+    obs: null,
+    streaks: freshStreaks(),
+    terminal: false,
+    lastCrankSlot: null,
+    benignNoProgress: 0,
   };
 }
 
@@ -345,13 +380,16 @@ export function buildCrankIx(owner: PublicKey, market: PublicKey, portfolio: Pub
   });
 }
 
-async function crankOneMarket(
+export async function crankOneMarket(
   devnetConn: Connection,
   keeper: Keypair,
   entry: Pick<MarketEntry, "marketAddress" | "label" | "lpPortfolio">,
   state: CrankMarketState,
   dryRun: boolean,
 ): Promise<void> {
+  // B13: a market seen Resolved/closed stays that way (resolution is one-way,
+  // a tombstone is final), so it costs no RPC and no alert from here on.
+  if (state.terminal) return;
   const marketAddress = entry.marketAddress;
   const label = entry.label;
   const market = new PublicKey(marketAddress);
@@ -395,6 +433,23 @@ async function crankOneMarket(
     // One read gives both the market state and the slot it was read at.
     const acct = await withRpcRetry(label, () => devnetConn.getAccountInfoAndContext(market, "processed"));
     if (!acct.value) throw new Error(`market ${marketAddress} could not find account`);
+    // B13 (E2E 2026-09-30): a Resolved market / CloseSlab tombstone is never
+    // cranked again. The engine refuses it, and cranking only produced critical
+    // crank-reverts + slot-lag alert noise. No observation is recorded, so any
+    // open crank alert for it resolves on the next health report.
+    if (isTerminalMarket(acct.value.data)) {
+      if (!state.terminal) console.log(`[cranker] ${label}: market is Resolved/closed — no longer cranked (wind-down is the terminal-insurance job's)`);
+      state.terminal = true;
+      state.obs = null;
+      state.consecutiveReverts = 0;
+      state.lastRevertCode = null;
+      return;
+    }
+    state.terminal = false;
+    // B7: this market was already cranked (by us) at this slot or later — e.g. the
+    // boot crank, then the loop's first cycle in the same slot. A second crank can
+    // only return Custom(22) EngineNonProgress; skip it instead of counting a revert.
+    if (state.lastCrankSlot !== null && BigInt(acct.context.slot) <= state.lastCrankSlot) return;
     let pre: MarketRefreshState | null = null;
     try {
       pre = decodeMarketRefreshState(acct.value.data);
@@ -410,8 +465,24 @@ async function crankOneMarket(
       ? await positionedPortfoliosFor(devnetConn, market, label, pre, state)
       : [];
 
+    // Liveness repairs (lapsed Fresh backing bucket, side stuck in ResetPending):
+    // states no crank can leave, which revert every crank Custom(19) or every
+    // open Custom(21). Prepended to this cycle's transaction; see liveness-repair.ts.
+    let repairs: LivenessRepair[] = [];
+    try {
+      repairs = planLivenessRepairs(decodeLivenessState(acct.value.data), BigInt(acct.context.slot));
+    } catch {
+      repairs = [];
+    }
+    const obs = observeMarket(acct.value.data, BigInt(acct.context.slot), pre, repairs);
+    state.obs = obs;
+
+    // Bankrupt positioned portfolios found in a clean simulation's post-state;
+    // they get a second crank (the engine's Liquidate step) in the same tx.
+    let liquidateTargets: PublicKey[] = [];
+
     const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan =>
-      planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t });
+      planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs, liquidateTargets });
 
     if (dryRun) {
       const plan = build(targets);
@@ -439,24 +510,66 @@ async function crankOneMarket(
     // The simulation also prunes refreshes the engine would reject (Custom(22)
     // for a portfolio this accrual did not re-stale), and returns the market's
     // post-state so the loop can confirm the market ends not loss-stale.
-    const resolved = await resolveCrankPlan(build, targets, async (plan) => {
+    const simulate = async (plan: CrankPlan): Promise<SimOutcome> => {
       const tx = toTx(plan);
+      const refreshed = plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio.toBase58());
       const sim = await withRpcRetry(label, () =>
         devnetConn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), {
           sigVerify: false,
           commitment: "processed",
-          accounts: { encoding: "base64", addresses: [marketAddress] },
+          accounts: { encoding: "base64", addresses: [marketAddress, ...refreshed] },
         }),
       );
-      const acc = sim.value.accounts?.[0];
+      const accs = sim.value.accounts ?? [];
+      const acc = accs[0];
+      const portfolioData = new Map<string, Uint8Array>();
+      refreshed.forEach((pk, i) => {
+        const a = accs[i + 1];
+        if (a) portfolioData.set(pk, Buffer.from(a.data[0], "base64"));
+      });
       return {
         err: sim.value.err,
         logs: sim.value.logs ?? null,
         marketData: acc ? Buffer.from(acc.data[0], "base64") : null,
+        portfolioData,
       };
-    });
+    };
+    const onOptionalRejected = (c: PlannedCrank) => {
+      if (c.kind === "repair") repairs = repairs.filter((x) => x !== c.repair);
+      if (c.kind === "liquidate") liquidateTargets = liquidateTargets.filter((x) => !x.equals(c.portfolio));
+    };
+    let resolved = await resolveCrankPlan(build, targets, simulate, onOptionalRejected);
+    // Bankruptcy pass: a positioned account whose post-refresh equity is <= 0 is
+    // re-planned with a second crank so the engine liquidates it this cycle.
+    if (!resolved.sim.err && resolved.sim.portfolioData) {
+      const bankrupt = [...resolved.sim.portfolioData.entries()]
+        .filter(([, data]) => isBankruptPortfolio(data))
+        .map(([pk]) => new PublicKey(pk));
+      if (bankrupt.length > 0) {
+        obs.bankruptFound = bankrupt.length;
+        liquidateTargets = bankrupt;
+        const remaining = targets.filter((t) => !resolved.pruned.some((p) => p.pubkey.equals(t.pubkey)));
+        const withLiq = await resolveCrankPlan(build, remaining, simulate, onOptionalRejected);
+        if (!withLiq.sim.err) {
+          resolved = { ...withLiq, pruned: [...resolved.pruned, ...withLiq.pruned] };
+        } else {
+          liquidateTargets = [];
+        }
+      }
+    }
 
+    if (resolved.sim.err && isBenignNoProgress(resolved.sim.err, resolved.plan, pre, BigInt(acct.context.slot))) {
+      // B7: EngineNonProgress on the accrual crank while the engine clock is already
+      // current = nothing to accrue this slot (a duplicate crank). Not a revert, not
+      // progress: counters untouched. A stuck clock is caught by the slot-lag alert.
+      state.benignNoProgress++;
+      if (state.benignNoProgress === 1) {
+        console.log(`[cranker] ${label}: no progress this slot (Custom(22), engine clock current) — expected after a same-slot crank, not counted as a revert`);
+      }
+      return;
+    }
     if (resolved.sim.err) {
+      obs.crankReverted = true;
       const code =
         parseCustomErrorCode(resolved.sim.err) ?? parseCustomErrorCode(resolved.sim.logs?.join("\n"));
       state.totalReverts++;
@@ -485,6 +598,11 @@ async function crankOneMarket(
       devnetConn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 }),
     );
     state.totalCranks++;
+    state.lastCrankSlot = BigInt(acct.context.slot);
+    // P3 senior draw: the accrual crank on a vault-LP market can draw its deficit too.
+    void reportSeniorDraw(getAlertSink(), marketAddress, label, resolved.sim.logs);
+    obs.crankOk = true;
+    obs.bankruptLiquidated = plan.cranks.filter((c) => c.kind === "liquidate").length;
     state.lastCrankAt = Date.now();
     state.lastSig = signature;
     state.lastErrorMsg = null;
@@ -495,6 +613,22 @@ async function crankOneMarket(
     }
     state.consecutiveReverts = 0;
     state.lastRevertCode = null;
+
+    const liquidated = plan.cranks.filter((c) => c.kind === "liquidate").map((c) => c.portfolio.toBase58().slice(0, 8));
+    if (liquidated.length > 0) {
+      console.log(`[cranker] ${label}: bankrupt portfolio(s) liquidated: [${liquidated.join(", ")}] sig=${signature.slice(0, 12)}…`);
+    }
+    const landedRepairs = plan.cranks.filter((c) => c.kind === "repair" && c.repair).map((c) => describeRepair(c.repair!));
+    if (landedRepairs.length > 0) {
+      console.log(`[cranker] ${label}: liveness repair sent: ${landedRepairs.join(", ")} sig=${signature.slice(0, 12)}…`);
+    }
+    const rejectedRepairs = resolved.pruned.filter((p) => p.repair);
+    if (rejectedRepairs.length > 0) {
+      console.warn(
+        `[cranker] ${label}: liveness repair rejected in simulation: ` +
+          rejectedRepairs.map((p) => `${describeRepair(p.repair!)}:${p.code ?? "?"}`).join(", "),
+      );
+    }
 
     reportRefreshOutcome(label, pre, resolved, state);
     if (plan.overflow.length > 0) {
@@ -612,16 +746,21 @@ export interface SimOutcome {
   err: unknown;
   logs: string[] | null;
   marketData: Uint8Array | null;
+  /** Post-simulation data of each refreshed portfolio, keyed by base58. */
+  portfolioData?: Map<string, Uint8Array>;
 }
 
 export interface ResolvedCrankPlan {
   plan: CrankPlan;
   sim: SimOutcome;
-  pruned: { pubkey: PublicKey; code: number | null }[];
+  /** Refreshes (and, with `repair` set, liveness repairs) dropped after a simulated rejection. */
+  pruned: { pubkey: PublicKey; code: number | null; repair?: LivenessRepair }[];
 }
 
 /** Refreshes pruned one at a time before giving up on refreshing this cycle. */
 export const MAX_REFRESH_PRUNES = 3;
+/** Optional instructions (<= 2 expiries + 2 finalizes, plus liquidations) dropped before giving up. */
+export const MAX_REPAIR_DROPS = 8;
 
 /**
  * Simulate the plan and drop refreshes the engine rejects, one per
@@ -638,15 +777,33 @@ export async function resolveCrankPlan(
   build: (targets: ReadonlyArray<PositionedPortfolio>) => CrankPlan,
   targets: ReadonlyArray<PositionedPortfolio>,
   simulate: (plan: CrankPlan) => Promise<SimOutcome>,
+  /**
+   * Called when a liveness repair or a bankruptcy liquidate crank is the
+   * rejected instruction. The caller must drop it from what `build` emits; the plan is then re-simulated without it,
+   * so a repair the engine refuses can never block the ordinary crank.
+   */
+  onOptionalRejected?: (crank: PlannedCrank) => void,
 ): Promise<ResolvedCrankPlan> {
   let remaining = [...targets];
-  const pruned: { pubkey: PublicKey; code: number | null }[] = [];
+  const pruned: { pubkey: PublicKey; code: number | null; repair?: LivenessRepair }[] = [];
+  let repairDrops = 0;
   for (;;) {
     const plan = build(remaining);
     const sim = await simulate(plan);
     if (!sim.err) return { plan, sim, pruned };
     const ie = parseInstructionError(sim.err);
     const crank = ie && ie.index >= 1 ? plan.cranks[ie.index - 1] : undefined;
+    if (
+      crank &&
+      (crank.kind === "repair" || crank.kind === "liquidate") &&
+      onOptionalRejected &&
+      repairDrops < MAX_REPAIR_DROPS
+    ) {
+      repairDrops++;
+      if (crank.kind === "repair") pruned.push({ pubkey: crank.portfolio, code: ie?.custom ?? null, repair: crank.repair });
+      onOptionalRejected(crank);
+      continue;
+    }
     if (!crank || crank.kind !== "refresh") return { plan, sim, pruned };
     pruned.push({ pubkey: crank.portfolio, code: ie?.custom ?? null });
     remaining = remaining.filter((p) => !p.pubkey.equals(crank.portfolio));
@@ -681,17 +838,19 @@ export async function crankAllOnce(
   keeper: Keypair,
   registry: Registry,
   dryRun: boolean,
-): Promise<void> {
+): Promise<Map<string, CrankMarketState>> {
+  const bootStates = new Map<string, CrankMarketState>();
   const seeded = registry.markets.filter((m) => !!m.lpPortfolio);
   if (seeded.length === 0) {
     console.log("[cranker][boot] no seeded (lpPortfolio-known) markets in registry.json — skipping crank-on-boot");
-    return;
+    return bootStates;
   }
   console.log(`[cranker][boot] cranking ${seeded.length} seeded market(s) once before starting the recurring loops…`);
 
   const results = await Promise.allSettled(
     seeded.map(async (m) => {
       const state = freshCrankMarketState();
+      bootStates.set(m.marketAddress, state);
       await crankOneMarket(devnetConn, keeper, m, state, dryRun);
       return { market: m, state };
     }),
@@ -719,6 +878,110 @@ export async function crankAllOnce(
     `[cranker][boot] crank-on-boot complete: ${ok} clean, ${notClean} not-clean` +
       `${notClean > 0 ? " (will keep retrying on the recurring crank loop)" : ""}.`,
   );
+  // B7: handed to startRecoveryCrankLoop so its first cycle knows what boot cranked.
+  return bootStates;
+}
+
+/**
+ * The ops-track observation for one pre-crank market read. Exported (pure) so
+ * the exact decode the cranker performs is under test, not a hand-built copy.
+ */
+export function observeMarket(
+  data: Uint8Array,
+  chainSlot: bigint,
+  pre: Pick<MarketRefreshState, "currentSlot"> | null,
+  repairs: ReadonlyArray<LivenessRepair>,
+): CrankObservation {
+  let adl: AdlState | null = null;
+  try {
+    adl = decodeAdlState(data);
+  } catch {
+    adl = null;
+  }
+  return {
+    chainSlot,
+    engineSlot: pre ? pre.currentSlot : null,
+    crankOk: false,
+    crankReverted: false,
+    lapsedBuckets: repairs.filter((r) => r.kind === "expire").length,
+    bankruptFound: 0,
+    bankruptLiquidated: 0,
+    adl,
+  };
+}
+
+/** Engine EngineNonProgress (enum position 22, 6377376a / b2b2559e). */
+export const ENGINE_NON_PROGRESS = 22;
+/** Slots the engine clock may trail the read slot and still count as "current". */
+export const NO_PROGRESS_CURRENT_SLOTS = 2n;
+
+/**
+ * B7 (E2E 2026-09-30): Custom(22) on the ACCRUAL (or catch-up) crank while the
+ * engine clock is already current (read slot − current_slot ≤ 2) means there is
+ * nothing to accrue in this slot — a duplicate crank, e.g. the boot crank then
+ * the loop's first cycle. Anything else (another code, a repair/liquidate/refresh
+ * instruction, a clock that is behind) stays a real revert.
+ */
+export function isBenignNoProgress(
+  err: unknown,
+  plan: Pick<CrankPlan, "cranks">,
+  pre: Pick<MarketRefreshState, "currentSlot"> | null,
+  readSlot: bigint,
+): boolean {
+  const ie = parseInstructionError(err);
+  if (!ie || ie.custom !== ENGINE_NON_PROGRESS || ie.index < 1) return false;
+  const crank = plan.cranks[ie.index - 1];
+  if (!crank || (crank.kind !== "accrue" && crank.kind !== "catchup")) return false;
+  if (!pre) return false;
+  return readSlot <= pre.currentSlot + NO_PROGRESS_CURRENT_SLOTS;
+}
+
+/** Emit the structured `[health]` line every N crank cycles (ops track). */
+export const HEALTH_LINE_EVERY_CYCLES = 3;
+
+export function crankSample(label: string, market: string, st: Pick<CrankMarketState, "obs" | "totalCranks" | "totalReverts" | "consecutiveReverts" | "lastRevertCode">): CrankHealthSample | null {
+  if (!st.obs) return null;
+  return {
+    label,
+    market,
+    ...st.obs,
+    totalOk: st.totalCranks,
+    totalReverts: st.totalReverts,
+    consecutiveReverts: st.consecutiveReverts,
+    lastRevertCode: st.lastRevertCode,
+  };
+}
+
+/**
+ * Evaluate every market's latest observation, reconcile alerts, and every
+ * HEALTH_LINE_EVERY_CYCLES cycles print one `[health]` line. Observations are
+ * consumed (set to null) so a market that did not read its account this
+ * cycle (e.g. discovery pending) is not re-evaluated on stale data.
+ */
+export async function reportCrankHealth(
+  registry: Registry,
+  states: Map<string, CrankMarketState>,
+  cycle: number,
+  sink: AlertSink,
+): Promise<Alert[]> {
+  const active: Alert[] = [];
+  const records: Array<Record<string, string | number | null>> = [];
+  for (const m of registry.markets) {
+    const st = states.get(m.marketAddress);
+    if (!st) continue;
+    const sample = crankSample(m.label, m.marketAddress, st);
+    if (!sample) continue;
+    const ev = evaluateCrankHealth(sample, st.streaks, sink.thresholds);
+    st.streaks = ev.streaks;
+    active.push(...ev.active);
+    records.push(crankHealthRecord(sample));
+    st.obs = null;
+  }
+  if (cycle % HEALTH_LINE_EVERY_CYCLES === 0 && records.length > 0) {
+    sink.health("crank", { cycle, markets: records });
+  }
+  await sink.reconcile("crank", active);
+  return active;
 }
 
 /**
@@ -732,9 +995,11 @@ export async function startRecoveryCrankLoop(
   keeper: Keypair,
   registry: Registry,
   config: CrankLoopConfig,
+  sink: AlertSink = getAlertSink(),
+  bootStates?: Map<string, CrankMarketState>,
 ): Promise<void> {
   const states = new Map<string, CrankMarketState>(
-    registry.markets.map((m) => [m.marketAddress, freshCrankMarketState()]),
+    registry.markets.map((m) => [m.marketAddress, bootStates?.get(m.marketAddress) ?? freshCrankMarketState()]),
   );
 
   console.log(
@@ -778,10 +1043,14 @@ export async function startRecoveryCrankLoop(
       }),
     );
     cycleCount++;
+    await reportCrankHealth(registry, states, cycleCount, sink);
     if (cycleCount % HEALTH_SUMMARY_EVERY_CYCLES === 0) {
       const summary = registry.markets
         .map((m) => {
-          const st = states.get(m.marketAddress)!;
+          // A market admitted by register-poll mid-run has no state until its first crank:
+          // the old non-null assertion crashed the whole cranker loop (2026-10-01).
+          const st = states.get(m.marketAddress);
+          if (!st) return `${m.label}=pending`;
           const flag = st.consecutiveReverts >= REVERT_ALERT_THRESHOLD ? "⚠STUCK" : st.consecutiveReverts > 0 ? "~drift" : "ok";
           return `${m.label}=${flag}(ok:${st.totalCranks} rev:${st.totalReverts}${st.consecutiveReverts ? ` cons:${st.consecutiveReverts}` : ""}${st.lastRevertCode != null ? ` last:${st.lastRevertCode}` : ""})`;
         })

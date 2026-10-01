@@ -16,6 +16,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair, PublicKey } from "@solana/web3.js";
+import { V17_EXPECTED_VERSION } from "@percolatorct/sdk";
 import { crankLpFeesOnce, crankAllLpFeesOnce } from "./lp-fee-cranker.ts";
 
 const KEEPER = Keypair.generate();
@@ -29,7 +30,11 @@ const KEEPER = Keypair.generate();
 function registryBuf(opts: { shares?: bigint; domain?: number } = {}): Buffer {
   const b = Buffer.alloc(176);
   b.writeBigUInt64LE(0x5045_5243_5631_3600n, 0); // V17_MAGIC
-  b.writeUInt16LE(17, 8);                        // V17_EXPECTED_VERSION
+  // The SDK's CURRENT header version (18 on v18 slabs). This fixture used to
+  // hardcode 17, which parseLpVaultRegistry rejects since the v18 cutover, so
+  // every test here silently ran the parse-failure fallback instead (and the
+  // "no depositor" test failed outright).
+  b.writeUInt16LE(V17_EXPECTED_VERSION, 8);
   b.writeUInt8(5, 10);                           // kind = LpVaultRegistry
   const H = 16;                                  // V17_ACCOUNT_HEADER_LEN
   const shares = opts.shares ?? 1_000_000n;
@@ -44,6 +49,12 @@ function fakeConn(opts: {
   shares?: bigint;
   domain?: number;
   sendError?: unknown;
+  /** confirmTransaction throws (e.g. block height exceeded) instead of resolving. */
+  confirmThrows?: boolean;
+  /** confirmTransaction resolves with this value.err (landed but failed on chain). */
+  confirmErr?: unknown;
+  /** What getSignatureStatuses reports for the sent signature (undefined = null). */
+  status?: { err: unknown; confirmationStatus: "processed" | "confirmed" | "finalized" };
 }) {
   let sends = 0;
   return {
@@ -64,10 +75,21 @@ function fakeConn(opts: {
         if (opts.sendError) throw opts.sendError;
         return "sig";
       },
-      async confirmTransaction() { return { value: { err: null } }; },
+      async confirmTransaction() {
+        if (opts.confirmThrows) {
+          throw new Error("TransactionExpiredBlockheightExceededError: Signature sig has expired: block height exceeded.");
+        }
+        return { value: { err: opts.confirmErr ?? null } };
+      },
+      async getSignatureStatuses() {
+        return { value: [opts.status ? { slot: 1, confirmations: 1, ...opts.status } : null] };
+      },
     },
   };
 }
+
+/** Fast status re-checks for tests. */
+const FAST = { statusRetries: 1, statusRetryDelayMs: 0 };
 
 const MARKET = () => Keypair.generate().publicKey.toBase58();
 
@@ -126,6 +148,30 @@ describe("crankLpFeesOnce — only spend a transaction when there is something t
     const f = fakeConn({});
     assert.equal(await crankLpFeesOnce(f.conn as never, KEEPER, MARKET(), true), "skipped");
     assert.equal(f.sends, 0);
+  });
+
+  it("F6: a timed-out confirmation of a tx that LANDED is 'cranked', not a failure", async () => {
+    // SOLCAT 5xq4yAXH… / ANSEM 4RJv6kJt… (2026-09-29): logged as "block height
+    // exceeded" failures, but lp_fee_withdrawn == accrued on chain.
+    const f = fakeConn({ confirmThrows: true, status: { err: null, confirmationStatus: "confirmed" } });
+    assert.equal(await crankLpFeesOnce(f.conn as never, KEEPER, MARKET(), false, FAST), "cranked");
+  });
+
+  it("F6: a timed-out confirmation with NO signature status is 'not landed', reported for retry", async () => {
+    const f = fakeConn({ confirmThrows: true });
+    const r = await crankLpFeesOnce(f.conn as never, KEEPER, MARKET(), false, FAST);
+    assert.ok(typeof r === "object" && /not landed/.test(r.error), JSON.stringify(r));
+  });
+
+  it("F6: a confirmation carrying value.err is a failure, never 'cranked'", async () => {
+    const f = fakeConn({ confirmErr: { InstructionError: [1, { Custom: 41 }] } });
+    const r = await crankLpFeesOnce(f.conn as never, KEEPER, MARKET(), false, FAST);
+    assert.ok(typeof r === "object" && /landed but failed/.test(r.error), JSON.stringify(r));
+  });
+
+  it("F6: a landed-but-failed Custom(38) found via signature status is still 'no-fees'", async () => {
+    const f = fakeConn({ confirmThrows: true, status: { err: { InstructionError: [1, { Custom: 38 }] }, confirmationStatus: "confirmed" } });
+    assert.equal(await crankLpFeesOnce(f.conn as never, KEEPER, MARKET(), false, FAST), "no-fees");
   });
 
   it("returns an error for an unparseable market instead of throwing", async () => {

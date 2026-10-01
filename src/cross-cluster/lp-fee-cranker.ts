@@ -40,6 +40,7 @@
  * recovery-cranker.ts is: independent interval, isolated errors, and one
  * instruction per transaction.
  */
+import { parseSeniorDrawLogs, seniorDrawAlerts } from "./vault-lp-crank.ts";
 import {
   Connection,
   Keypair,
@@ -47,6 +48,7 @@ import {
   Transaction,
   TransactionInstruction,
   ComputeBudgetProgram,
+  VersionedTransaction,
 } from "@solana/web3.js";
 import {
   encodeLpVaultCrankFees,
@@ -58,7 +60,27 @@ import {
 } from "@percolatorct/sdk";
 import { SystemProgram } from "@solana/web3.js";
 import type { Registry } from "./registry.ts";
-import { WRAPPER_PROGRAM_ID } from "./auth-mark-pusher.ts";
+import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
+import { confirmBySignature, customCodeOf } from "./tx-confirm.ts";
+import type { ConfirmOptions } from "./tx-confirm.ts";
+import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
+import { decodeTerminalState, isTerminalFlat, marketMode } from "./market-state.ts";
+import { deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
+
+/**
+ * P3 bound-vault flag: `LpVaultRegistryV16._reserved[VAULT_LP_REGISTRY_BOUND_FLAG_IDX = 0]`
+ * (struct offset 144 => absolute 160; layout identical on v18.2 6377376a and P3 b2b2559e).
+ * 0 = unbound, 1 = bound; any other byte is InvalidAccountData on-chain
+ * (`registry_vault_lp_bound`, b2b2559e v16_program.rs:5733), so it is reported, not guessed.
+ */
+export const LP_VAULT_REGISTRY_BOUND_FLAG_OFF = 16 + 144;
+export function lpVaultRegistryBound(data: Uint8Array): boolean {
+  if (data.length <= LP_VAULT_REGISTRY_BOUND_FLAG_OFF) return false;
+  const b = data[LP_VAULT_REGISTRY_BOUND_FLAG_OFF];
+  if (b === 0) return false;
+  if (b === 1) return true;
+  throw new Error(`LP-vault registry bound flag is ${b} (only 0/1 are valid)`);
+}
 
 /**
  * Fallback only. v17 vaults are DUAL-DOMAIN: the vault serves both pots of its
@@ -69,17 +91,14 @@ import { WRAPPER_PROGRAM_ID } from "./auth-mark-pusher.ts";
  */
 const LP_VAULT_DOMAIN_FALLBACK = 0;
 
-const COMPUTE_UNIT_LIMIT = 120_000;
+// P3: tag 78 also books any pending senior draw into both pot ledgers; 120k is not enough
+// headroom once a draw is pending (security review of dfa4559b measured +1.3k..20k CU per ix).
+const COMPUTE_UNIT_LIMIT = 400_000;
 
 /** Engine code for "no new fees to distribute" — expected, not a failure. */
 const NO_FEES_TO_CRANK = 38;
-
-export interface LpFeeCrankConfig {
-  /** Milliseconds between sweeps. */
-  intervalMs: number;
-  /** Build and log, but never send. */
-  dryRun: boolean;
-}
+/** EngineLockActive: what a pre-07a1d0eb wrapper answers to tag 78 on a Resolved market. */
+const RESOLVED_HARVEST_UNSUPPORTED = 21;
 
 export interface LpFeeCrankResult {
   /** Markets whose fees were actually distributed. */
@@ -93,22 +112,26 @@ export interface LpFeeCrankResult {
 }
 
 function extractErrorCode(err: unknown): number | null {
-  const msg = err instanceof Error ? err.message : String(err);
-  const json = msg.match(/"Custom"\s*:\s*(\d+)/);
-  if (json) return Number(json[1]);
-  const hex = msg.match(/custom program error:\s*0x([0-9a-fA-F]+)/);
-  if (hex) return parseInt(hex[1], 16);
-  return null;
+  return customCodeOf(err instanceof Error ? err.message : err);
 }
+
+/** The Connection surface the LP-fee crank uses (stubbable in tests). */
+export type LpFeeConnection = Pick<
+  Connection,
+  "getMultipleAccountsInfo" | "getLatestBlockhash" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses" | "simulateTransaction"
+>;
 
 /**
  * Crank one market's LP fees. Never throws — every outcome is reported.
  */
 export async function crankLpFeesOnce(
-  devnetConn: Connection,
+  devnetConn: LpFeeConnection,
   keeper: Keypair,
   marketAddress: string,
   dryRun: boolean,
+  confirmOpts?: ConfirmOptions,
+  /** Receives the `p3_senior_draw*` log lines of the simulated send (bound vaults only). */
+  observe?: { seniorDrawLogs: string[] },
 ): Promise<"cranked" | "no-fees" | "skipped" | { error: string }> {
   let market: PublicKey;
   try {
@@ -127,23 +150,50 @@ export async function crankLpFeesOnce(
   // checks (it rejects LpVaultZeroSharesMinted when no share can claim the atoms).
   let infos: Array<{ data: Buffer } | null>;
   try {
-    infos = (await devnetConn.getMultipleAccountsInfo([registry], "confirmed")) as Array<
+    infos = (await devnetConn.getMultipleAccountsInfo([registry, market], "confirmed")) as Array<
       { data: Buffer } | null
     >;
   } catch (err) {
     return { error: `account read failed: ${(err as Error).message.slice(0, 100)}` };
   }
-  const [registryInfo] = infos;
+  const [registryInfo, marketInfo] = infos;
+  // B13: a tombstone is never cranked, and a Resolved market only in the one case
+  // P3 07a1d0eb allows: a BOUND vault on a TERMINAL-FLAT market (checked below).
+  const terminal = marketInfo ? decodeTerminalState(new Uint8Array(marketInfo.data)) : null;
+  if (terminal && terminal.kind === "closed") return "skipped";
+  // Recovery (mode 2; e.g. after the expired-bankrupt-close valve): tag 78 is refused there.
+  if (marketInfo && marketMode(new Uint8Array(marketInfo.data)) === 2) return "skipped";
+  const resolvedHarvest = terminal !== null && terminal.kind === "resolved";
+  if (resolvedHarvest && !isTerminalFlat(terminal)) return "skipped";
 
   // No vault -> nothing to distribute. Skipping locally keeps a market with no
   // LP vault from costing a transaction every single cycle.
   if (!registryInfo) return "skipped";
 
+  // P3 (ported from rehearsal/p0a-feeloop-sdk8@5b5d14a, re-implemented without SDK 8):
+  // on a vault-owned-LP market tag 78 REQUIRES the bound-vault tail [6] vault_lp_state
+  // (writable) — handle_lp_vault_crank_fees -> load_bound_vault_lp_tail(idx 6, need_lp =
+  // false), b2b2559e. Without it every cycle fails NotEnoughAccountKeys and the LP fee leg
+  // never reaches senior NAV. Unbound vaults (all v18.2 markets) are unchanged.
+  let bound: boolean;
+  try {
+    bound = lpVaultRegistryBound(new Uint8Array(registryInfo.data));
+  } catch (err) {
+    return { error: (err as Error).message };
+  }
+  // Resolved + terminal-flat is harvestable only through the bound-vault path.
+  if (resolvedHarvest && !bound) return "skipped";
   let domainIdx = LP_VAULT_DOMAIN_FALLBACK;
   try {
     const parsed = parseLpVaultRegistry(new Uint8Array(registryInfo.data));
     domainIdx = Number(parsed.domain);
-    if (parsed.totalLpSharesOutstanding === 0n) return "skipped";
+    // Live: no share can claim the atoms (the program refuses LpVaultZeroSharesMinted). On a
+    // terminal Resolved harvest 78 can still absorb the claim-free residual for the junior (102),
+    // so it is not skipped there — the simulation gate below decides.
+    // d119eebd: a BOUND vault is not skipped at 0 shares — tag 78 there still books a
+    // pending senior draw (P3-L1: the junior is the claimant), and preflight answers 38
+    // for free when there is nothing to do.
+    if (parsed.totalLpSharesOutstanding === 0n && !resolvedHarvest && !bound) return "skipped";
   } catch {
     // Unparseable registry: fall back rather than skip, so a layout change does
     // not silently stop fee cranking on every market at once.
@@ -169,7 +219,7 @@ export async function crankLpFeesOnce(
         ledger,
         siblingLedger,
         systemProgram: SystemProgram.programId,
-      }),
+      }).concat(bound ? [{ pubkey: deriveVaultLpState(WRAPPER_PROGRAM_ID, market), isSigner: false, isWritable: true }] : []),
       data: Buffer.from(encodeLpVaultCrankFees({ domain: domainIdx })),
     }),
   );
@@ -179,12 +229,44 @@ export async function crankLpFeesOnce(
     tx.recentBlockhash = blockhash;
     tx.feePayer = keeper.publicKey;
     tx.sign(keeper);
-    const sig = await devnetConn.sendRawTransaction(tx.serialize(), { maxRetries: 2 });
-    await devnetConn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
-    console.log(`[lp-fee] distributed ${marketAddress.slice(0, 8)}… sig=${sig.slice(0, 16)}…`);
+    if (resolvedHarvest) {
+      // P3 FINAL 58e379f1: a terminal harvest with nothing pending is a no-op SUCCESS (no
+      // longer Custom(38)), and what it may absorb (the claim-free terminal residual) is
+      // computed inside the engine. So simulate and send only if the market or the vault's
+      // own ledger would change; otherwise this would spend a tx every cycle forever.
+      const gate = await resolvedHarvestChangesState(devnetConn, tx, market, ledger, observe);
+      if (gate === "unsupported") return "skipped";
+      if (gate === "no-change") return "no-fees";
+      if (typeof gate === "object") return { error: gate.error };
+    } else if (bound && observe) {
+      // P3 senior draw (d119eebd): on a bound vault tag 78 BOOKS any pending senior draw
+      // into C before the harvest (vault_lp_draw_then_book, both ledgers writable). The
+      // send's own logs are not returned, so simulate first to see the booking lines.
+      const sim = await devnetConn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), { sigVerify: false, commitment: "confirmed" });
+      for (const l of sim.value.logs ?? []) if (l.includes("p3_senior_draw")) observe.seniorDrawLogs.push(l);
+      if (sim.value.err && extractErrorCode(JSON.stringify(sim.value.err)) === NO_FEES_TO_CRANK) return "no-fees";
+    }
+    const sig = await devnetConn.sendRawTransaction(tx.serialize(), { maxRetries: 2, skipPreflight: resolvedHarvest });
+    // F6 (fee-flow audit 2026-09-29): the signature STATUS decides, not whether
+    // confirmTransaction returned before its block-height deadline. SOLCAT
+    // 5xq4yAXH… and ANSEM 4RJv6kJt… were logged as "block height exceeded"
+    // failures but had landed. A confirmation that carries value.err (landed but
+    // failed on chain) is a failure, not a success, too.
+    const c = await confirmBySignature(devnetConn, sig, blockhash, lastValidBlockHeight, confirmOpts);
+    if (c.status === "failed") {
+      if (c.code === NO_FEES_TO_CRANK) return "no-fees";
+      return { error: `landed but failed on chain: ${JSON.stringify(c.err).slice(0, 100)} sig=${sig.slice(0, 16)}…` };
+    }
+    if (c.status === "not-landed") {
+      return { error: `not landed (retry next cycle): ${c.reason} sig=${sig.slice(0, 16)}…` };
+    }
+    console.log(`[lp-fee] distributed ${marketAddress.slice(0, 8)}… sig=${sig.slice(0, 16)}… [${c.via}]`);
     return "cranked";
   } catch (err) {
     if (extractErrorCode(err) === NO_FEES_TO_CRANK) return "no-fees";
+    // Version gate: a wrapper before P3 07a1d0eb refuses tag 78 on a Resolved
+    // market with EngineLockActive (21) — in preflight, so nothing is spent.
+    if (resolvedHarvest && extractErrorCode(err) === RESOLVED_HARVEST_UNSUPPORTED) return "skipped";
     return { error: (err instanceof Error ? err.message : String(err)).slice(0, 140) };
   }
 }
@@ -218,44 +300,59 @@ export async function crankAllLpFeesOnce(
 }
 
 /**
- * Periodic LP-fee distribution loop. Mirrors startRecoveryCrankLoop's shape:
- * isolated per-market errors, concurrent sweep, never throws out of scope.
+ * Simulate the resolved-harvest tx and compare the market + own-ledger bytes with
+ * their current state. "changes" = worth sending. Never throws.
  */
-export async function startLpFeeCrankLoop(
-  devnetConn: Connection,
-  keeper: Keypair,
-  registry: Registry,
-  config: LpFeeCrankConfig,
-): Promise<void> {
-  console.log(
-    `[lp-fee] LP fee crank loop starting: ${registry.markets.length} markets,` +
-      ` interval=${config.intervalMs}ms, mode=${config.dryRun ? "DRY-RUN" : "LIVE"}`,
-  );
-
-  let stopping = false;
-  process.on("SIGINT", () => { stopping = true; });
-  process.on("SIGTERM", () => { stopping = true; });
-
-  let cycle = 0;
-  while (!stopping) {
-    const start = Date.now();
-    try {
-      const r = await crankAllLpFeesOnce(devnetConn, keeper, registry, config.dryRun);
-      // Only speak up when something actually moved, or every ~20 cycles, so a
-      // quiet fleet does not fill the log with "nothing happened".
-      if (r.cranked.length > 0 || cycle % 20 === 0) {
-        console.log(
-          `[lp-fee] cycle ${cycle}: ${r.cranked.length} distributed, ` +
-            `${r.noFees.length} no-fees, ${r.skipped.length} no-vault/no-depositors, ` +
-            `${r.failed.length} failed`,
-        );
-      }
-    } catch (err) {
-      // Defense in depth — crankAllLpFeesOnce already swallows per-market errors.
-      console.error(`[lp-fee] sweep error — ${(err as Error).message.slice(0, 140)}`);
+export async function resolvedHarvestChangesState(
+  conn: Pick<LpFeeConnection, "simulateTransaction" | "getMultipleAccountsInfo">,
+  tx: Transaction,
+  market: PublicKey,
+  ledger: PublicKey,
+  observe?: { seniorDrawLogs: string[] },
+): Promise<"changes" | "no-change" | "unsupported" | { error: string }> {
+  try {
+    const [pre] = [await conn.getMultipleAccountsInfo([market, ledger], "confirmed")];
+    const sim = await conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), {
+      sigVerify: false,
+      commitment: "confirmed",
+      accounts: { encoding: "base64", addresses: [market.toBase58(), ledger.toBase58()] },
+    });
+    if (observe && !sim.value.err) for (const l of sim.value.logs ?? []) if (l.includes("p3_senior_draw")) observe.seniorDrawLogs.push(l);
+    if (sim.value.err) {
+      const code = extractErrorCode(JSON.stringify(sim.value.err));
+      if (code === RESOLVED_HARVEST_UNSUPPORTED) return "unsupported";
+      if (code === NO_FEES_TO_CRANK) return "no-change";
+      return { error: `resolved harvest sim: ${JSON.stringify(sim.value.err).slice(0, 100)}` };
     }
-    cycle++;
-    const elapsed = Date.now() - start;
-    await new Promise((r) => setTimeout(r, Math.max(1000, config.intervalMs - elapsed)));
+    const post = sim.value.accounts ?? [];
+    const same = (i: number): boolean => {
+      const a = pre[i];
+      const b = post[i];
+      if (!a || !b) return !a && !b;
+      return Buffer.from(b.data[0], "base64").equals(Buffer.from(a.data));
+    };
+    return same(0) && same(1) ? "no-change" : "changes";
+  } catch (err) {
+    return { error: `resolved harvest sim failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}` };
   }
+}
+
+/**
+ * The LP-fee crank as a fee job (see fee-jobs.ts), so it runs in the shared
+ * fee loop next to the stake-fee push and inherits its health/alerting.
+ */
+export function makeLpFeeJob(confirmOpts?: ConfirmOptions): FeeJob {
+  return {
+    name: "lp-fee",
+    async run(ctx, m): Promise<FeeJobOutcome> {
+      const observe = { seniorDrawLogs: [] as string[] };
+      const o = await crankLpFeesOnce(ctx.conn, ctx.keeper, m.marketAddress, ctx.dryRun, confirmOpts, observe);
+      // "Earn absorbed X": only a booking that LANDED (the tx was sent and confirmed).
+      const events = o === "cranked" ? seniorDrawAlerts(m.marketAddress, m.label, parseSeniorDrawLogs(observe.seniorDrawLogs)) : [];
+      if (o === "cranked") return { kind: "done", detail: "LP fees distributed into the LP vault", ...(events.length ? { events } : {}) };
+      if (o === "no-fees") return { kind: "nothing", detail: "no new LP fees (Custom(38))" };
+      if (o === "skipped") return { kind: "skipped", reason: "no LP vault, or no depositors yet" };
+      return { kind: "failed", error: o.error };
+    },
+  };
 }
