@@ -107,11 +107,20 @@ function conn(pfs: Array<{ key: PublicKey; data: Buffer }>) {
 describe("late-finalize cleanup: receipt-only portfolios -> tag 8 -> 78 (junior 102 unblocked)", () => {
   const WALLET = Keypair.generate().publicKey;
 
-  it("isFinalizedReceiptOnly: finalized + empty claim only", () => {
+  it("isFinalizedReceiptOnly: empty claim and no OPEN receipt (finalized, or none)", () => {
     assert.equal(isFinalizedReceiptOnly(pf(WALLET, { present: true, finalized: true })), true);
     assert.equal(isFinalizedReceiptOnly(pf(WALLET, { present: true, finalized: false })), false, "open (partial) receipt: the revisit's job, not this step");
-    assert.equal(isFinalizedReceiptOnly(pf(WALLET, { present: false, finalized: false })), false, "no receipt");
+    assert.equal(isFinalizedReceiptOnly(pf(WALLET, { present: false, finalized: false })), true, "no receipt at all (a full CloseResolved) but still materialized: closable too");
     assert.equal(isFinalizedReceiptOnly(pf(WALLET, { present: true, finalized: true }, 5n)), false, "still holds capital");
+  });
+
+  it("rehearsal-33 shape: two empty portfolios with NO receipt (full CloseResolved) are closed, then 78", async () => {
+    const A = Keypair.generate().publicKey, B = Keypair.generate().publicKey;
+    const w = conn([{ key: Keypair.generate().publicKey, data: pf(A, { present: false, finalized: false }) }, { key: Keypair.generate().publicKey, data: pf(B, { present: false, finalized: false }) }]);
+    const r = await windDownOnce(w.conn, KEEPER, MARKET.toBase58(), false, CFG(), new TerminalInsuranceState());
+    assert.deepEqual(w.order, ["w8", "w8", "w78"], w.order.join(" | "));
+    assert.deepEqual(w.closedTo.sort(), [A.toBase58(), B.toBase58()].sort());
+    assert.equal(r.outcome.kind, "done");
   });
 
   it("unbound-stake Resolved market: tag 8 ([3] = owner) then 78, outcome done, market terminal-flat", async () => {

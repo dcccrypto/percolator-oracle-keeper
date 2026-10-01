@@ -835,11 +835,17 @@ export async function cleanupResolvedPortfolios(
 // and the NFT program tolerates the closed account on a later burn (nft db4aa09 #131). Then the caller
 // re-reads the market and runs 78 once terminal-flat, which unblocks the junior's 102.
 
-/** A portfolio whose resolved receipt is finalized and which has nothing left to claim. */
+/**
+ * A portfolio with nothing left to claim and NO OPEN receipt: either its receipt was finalized (late
+ * 46 / repeat CloseResolved) or it never got one (a full CloseResolved leaves `present` = 0 — fork
+ * rehearsal-33 on bd4fe5f8: both traders sat materialized at cap 0 / pnl 0 / no receipt). Either way
+ * it still counts as materialized and only a tag 8 removes it. An OPEN (present && !finalized)
+ * receipt is excluded: that is the revisit's job (46 first).
+ */
 export function isFinalizedReceiptOnly(d: Uint8Array): boolean {
   if (d.length < RESOLVED_RECEIPT_ACCOUNT_OFF_P3 + RESOLVED_RECEIPT_LEN_P3) return false;
   const r = decodeResolvedPayoutReceiptP3(d);
-  if (!r.present || !r.finalized) return false;
+  if (r.open) return false;
   const p = parsePortfolioV17(d);
   return p.capital === 0n && p.pnl === 0n && p.reservedPnl === 0n && p.cancelDepositEscrow === 0n && !p.legs.some((l) => l.active);
 }
