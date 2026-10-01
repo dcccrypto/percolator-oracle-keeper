@@ -822,3 +822,119 @@ export async function cleanupResolvedPortfolios(
   }
   return out;
 }
+
+// ── Late-finalize cleanup (gate-100 finding on bd4fe5f8) ─────────────────────────────────────────
+// After ANY late receipt finalize (a tag 46 or a repeat CloseResolved on a Resolved bound market — by
+// this keeper, the frontend, or the owner), the portfolio stays MATERIALIZED with capital 0, pnl 0 and
+// its receipt finalized. While it exists the market is not terminal-flat: the Resolved 78 harvest is
+// skipped and the junior's tag 102 is refused with 21 (EngineLockActive). bd4fe5f8 lets the seniors'
+// Resolved 77 ignore receipt-only portfolios, but NOT 102. So every cycle, on every Resolved market
+// (stake-bound or not), the keeper closes each such receipt-only portfolio with the permissionless
+// tag 8 ([3] = the recorded owner, which receives the rent) — escrowed ones included, with no holder
+// grace: the holder has already been paid (bd4fe5f8 pays the proven holder), nothing is left to claim,
+// and the NFT program tolerates the closed account on a later burn (nft db4aa09 #131). Then the caller
+// re-reads the market and runs 78 once terminal-flat, which unblocks the junior's 102.
+
+/** A portfolio whose resolved receipt is finalized and which has nothing left to claim. */
+export function isFinalizedReceiptOnly(d: Uint8Array): boolean {
+  if (d.length < RESOLVED_RECEIPT_ACCOUNT_OFF_P3 + RESOLVED_RECEIPT_LEN_P3) return false;
+  const r = decodeResolvedPayoutReceiptP3(d);
+  if (!r.present || !r.finalized) return false;
+  const p = parsePortfolioV17(d);
+  return p.capital === 0n && p.pnl === 0n && p.reservedPnl === 0n && p.cancelDepositEscrow === 0n && !p.legs.some((l) => l.active);
+}
+
+export interface FinalizedCleanupResult {
+  /** Receipt-only portfolios closed by tag 8 this pass. */
+  closed: string[];
+  /** Receipt-only portfolios that could not be closed this pass (retried next cycle). */
+  failed: Array<{ portfolio: string; reason: string }>;
+}
+
+/**
+ * Close every receipt-only portfolio (receipt present && finalized, empty claim) of `market` with the
+ * permissionless tag 8 ([3] = owner). Skips the vault LP (registry-owned: it closes via 101 + 8 in the
+ * main cleanup). Bounded by `cfg.maxPerCycle`. Never throws.
+ * @param conn    Devnet connection.
+ * @param keeper  Fee payer and tag-8 closer.
+ * @param market  Resolved market (slab).
+ * @param dryRun  Simulate only.
+ * @param cfg     Cleanup config (wrapper/nft ids, per-cycle bound, confirm options).
+ * @returns The closed and failed portfolios.
+ * @example
+ * ```ts
+ * const r = await closeFinalizedReceiptPortfolios(conn, keeper, market, false, cfg.cleanup!);
+ * if (r.closed.length) await crankLpFeesOnce(conn, keeper, market.toBase58(), false);
+ * ```
+ */
+export async function closeFinalizedReceiptPortfolios(
+  conn: CleanupConnection,
+  keeper: Keypair,
+  market: PublicKey,
+  dryRun: boolean,
+  cfg: CleanupConfig,
+): Promise<FinalizedCleanupResult> {
+  const out: FinalizedCleanupResult = { closed: [], failed: [] };
+  let accs: Awaited<ReturnType<CleanupConnection["getProgramAccounts"]>>;
+  try {
+    accs = await conn.getProgramAccounts(cfg.wrapperProgramId, {
+      filters: [
+        { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
+        { memcmp: { offset: 0, bytes: V17_PORTFOLIO_MAGIC.toString("base64"), encoding: "base64" } },
+        { memcmp: { offset: 16, bytes: market.toBase58() } },
+      ],
+    });
+  } catch (err) {
+    out.failed.push({ portfolio: "*", reason: `portfolio discovery failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}` });
+    return out;
+  }
+  const targets = accs.filter((a) => {
+    const d = new Uint8Array(a.account.data);
+    if (!isFinalizedReceiptOnly(d)) return false;
+    return pdaOwnerKind(parsePortfolioV17(d).owner, market, cfg) !== "lp-registry";
+  });
+  if (targets.length === 0) return out;
+  let blockhash: string;
+  let lastValidBlockHeight: number;
+  try {
+    ({ blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed"));
+  } catch (err) {
+    out.failed.push({ portfolio: "*", reason: `blockhash: ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}` });
+    return out;
+  }
+  for (const [i, a] of targets.entries()) {
+    if (i >= cfg.maxPerCycle) {
+      out.failed.push({ portfolio: a.pubkey.toBase58(), reason: `over the ${cfg.maxPerCycle}-per-cycle bound; next cycle` });
+      continue;
+    }
+    try {
+      const p = parsePortfolioV17(new Uint8Array(a.account.data));
+      const tx = new Transaction();
+      tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT }));
+      tx.add(buildClosePortfolioIx({
+        wrapperProgramId: cfg.wrapperProgramId, closer: keeper.publicKey, market, portfolio: a.pubkey, owner: p.owner,
+        portfolioId: p.portfolioId, expectedSequence: p.matcherSequence, positionEpoch: p.matcherPositionEpoch,
+      }));
+      tx.recentBlockhash = blockhash;
+      tx.feePayer = keeper.publicKey;
+      tx.sign(keeper);
+      const s = await conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), { sigVerify: false, commitment: "confirmed" });
+      if (s.value.err) {
+        out.failed.push({ portfolio: a.pubkey.toBase58(), reason: `tag 8 ${why(s.value.err, s.value.logs ?? null, { 1: "ClosePortfolio" })}` });
+        continue;
+      }
+      if (!dryRun) {
+        const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
+        const c = await confirmBySignature(conn, sig, blockhash, lastValidBlockHeight, cfg.confirm);
+        if (c.status !== "landed") {
+          out.failed.push({ portfolio: a.pubkey.toBase58(), reason: "tag 8 did not land; retry next cycle" });
+          continue;
+        }
+      }
+      out.closed.push(a.pubkey.toBase58());
+    } catch (err) {
+      out.failed.push({ portfolio: a.pubkey.toBase58(), reason: (err instanceof Error ? err.message : String(err)).slice(0, 120) });
+    }
+  }
+  return out;
+}

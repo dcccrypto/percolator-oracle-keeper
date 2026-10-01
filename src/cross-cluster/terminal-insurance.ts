@@ -69,7 +69,7 @@ import { confirmBySignature } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
 import type { Alert } from "./alerting.ts";
-import { CleanupState, cleanupResolvedPortfolios } from "./resolved-portfolio-cleanup.ts";
+import { CleanupState, cleanupResolvedPortfolios, closeFinalizedReceiptPortfolios } from "./resolved-portfolio-cleanup.ts";
 import { crankLpFeesOnce } from "./lp-fee-cranker.ts";
 import type { CleanupConfig, CleanupConnection, CleanupResult } from "./resolved-portfolio-cleanup.ts";
 import { NFT_PROGRAM_ID } from "../program-ids.ts";
@@ -165,6 +165,12 @@ export interface TerminalInsuranceConfig {
   now?: () => number;
   /** B12 cleanup (P3 b2b2559e permissionless CloseResolved + ClosePortfolio); undefined = off. */
   cleanup?: CleanupConfig;
+  /**
+   * Late-finalize cleanup (gate-100 on bd4fe5f8): tag 8 every receipt-only portfolio (receipt
+   * finalized, empty claim) on ANY Resolved market, then 78 once terminal-flat, so the junior's 102 is
+   * not refused with 21. Default on (needs `cleanup`); TERMINAL_RECEIPT_CLEANUP_ENABLED=false disables.
+   */
+  receiptCleanup?: boolean;
 }
 
 export function terminalInsuranceConfigFromEnv(env: Readonly<Record<string, string | undefined>>): TerminalInsuranceConfig {
@@ -172,6 +178,7 @@ export function terminalInsuranceConfigFromEnv(env: Readonly<Record<string, stri
   const n = raw === undefined || raw.trim() === "" ? 3 : Number(raw);
   if (!Number.isInteger(n) || n <= 0) throw new Error(`ALERT_TERMINAL_BUDGET_CYCLES="${raw}" must be a positive integer`);
   const cleanupOn = env.TERMINAL_CLEANUP_ENABLED !== "false";
+  const receiptCleanupOn = env.TERMINAL_RECEIPT_CLEANUP_ENABLED !== "false";
   const graceRaw = env.TERMINAL_PDA_GRACE_SLOTS;
   if (graceRaw !== undefined && graceRaw.trim() !== "" && !/^\d+$/.test(graceRaw.trim())) {
     throw new Error(`TERMINAL_PDA_GRACE_SLOTS="${graceRaw}" must be a non-negative integer`);
@@ -182,6 +189,7 @@ export function terminalInsuranceConfigFromEnv(env: Readonly<Record<string, stri
     stakeProgramId: STAKE_PROGRAM_ID,
     unbookedAlertCycles: n,
     probeTtlMs: 60 * 60_000,
+    receiptCleanup: receiptCleanupOn,
     cleanup: cleanupOn
       ? {
           wrapperProgramId: WRAPPER_PROGRAM_ID,
@@ -306,7 +314,36 @@ export async function windDownOnce(
     st.unbookedStreak.delete(marketAddress);
     return res({ kind: "nothing", detail: "market is Live (wind-down applies after resolve)" }, { state });
   }
+  // Late-finalize cleanup — every Resolved market, stake-bound or not, every cycle: a portfolio left
+  // materialized by a late receipt finalize (46 / repeat CloseResolved: capital 0, pnl 0, receipt
+  // finalized) keeps the market off terminal-flat, so 78 is skipped and the junior's 102 = 21. Close
+  // each with the permissionless tag 8 ([3] = owner), re-read, then 78 once terminal-flat.
+  let lateNote = "";
+  if (cfg.receiptCleanup !== false && cfg.cleanup && state.kind === "resolved" && state.materializedPortfolios > 0n) {
+    const lc = await closeFinalizedReceiptPortfolios(conn as CleanupConnection, keeper, market, dryRun, cfg.cleanup);
+    for (const f of lc.failed) console.warn(`[terminal-insurance] ${marketAddress.slice(0, 8)}…: receipt-only portfolio ${f.portfolio} not closed: ${f.reason}`);
+    if (lc.closed.length > 0) {
+      console.log(`[terminal-insurance] ${marketAddress.slice(0, 8)}…: closed ${lc.closed.length} receipt-only portfolio(s) (tag 8 after a late receipt finalize): ${lc.closed.join(", ")}`);
+      lateNote = ` Late-finalize cleanup: tag 8 closed ${lc.closed.length} receipt-only portfolio(s).`;
+      if (!dryRun) {
+        try {
+          const [mi2] = await conn.getMultipleAccountsInfo([market], "confirmed");
+          const s2 = mi2 ? decodeTerminalState(new Uint8Array(mi2.data)) : null;
+          if (s2) state = s2;
+        } catch {
+          // keep the pre-cleanup view
+        }
+      }
+      if (state.kind === "resolved" && isTerminalFlat(state)) {
+        const h = await crankLpFeesOnce(conn, keeper, marketAddress, dryRun, cfg.confirm);
+        lateNote += h === "cranked" ? " Tag 78 harvested (terminal-flat): the junior's 102 is unblocked."
+          : h === "no-fees" || h === "skipped" ? " Terminal-flat: the junior's 102 is unblocked."
+            : ` Tag 78 harvest failed: ${h.error}.`;
+      }
+    }
+  }
   if (!poolState || !poolState.slab.equals(market) || !poolState.percolatorProgram.equals(cfg.wrapperProgramId)) {
+    if (lateNote) return res({ kind: "done", detail: lateNote.trim() }, { state });
     return res({ kind: "skipped", reason: "no stake pool bound to this market" }, { state });
   }
   const [vaultAuth] = deriveStakeVaultAuth(pool, cfg.stakeProgramId);
@@ -494,7 +531,7 @@ export async function windDownOnce(
   }
   const s2 = await call(0n, stray);
   steps.push(s2);
-  const recoveredNote = (harvestNote ? `${harvestNote.trim()} ` : "") + (recovered ? `tag 29 recovered ${budget} atoms of terminal insurance into the stake pool ${recovered.detail}; ` : "");
+  const recoveredNote = (lateNote ? `${lateNote.trim()} ` : "") + (harvestNote ? `${harvestNote.trim()} ` : "") + (recovered ? `tag 29 recovered ${budget} atoms of terminal insurance into the stake pool ${recovered.detail}; ` : "");
   if (s2.outcome === "nothing") {
     // Done ONLY on 31 from the amount-0 step (B14).
     st.done.add(marketAddress);
