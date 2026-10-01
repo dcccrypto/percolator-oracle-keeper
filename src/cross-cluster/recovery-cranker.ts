@@ -1047,7 +1047,10 @@ export async function startRecoveryCrankLoop(
     if (cycleCount % HEALTH_SUMMARY_EVERY_CYCLES === 0) {
       const summary = registry.markets
         .map((m) => {
-          const st = states.get(m.marketAddress)!;
+          // A market admitted by register-poll mid-run has no state until its first crank:
+          // the old non-null assertion crashed the whole cranker loop (2026-10-01).
+          const st = states.get(m.marketAddress);
+          if (!st) return `${m.label}=pending`;
           const flag = st.consecutiveReverts >= REVERT_ALERT_THRESHOLD ? "⚠STUCK" : st.consecutiveReverts > 0 ? "~drift" : "ok";
           return `${m.label}=${flag}(ok:${st.totalCranks} rev:${st.totalReverts}${st.consecutiveReverts ? ` cons:${st.consecutiveReverts}` : ""}${st.lastRevertCode != null ? ` last:${st.lastRevertCode}` : ""})`;
         })

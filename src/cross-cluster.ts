@@ -373,14 +373,30 @@ const bootCrankStates = CRANK_ENABLED ? await crankAllOnce(devnetConn, keeper, r
 // NOT awaited, and deliberately never allowed to throw out of this scope, so
 // it can never delay or take down the oracle push loop below.
 if (CRANK_ENABLED) {
-  void startRecoveryCrankLoop(devnetConn, keeper, registry, {
-    intervalMs: CRANK_INTERVAL_MS,
-    dryRun: DRY_RUN,
-  }, ALERT_SINK, bootCrankStates).catch((err: unknown) => {
-    console.error(
-      `[cranker] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
-    );
-  });
+  // Supervised: a crash used to kill the cranker for the life of the process (2026-10-01:
+  // "Cannot read properties of undefined (reading 'consecutiveReverts')" after a run of
+  // cycle timeouts froze every market's engine clock for ~1h while /health said ok).
+  // Restart with backoff; boot states are only valid for the first run.
+  void (async () => {
+    let states = bootCrankStates;
+    let backoffMs = 5_000;
+    for (;;) {
+      try {
+        await startRecoveryCrankLoop(devnetConn, keeper, registry, {
+          intervalMs: CRANK_INTERVAL_MS,
+          dryRun: DRY_RUN,
+        }, ALERT_SINK, states);
+        console.error("[cranker] loop exited unexpectedly — restarting");
+      } catch (err: unknown) {
+        console.error(
+          `[cranker] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.stack ?? err.message : String(err)} — restarting in ${backoffMs}ms`,
+        );
+      }
+      states = undefined;
+      await new Promise((r) => setTimeout(r, backoffMs));
+      backoffMs = Math.min(backoffMs * 2, 60_000);
+    }
+  })();
 }
 
 // P3 senior draw (d119eebd): crank each bound market's vault LP after every landed mark
