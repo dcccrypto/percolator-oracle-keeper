@@ -89,6 +89,34 @@ interface MarketStat {
   authorityMismatch: boolean;
 }
 
+/**
+ * Record a push that LANDED for one market, and clear its last error.
+ *
+ * `lastErrorMsg` used to be sticky: a transient cold-start condition (the mark
+ * smoother withholding its first few cycles until minSamples) stayed on
+ * /health as `lastError` for the life of the process, even while the market
+ * pushed every cycle. On 2026-10-01 that stale "mark smoother re-priming"
+ * label on two healthy, current markets read as the cause of a trading outage.
+ * A landed push supersedes every earlier error; a later failure sets it again.
+ *
+ * @param stat - The market's /health stat record (mutated).
+ * @param stamp - Unix ms the push was confirmed landed.
+ * @param signature - The batch transaction signature that carried it.
+ * @returns Nothing; mutates `stat`.
+ * @example
+ * recordLandedPush(stat, Date.now(), res.signature); // stat.lastErrorMsg === null
+ */
+export function recordLandedPush(
+  stat: Pick<MarketStat, "totalPushes" | "lastPushAt" | "lastSig" | "lastErrorMsg">,
+  stamp: number,
+  signature: string,
+): void {
+  stat.totalPushes++;
+  stat.lastPushAt = stamp;
+  stat.lastSig = signature;
+  stat.lastErrorMsg = null;
+}
+
 interface LoopState {
   startedAt: number;
   lastCycleAt: number | null;
@@ -760,9 +788,7 @@ async function runCycle(
             ),
           );
         }
-        stat.totalPushes++;
-        stat.lastPushAt = stamp;
-        stat.lastSig = res.signature;
+        recordLandedPush(stat, stamp, res.signature);
       } else {
         stat.totalErrors++;
         stat.lastErrorMsg = "dropped from batch (reverted in preflight or quarantined)";

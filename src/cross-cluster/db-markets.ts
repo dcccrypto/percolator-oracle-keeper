@@ -67,12 +67,27 @@ export async function classifyPools(
  * unclassified pool means we would have to GUESS a dexType. Neither belongs in
  * the registry — the push loop reads it without re-checking these.
  */
+const warnedUnclassified = new Set<string>();
+
 export function rowsToEntries(rows: readonly DbMarketRow[], dexByPool: DexCache): MarketEntry[] {
   const out: MarketEntry[] = [];
   for (const r of rows) {
     if (!r.dex_pool_address) continue;
     const dexType = dexByPool.get(r.dex_pool_address);
-    if (!dexType) continue;
+    if (!dexType) {
+      // Said out loud, once per market: a silently dropped row leaves a live
+      // market uncranked with nothing in the logs. 9EPm8nB8 (2026-10-01) sat
+      // ~34 min between its INSERT and its admission with no keeper line
+      // explaining why.
+      if (!warnedUnclassified.has(r.slab_address)) {
+        warnedUnclassified.add(r.slab_address);
+        console.warn(
+          `[db-markets] NOT admitting ${r.slab_address.slice(0, 8)}… — pool ` +
+            `${r.dex_pool_address.slice(0, 8)}… is not a recognised DEX pool (unclassified); no price source`,
+        );
+      }
+      continue;
+    }
     const name = r.symbol ?? r.slab_address.slice(0, 8);
     out.push({
       label: `${name}/USDC — ${dexType}`,
