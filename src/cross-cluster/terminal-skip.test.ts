@@ -65,7 +65,7 @@ describe("B13 — the crank loop leaves Resolved/closed markets alone", () => {
     const sink = new AlertSink({ thresholds: DEFAULT_THRESHOLDS, log: (l) => lines.push(l), logError: (l) => lines.push(l), now: () => 0 });
     const st = freshCrankMarketState();
     st.consecutiveReverts = 5; st.totalReverts = 5; st.lastRevertCode = 19;
-    st.obs = { chainSlot: 1_000n, engineSlot: 0n, crankOk: false, crankReverted: true, lapsedBuckets: 0, bankruptFound: 0, bankruptLiquidated: 0, adl: null };
+    st.obs = { chainSlot: 1_000n, engineSlot: 0n, crankOk: false, crankReverted: true, lapsedBuckets: 0, bankruptFound: 0, bankruptLiquidated: 0, adl: null, staleLong: 0, staleShort: 0, positioned: 0, overflow: 0, overflowRefreshed: 0, lossStaleCycles: 0 };
     const states = new Map([[SOL, st]]);
     const reg = { markets: [{ label: "SOL", marketAddress: SOL }] } as never;
     const first = await reportCrankHealth(reg, states as never, 1, sink);

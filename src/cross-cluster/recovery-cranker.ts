@@ -121,10 +121,13 @@ import {
   isAssetLossStale,
   marketHasPositions,
   parseInstructionError,
+  chunkOverflowTargets,
   planCrankTx,
+  planRefreshTx,
   positionedSetMatchesMarket,
   selectPositionedPortfolios,
 } from "./positioned-refresh.ts";
+import { holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coordination.ts";
 import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
 import { decodeAdlState } from "./adl-state.ts";
@@ -194,6 +197,10 @@ interface CrankMarketState {
   lastCrankSlot: bigint | null;
   /** B7: benign "no progress this slot" Custom(22) results (not reverts). */
   benignNoProgress: number;
+  /** Consecutive cycles that ended with the market still loss-stale (stale count > 0 after our cranks). */
+  lossStaleCycles: number;
+  /** Last overflow (follow-up refresh) summary logged, so steady-state cycles stay quiet. */
+  lastOverflowSummary: string | null;
 }
 
 /** What one crank attempt saw — feeds alerting.ts. */
@@ -207,6 +214,16 @@ export interface CrankObservation {
   bankruptLiquidated: number;
   /** ADL reduce-only inputs from the pre-crank read (null: not a v18 market header). */
   adl: AdlState | null;
+  /** stale_account_count_long/short at the pre-crank read (null: header did not decode). */
+  staleLong: number | null;
+  staleShort: number | null;
+  /** Positioned portfolios targeted for refresh this cycle. */
+  positioned: number;
+  /** Refreshes that did not fit the accrual tx, and how many landed in follow-up txs. */
+  overflow: number;
+  overflowRefreshed: number;
+  /** Consecutive cycles the market ended loss-stale (set by the cranker after its cranks). */
+  lossStaleCycles: number;
 }
 
 export function freshCrankMarketState(): CrankMarketState {
@@ -232,6 +249,8 @@ export function freshCrankMarketState(): CrankMarketState {
     terminal: false,
     lastCrankSlot: null,
     benignNoProgress: 0,
+    lossStaleCycles: 0,
+    lastOverflowSummary: null,
   };
 }
 
@@ -428,6 +447,13 @@ export async function crankOneMarket(
   }
 
   const lpPortfolio = state.lpPortfolio;
+  /** True while this market's pushes are held for follow-up refreshes. */
+  let held = false;
+  /** This cycle's observation, once the market header decoded (feeds the loss-stale health). */
+  let observed: CrankObservation | null = null;
+  /** Stale counts after this cycle's cranks; null = unknown (revert, no simulation). */
+  let postStale: MarketRefreshState | null = null;
+  let overflowError: string | null = null;
 
   try {
     // One read gives both the market state and the slot it was read at.
@@ -476,6 +502,7 @@ export async function crankOneMarket(
     }
     const obs = observeMarket(acct.value.data, BigInt(acct.context.slot), pre, repairs);
     state.obs = obs;
+    if (pre) observed = obs;
 
     // Bankrupt positioned portfolios found in a clean simulation's post-state;
     // they get a second crank (the engine's Liquidate step) in the same tx.
@@ -491,6 +518,15 @@ export async function crankOneMarket(
           `refresh=[${plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio.toBase58().slice(0, 8)).join(",")}]`,
       );
       return;
+    }
+
+    obs.positioned = targets.length;
+    // More positioned portfolios than one transaction can refresh: the rest go out
+    // as follow-up transactions, which only land while the mark has not moved since
+    // this accrual. Hold this market's pushes from now until they land (auto-expires).
+    if (build(targets).overflow.length > 0) {
+      holdPushes(marketAddress, OVERFLOW_PUSH_HOLD_MS);
+      held = true;
     }
 
     const bh = await withRpcRetry(label, () => devnetConn.getLatestBlockhash("processed"));
@@ -510,8 +546,8 @@ export async function crankOneMarket(
     // The simulation also prunes refreshes the engine would reject (Custom(22)
     // for a portfolio this accrual did not re-stale), and returns the market's
     // post-state so the loop can confirm the market ends not loss-stale.
-    const simulate = async (plan: CrankPlan): Promise<SimOutcome> => {
-      const tx = toTx(plan);
+    const simulate = async (plan: CrankPlan): Promise<SimOutcome> => simulateWith(toTx(plan), plan);
+    const simulateWith = async (tx: Transaction, plan: CrankPlan): Promise<SimOutcome> => {
       const refreshed = plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio.toBase58());
       const sim = await withRpcRetry(label, () =>
         devnetConn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), {
@@ -630,13 +666,61 @@ export async function crankOneMarket(
       );
     }
 
-    reportRefreshOutcome(label, pre, resolved, state);
+    let finalPost = decodePostState(resolved.sim.marketData);
     if (plan.overflow.length > 0) {
-      console.warn(
-        `[cranker][ALERT] ${label}: ${plan.overflow.length} positioned portfolio(s) did not fit one transaction and were not refreshed — ` +
-          `the market stays loss-stale until they are (needs multi-tx same-slot refresh or an ALT).`,
-      );
+      obs.overflow = plan.overflow.length;
+      // Follow-up refreshes: after the accrual lands, before the next push (held above).
+      const accrual = await waitLanded(devnetConn, signature);
+      let ov: OverflowResult;
+      if (accrual !== "landed") {
+        ov = { attempted: plan.overflow.length, refreshed: 0, liquidated: 0, bankruptFound: 0, pruned: [], signatures: [], error: `accrual tx ${accrual}` };
+      } else {
+        const ovBh = await withRpcRetry(label, () => devnetConn.getLatestBlockhash("processed"));
+        const toOvTx = (p: CrankPlan): Transaction => {
+          const t = new Transaction();
+          t.add(ComputeBudgetProgram.setComputeUnitLimit({ units: p.computeUnits }));
+          for (const c of p.cranks) t.add(c.ix);
+          t.recentBlockhash = ovBh.blockhash;
+          t.feePayer = keeper.publicKey;
+          t.sign(keeper);
+          return t;
+        };
+        ov = await refreshOverflow({
+          owner: keeper.publicKey,
+          market,
+          overflow: plan.overflow,
+          simulate: (p) => simulateWith(toOvTx(p), p),
+          send: (p) =>
+            withRpcRetry(label, () => devnetConn.sendRawTransaction(toOvTx(p).serialize(), { skipPreflight: true, maxRetries: 2 })),
+          waitLanded: (sig) => waitLanded(devnetConn, sig),
+        });
+        // Verification read: the stale counts the market really ended with.
+        try {
+          const after = await withRpcRetry(label, () => devnetConn.getAccountInfo(market, "processed"));
+          if (after) finalPost = decodePostState(after.data);
+        } catch {
+          /* keep the simulated post-state */
+        }
+      }
+      obs.overflowRefreshed = ov.refreshed;
+      obs.bankruptFound += ov.bankruptFound;
+      obs.bankruptLiquidated += ov.liquidated;
+      overflowError = ov.error;
+      const ovSummary =
+        `overflow=${ov.attempted} refreshed=${ov.refreshed} pruned=${ov.pruned.length}` +
+        `${ov.pruned.length ? ` [${ov.pruned.map((p) => `${p.pubkey.toBase58().slice(0, 8)}:${p.code ?? "?"}`).join(",")}]` : ""}` +
+        ` txs=${ov.signatures.length} stale_after=${finalPost ? `${finalPost.staleLong}L/${finalPost.staleShort}S` : "?"}` +
+        `${ov.error ? ` error=${ov.error}` : ""}`;
+      const failed = ov.error !== null || (finalPost !== null && (finalPost.staleLong !== 0n || finalPost.staleShort !== 0n));
+      if (failed) {
+        console.warn(`[cranker][overflow] ${label}: follow-up refreshes did not clear loss-stale (${ovSummary}) — retrying next cycle`);
+      } else if (state.lastOverflowSummary !== ovSummary) {
+        console.log(`[cranker][overflow] ${label}: follow-up refreshes landed (${ovSummary})`);
+      }
+      state.lastOverflowSummary = ovSummary;
     }
+    reportRefreshOutcome(label, pre, resolved, state, finalPost);
+    postStale = finalPost;
   } catch (err) {
     state.totalErrors++;
     state.lastErrorMsg = err instanceof Error ? err.message : String(err);
@@ -653,6 +737,9 @@ export async function crankOneMarket(
       state.lpPortfolio = null;
       state.positioned = null;
     }
+  } finally {
+    if (held) releasePushes(marketAddress);
+    if (observed) publishRefreshHealth(marketAddress, state, observed, postStale, overflowError);
   }
 }
 
@@ -712,24 +799,32 @@ async function positionedPortfoliosFor(
   }
 }
 
+function decodePostState(data: Uint8Array | null): MarketRefreshState | null {
+  if (!data) return null;
+  try {
+    return decodeMarketRefreshState(data);
+  } catch {
+    return null;
+  }
+}
+
 function reportRefreshOutcome(
   label: string,
   pre: MarketRefreshState | null,
   resolved: ResolvedCrankPlan,
   state: CrankMarketState,
+  /** Market state after ALL of this cycle's cranks (accrual tx + follow-up refreshes). */
+  post: MarketRefreshState | null,
 ): void {
-  const refreshed = resolved.plan.cranks.filter((c) => c.kind === "refresh").length;
-  let post: MarketRefreshState | null = null;
-  try {
-    post = resolved.sim.marketData ? decodeMarketRefreshState(resolved.sim.marketData) : null;
-  } catch {
-    post = null;
-  }
-  const postStale = post ? isAssetLossStale(post) || post.lossStaleActive : null;
+  const refreshed = resolved.plan.cranks.filter((c) => c.kind === "refresh").length + (state.obs?.overflowRefreshed ?? 0);
+  // A positioned portfolio left unrefreshed shows up as a non-zero stale count;
+  // the slot_last < current_slot clause of the predicate is not a refresh problem.
+  const postStale = post ? post.staleLong !== 0n || post.staleShort !== 0n : null;
   const summary =
     `refreshed=${refreshed} pruned=${resolved.pruned.length}` +
     `${resolved.pruned.length ? ` [${resolved.pruned.map((p) => `${p.pubkey.toBase58().slice(0, 8)}:${p.code ?? "?"}`).join(",")}]` : ""}` +
-    ` loss_stale ${pre ? Number(pre.lossStaleActive) : "?"}→${post ? Number(post.lossStaleActive) : "?"}`;
+    ` loss_stale ${pre ? Number(pre.lossStaleActive) : "?"}→${post ? Number(post.lossStaleActive) : "?"}` +
+    ` stale ${pre ? `${pre.staleLong}L/${pre.staleShort}S` : "?"}→${post ? `${post.staleLong}L/${post.staleShort}S` : "?"}`;
   if (postStale && pre && marketHasPositions(pre)) {
     // Something positioned was not refreshed: re-read the set next cycle.
     state.positionedDirty = true;
@@ -814,6 +909,168 @@ export async function resolveCrankPlan(
   }
 }
 
+// ── Overflow refreshes (2026-10-02 Percolator outage) ───────────────────────
+//
+// A market with more positioned portfolios than one transaction can refresh
+// (~9 at 130k CU each under the 1.4M cap, after the accrual) used to leave the
+// rest stale: stale_account_count stayed > 0, loss_stale held, and every
+// risk-increasing trade reverted Custom(21) indefinitely (Percolator 9EPm8nB8,
+// 12 positioned, locked for opens from ~18:55Z). The rest now go out as
+// follow-up refresh-only transactions once the accrual has landed. A
+// no-observation refresh is only accepted while the committed mark has not
+// moved since the accrual, so the market's pushes are held (refresh-
+// coordination.ts) from before the accrual until the follow-ups land.
+
+/** Push hold for a market with overflow refreshes (auto-expires; released as soon as they land). */
+export const OVERFLOW_PUSH_HOLD_MS = 12_000;
+/** How long to wait for one transaction to show up (processed) before giving up on it this cycle. */
+export const LAND_TIMEOUT_MS = 6_000;
+const LAND_POLL_MS = 400;
+/** Consecutive cycles ending loss-stale before the market's crank status turns "loss-stale". */
+export const LOSS_STALE_ALERT_CYCLES = (() => {
+  const n = Number(process.env.ALERT_LOSS_STALE_CYCLES ?? "3");
+  return Number.isInteger(n) && n > 0 ? n : 3;
+})();
+
+export type LandOutcome = "landed" | "failed" | "timeout";
+
+/** Poll the signature status until it is processed (or better), failed, or LAND_TIMEOUT_MS passes. */
+export async function waitLanded(
+  conn: Pick<Connection, "getSignatureStatuses">,
+  signature: string,
+  timeoutMs = LAND_TIMEOUT_MS,
+  pollMs = LAND_POLL_MS,
+): Promise<LandOutcome> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const st = (await conn.getSignatureStatuses([signature])).value[0];
+      if (st) return st.err ? "failed" : "landed";
+    } catch {
+      /* transient: keep polling until the deadline */
+    }
+    if (Date.now() >= deadline) return "timeout";
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+}
+
+export interface OverflowResult {
+  attempted: number;
+  /** Refresh cranks in follow-up transactions that landed. */
+  refreshed: number;
+  liquidated: number;
+  bankruptFound: number;
+  /** Refreshes dropped after a simulated rejection (Custom(22): not stale, or the mark moved). */
+  pruned: { pubkey: PublicKey; code: number | null }[];
+  signatures: string[];
+  /** Why the follow-ups did not all go out / land; null when they did. */
+  error: string | null;
+}
+
+/**
+ * Send the overflow refreshes as follow-up transactions: chunked to the CU cap,
+ * each chunk simulated (pruning rejected refreshes, adding a liquidate crank for
+ * an account the simulation shows bankrupt) and then sent. Waits for every
+ * chunk to land. Never throws for an RPC/simulation failure: the error is
+ * returned and the next cycle (a fresh accrual) tries again.
+ */
+export async function refreshOverflow(params: {
+  owner: PublicKey;
+  market: PublicKey;
+  overflow: ReadonlyArray<PositionedPortfolio>;
+  simulate: (plan: CrankPlan) => Promise<SimOutcome>;
+  send: (plan: CrankPlan) => Promise<string>;
+  waitLanded: (signature: string) => Promise<LandOutcome>;
+}): Promise<OverflowResult> {
+  const { owner, market, overflow } = params;
+  const out: OverflowResult = {
+    attempted: overflow.length, refreshed: 0, liquidated: 0, bankruptFound: 0, pruned: [], signatures: [], error: null,
+  };
+  const sent: { sig: string; refreshes: number; liquidates: number }[] = [];
+  try {
+    for (const chunk of chunkOverflowTargets(overflow)) {
+      let liquidate: PublicKey[] = [];
+      const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan =>
+        planRefreshTx({ owner, market, targets: t, liquidateTargets: liquidate });
+      const onOptional = (c: PlannedCrank) => {
+        if (c.kind === "liquidate") liquidate = liquidate.filter((x) => !x.equals(c.portfolio));
+      };
+      let resolved = await resolveCrankPlan(build, chunk, params.simulate, onOptional);
+      if (!resolved.sim.err && resolved.sim.portfolioData) {
+        const bankrupt = [...resolved.sim.portfolioData.entries()]
+          .filter(([, d]) => isBankruptPortfolio(d))
+          .map(([pk]) => new PublicKey(pk));
+        if (bankrupt.length > 0) {
+          out.bankruptFound += bankrupt.length;
+          liquidate = bankrupt;
+          const remaining = chunk.filter((t) => !resolved.pruned.some((p) => p.pubkey.equals(t.pubkey)));
+          const withLiq = await resolveCrankPlan(build, remaining, params.simulate, onOptional);
+          if (!withLiq.sim.err) resolved = { ...withLiq, pruned: [...resolved.pruned, ...withLiq.pruned] };
+        }
+      }
+      for (const p of resolved.pruned) if (!p.repair) out.pruned.push({ pubkey: p.pubkey, code: p.code });
+      if (resolved.sim.err) {
+        const code = parseInstructionError(resolved.sim.err)?.custom ?? null;
+        out.error = `follow-up simulation failed ${code !== null ? `Custom(${code})` : JSON.stringify(resolved.sim.err)}`;
+        break;
+      }
+      const refreshes = resolved.plan.cranks.filter((c) => c.kind === "refresh").length;
+      if (refreshes === 0) continue; // every refresh of this chunk was rejected (pruned, reported above)
+      const sig = await params.send(resolved.plan);
+      out.signatures.push(sig);
+      sent.push({ sig, refreshes, liquidates: resolved.plan.cranks.filter((c) => c.kind === "liquidate").length });
+    }
+  } catch (err) {
+    out.error = `follow-up send failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`;
+  }
+  const outcomes = await Promise.all(sent.map((x) => params.waitLanded(x.sig)));
+  outcomes.forEach((o, i) => {
+    if (o === "landed") {
+      out.refreshed += sent[i].refreshes;
+      out.liquidated += sent[i].liquidates;
+    } else if (out.error === null) {
+      out.error = `follow-up tx ${sent[i].sig.slice(0, 12)}… ${o}`;
+    }
+  });
+  if (out.error === null && out.refreshed === 0 && out.pruned.length > 0) {
+    out.error = "every follow-up refresh was rejected (mark moved since the accrual?)";
+  }
+  return out;
+}
+
+/** Stale counts the market ended this cycle with: the post-state when known, else the pre-crank read. */
+export function endedLossStale(
+  obs: Pick<CrankObservation, "staleLong" | "staleShort">,
+  post: Pick<MarketRefreshState, "staleLong" | "staleShort"> | null,
+): boolean {
+  if (post) return post.staleLong !== 0n || post.staleShort !== 0n;
+  return (obs.staleLong ?? 0) !== 0 || (obs.staleShort ?? 0) !== 0;
+}
+
+function publishRefreshHealth(
+  marketAddress: string,
+  state: CrankMarketState,
+  obs: CrankObservation,
+  post: MarketRefreshState | null,
+  overflowError: string | null,
+): void {
+  state.lossStaleCycles = endedLossStale(obs, post) ? state.lossStaleCycles + 1 : 0;
+  obs.lossStaleCycles = state.lossStaleCycles;
+  setCrankRefreshHealth(marketAddress, {
+    staleLong: obs.staleLong ?? 0,
+    staleShort: obs.staleShort ?? 0,
+    postStaleLong: post ? Number(post.staleLong) : null,
+    postStaleShort: post ? Number(post.staleShort) : null,
+    positioned: obs.positioned,
+    overflow: obs.overflow,
+    overflowRefreshed: obs.overflowRefreshed,
+    overflowError,
+    lossStaleCycles: state.lossStaleCycles,
+    status: state.lossStaleCycles >= LOSS_STALE_ALERT_CYCLES ? "loss-stale" : "ok",
+    updatedAt: Date.now(),
+  });
+}
+
 /**
  * D1: Deterministic crank-on-boot. Cranks every SEEDED market (one with a
  * known `lpPortfolio` in registry.json) exactly once, using ONLY that seeded
@@ -889,7 +1146,7 @@ export async function crankAllOnce(
 export function observeMarket(
   data: Uint8Array,
   chainSlot: bigint,
-  pre: Pick<MarketRefreshState, "currentSlot"> | null,
+  pre: (Pick<MarketRefreshState, "currentSlot"> & Partial<Pick<MarketRefreshState, "staleLong" | "staleShort">>) | null,
   repairs: ReadonlyArray<LivenessRepair>,
 ): CrankObservation {
   let adl: AdlState | null = null;
@@ -907,6 +1164,12 @@ export function observeMarket(
     bankruptFound: 0,
     bankruptLiquidated: 0,
     adl,
+    staleLong: pre?.staleLong !== undefined ? Number(pre.staleLong) : null,
+    staleShort: pre?.staleShort !== undefined ? Number(pre.staleShort) : null,
+    positioned: 0,
+    overflow: 0,
+    overflowRefreshed: 0,
+    lossStaleCycles: 0,
   };
 }
 
