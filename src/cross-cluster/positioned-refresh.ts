@@ -447,8 +447,14 @@ export function planRefreshTx(params: {
       cu += LIQUIDATE_CRANK_CU;
     }
   }
-  return { cranks, overflow: [], computeUnits: Math.min(MAX_TX_CU, cu) };
+  // The accrual tx's 1.4M budget absorbs per-refresh variance across ~9 refreshes;
+  // a short follow-up has no such slack (live 2026-10-02: a lone LP refresh hit
+  // ComputationalBudgetExceeded at 130k), so it gets explicit headroom.
+  return { cranks, overflow: [], computeUnits: cranks.length === 0 ? 0 : Math.min(MAX_TX_CU, cu + FOLLOWUP_CU_HEADROOM) };
 }
+
+/** Extra CU on every follow-up refresh tx (see planRefreshTx). */
+export const FOLLOWUP_CU_HEADROOM = 200_000;
 
 /** Refreshes per follow-up transaction: the CU cap, leaving room for one liquidation. */
 export const REFRESHES_PER_OVERFLOW_TX = Math.floor((MAX_TX_CU - LIQUIDATE_CRANK_CU) / REFRESH_CRANK_CU);

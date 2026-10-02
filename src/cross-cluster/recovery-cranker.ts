@@ -987,6 +987,9 @@ export async function refreshOverflow(params: {
     attempted: overflow.length, refreshed: 0, liquidated: 0, bankruptFound: 0, pruned: [], signatures: [], error: null,
   };
   const sent: { sig: string; refreshes: number; liquidates: number }[] = [];
+  // Every refresh of a chunk pruned: nothing left to simulate (an empty tx is not a test of anything).
+  const simulate = async (plan: CrankPlan): Promise<SimOutcome> =>
+    plan.cranks.length === 0 ? { err: null, logs: [], marketData: null } : params.simulate(plan);
   try {
     for (const chunk of chunkOverflowTargets(overflow)) {
       let liquidate: PublicKey[] = [];
@@ -995,7 +998,7 @@ export async function refreshOverflow(params: {
       const onOptional = (c: PlannedCrank) => {
         if (c.kind === "liquidate") liquidate = liquidate.filter((x) => !x.equals(c.portfolio));
       };
-      let resolved = await resolveCrankPlan(build, chunk, params.simulate, onOptional);
+      let resolved = await resolveCrankPlan(build, chunk, simulate, onOptional);
       if (!resolved.sim.err && resolved.sim.portfolioData) {
         const bankrupt = [...resolved.sim.portfolioData.entries()]
           .filter(([, d]) => isBankruptPortfolio(d))
@@ -1004,7 +1007,7 @@ export async function refreshOverflow(params: {
           out.bankruptFound += bankrupt.length;
           liquidate = bankrupt;
           const remaining = chunk.filter((t) => !resolved.pruned.some((p) => p.pubkey.equals(t.pubkey)));
-          const withLiq = await resolveCrankPlan(build, remaining, params.simulate, onOptional);
+          const withLiq = await resolveCrankPlan(build, remaining, simulate, onOptional);
           if (!withLiq.sim.err) resolved = { ...withLiq, pruned: [...resolved.pruned, ...withLiq.pruned] };
         }
       }

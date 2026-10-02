@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { ComputeBudgetProgram, Keypair, PublicKey, Transaction, VersionedTransaction } from "@solana/web3.js";
 import {
+  FOLLOWUP_CU_HEADROOM,
   LIQUIDATE_CRANK_CU,
   MAX_TX_CU,
   REFRESHES_PER_OVERFLOW_TX,
@@ -121,6 +122,12 @@ describe("chunking the overflow", () => {
     assert.ok(REFRESHES_PER_OVERFLOW_TX * 130_000 + LIQUIDATE_CRANK_CU <= MAX_TX_CU);
   });
 
+  it("a lone follow-up refresh gets CU headroom (live: one LP refresh exceeded a bare 130k)", () => {
+    const one = planRefreshTx({ owner, market: MARKET, targets: many(1) });
+    assert.ok(one.computeUnits >= 130_000 + FOLLOWUP_CU_HEADROOM);
+    assert.equal(planRefreshTx({ owner, market: MARKET, targets: [] }).computeUnits, 0);
+  });
+
   it("follow-up refreshes carry no observation (they must not accrue/re-stale)", () => {
     const plan = planRefreshTx({ owner, market: MARKET, targets: many(3) });
     for (const c of plan.cranks) assert.equal(c.ix.data[9], 0, "zero observation hints");
@@ -171,6 +178,23 @@ describe("refreshOverflow", () => {
     });
     assert.equal(r.refreshed, 0);
     assert.match(r.error ?? "", /timeout/);
+  });
+
+  it("all refreshes of a chunk rejected: the empty remainder is never simulated", async () => {
+    let emptySims = 0;
+    const r = await refreshOverflow({
+      owner, market: MARKET, overflow: targets(2),
+      simulate: async (p) => {
+        if (p.cranks.length === 0) emptySims++;
+        const i = p.cranks.findIndex((c) => c.kind === "refresh");
+        return i >= 0 ? { err: { InstructionError: [i + 1, { Custom: 22 }] }, logs: [], marketData: null } : { err: { InstructionError: [0, "ComputationalBudgetExceeded"] }, logs: [], marketData: null };
+      },
+      send: async () => "x",
+      waitLanded: async () => "landed",
+    });
+    assert.equal(emptySims, 0);
+    assert.equal(r.pruned.length, 2);
+    assert.match(r.error ?? "", /rejected/);
   });
 
   it("a send failure is reported, never thrown", async () => {
