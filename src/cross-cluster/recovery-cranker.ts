@@ -574,7 +574,7 @@ export async function crankOneMarket(
       if (c.kind === "repair") repairs = repairs.filter((x) => x !== c.repair);
       if (c.kind === "liquidate") liquidateTargets = liquidateTargets.filter((x) => !x.equals(c.portfolio));
     };
-    let resolved = await resolveCrankPlan(build, targets, simulate, onOptionalRejected);
+    let resolved = await resolveCrankPlan(build, targets, simulate, onOptionalRejected, refreshPruneBudget(targets.length));
     // Bankruptcy pass: a positioned account whose post-refresh equity is <= 0 is
     // re-planned with a second crank so the engine liquidates it this cycle.
     if (!resolved.sim.err && resolved.sim.portfolioData) {
@@ -585,7 +585,7 @@ export async function crankOneMarket(
         obs.bankruptFound = bankrupt.length;
         liquidateTargets = bankrupt;
         const remaining = targets.filter((t) => !resolved.pruned.some((p) => p.pubkey.equals(t.pubkey)));
-        const withLiq = await resolveCrankPlan(build, remaining, simulate, onOptionalRejected);
+        const withLiq = await resolveCrankPlan(build, remaining, simulate, onOptionalRejected, refreshPruneBudget(remaining.length));
         if (!withLiq.sim.err) {
           resolved = { ...withLiq, pruned: [...resolved.pruned, ...withLiq.pruned] };
         } else {
@@ -705,13 +705,14 @@ export async function crankOneMarket(
       obs.overflowRefreshed = ov.refreshed;
       obs.bankruptFound += ov.bankruptFound;
       obs.bankruptLiquidated += ov.liquidated;
-      overflowError = ov.error;
+      const staleAfter = finalPost !== null && (finalPost.staleLong !== 0n || finalPost.staleShort !== 0n);
+      overflowError = ov.error ?? (staleAfter ? `stale ${finalPost!.staleLong}L/${finalPost!.staleShort}S after follow-ups (pruned ${ov.pruned.length})` : null);
       const ovSummary =
         `overflow=${ov.attempted} refreshed=${ov.refreshed} pruned=${ov.pruned.length}` +
         `${ov.pruned.length ? ` [${ov.pruned.map((p) => `${p.pubkey.toBase58().slice(0, 8)}:${p.code ?? "?"}`).join(",")}]` : ""}` +
         ` txs=${ov.signatures.length} stale_after=${finalPost ? `${finalPost.staleLong}L/${finalPost.staleShort}S` : "?"}` +
         `${ov.error ? ` error=${ov.error}` : ""}`;
-      const failed = ov.error !== null || (finalPost !== null && (finalPost.staleLong !== 0n || finalPost.staleShort !== 0n));
+      const failed = ov.error !== null || staleAfter;
       if (failed) {
         console.warn(`[cranker][overflow] ${label}: follow-up refreshes did not clear loss-stale (${ovSummary}) — retrying next cycle`);
       } else if (state.lastOverflowSummary !== ovSummary) {
@@ -854,6 +855,16 @@ export interface ResolvedCrankPlan {
 
 /** Refreshes pruned one at a time before giving up on refreshing this cycle. */
 export const MAX_REFRESH_PRUNES = 3;
+/**
+ * Prune budget the cranker actually uses: one per positioned portfolio, capped.
+ * When an accrual does not move K/F, every refresh of a NON-stale portfolio
+ * returns Custom(22) (NoAction), so a budget of 3 gave up before reaching the
+ * stale one (live 2026-10-02: Percolator pruned=12 with 1L still stale).
+ */
+export function refreshPruneBudget(targets: number): number {
+  return Math.min(MAX_REFRESH_PRUNE_BUDGET, Math.max(MAX_REFRESH_PRUNES, targets));
+}
+export const MAX_REFRESH_PRUNE_BUDGET = 16;
 /** Optional instructions (<= 2 expiries + 2 finalizes, plus liquidations) dropped before giving up. */
 export const MAX_REPAIR_DROPS = 8;
 
@@ -878,6 +889,8 @@ export async function resolveCrankPlan(
    * so a repair the engine refuses can never block the ordinary crank.
    */
   onOptionalRejected?: (crank: PlannedCrank) => void,
+  /** Refreshes pruned before every remaining one is dropped (default MAX_REFRESH_PRUNES). */
+  maxPrunes: number = MAX_REFRESH_PRUNES,
 ): Promise<ResolvedCrankPlan> {
   let remaining = [...targets];
   const pruned: { pubkey: PublicKey; code: number | null; repair?: LivenessRepair }[] = [];
@@ -902,7 +915,7 @@ export async function resolveCrankPlan(
     if (!crank || crank.kind !== "refresh") return { plan, sim, pruned };
     pruned.push({ pubkey: crank.portfolio, code: ie?.custom ?? null });
     remaining = remaining.filter((p) => !p.pubkey.equals(crank.portfolio));
-    if (pruned.length >= MAX_REFRESH_PRUNES && remaining.length > 0) {
+    if (pruned.filter((p) => !p.repair).length >= maxPrunes && remaining.length > 0) {
       for (const p of remaining) pruned.push({ pubkey: p.pubkey, code: null });
       remaining = [];
     }
@@ -998,7 +1011,7 @@ export async function refreshOverflow(params: {
       const onOptional = (c: PlannedCrank) => {
         if (c.kind === "liquidate") liquidate = liquidate.filter((x) => !x.equals(c.portfolio));
       };
-      let resolved = await resolveCrankPlan(build, chunk, simulate, onOptional);
+      let resolved = await resolveCrankPlan(build, chunk, simulate, onOptional, refreshPruneBudget(chunk.length));
       if (!resolved.sim.err && resolved.sim.portfolioData) {
         const bankrupt = [...resolved.sim.portfolioData.entries()]
           .filter(([, d]) => isBankruptPortfolio(d))
@@ -1007,7 +1020,7 @@ export async function refreshOverflow(params: {
           out.bankruptFound += bankrupt.length;
           liquidate = bankrupt;
           const remaining = chunk.filter((t) => !resolved.pruned.some((p) => p.pubkey.equals(t.pubkey)));
-          const withLiq = await resolveCrankPlan(build, remaining, simulate, onOptional);
+          const withLiq = await resolveCrankPlan(build, remaining, simulate, onOptional, refreshPruneBudget(remaining.length));
           if (!withLiq.sim.err) resolved = { ...withLiq, pruned: [...resolved.pruned, ...withLiq.pruned] };
         }
       }
@@ -1035,9 +1048,8 @@ export async function refreshOverflow(params: {
       out.error = `follow-up tx ${sent[i].sig.slice(0, 12)}… ${o}`;
     }
   });
-  if (out.error === null && out.refreshed === 0 && out.pruned.length > 0) {
-    out.error = "every follow-up refresh was rejected (mark moved since the accrual?)";
-  }
+  // Every refresh rejected is not an error by itself: Custom(22) is also what a
+  // portfolio that is not stale returns. The caller's verification read decides.
   return out;
 }
 

@@ -42,6 +42,8 @@ import {
   endedLossStale,
   freshCrankMarketState,
   refreshOverflow,
+  refreshPruneBudget,
+  resolveCrankPlan,
 } from "./recovery-cranker.ts";
 import type { SimOutcome } from "./recovery-cranker.ts";
 import {
@@ -153,7 +155,7 @@ describe("refreshOverflow", () => {
     assert.equal(sent.length, chunkOverflowTargets(targets(10)).length);
   });
 
-  it("mark moved since the accrual (every refresh Custom(22)): nothing sent, error reported for next cycle", async () => {
+  it("mark moved since the accrual (every refresh Custom(22)): nothing sent, nothing counted refreshed", async () => {
     let sends = 0;
     const r = await refreshOverflow({
       owner, market: MARKET, overflow: targets(3),
@@ -166,7 +168,7 @@ describe("refreshOverflow", () => {
     });
     assert.equal(sends, 0);
     assert.equal(r.refreshed, 0);
-    assert.notEqual(r.error, null);
+    assert.equal(r.pruned.length, 3);
   });
 
   it("a follow-up that does not land is an error, not a success", async () => {
@@ -194,7 +196,7 @@ describe("refreshOverflow", () => {
     });
     assert.equal(emptySims, 0);
     assert.equal(r.pruned.length, 2);
-    assert.match(r.error ?? "", /rejected/);
+    assert.equal(r.refreshed, 0);
   });
 
   it("a send failure is reported, never thrown", async () => {
@@ -375,6 +377,27 @@ describe("crankOneMarket with 12 positioned portfolios (modelled engine)", () =>
     await crankOneMarket(good.conn as never, KEEPER, ENTRY, st, false);
     assert.equal(good.staleNow(), 0);
     assert.equal(getCrankRefreshHealth(MARKET.toBase58())?.lossStaleCycles, 0);
+  });
+});
+
+describe("prune budget covers every positioned portfolio", () => {
+  it("only the LAST of 12 refreshes is stale (accrual moved no K/F): it is still reached and kept", async () => {
+    const set = selectPositionedPortfolios(portfolioAccounts());
+    const staleOne = set[set.length - 1].pubkey;
+    const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan =>
+      planCrankTx({ owner: KEEPER.publicKey, market: MARKET, lpPortfolio: LP, catchup: 0, refreshTargets: t });
+    const sim = async (p: CrankPlan): Promise<SimOutcome> => {
+      const i = p.cranks.findIndex((c) => c.kind === "refresh" && !c.portfolio.equals(staleOne));
+      return i >= 0 ? { err: { InstructionError: [i + 1, { Custom: 22 }] }, logs: [], marketData: null } : { err: null, logs: [], marketData: null };
+    };
+    const r = await resolveCrankPlan(build, set, sim, undefined, refreshPruneBudget(set.length));
+    const refreshed = r.plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio.toBase58());
+    const kept = [...refreshed, ...r.plan.overflow.map((p) => p.pubkey.toBase58())];
+    assert.ok(kept.includes(staleOne.toBase58()), "the stale portfolio survives pruning");
+    // Negative control: the old fixed budget of 3 gives up first.
+    const old = await resolveCrankPlan(build, set, sim);
+    const oldKept = [...old.plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio.toBase58()), ...old.plan.overflow.map((p) => p.pubkey.toBase58())];
+    assert.equal(oldKept.includes(staleOne.toBase58()), false);
   });
 });
 
