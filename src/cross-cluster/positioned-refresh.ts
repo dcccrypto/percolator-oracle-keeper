@@ -166,6 +166,12 @@ export function decodeMarketRefreshState(
   };
 }
 
+/** Absolute byte offsets of stale_account_count_long/short for `assetIndex` (tests patch these). */
+export function staleCountOffsets(assetIndex = REFRESH_ASSET_INDEX): { long: number; short: number } {
+  const a = ASSET_SLOT_BASE + assetIndex * ASSET_SLOT_LEN + ASSET_WRAPPER_LEN;
+  return { long: a + AS_STALE_LONG, short: a + AS_STALE_SHORT };
+}
+
 /** Mirror of `asset_is_loss_stale_at_slot(asset, header.current_slot)`. */
 export function isAssetLossStale(s: MarketRefreshState): boolean {
   return (
@@ -324,8 +330,12 @@ export interface PlannedCrank {
 
 export interface CrankPlan {
   cranks: PlannedCrank[];
-  /** Refreshes that did not fit this transaction's CU budget. */
-  overflow: PublicKey[];
+  /**
+   * Refreshes that did not fit this transaction's CU budget. The cranker sends
+   * them as follow-up transactions (`planOverflowRefreshTxs`) in the same price
+   * window, so every positioned portfolio is refreshed each cohort.
+   */
+  overflow: PositionedPortfolio[];
   computeUnits: number;
 }
 
@@ -392,10 +402,10 @@ export function planCrankTx(params: {
   let cu = repairCu + catchup * CATCHUP_CRANK_CU + ACCRUE_CRANK_CU;
 
   const ordered = [...refreshTargets].sort((x, y) => Number(x.isLp) - Number(y.isLp));
-  const overflow: PublicKey[] = [];
+  const overflow: PositionedPortfolio[] = [];
   for (const p of ordered) {
     if (cu + REFRESH_CRANK_CU > MAX_TX_CU) {
-      overflow.push(p.pubkey);
+      overflow.push(p);
       continue;
     }
     cranks.push({ kind: "refresh", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
@@ -406,6 +416,63 @@ export function planCrankTx(params: {
     }
   }
   return { cranks, overflow, computeUnits: Math.min(MAX_TX_CU, cu) };
+}
+
+// ── Overflow refreshes (follow-up transactions) ──────────────────────────
+
+/**
+ * Refresh-only transaction for `targets`: one no-observation crank per target,
+ * plus a second (liquidate) crank right after each non-LP target listed in
+ * `liquidateTargets`. Used for the refreshes that did not fit the accrual
+ * transaction. It must land after the accrual and before the market's next
+ * price push (see refresh-coordination.ts): a no-observation crank is only
+ * accepted while the committed mark has not moved since the accrual.
+ * The caller sizes `targets` with `chunkOverflowTargets`, so this fits MAX_TX_CU.
+ */
+export function planRefreshTx(params: {
+  owner: PublicKey;
+  market: PublicKey;
+  targets: ReadonlyArray<PositionedPortfolio>;
+  liquidateTargets?: ReadonlyArray<PublicKey>;
+}): CrankPlan {
+  const { owner, market, targets } = params;
+  const liq = params.liquidateTargets ?? [];
+  const cranks: PlannedCrank[] = [];
+  let cu = 0;
+  for (const p of targets) {
+    cranks.push({ kind: "refresh", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
+    cu += REFRESH_CRANK_CU;
+    if (!p.isLp && liq.some((t) => t.equals(p.pubkey)) && cu + LIQUIDATE_CRANK_CU <= MAX_TX_CU) {
+      cranks.push({ kind: "liquidate", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
+      cu += LIQUIDATE_CRANK_CU;
+    }
+  }
+  // The accrual tx's 1.4M budget absorbs per-refresh variance across ~9 refreshes;
+  // a short follow-up has no such slack (live 2026-10-02: a lone LP refresh hit
+  // ComputationalBudgetExceeded at 130k), so it gets explicit headroom.
+  return { cranks, overflow: [], computeUnits: cranks.length === 0 ? 0 : Math.min(MAX_TX_CU, cu + FOLLOWUP_CU_HEADROOM) };
+}
+
+/** Extra CU on every follow-up refresh tx (see planRefreshTx). */
+export const FOLLOWUP_CU_HEADROOM = 200_000;
+
+/** Refreshes per follow-up transaction: the CU cap, leaving room for one liquidation. */
+export const REFRESHES_PER_OVERFLOW_TX = Math.floor((MAX_TX_CU - LIQUIDATE_CRANK_CU) / REFRESH_CRANK_CU);
+
+/**
+ * Split the overflow into follow-up transaction groups, in order. Every target
+ * appears in exactly one group; each group fits MAX_TX_CU even with one
+ * liquidation added (more liquidations than that are skipped by
+ * `planRefreshTx`'s CU check and caught by the next cycle).
+ */
+export function chunkOverflowTargets(
+  overflow: ReadonlyArray<PositionedPortfolio>,
+  perTx: number = REFRESHES_PER_OVERFLOW_TX,
+): PositionedPortfolio[][] {
+  const n = Math.max(1, Math.floor(perTx));
+  const out: PositionedPortfolio[][] = [];
+  for (let i = 0; i < overflow.length; i += n) out.push(overflow.slice(i, i + n));
+  return out;
 }
 
 /**

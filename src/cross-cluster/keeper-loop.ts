@@ -26,6 +26,8 @@ import { checkCircuitBreaker, recordMarkInForce } from "../circuit-breaker.ts";
 import type { CircuitBreakerState } from "../circuit-breaker.ts";
 import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets } from "./auth-mark-pusher.ts";
 import { evaluatePushCycle, getAlertSink } from "./alerting.ts";
+import { getCrankRefreshHealth, isPushHeld } from "./refresh-coordination.ts";
+import type { CrankRefreshHealth } from "./refresh-coordination.ts";
 import {
   type WalletBalanceState,
   createWalletBalanceState,
@@ -165,6 +167,29 @@ export function landedPushes<T extends { marketAddress: string; priceE6: bigint 
 }
 
 /** P3 exhausted-backing gate: skip the push when the hook says to withhold it. */
+/**
+ * Per-market crank refresh health for /health. `status` is non-ok once a market
+ * has ended loss-stale (stale count > 0 after the keeper's refreshes) for
+ * ALERT_LOSS_STALE_CYCLES cycles: every risk-increasing trade reverts Custom(21).
+ */
+export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<string, string | number | null> {
+  if (!h) return { crankStatus: null };
+  return {
+    crankStatus: h.status,
+    lossStale: h.postStaleLong !== null ? Number(h.postStaleLong + (h.postStaleShort ?? 0) > 0) : Number(h.staleLong + h.staleShort > 0),
+    lossStaleCycles: h.lossStaleCycles,
+    staleLong: h.staleLong,
+    staleShort: h.staleShort,
+    postStaleLong: h.postStaleLong,
+    postStaleShort: h.postStaleShort,
+    positioned: h.positioned,
+    overflow: h.overflow,
+    overflowRefreshed: h.overflowRefreshed,
+    overflowError: h.overflowError,
+    crankHealthAgo: `${Math.floor((Date.now() - h.updatedAt) / 1000)}s`,
+  };
+}
+
 export function withheldFromPush(market: string, withholdPush: ((m: string) => boolean) | undefined): boolean {
   if (!withholdPush) return false;
   try {
@@ -234,8 +259,12 @@ function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Regis
         totalErrors: stat.totalErrors,
         authorityMismatch: stat.authorityMismatch,
         lastError: stat.lastErrorMsg,
+        ...crankHealthFields(getCrankRefreshHealth(addr)),
       };
     }
+    const lossStaleMarkets = [...state.stats.entries()]
+      .filter(([addr]) => getCrankRefreshHealth(addr)?.status === "loss-stale")
+      .map(([addr, stat]) => stat.label || addr);
     // A quarantined market reverted its push 3 cycles running, so the pusher
     // stopped batching it to keep it from freezing everyone else's price.
     //
@@ -258,7 +287,7 @@ function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Regis
       status:
         pricingStatus !== "ok"
           ? pricingStatus
-          : quarantinedMarkets.length > 0
+          : quarantinedMarkets.length > 0 || lossStaleMarkets.length > 0
             ? "degraded-markets"
             : "ok",
       lastSuccessfulPushAgo:
@@ -268,6 +297,7 @@ function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Regis
       consecutiveBatchReadFailures: state.consecutiveBatchReadFailures,
       lastBatchReadError: state.lastBatchReadError,
       quarantinedMarkets,
+      lossStaleMarkets,
       uptimeSec,
       cycleCount: state.cycleCount,
       timeoutCount: state.timeoutCount,
@@ -608,6 +638,9 @@ async function runCycle(
   const pendingCircuitBreakerStates = new Map<string, CircuitBreakerState>();
   for (const entry of registry.markets) {
     if (notPushable.has(entry.marketAddress)) continue;
+    // The cranker is landing follow-up refreshes for this market's current
+    // accrual; a push now would void them (Custom(22)). Auto-expires.
+    if (isPushHeld(entry.marketAddress)) continue;
     if (withheldFromPush(entry.marketAddress, config.withholdPush)) {
       const ws = state.stats.get(entry.marketAddress);
       if (ws) ws.lastErrorMsg = "push withheld: P3 senior backing exhausted, waiting for the tag 39 stale window";

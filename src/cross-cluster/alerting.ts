@@ -45,6 +45,7 @@ export type AlertKind =
   | "fee-leg-blocked"
   | "fee-job-failed"
   | "adl-reduce-only"
+  | "loss-stale"
   | "terminal-budget-unbooked"
   | "terminal-recovery-blocked-portfolios"
   | "terminal-pda-portfolio-closed"
@@ -85,6 +86,8 @@ export interface AlertThresholds {
   cooldownMs: number;
   /** Slots a market may stay ADL reduce-only before the alert turns critical (R2). */
   adlReduceOnlyCriticalSlots: number;
+  /** Consecutive crank cycles a market may END loss-stale (stale count > 0 after the keeper's refreshes). */
+  lossStaleCycles: number;
 }
 
 export const DEFAULT_THRESHOLDS: AlertThresholds = {
@@ -96,6 +99,7 @@ export const DEFAULT_THRESHOLDS: AlertThresholds = {
   bankruptCycles: 2,
   cooldownMs: 15 * 60_000,
   adlReduceOnlyCriticalSlots: 9_000, // ~1 hour
+  lossStaleCycles: 3,
 };
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -121,6 +125,7 @@ export function thresholdsFromEnv(env: Env): AlertThresholds {
     bankruptCycles: envInt(env, "ALERT_BANKRUPT_CYCLES", DEFAULT_THRESHOLDS.bankruptCycles),
     cooldownMs: envInt(env, "ALERT_COOLDOWN_MS", DEFAULT_THRESHOLDS.cooldownMs),
     adlReduceOnlyCriticalSlots: envInt(env, "ALERT_ADL_REDUCE_ONLY_CRITICAL_SLOTS", DEFAULT_THRESHOLDS.adlReduceOnlyCriticalSlots),
+    lossStaleCycles: envInt(env, "ALERT_LOSS_STALE_CYCLES", DEFAULT_THRESHOLDS.lossStaleCycles),
   };
   if (t.slotLagCritical < t.slotLagWarn) {
     throw new Error("ALERT_SLOT_LAG_CRITICAL must be >= ALERT_SLOT_LAG_WARN");
@@ -154,6 +159,15 @@ export interface CrankHealthSample {
   bankruptLiquidated: number;
   /** ADL side factors + effective OI (adl-state.ts); null when not a v18 market header. */
   adl?: { aLong: bigint; aShort: bigint; oiEffLong: bigint; oiEffShort: bigint; reduceOnly: boolean } | null;
+  /** stale_account_count_long/short at the pre-crank read (null/undefined: unknown). */
+  staleLong?: number | null;
+  staleShort?: number | null;
+  /** Positioned portfolios targeted, refreshes that overflowed the accrual tx, and how many of those landed. */
+  positioned?: number;
+  overflow?: number;
+  overflowRefreshed?: number;
+  /** Consecutive cycles the market ENDED loss-stale (Custom(21) for every open while it lasts). */
+  lossStaleCycles?: number;
 }
 
 /** Streak counters carried between cycles, per market. */
@@ -252,6 +266,27 @@ export function evaluateCrankHealth(
       data: { consecutive: s.consecutiveReverts, lastCode: s.lastRevertCode, ok: s.totalOk, rev: s.totalReverts, market: s.market },
     });
   }
+  const lsc = s.lossStaleCycles ?? 0;
+  if (lsc >= t.lossStaleCycles) {
+    active.push({
+      kind: "loss-stale",
+      severity: "critical",
+      subject: s.label,
+      message:
+        `market still loss-stale after ${lsc} consecutive crank cycles (stale ${s.staleLong ?? "?"}L/${s.staleShort ?? "?"}S, ` +
+        `positioned ${s.positioned ?? "?"}, overflow ${s.overflow ?? 0}, follow-up refreshed ${s.overflowRefreshed ?? 0}) — ` +
+        "every risk-increasing trade reverts Custom(21) until each positioned portfolio is refreshed",
+      data: {
+        market: s.market,
+        cycles: lsc,
+        staleLong: s.staleLong ?? null,
+        staleShort: s.staleShort ?? null,
+        positioned: s.positioned ?? null,
+        overflow: s.overflow ?? 0,
+        overflowRefreshed: s.overflowRefreshed ?? 0,
+      },
+    });
+  }
   const lapsedCycles = s.lapsedBuckets > 0 ? prev.lapsedCycles + 1 : 0;
   if (lapsedCycles >= t.lapsedBucketCycles) {
     active.push({
@@ -287,6 +322,10 @@ export function crankHealthRecord(s: CrankHealthSample): Record<string, string |
     lapsed: s.lapsedBuckets,
     bankrupt: s.bankruptFound,
     liq: s.bankruptLiquidated,
+    ...(s.staleLong != null ? { stL: s.staleLong, stS: s.staleShort ?? null } : {}),
+    ...(s.positioned ? { pos: s.positioned } : {}),
+    ...(s.overflow ? { ovf: s.overflow, ovfOk: s.overflowRefreshed ?? 0 } : {}),
+    lsc: s.lossStaleCycles ?? 0,
     ...(s.adl?.reduceOnly
       ? { ro: 1, aL: frac(s.adl.aLong), aS: frac(s.adl.aShort), oiL: s.adl.oiEffLong.toString(), oiS: s.adl.oiEffShort.toString() }
       : {}),
