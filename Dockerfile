@@ -6,7 +6,7 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git && \
     rm -rf /var/lib/apt/lists/* && \
-    corepack enable && corepack prepare pnpm@10.33.0 --activate
+    npm install -g pnpm@10.33.0
 
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile --prod
