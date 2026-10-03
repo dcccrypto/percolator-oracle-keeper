@@ -15,6 +15,14 @@
  *   - lapsed buckets Fresh backing buckets past expiry (block one side)
  *   - bankrupt       positioned accounts with equity <= 0 not liquidated
  *   - fee jobs       fee legs that cannot be pushed (e.g. stake pool unbound)
+ *   - market no-push  one market lands no push for N cycles while the board
+ *                    is otherwise fine (K-1: BOME failed 46,623/46,623 cycles
+ *                    while /health said ok)
+ *   - mark lagging    the breaker has kept the published mark away from the
+ *                    source price for a sustained period (K-3: Agency trailed
+ *                    its pool by 40–160% for ~3h45m and the LP was emptied)
+ *   - source frozen   the raw pool price has not changed for hours (dead pool
+ *                    or a DLMM active bin that never moves)
  *   - ADL reduce-only  a_long/a_short != ADL_ONE (F-3/R2): opens revert
  *                    Custom(21) until one whole side exits; reported with the
  *                    observed duration and both sides' OI so an abandoned
@@ -40,6 +48,9 @@ export type AlertKind =
   | "slot-lag"
   | "crank-reverts"
   | "zero-pushes"
+  | "market-no-push"
+  | "mark-lagging"
+  | "source-frozen"
   | "lapsed-bucket"
   | "bankrupt-unliquidated"
   | "fee-leg-blocked"
@@ -88,6 +99,14 @@ export interface AlertThresholds {
   adlReduceOnlyCriticalSlots: number;
   /** Consecutive crank cycles a market may END loss-stale (stale count > 0 after the keeper's refreshes). */
   lossStaleCycles: number;
+  /** K-1: consecutive push cycles ONE market may go without a landed push. */
+  marketNoPushCycles: number;
+  /** K-3: ms the breaker may keep the mark away from the source before alerting. */
+  markLagMs: number;
+  /** K-3: ... only when the source is at least this far (percent) from the mark. */
+  markLagPct: number;
+  /** K-3: ms the raw pool price may stay bit-identical before a source-frozen warning. */
+  sourceFrozenMs: number;
 }
 
 export const DEFAULT_THRESHOLDS: AlertThresholds = {
@@ -100,6 +119,10 @@ export const DEFAULT_THRESHOLDS: AlertThresholds = {
   cooldownMs: 15 * 60_000,
   adlReduceOnlyCriticalSlots: 9_000, // ~1 hour
   lossStaleCycles: 3,
+  marketNoPushCycles: 40, // ~1 min at the 1.5 s push cadence
+  markLagMs: 120_000,
+  markLagPct: 10,
+  sourceFrozenMs: 2 * 3_600_000,
 };
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -126,6 +149,10 @@ export function thresholdsFromEnv(env: Env): AlertThresholds {
     cooldownMs: envInt(env, "ALERT_COOLDOWN_MS", DEFAULT_THRESHOLDS.cooldownMs),
     adlReduceOnlyCriticalSlots: envInt(env, "ALERT_ADL_REDUCE_ONLY_CRITICAL_SLOTS", DEFAULT_THRESHOLDS.adlReduceOnlyCriticalSlots),
     lossStaleCycles: envInt(env, "ALERT_LOSS_STALE_CYCLES", DEFAULT_THRESHOLDS.lossStaleCycles),
+    marketNoPushCycles: envInt(env, "ALERT_MARKET_NO_PUSH_CYCLES", DEFAULT_THRESHOLDS.marketNoPushCycles),
+    markLagMs: envInt(env, "ALERT_MARK_LAG_MS", DEFAULT_THRESHOLDS.markLagMs),
+    markLagPct: envInt(env, "ALERT_MARK_LAG_PCT", DEFAULT_THRESHOLDS.markLagPct),
+    sourceFrozenMs: envInt(env, "ALERT_SOURCE_FROZEN_MS", DEFAULT_THRESHOLDS.sourceFrozenMs),
   };
   if (t.slotLagCritical < t.slotLagWarn) {
     throw new Error("ALERT_SLOT_LAG_CRITICAL must be >= ALERT_SLOT_LAG_WARN");
@@ -358,6 +385,83 @@ export function evaluatePushCycle(
     });
   }
   return { active, zeroStreak };
+}
+
+// ── Per-market push health (K-1, K-3) ───────────────────────────────────────
+
+/** What the push loop knows about one market after a cycle. */
+export interface MarketPushSample {
+  label: string;
+  market: string;
+  /** Consecutive cycles without a landed push. */
+  noPushCycles: number;
+  /** Last push landed at (unix ms); null = never since boot. */
+  lastPushAt: number | null;
+  lastError: string | null;
+  /** The breaker's open gap episode, or null. */
+  markGap: { pct: number; ageMs: number; checks: number; dir: 1 | -1 } | null;
+  /** Raw pool price unchanged since (unix ms); null = no price read yet. */
+  sourceUnchangedSince: number | null;
+  /** No push expected (last seen Resolved/closed, or no longer registered): never degraded, never alerted. */
+  terminal: boolean;
+}
+
+export type MarketPushStatus = "ok" | "no-push" | "mark-lagging";
+
+/**
+ * Per-market verdict for /health and the alert set. Pure. "no-push" outranks
+ * "mark-lagging": a market that pushes nothing is frozen whatever the gap.
+ * source-frozen is a warning only and does not change the status (a quiet
+ * pool can legitimately sit on one price).
+ */
+export function evaluateMarketPush(
+  s: MarketPushSample,
+  t: AlertThresholds,
+  nowMs: number = Date.now(),
+): { status: MarketPushStatus; active: Alert[] } {
+  if (s.terminal) return { status: "ok", active: [] };
+  const active: Alert[] = [];
+  let status: MarketPushStatus = "ok";
+  if (s.noPushCycles >= t.marketNoPushCycles) {
+    status = "no-push";
+    const ago = s.lastPushAt === null ? "never since keeper boot" : `${Math.floor((nowMs - s.lastPushAt) / 1000)}s ago`;
+    active.push({
+      kind: "market-no-push",
+      severity: "critical",
+      subject: s.label,
+      message:
+        `no price push landed for ${s.noPushCycles} consecutive cycles (last push ${ago}; last error: ${s.lastError ?? "none"}) — ` +
+        "this market's AuthMark is frozen while the rest of the board pushes",
+      data: { market: s.market, noPushCycles: s.noPushCycles, lastPushAt: s.lastPushAt, lastError: s.lastError },
+    });
+  }
+  const g = s.markGap;
+  if (g && g.ageMs >= t.markLagMs && g.pct >= t.markLagPct) {
+    if (status === "ok") status = "mark-lagging";
+    active.push({
+      kind: "mark-lagging",
+      severity: "critical",
+      subject: s.label,
+      message:
+        `the published mark has been held ${g.pct.toFixed(1)}% ${g.dir > 0 ? "BELOW" : "ABOVE"} the source price for ` +
+        `${Math.floor(g.ageMs / 1000)}s (${g.checks} checks) by the circuit breaker. The mark can only move toward the source, ` +
+        `so a ${g.dir > 0 ? "long" : "short"} opened now is a free option against the LP. Consider pausing the market.`,
+      data: { market: s.market, gapPct: Number(g.pct.toFixed(2)), gapAgeMs: g.ageMs, checks: g.checks, dir: g.dir },
+    });
+  }
+  if (s.sourceUnchangedSince !== null && nowMs - s.sourceUnchangedSince >= t.sourceFrozenMs) {
+    const mins = Math.floor((nowMs - s.sourceUnchangedSince) / 60_000);
+    active.push({
+      kind: "source-frozen",
+      severity: "warn",
+      subject: s.label,
+      message:
+        `the pool price has not changed for ${mins} min — the pool may be dead or its active bin never moves; ` +
+        "the keeper keeps republishing it as a fresh mark",
+      data: { market: s.market, unchangedMinutes: mins },
+    });
+  }
+  return { status, active };
 }
 
 // ── Sink: dedupe, cooldown, delivery ─────────────────────────────────────────

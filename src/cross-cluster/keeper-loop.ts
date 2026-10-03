@@ -22,10 +22,11 @@ import type { Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
 import { readAllPoolPricesE6 } from "./price-reader.ts";
 import { createMarkSmoother } from "./mark-smoother.ts";
-import { checkCircuitBreaker, recordMarkInForce } from "../circuit-breaker.ts";
+import { checkCircuitBreaker, markGap, recordMarkInForce } from "../circuit-breaker.ts";
 import type { CircuitBreakerState } from "../circuit-breaker.ts";
 import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets } from "./auth-mark-pusher.ts";
-import { evaluatePushCycle, getAlertSink } from "./alerting.ts";
+import { evaluateMarketPush, evaluatePushCycle, getAlertSink } from "./alerting.ts";
+import type { Alert, MarketPushSample } from "./alerting.ts";
 import { getCrankRefreshHealth, isPushHeld } from "./refresh-coordination.ts";
 import type { CrankRefreshHealth } from "./refresh-coordination.ts";
 import {
@@ -89,6 +90,59 @@ interface MarketStat {
   lastErrorMsg: string | null;
   /** True if the last attempt found oracle_authority != keeper. */
   authorityMismatch: boolean;
+  /**
+   * K-1: consecutive cycles in which this market did NOT land a push (any
+   * reason: no pool price, breaker block, dropped from the batch, withheld).
+   * Reset by a landed push. A dry-run "push" counts as landed.
+   */
+  noPushCycles: number;
+  /** K-3: smoothed source price this cycle (E6), 0 when there was none. */
+  sourcePriceE6: bigint;
+  /** K-3: the breaker's gap episode after this cycle's check; null when the source was published as-is. */
+  markGap: { pct: number; ageMs: number; checks: number; dir: 1 | -1 } | null;
+  /** K-3 (WIF/KMNO): raw pool price unchanged since this unix ms; null until a price was read. */
+  sourceUnchangedSince: number | null;
+  /** The last raw pool price read (E6), for sourceUnchangedSince. */
+  lastRawPriceE6: bigint;
+}
+
+/** A fresh /health stat record for one registry entry. */
+export function newMarketStat(m: { label: string; marketAddress: string; poolAddress: string; dexType: string }): MarketStat {
+  return {
+    label: m.label,
+    marketAddress: m.marketAddress,
+    poolAddress: m.poolAddress,
+    dexType: m.dexType,
+    lastPriceE6: 0n,
+    lastPushAt: null,
+    lastSig: null,
+    totalPushes: 0,
+    totalErrors: 0,
+    lastErrorMsg: null,
+    authorityMismatch: false,
+    noPushCycles: 0,
+    sourcePriceE6: 0n,
+    markGap: null,
+    sourceUnchangedSince: null,
+    lastRawPriceE6: 0n,
+  };
+}
+
+/**
+ * K-3: track how long the RAW pool price has been bit-identical. A DLMM pool
+ * whose active bin never moves (or a dead pool) reads the same price every
+ * cycle; the keeper then republishes it as a fresh mark while the token moves
+ * elsewhere (WIF/KMNO marks did not change for 74.8k/19.5k slots on 10-03).
+ */
+export function recordRawPrice(
+  stat: Pick<MarketStat, "sourceUnchangedSince" | "lastRawPriceE6">,
+  rawPriceE6: bigint,
+  nowMs: number,
+): void {
+  if (stat.sourceUnchangedSince === null || rawPriceE6 !== stat.lastRawPriceE6) {
+    stat.sourceUnchangedSince = nowMs;
+    stat.lastRawPriceE6 = rawPriceE6;
+  }
 }
 
 /**
@@ -109,7 +163,8 @@ interface MarketStat {
  * recordLandedPush(stat, Date.now(), res.signature); // stat.lastErrorMsg === null
  */
 export function recordLandedPush(
-  stat: Pick<MarketStat, "totalPushes" | "lastPushAt" | "lastSig" | "lastErrorMsg">,
+  stat: Pick<MarketStat, "totalPushes" | "lastPushAt" | "lastSig" | "lastErrorMsg"> &
+    Partial<Pick<MarketStat, "noPushCycles">>,
   stamp: number,
   signature: string,
 ): void {
@@ -117,6 +172,7 @@ export function recordLandedPush(
   stat.lastPushAt = stamp;
   stat.lastSig = signature;
   stat.lastErrorMsg = null;
+  stat.noPushCycles = 0;
 }
 
 interface LoopState {
@@ -145,6 +201,8 @@ interface LoopState {
   zeroPushStreak: number;
   /** B20: markets last seen Resolved/closed — excluded from the zero-push health count. */
   terminalMarkets: Set<string>;
+  /** K-1: markets whose push landed (or dry-ran) this cycle. Reset every cycle. */
+  landedThisCycle: Set<string>;
 }
 
 /**
@@ -243,8 +301,22 @@ function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Regis
     }
     const uptimeSec = Math.floor((Date.now() - state.startedAt) / 1000);
     const markets: Record<string, object> = {};
+    const nowMs = Date.now();
+    const thresholds = getAlertSink().thresholds;
+    const noPushMarkets: string[] = [];
+    const markLaggingMarkets: string[] = [];
     for (const [addr, stat] of state.stats) {
+      const verdict = evaluateMarketPush(marketPushSample(stat, !pushExpected(state, registry, addr)), thresholds, nowMs);
+      if (verdict.status === "no-push") noPushMarkets.push(stat.label || addr);
+      if (verdict.active.some((a) => a.kind === "mark-lagging")) markLaggingMarkets.push(stat.label || addr);
       markets[addr] = {
+        status: verdict.status,
+        noPushCycles: stat.noPushCycles,
+        sourcePriceUsd: stat.sourcePriceE6 > 0n ? (Number(stat.sourcePriceE6) / 1e6).toString() : null,
+        markGapPct: stat.markGap ? Number(stat.markGap.pct.toFixed(2)) : null,
+        markGapAgo: stat.markGap ? `${Math.floor(stat.markGap.ageMs / 1000)}s` : null,
+        sourceUnchangedFor:
+          stat.sourceUnchangedSince !== null ? `${Math.floor((nowMs - stat.sourceUnchangedSince) / 1000)}s` : null,
         label: stat.label,
         lastPriceUsd:
           stat.lastPriceE6 > 0n
@@ -287,7 +359,10 @@ function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Regis
       status:
         pricingStatus !== "ok"
           ? pricingStatus
-          : quarantinedMarkets.length > 0 || lossStaleMarkets.length > 0
+          : quarantinedMarkets.length > 0 ||
+              lossStaleMarkets.length > 0 ||
+              noPushMarkets.length > 0 ||
+              markLaggingMarkets.length > 0
             ? "degraded-markets"
             : "ok",
       lastSuccessfulPushAgo:
@@ -298,6 +373,8 @@ function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Regis
       lastBatchReadError: state.lastBatchReadError,
       quarantinedMarkets,
       lossStaleMarkets,
+      noPushMarkets,
+      markLaggingMarkets,
       uptimeSec,
       cycleCount: state.cycleCount,
       timeoutCount: state.timeoutCount,
@@ -389,6 +466,22 @@ const CROSS_CLUSTER_MAX_MOVE_PCT = parseCrossClusterPositiveNumberEnv(
   10,
   100,
 );
+/**
+ * K-3 — the longest the breaker may keep the mark away from the source price
+ * (see CircuitBreakerConfig.sustainedRelocationMs). Default 5 min; 0 disables.
+ */
+export function parseSustainedRelocationMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 300_000;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error("CROSS_CLUSTER_SUSTAINED_RELOCATION_MS must be a non-negative integer (0 disables)");
+  }
+  return n;
+}
+const CROSS_CLUSTER_SUSTAINED_RELOCATION_MS = parseSustainedRelocationMs(
+  process.env.CROSS_CLUSTER_SUSTAINED_RELOCATION_MS,
+);
+
 const CROSS_CLUSTER_CIRCUIT_BREAKER_CONFIRM_TRIPS = parseCrossClusterPositiveIntegerEnv(
   "CROSS_CLUSTER_CIRCUIT_BREAKER_CONFIRM_TRIPS",
   3,
@@ -485,6 +578,10 @@ export function splitBreakerCommit(
 ): { commitNow: CircuitBreakerState; deferred: CircuitBreakerState } {
   const commitNow = cloneCircuitBreakerState(candidate);
   commitNow.lastPrice = current.lastPrice; // baseline does NOT advance yet
+  // K-3: a sustained-relocation snap only takes effect once it lands. Until
+  // then the gap episode stays open (so a dropped snap retries next cycle) and
+  // the window is untouched.
+  delete commitNow.cbSnapPending;
   const deferred = cloneCircuitBreakerState(candidate);
   deferred.lastPrice = acceptedPriceUsd; // advances only on a confirmed push
   return { commitNow, deferred };
@@ -506,6 +603,21 @@ export function commitPublishedBreakerState(
   landedAtMs: number,
 ): CircuitBreakerState {
   const next = cloneCircuitBreakerState(pending);
+  if (next.cbSnapPending) {
+    // K-3: a landed sustained-relocation snap. The mark it replaced was wrong
+    // by more than the band for the whole episode; keeping it in the window
+    // would clamp the market straight back to a lagging mark. The window
+    // restarts at the published source price and the gap episode ends; the
+    // next divergence must be sustained again from scratch.
+    delete next.cbSnapPending;
+    next.cbWindowMax = undefined;
+    next.cbWindowMin = undefined;
+    next.cbGapSince = undefined;
+    next.cbGapDir = undefined;
+    next.cbGapChecks = undefined;
+    recordMarkInForce(next, next.lastPrice, landedAtMs);
+    return next;
+  }
   if (committed && committed.lastPrice > 0) {
     recordMarkInForce(next, committed.lastPrice, landedAtMs);
   }
@@ -552,19 +664,7 @@ async function runCycle(
   // Ensure stat entries exist.
   for (const entry of registry.markets) {
     if (!state.stats.has(entry.marketAddress)) {
-      state.stats.set(entry.marketAddress, {
-        label: entry.label,
-        marketAddress: entry.marketAddress,
-        poolAddress: entry.poolAddress,
-        dexType: entry.dexType,
-        lastPriceE6: 0n,
-        lastPushAt: null,
-        lastSig: null,
-        totalPushes: 0,
-        totalErrors: 0,
-        lastErrorMsg: null,
-        authorityMismatch: false,
-      });
+      state.stats.set(entry.marketAddress, newMarketStat(entry));
     }
   }
 
@@ -651,8 +751,10 @@ async function runCycle(
     if (rawPriceE6 === undefined || rawPriceE6 <= 0n) {
       stat.totalErrors++;
       stat.lastErrorMsg = "no pool price this cycle";
+      stat.sourcePriceE6 = 0n;
       continue;
     }
+    recordRawPrice(stat, rawPriceE6, smoothNowMs);
     // The mark that settles trades is the SMOOTHED price, never raw spot.
     let priceE6 = smoothedThisCycle.get(entry.poolAddress);
     if (priceE6 === undefined) {
@@ -676,8 +778,14 @@ async function runCycle(
     const acceptedUsd = checkCircuitBreaker(candidateCircuitBreakerState, priceUsd, {
       maxMovePct: CROSS_CLUSTER_MAX_MOVE_PCT,
       confirmTrips: CROSS_CLUSTER_CIRCUIT_BREAKER_CONFIRM_TRIPS,
+      sustainedRelocationMs: CROSS_CLUSTER_SUSTAINED_RELOCATION_MS,
       log: (msg) => console.warn(`[loop] ${msg}`),
     });
+    stat.sourcePriceE6 = priceE6;
+    {
+      const g = markGap(candidateCircuitBreakerState, priceUsd, Date.now());
+      stat.markGap = g && { pct: g.pct, ageMs: g.ageMs, checks: g.checks, dir: g.dir };
+    }
     if (acceptedUsd === null) {
       // Keep breaker trip accounting for sustained-relocation detection, but do
       // not advance the accepted baseline. checkCircuitBreaker() does not move
@@ -807,6 +915,8 @@ async function runCycle(
       stat.authorityMismatch = false;
       if (config.dryRun) {
         stat.lastSig = "DRY_RUN";
+        stat.noPushCycles = 0;
+        state.landedThisCycle.add(p.marketAddress);
       } else if (pushedSet.has(p.marketAddress) && res.signature) {
         const pendingCircuitBreakerState = pendingCircuitBreakerStates.get(
           p.marketAddress,
@@ -822,6 +932,7 @@ async function runCycle(
           );
         }
         recordLandedPush(stat, stamp, res.signature);
+        state.landedThisCycle.add(p.marketAddress);
       } else {
         stat.totalErrors++;
         stat.lastErrorMsg = "dropped from batch (reverted in preflight or quarantined)";
@@ -858,6 +969,58 @@ async function runCycle(
       s.totalErrors++;
       s.lastErrorMsg = msg;
     }
+  }
+}
+
+/**
+ * K-1: after every cycle (including a timed-out one), a market that did not
+ * land a push extends its no-push streak. A landed push already reset it.
+ */
+export function advanceNoPushStreaks(
+  stats: Iterable<Pick<MarketStat, "marketAddress" | "noPushCycles">>,
+  landed: ReadonlySet<string>,
+): void {
+  for (const stat of stats) {
+    if (!landed.has(stat.marketAddress)) stat.noPushCycles++;
+  }
+}
+
+/**
+ * K-1: should this market be pushing? Not when it was last seen Resolved/closed,
+ * and not when the hot-reloaded registry no longer lists it (stats are never
+ * pruned, so a de-registered market would otherwise alert forever).
+ */
+function pushExpected(state: LoopState, registry: Registry, market: string): boolean {
+  return !state.terminalMarkets.has(market) && registry.markets.some((m) => m.marketAddress === market);
+}
+
+/** K-1/K-3: the per-market sample the alert evaluator and /health read. `terminal` = no push expected. */
+export function marketPushSample(stat: MarketStat, terminal: boolean): MarketPushSample {
+  return {
+    label: stat.label,
+    market: stat.marketAddress,
+    noPushCycles: stat.noPushCycles,
+    lastPushAt: stat.lastPushAt,
+    lastError: stat.lastErrorMsg,
+    markGap: stat.markGap,
+    sourceUnchangedSince: stat.sourceUnchangedSince,
+    terminal,
+  };
+}
+
+/** K-1/K-3: reconcile per-market push alerts once per cycle. Never throws. */
+async function reportMarketPush(state: LoopState, registry: Registry): Promise<void> {
+  try {
+    const sink = getAlertSink();
+    const now = Date.now();
+    const active: Alert[] = [];
+    for (const stat of state.stats.values()) {
+      const ev = evaluateMarketPush(marketPushSample(stat, !pushExpected(state, registry, stat.marketAddress)), sink.thresholds, now);
+      active.push(...ev.active);
+    }
+    await sink.reconcile("push-market", active);
+  } catch (err) {
+    console.error(`[keeper] market push health report failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -943,24 +1106,8 @@ export async function startKeeperLoop(
     cyclePushed: 0,
     zeroPushStreak: 0,
     terminalMarkets: new Set(),
-    stats: new Map(
-      registry.markets.map((m) => [
-        m.marketAddress,
-        {
-          label: m.label,
-          marketAddress: m.marketAddress,
-          poolAddress: m.poolAddress,
-          dexType: m.dexType,
-          lastPriceE6: 0n,
-          lastPushAt: null,
-          lastSig: null,
-          totalPushes: 0,
-          totalErrors: 0,
-          lastErrorMsg: null,
-          authorityMismatch: false,
-        } satisfies MarketStat,
-      ]),
-    ),
+    landedThisCycle: new Set(),
+    stats: new Map(registry.markets.map((m) => [m.marketAddress, newMarketStat(m)])),
   };
 
   const decimalsCache: DecimalsCache = new Map();
@@ -997,6 +1144,7 @@ export async function startKeeperLoop(
     state.cycleCount++;
     state.cycleAttempted = 0;
     state.cyclePushed = 0;
+    state.landedThisCycle = new Set();
     console.log(
       `\n[keeper] === Cycle ${state.cycleCount} ${new Date().toISOString()} ===`,
     );
@@ -1025,8 +1173,13 @@ export async function startKeeperLoop(
     }
 
     state.lastCycleAt = Date.now();
+    advanceNoPushStreaks(
+      [...state.stats.values()].filter((st) => pushExpected(state, registry, st.marketAddress)),
+      state.landedThisCycle,
+    );
     // B20: terminal markets can never be pushed; a board of only terminal markets is not an outage.
     await reportPushCycle(state, countPushableMarkets(registry.markets, state.terminalMarkets));
+    await reportMarketPush(state, registry);
     const elapsed = Date.now() - cycleStart;
     const remaining = config.intervalMs - elapsed;
     if (remaining > 0 && !stopping) {

@@ -75,6 +75,7 @@ describe("trailing-window bound survives the keeper-loop commit protocol (#82, #
       cbConsecutiveTrips: 2,
       cbWindowMax: [{ price: 125, at: 1_000 }],
       cbWindowMin: [{ price: 100, at: 900 }, { price: 125, at: 1_000 }],
+      cbGapSince: 800, cbGapDir: 1, cbGapChecks: 40, cbSnapPending: true,
     };
     const c = cloneCircuitBreakerState(full);
     assert.deepEqual(c, full);

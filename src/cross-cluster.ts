@@ -38,6 +38,10 @@
  *   KEEPER_ALERT_WEBHOOK_URL  https webhook for [ALERT] lines (optional; Slack/Discord-compatible `text`)
  *   ALERT_SLOT_LAG_WARN / ALERT_SLOT_LAG_CRITICAL / ALERT_CRANK_REVERTS / ALERT_ZERO_PUSH_CYCLES /
  *   ALERT_LAPSED_BUCKET_CYCLES / ALERT_BANKRUPT_CYCLES / ALERT_COOLDOWN_MS  alert thresholds (alerting.ts)
+ *   ALERT_MARKET_NO_PUSH_CYCLES (default 40) / ALERT_MARK_LAG_MS (120000) / ALERT_MARK_LAG_PCT (10) /
+ *   ALERT_SOURCE_FROZEN_MS (7200000)  K-1/K-3 per-market push alerts + /health status (alerting.ts)
+ *   CROSS_CLUSTER_SUSTAINED_RELOCATION_MS  K-3: longest the breaker may hold the mark away from a
+ *                           consistently-diverged source before publishing it (default 300000; 0 = off)
  *   REGISTER_SOURCE_URL     GET endpoint polled for wizard-registered markets (unset = disabled)
  *   REGISTER_POLL_INTERVAL_MS  register-poll interval ms (default: 30000)
  *   REGISTRY_RELOAD_INTERVAL_MS  G6 registry.json hot-reload interval ms (default: 15000)

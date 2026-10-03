@@ -40,6 +40,23 @@ export interface CircuitBreakerState {
    */
   cbWindowMax?: readonly MarkObservation[];
   cbWindowMin?: readonly MarkObservation[];
+  /**
+   * K-3 (2026-10-03) — the current "mark gap" episode: every check since
+   * `cbGapSince` has refused to publish the source price as-is (an unconfirmed
+   * trip, a band-edge clamp or a band hold), always with the source on the
+   * `cbGapDir` side of the mark. Undefined when the last check published the
+   * source price unchanged. `cbGapChecks` counts the checks in the episode.
+   */
+  cbGapSince?: number;
+  cbGapDir?: 1 | -1;
+  cbGapChecks?: number;
+  /**
+   * K-3 — set by a check that ended a sustained gap by publishing the source
+   * price (see `sustainedRelocationMs`). Consumed by the caller's commit: once
+   * that push LANDS, the trailing window restarts at the new mark, and the gap
+   * episode ends. Never set on persisted state for a push that did not land.
+   */
+  cbSnapPending?: boolean;
 }
 
 export interface CircuitBreakerConfig {
@@ -75,6 +92,37 @@ export interface CircuitBreakerConfig {
   maxCumulativeMovePct?: number;
   /** Trailing window for the cumulative bound. Defaults to one hour. */
   driftWindowMs?: number;
+  /**
+   * K-3 (2026-10-03) — the longest the published mark may stay away from the
+   * source price. When EVERY check for this long has refused to publish the
+   * source price as-is, always with the source on the same side of the mark
+   * (and at least `sustainedRelocationMinChecks` checks), the source price is
+   * published unchanged and the trailing window restarts there.
+   *
+   * Why: the cumulative band is a rate limit (±maxCumulativeMovePct per
+   * window). A genuine repricing faster than that leaves the mark lagging the
+   * source by a known amount, and the mark can then only move one way: toward
+   * the source, in published, predictable band-edge steps. On 2026-10-03 the
+   * Agency mark trailed its DEX pool by 40–160% for ~3h45m (16:20–20:05 UTC);
+   * one wallet went long twice at a mark half the DEX price, rode two +30%
+   * band steps, and emptied the LP (3,000 capital + ~186 insurance). The
+   * engine has no oracle-age gate for AUTH_MARK, so a held or clamped mark is a
+   * live, tradeable mark on chain. A lag that is not bounded is a free option
+   * against the LP.
+   *
+   * What it keeps: a one-cycle spike still never publishes (confirmTrips), a
+   * manipulated move still needs the full window to drag the mark further than
+   * the band, UNLESS the manipulator holds the smoothed pool price beyond the
+   * band on every single check for this long. One check where the source is
+   * publishable as-is ends the episode and restarts the clock. The engine's own
+   * per-slot clamp (max_price_move_bps_per_slot) still rate-limits the
+   * effective price.
+   *
+   * 0 disables (the pre-K-3 behaviour: the band alone, unbounded lag).
+   */
+  sustainedRelocationMs?: number;
+  /** K-3 — minimum checks in a gap episode before it can end in a snap. Defaults to 20. */
+  sustainedRelocationMinChecks?: number;
   /** Injectable clock, for tests. Defaults to Date.now. */
   now?: () => number;
   /** Optional log sink — defaults to console.log. */
@@ -82,6 +130,79 @@ export interface CircuitBreakerConfig {
 }
 
 const DEFAULT_DRIFT_WINDOW_MS = 3_600_000;
+
+/**
+ * Prices in log lines. These used to print with toFixed(2), so every sub-cent
+ * market logged "0.00 → 0.00" and its breaker history could not be read back
+ * (the 2026-10-03 Agency investigation had to rebuild the marks from chain).
+ */
+export function fmtPrice(p: number): string {
+  return Number.isFinite(p) ? Number(p.toPrecision(6)).toString() : String(p);
+}
+const DEFAULT_SUSTAINED_RELOCATION_MIN_CHECKS = 20;
+
+/**
+ * K-3 — fold one check's outcome into the gap episode. `published` is what the
+ * check returned. The source price counts as published only when returned
+ * unchanged; null, a clamp and a hold all extend (or start) the episode.
+ */
+function trackGap(
+  state: CircuitBreakerState,
+  newPrice: number,
+  published: number | null,
+  nowMs: number,
+): void {
+  if (published === newPrice || newPrice === state.lastPrice) {
+    state.cbGapSince = undefined;
+    state.cbGapDir = undefined;
+    state.cbGapChecks = undefined;
+    return;
+  }
+  const dir: 1 | -1 = newPrice > state.lastPrice ? 1 : -1;
+  if (state.cbGapDir !== dir || state.cbGapSince === undefined) {
+    state.cbGapSince = nowMs;
+    state.cbGapDir = dir;
+    state.cbGapChecks = 1;
+    return;
+  }
+  state.cbGapChecks = (state.cbGapChecks ?? 0) + 1;
+}
+
+/**
+ * K-3 — has the current gap episode lasted long enough to publish the source?
+ * Read AFTER trackGap has folded in the current check.
+ */
+function gapSustained(state: CircuitBreakerState, cfg: CircuitBreakerConfig, nowMs: number): boolean {
+  const ms = cfg.sustainedRelocationMs ?? 0;
+  if (!(ms > 0) || state.cbGapSince === undefined) return false;
+  const minChecks = Math.max(
+    cfg.confirmTrips,
+    cfg.sustainedRelocationMinChecks ?? DEFAULT_SUSTAINED_RELOCATION_MIN_CHECKS,
+  );
+  return nowMs - state.cbGapSince >= ms && (state.cbGapChecks ?? 0) >= minChecks;
+}
+
+/**
+ * K-3 — the mark gap a caller should report: how far the source is from the
+ * mark in force, how long the source has been unpublishable, and in which
+ * direction. null when the last check published the source as-is.
+ */
+export function markGap(
+  state: CircuitBreakerState,
+  sourcePrice: number,
+  nowMs: number,
+): { pct: number; sinceMs: number; ageMs: number; checks: number; dir: 1 | -1 } | null {
+  if (state.cbGapSince === undefined || state.cbGapDir === undefined || !(state.lastPrice > 0)) {
+    return null;
+  }
+  return {
+    pct: (Math.abs(sourcePrice - state.lastPrice) / state.lastPrice) * 100,
+    sinceMs: state.cbGapSince,
+    ageMs: Math.max(0, nowMs - state.cbGapSince),
+    checks: state.cbGapChecks ?? 0,
+    dir: state.cbGapDir,
+  };
+}
 
 function lastAt(dq: readonly MarkObservation[] | undefined): number {
   return dq && dq.length > 0 ? dq[dq.length - 1].at : Number.NEGATIVE_INFINITY;
@@ -264,11 +385,45 @@ export function checkCircuitBreaker(
   newPrice: number,
   cfg: CircuitBreakerConfig,
 ): number | null {
-  const emit = cfg.log ?? console.log;
-
   if (state.lastPrice === 0) return newPrice; // First price — always accept.
-
   const nowMs = (cfg.now ?? Date.now)();
+  const baseline = state.lastPrice;
+  const result = checkBand(state, newPrice, cfg, nowMs);
+
+  // K-3 — bound the lag. trackGap compares against the baseline the check
+  // started from: a confirmed relocation moves state.lastPrice to what it
+  // returned, which must not be read as "the source was published".
+  const lastPriceAfter = state.lastPrice;
+  state.lastPrice = baseline;
+  trackGap(state, newPrice, result, nowMs);
+  state.lastPrice = lastPriceAfter;
+  if (result === newPrice || !gapSustained(state, cfg, nowMs)) return result;
+
+  const emit = cfg.log ?? console.log;
+  const ageS = Math.round((nowMs - (state.cbGapSince ?? nowMs)) / 1000);
+  emit(
+    `🟣 ${state.symbol}: Circuit breaker SUSTAINED relocation — publishing the ` +
+      `source price ${fmtPrice(newPrice)} (mark ${fmtPrice(baseline)}, ` +
+      `${((Math.abs(newPrice - baseline) / baseline) * 100).toFixed(1)}% away) after ` +
+      `${state.cbGapChecks ?? 0} consecutive checks over ${ageS}s with the source on ` +
+      `the same side. A lagging mark only moves one way, toward the source, so ` +
+      `holding it longer is a free option against the LP.`,
+  );
+  state.lastPrice = newPrice;
+  state.cbConsecutiveTrips = 0;
+  state.cbTripPrice = 0;
+  state.cbSnapPending = true;
+  return newPrice;
+}
+
+/** The pre-K-3 breaker: single-step threshold, confirmation run, trailing band. */
+function checkBand(
+  state: CircuitBreakerState,
+  newPrice: number,
+  cfg: CircuitBreakerConfig,
+  nowMs: number,
+): number | null {
+  const emit = cfg.log ?? console.log;
   const windowMs = cfg.driftWindowMs ?? DEFAULT_DRIFT_WINDOW_MS;
   const maxCumulative = cfg.maxCumulativeMovePct ?? cfg.maxMovePct * 3;
 
@@ -315,8 +470,8 @@ export function checkCircuitBreaker(
     if (t.kind === "spent") {
       emit(
         `🛑 ${state.symbol}: Circuit breaker CUMULATIVE bound — holding ` +
-          `${state.lastPrice.toFixed(2)} (price ${newPrice.toFixed(2)}, trailing ` +
-          `band ${band.lo.toFixed(2)}–${band.hi.toFixed(2)} = ±${maxCumulative}% ` +
+          `${fmtPrice(state.lastPrice)} (price ${fmtPrice(newPrice)}, trailing ` +
+          `band ${fmtPrice(band.lo)}–${fmtPrice(band.hi)} = ±${maxCumulative}% ` +
           `over ${Math.round(windowMs / 1000)}s); next step in ~` +
           `${retryInS(newPrice > band.hi)}s.`,
       );
@@ -355,8 +510,8 @@ export function checkCircuitBreaker(
       // the first confirmed trip after the binding extreme leaves the window.
       emit(
         `🛑 ${state.symbol}: Circuit breaker CUMULATIVE bound — holding ` +
-          `${state.lastPrice.toFixed(2)} (target ${newPrice.toFixed(2)}); ` +
-          `trailing band ${band.lo.toFixed(2)}–${band.hi.toFixed(2)} ` +
+          `${fmtPrice(state.lastPrice)} (target ${fmtPrice(newPrice)}); ` +
+          `trailing band ${fmtPrice(band.lo)}–${fmtPrice(band.hi)} ` +
           `(±${maxCumulative}% over ${Math.round(windowMs / 1000)}s) is spent, ` +
           `next step in ~${retryInS(up)}s.`,
       );
@@ -368,9 +523,9 @@ export function checkCircuitBreaker(
       // #116 — advance to the band edge instead of refusing forever.
       emit(
         `🟠 ${state.symbol}: Circuit breaker CUMULATIVE bound — rate-limiting ` +
-          `relocation ${state.lastPrice.toFixed(2)} → ${newPrice.toFixed(2)} ` +
-          `to the band edge ${t.edge.toFixed(2)} (trailing band ` +
-          `${band.lo.toFixed(2)}–${band.hi.toFixed(2)}, ±${maxCumulative}%). ` +
+          `relocation ${fmtPrice(state.lastPrice)} → ${fmtPrice(newPrice)} ` +
+          `to the band edge ${fmtPrice(t.edge)} (trailing band ` +
+          `${fmtPrice(band.lo)}–${fmtPrice(band.hi)}, ±${maxCumulative}%). ` +
           `Next step in ~${retryInS(up)}s.`,
       );
       accepted = t.edge;
@@ -379,7 +534,7 @@ export function checkCircuitBreaker(
       emit(
         `🟡 ${state.symbol}: Circuit breaker relocation confirmed after ` +
           `${state.cbConsecutiveTrips} trips — re-baselining ` +
-          `${state.lastPrice.toFixed(2)} → ${newPrice.toFixed(2)} ` +
+          `${fmtPrice(state.lastPrice)} → ${fmtPrice(newPrice)} ` +
           `(${movePct.toFixed(1)}% move)`,
       );
     }
@@ -392,7 +547,7 @@ export function checkCircuitBreaker(
   // Not yet confirmed — block this push.
   emit(
     `🔴 ${state.symbol}: Circuit breaker! ` +
-      `${state.lastPrice.toFixed(2)} → ${newPrice.toFixed(2)} ` +
+      `${fmtPrice(state.lastPrice)} → ${fmtPrice(newPrice)} ` +
       `(${movePct.toFixed(1)}% > ${cfg.maxMovePct}%) ` +
       `[${state.cbConsecutiveTrips}/${cfg.confirmTrips} confirmation trips]`,
   );
