@@ -212,8 +212,13 @@ function loadKeypair(): Keypair {
 }
 
 // ── Config ─────────────────────────────────────────────────────────────────────
+// KEEPER_DRY_RUN=1 is the Railway cutover switch (same meaning as DRY_RUN=true):
+// a standby keeper boots with it on so two keepers never sign at once.
 const DRY_RUN =
-  process.env.DRY_RUN === "true" || process.argv.includes("--dry-run");
+  process.env.DRY_RUN === "true" ||
+  process.env.KEEPER_DRY_RUN === "1" ||
+  process.env.KEEPER_DRY_RUN === "true" ||
+  process.argv.includes("--dry-run");
 
 const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "7000", 10);
 
@@ -226,7 +231,7 @@ const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "7000", 10);
 {
   const windowMs = Number(process.env.CC_MARK_WINDOW_MS ?? 15_000);
   const c = markCadenceCheck(CC_INTERVAL_MS, windowMs);
-  if (c.verdict === "never" && !(process.env.DRY_RUN === "true" || process.argv.includes("--dry-run"))) {
+  if (c.verdict === "never" && !DRY_RUN) {
     console.error(`[fatal] this cadence can never publish a mark — the keeper would never push. ${c.detail}. Use e.g. 1500 / 8000 (the live pair).`);
     process.exit(1);
   }
@@ -324,6 +329,22 @@ const mainnetConn = new Connection(MAINNET_RPC, "confirmed");
 // DEVNET_RPC_ORIGIN replaces the uncommitted `httpHeaders: { Origin }` edit the
 // live machine carried here (Origin-restricted Helius key; see rpc-headers.ts).
 const devnetConn = new Connection(DEVNET_RPC, DEVNET_CONN_CONFIG);
+
+// Dry-run hard stop. Every write path is meant to honour `dryRun` on its own,
+// but there are a dozen send sites; a standby keeper that signs even one tx
+// while the live keeper runs races it (Custom(19) sequence collisions). So in
+// dry-run the connections themselves refuse to send — any path that forgets
+// the flag fails loudly instead of landing a transaction.
+if (DRY_RUN) {
+  for (const conn of [devnetConn, mainnetConn]) {
+    const refuse = (): never => {
+      throw new Error("DRY-RUN: transaction send blocked at the connection");
+    };
+    conn.sendRawTransaction = refuse;
+    conn.sendTransaction = refuse;
+    conn.sendEncodedTransaction = refuse;
+  }
+}
 
 console.log("[cross-cluster] Boot:");
 console.log(`  keeper:    ${keeper.publicKey.toBase58()}`);

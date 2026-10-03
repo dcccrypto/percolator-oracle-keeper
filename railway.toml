@@ -1,10 +1,19 @@
+# Railway: service percolator-oracle-keeper-relaunch (project percolator-keeper-devnet).
+# Deploys from GitHub branch `relaunch-live` on push. See deploy/railway-start.sh.
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
+watchPatterns = ["src/**", "deploy/**", "Dockerfile", "railway.toml", "package.json", "pnpm-lock.yaml", "tsconfig.json"]
 
 [deploy]
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 5
+# Health is always HTTP 200 (degraded state is reported in the body), so this
+# gates "process up and serving", not market health.
 healthcheckPath = "/health"
-healthcheckTimeout = 30
-# Railway auto-deploy config
+healthcheckTimeout = 300
+restartPolicyType = "ALWAYS"
+restartPolicyMaxRetries = 1000
+# One keeper only: never run two replicas (double signing races the sequence).
+numReplicas = 1
+# Stop the old container before the new one starts signing.
+overlapSeconds = 0
+drainingSeconds = 10

@@ -1,0 +1,31 @@
+#!/bin/bash
+# Railway launcher — the container twin of start-keeper-relaunch.sh.
+# Config comes from Railway service variables (no .env file). The keypair comes
+# from the KEEPER_KEYPAIR secret (inline JSON u8 array, read directly by
+# cross-cluster.ts — never written to disk). The registry lives on the /data
+# volume so wizard-registered markets survive restarts; first boot seeds it
+# from deploy/registry.relaunch.seed.json.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+export TSX_DISABLE_CACHE=1
+
+: "${MAINNET_RPC_URL:?[fatal] MAINNET_RPC_URL missing}"
+: "${DEVNET_RPC_URL:?[fatal] DEVNET_RPC_URL missing}"
+: "${WRAPPER_PROGRAM_ID:?[fatal] WRAPPER_PROGRAM_ID missing}"
+: "${KEEPER_KEYPAIR:?[fatal] KEEPER_KEYPAIR secret missing}"
+
+export REGISTRY_PATH="${REGISTRY_PATH:-/data/registry.relaunch.json}"
+if [[ ! -f "$REGISTRY_PATH" ]]; then
+  mkdir -p "$(dirname "$REGISTRY_PATH")"
+  cp deploy/registry.relaunch.seed.json "$REGISTRY_PATH"
+  echo "[railway-start] seeded $REGISTRY_PATH from deploy/registry.relaunch.seed.json"
+fi
+
+# Railway routes and health-checks $PORT; the keeper's health server must be on it.
+export CC_HEALTH_PORT="${PORT:-${CC_HEALTH_PORT:-18795}}"
+
+SDK_VER=$(node -p 'require("./node_modules/@percolatorct/sdk/package.json").version' 2>/dev/null || echo unknown)
+MODE=LIVE
+if [[ "${KEEPER_DRY_RUN:-}" == "1" || "${KEEPER_DRY_RUN:-}" == "true" || "${DRY_RUN:-}" == "true" ]]; then MODE=DRY-RUN; fi
+echo "[railway-start] $(date -u +%Y-%m-%dT%H:%M:%SZ) BUILDTAG=${RAILWAY_GIT_COMMIT_SHA:0:7} branch=${RAILWAY_GIT_BRANCH:-?} node=$(node -v) sdk=${SDK_VER} wrapper=${WRAPPER_PROGRAM_ID} health=${CC_HEALTH_PORT} registry=${REGISTRY_PATH} mode=${MODE}"
+exec node_modules/.bin/tsx src/cross-cluster.ts

@@ -1,0 +1,306 @@
+{
+  "version": 1,
+  "description": "Relaunch keeper (fresh-ID wrapper ETDLAdi) - wizard-created markets only",
+  "markets": [
+    {
+      "label": "Percolator/USDC — pumpswap",
+      "marketAddress": "9EPm8nB8Fs7WcEZgE1WGFPTGc6rAzD6GhFJyMm4dEFHn",
+      "poolAddress": "Ebs3mXAzqZfzHfsdinTNw7gPy4uNyEAywcCiJxzLRrBW",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "Percolator",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "8PzFWyLpCVEmbZmVJcaRTU5r69XKJx1rd7YGpWvnpump"
+    },
+    {
+      "label": "SI/USDC — meteora-dlmm",
+      "marketAddress": "8WC8vALsDJhNCUVRmqZBDSg5xgFAhDrgy7zWqF512pDx",
+      "poolAddress": "21bzHy2kRoVKgtYZ8hFoetki2134MG2jyWGC49UV5pyi",
+      "dexType": "meteora-dlmm",
+      "assetIndex": 0,
+      "symbol": "SI",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "9aqmJjCnnMQv42TXLk921ceUkN35nea2QP969n1caqjj"
+    },
+    {
+      "label": "MICRO/USDC — meteora-dlmm",
+      "marketAddress": "AwfiVkCVpWcgjQuXh5LvGZuYo7Xn7KRjhDFxV7N7w2Ej",
+      "poolAddress": "8rxspmBpgcQ9N3BKzg42x6hcepcFnGXsTsh1xSKQwUXp",
+      "dexType": "meteora-dlmm",
+      "assetIndex": 0,
+      "symbol": "MICRO",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "DvNcJZTiSMD1RBCtZ2J31mh7s42CVCwrzGapv1Lypump"
+    },
+    {
+      "label": "TRENDS/USDC — meteora-dlmm",
+      "marketAddress": "Fz5JfUcbEdt5DNSNwZpBn2dZ7NpN8MnvJMiYjnqMacMh",
+      "poolAddress": "CvwDyBp9G4fQvwoGePT3b1vGveYfea1HVhPGUNu7mppR",
+      "dexType": "meteora-dlmm",
+      "assetIndex": 0,
+      "symbol": "TRENDS",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "3W3K5i4T2vARM1UzJHh48dw4uNhjtg3Wk8GS2inmNUZV"
+    },
+    {
+      "label": "NPC/USDC — pumpswap",
+      "marketAddress": "Fyg7RPVPybfRZeWCkRN9jHhd9NZrUqNWBRV2t7AReTFV",
+      "poolAddress": "BRjMA8UALNp3diTKHfdeAn5riQrYPoaYez7KhYWD4oEs",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "NPC",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "7GUnr7krtQhJwd6ASY2VUprd9t4c64zcgCsjdmZepump"
+    },
+    {
+      "label": "STONK/USDC — meteora-dlmm",
+      "marketAddress": "4EGvEGdLY2i9JeApJ8cEjkFehuSXpzfo11BBJarB7MTw",
+      "poolAddress": "zxTpi4BtaWX3mgdAPoezkMD1hxx8CdeCfrqXMWvSCLX",
+      "dexType": "meteora-dlmm",
+      "assetIndex": 0,
+      "symbol": "STONK",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx"
+    },
+    {
+      "label": "PUTIN/USDC — pumpswap",
+      "marketAddress": "Ev5DZC5FGav5ZptzoAQqkn4JbYyRk3e7nXKTRznfzd6d",
+      "poolAddress": "EjHSLEKLautwaTSXDH5mTg6SVq2iGwo5eLeXr5CaeGdc",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "PUTIN",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "H5Kugtkfc5vrm3oSdX6FDkxuutRK1S3GW7Rr7UgnoDhP"
+    },
+    {
+      "label": "OTC/USDC — pumpswap",
+      "marketAddress": "6Y4bfYLWrhabgzU4p3onx9CeW1jCKjGjjSCaoCHf2Q9R",
+      "poolAddress": "DA4pM4xSDY4M9V4CgAKKBVH1pw1yscTQQa5nEkGHuKpt",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "OTC",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "MukLDtJ8Cx9DxLbeyLRSWPSposTMWuwHANbuaudpump"
+    },
+    {
+      "label": "backpack/USDC — meteora-dlmm",
+      "marketAddress": "CzKfk54TNja7UQFyDrHfad8pKSU3QkteZhDhQwkSLDcQ",
+      "poolAddress": "GaiM9oX6w1NvBWPC4XuoyTu1yohFYzrPgpcGmLi27RjE",
+      "dexType": "meteora-dlmm",
+      "assetIndex": 0,
+      "symbol": "backpack",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "G6autZruJLEzYKRh84qTsbVhrTvLEbjBYdHnBQH1zitp"
+    },
+    {
+      "label": "OTC/USDC — pumpswap",
+      "marketAddress": "A9u1KkM9fYDjs7Q6ATCvBaxqK4ncSH7TsyN81awVPcW3",
+      "poolAddress": "DA4pM4xSDY4M9V4CgAKKBVH1pw1yscTQQa5nEkGHuKpt",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "OTC",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "MukLDtJ8Cx9DxLbeyLRSWPSposTMWuwHANbuaudpump"
+    },
+    {
+      "label": "Jimothy/USDC — pumpswap",
+      "marketAddress": "CzKxVxPm9gpt7eyQ3xJKh57EMT6i5bep5Swu9NRcpzCh",
+      "poolAddress": "5PGhKctym6odbHGo2tKMST2AjmJsb2uZBQrKkn4ZuFT5",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "Jimothy",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "Ge87EtsjwRQbHaqQmKRno69RFTwh9bfSsm99XNxTpump"
+    },
+    {
+      "label": "Jane/USDC — pumpswap",
+      "marketAddress": "EzVoxYvuETKTM7QpUXgxYaji9ocjDRRGDALK2Vs71M15",
+      "poolAddress": "31eCTC8W3VcX7BiFwK2o5Ax41FPi2UyHcehcy2Gd3H5h",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "Jane",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "9pJWJdpPebyANys45eetpemLJo8yTz4n5B9zbpYw9ZMr"
+    },
+    {
+      "label": "SI/USDC — meteora-dlmm",
+      "marketAddress": "CeRP5hdDuLxmXQ1aNaUmrkBiYASQHumZiNzN8jpZy3CU",
+      "poolAddress": "9GkbbuLJzy5QNeVoNUfSYsqJkAsLCcSgimfkN2zzCMhG",
+      "dexType": "meteora-dlmm",
+      "assetIndex": 0,
+      "symbol": "SI",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "DEW9dSN6QpWyNthphCpMmAbZP1Q4cEKR9xQXAri98WDP"
+    },
+    {
+      "label": "ANSEM/USDC — pumpswap",
+      "marketAddress": "3mZzP13x7ud5UzDwRit31yMUwSRyzn151UjBvX4UkznD",
+      "poolAddress": "FnzKY6x7entQ1eR3D225dQyT7ybfka4PskBMQhb8L3CC",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "ANSEM",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump"
+    },
+    {
+      "label": "USELESS/USDC — meteora-dlmm",
+      "marketAddress": "2i51AtKPmVVMk6VqZF1FbEknChnhWXZmhmbemHw2vgxR",
+      "poolAddress": "9Ux4vtd8juEH4NMF4ae3tXYpKBdeCUUipX8z3EficKme",
+      "dexType": "meteora-dlmm",
+      "assetIndex": 0,
+      "symbol": "USELESS",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk"
+    },
+    {
+      "label": "www/USDC — pumpswap",
+      "marketAddress": "5iGg1DPyoyWEzFCvbd26CVgPG2X9FgKaJrHaaGUWJyLr",
+      "poolAddress": "Cr469Kh7oCPtQk5YADEmjVpBWx1DiXXLiooPFJn23jsg",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "www",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "GAwhcphCqCv5bKHmCiN4VDdNWfbXJL4npmkc8L3Q9S9H"
+    },
+    {
+      "label": "Agency/USDC — pumpswap",
+      "marketAddress": "Nwmb5na6vxUfT7gYRfxz8iLQTzCbVbJm15MtjXdx5FR",
+      "poolAddress": "CyJwKnLiiY4fmiwqMCSWFSHxo7T9Ubshgs2uRAuJCrk5",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "Agency",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "7VertkgF9KLhxxJXHX6uaWuoYZTP9LdGj2bWmVXVpump"
+    },
+    {
+      "label": "PUMPCADE/USDC — pumpswap",
+      "marketAddress": "134bi4J3k8raxgSfxQaMs3RBES54nchY1PQoNXPt5acQ",
+      "poolAddress": "FKfRK3WdaGXokysR1fPGgCDEeGkV1b1YYnX9ykVpG3JG",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "PUMPCADE",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "Eg2ymQ2aQqjMcibnmTt8erC6Tvk9PVpJZCxvVPJz2agu"
+    },
+    {
+      "label": "eacc/USDC — pumpswap",
+      "marketAddress": "BCznoBzBhkLBjtn1M5ymLWGs9YPRMF8hK2MSvKh2od6p",
+      "poolAddress": "4JAnKFddd5fFTk5PxDj3PpTWJuTEfSWQEjZJcgKQ9KwW",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "eacc",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "CbcyNo7m1amFWqEQm2m4PLv1UNvpcL3C1Ujm6AkzpKoU"
+    },
+    {
+      "label": "CATE/USDC — pumpswap",
+      "marketAddress": "Gprscv7AxE8jedSNbLqdfYX7ZgoE8dXpiJuwKEQ8ubCd",
+      "poolAddress": "HMzvsEEmtzHhvZNw9uwbaG85HCTmFnkbhzUx16cy7ca3",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "CATE",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "Ai66LHZG9MCzg1WKdawwqduVAXpNDUuV8M3uyq5ppump"
+    },
+    {
+      "label": "BOME/USDC — pumpswap",
+      "marketAddress": "7mqDbApofg6FvtEXj8vj4Rz29c4gDdzXR7furatTfP2L",
+      "poolAddress": "GmoZsr3G4aV5B4Uk6zsTN2KbXGagV3JM2RkDCgszr8Ls",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "BOME",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82"
+    },
+    {
+      "label": "CATGPT/USDC — pumpswap",
+      "marketAddress": "BxB5NKTeqhfxWZ2i4S1v8UdvzduFGJ8FEeqQQYjc7FMQ",
+      "poolAddress": "3hSL3G9q4ZYZWLgyQVX2TCVM6hS2izKcDuweHTPzZgfV",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "CATGPT",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "CNohWHNTurS7PpB55czspwUJfpk9yy92uf1wXdweEGg9"
+    },
+    {
+      "label": "CHILLHOUSE/USDC — pumpswap",
+      "marketAddress": "7R9rjUJA4crGzqWaGFfbHF9exaEtyZkVY2zXRQYCEnud",
+      "poolAddress": "35TqQMeiRwEbK6FR5qiPwastuAAvo32VjnULJpxVSxUK",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "CHILLHOUSE",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "GkyPYa7NnCFbduLknCfBfP7p8564X1VZhwZYJ6CZpump"
+    },
+    {
+      "label": "EMBER/USDC — meteora-dlmm",
+      "marketAddress": "Bki3SdtsDMYbPnYqYGdVAwCENR6USB6wwi6QZQJXoLUS",
+      "poolAddress": "5tb9fNLKr2wdJRSTNYRu39kGTjnYVseWo2bGyNgxnLHS",
+      "dexType": "meteora-dlmm",
+      "assetIndex": 0,
+      "symbol": "EMBER",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "5dvXTZ5qwgafnHtwu3Ls3QrWx1U4LQsFeCuJgkk4QEC6"
+    },
+    {
+      "label": "SPX/USDC — meteora-dlmm",
+      "marketAddress": "E95LsDACpjXtZdpRA5qcpvi3kpcZ44j7ju72pG6iLv1k",
+      "poolAddress": "62KR7tk1KWARJ9PdCgoK9tTcTJBvDjB1aEcdr8myxKXN",
+      "dexType": "meteora-dlmm",
+      "assetIndex": 0,
+      "symbol": "SPX",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr"
+    },
+    {
+      "label": "TROLL/USDC — pumpswap",
+      "marketAddress": "gWwfjopLD98zh1NUVokepNcbYRyU4jzX2gdhUUD3kiY",
+      "poolAddress": "4w2cysotX6czaUGmmWg13hDpY4QEMG2CzeKYEQyK9Ama",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "TROLL",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "5UUH9RTDiSpq6HKS6bp4NdU9PNJpXRXuiw6ShBTBhgH2"
+    },
+    {
+      "label": "PENGU/USDC — meteora-dlmm",
+      "marketAddress": "FEvg9DDJ3AKepzEyddZdE9Geyn4wcjsDdsejmPXJdfmt",
+      "poolAddress": "DdMA1cHcHEqYfttc1z1sJEY978CcU1pyjNuTWTNmdvzU",
+      "dexType": "meteora-dlmm",
+      "assetIndex": 0,
+      "symbol": "PENGU",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv"
+    },
+    {
+      "label": "BURNIE/USDC — pumpswap",
+      "marketAddress": "AcaTmUFncavEBcvUoR57yWU5eJgonUvanWHGYxmXok18",
+      "poolAddress": "5tYFviFWQRKV9BJSTHGitbdqEYC1BGUgRUDnSADUXqJP",
+      "dexType": "pumpswap",
+      "assetIndex": 0,
+      "symbol": "BURNIE",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "CGEDT9QZDvvH5GmVkWJH2BXiMJqMJySC9ihWyr7Spump"
+    },
+    {
+      "label": "JUP/USDC — meteora-dlmm",
+      "marketAddress": "HBU9iugdcxdvQ9tNFuTLTtcB1bYXFdh4d5reD8M2dpop",
+      "poolAddress": "C8Gr6AUuq9hEdSYJzoEpNcdjpojPZwqG5MtQbeouNNwg",
+      "dexType": "meteora-dlmm",
+      "assetIndex": 0,
+      "symbol": "JUP",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
+    },
+    {
+      "label": "WIF/USDC — meteora-dlmm",
+      "marketAddress": "6X1yuG4xdX3r1Bdmdii6KktyYBZZg214QmZiWYw376NQ",
+      "poolAddress": "ADEjbFryutjfrJTpZfFPRMFhF7XBisPY63Awe79EVhe9",
+      "dexType": "meteora-dlmm",
+      "assetIndex": 0,
+      "symbol": "WIF",
+      "collateral": "DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC",
+      "mainnetCa": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"
+    }
+  ]
+}
