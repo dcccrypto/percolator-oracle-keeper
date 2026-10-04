@@ -170,7 +170,7 @@ describe("planCrankTx", () => {
     }));
     const plan = planCrankTx({ owner, market: CATE, lpPortfolio: CATE_LP, catchup: 0, refreshTargets: many });
     const refreshes = plan.cranks.filter((c) => c.kind === "refresh").length;
-    assert.ok(refreshes >= 8 && refreshes < 20, `refreshes=${refreshes}`);
+    assert.equal(refreshes, 7, `refreshes=${refreshes} (7 at REFRESH_CRANK_CU 145k beside the accrual)`);
     assert.equal(refreshes + plan.overflow.length, 20);
     assert.ok(plan.computeUnits <= 1_400_000);
     // The planned transaction must also fit the 1232-byte packet.

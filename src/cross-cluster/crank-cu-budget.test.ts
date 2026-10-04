@@ -22,9 +22,15 @@ import assert from "node:assert/strict";
 import { PublicKey } from "@solana/web3.js";
 import {
   ACCRUAL_TX_CU_HEADROOM,
+  ACCRUE_CRANK_CU,
+  LIQUIDATE_CRANK_CU,
   MAX_TX_CU,
+  REFRESHES_PER_OVERFLOW_TX,
+  REFRESH_CRANK_CU,
+  chunkOverflowTargets,
   isComputeExhaustion,
   planCrankTx,
+  planRefreshTx,
 } from "./positioned-refresh.ts";
 import type { CrankPlan, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
 import { resolveCrankPlan, refreshPruneBudget } from "./recovery-cranker.ts";
@@ -150,16 +156,84 @@ describe("OTC ProgramFailedToComplete streaks (2026-10-04): crank CU budget", ()
     assert.equal(calls.length, 3);
   });
 
-  it("capacity: 8 refreshes still fit beside the accrual (Percolator has 8 positioned), headroom reserved", () => {
-    const eight: PositionedPortfolio[] = Array.from({ length: 8 }, () => ({ pubkey: PublicKey.unique(), longLegs: 1, shortLegs: 0, isLp: false }));
-    const plan = build()(eight);
+  it("capacity: 7 refreshes fit beside the accrual at 145k each, headroom reserved; the 8th overflows", () => {
+    const seven: PositionedPortfolio[] = Array.from({ length: 7 }, () => ({ pubkey: PublicKey.unique(), longLegs: 1, shortLegs: 0, isLp: false }));
+    const plan = build()(seven);
     assert.equal(plan.overflow.length, 0);
-    assert.equal(plan.cranks.filter((c) => c.kind === "refresh").length, 8);
+    assert.equal(plan.cranks.filter((c) => c.kind === "refresh").length, 7);
     assert.ok(plan.computeUnits <= MAX_TX_CU);
-    const nine = [...eight, { pubkey: PublicKey.unique(), longLegs: 1, shortLegs: 0, isLp: false }];
-    const p9 = build()(nine);
-    assert.equal(p9.overflow.length, 1, "the 9th goes to a follow-up tx rather than eating the headroom");
+    const eight = [...seven, { pubkey: PublicKey.unique(), longLegs: 1, shortLegs: 0, isLp: false }];
+    const p8 = build()(eight);
+    assert.equal(p8.overflow.length, 1, "the 8th goes to a follow-up tx rather than eating the headroom");
     assert.ok(ACCRUAL_TX_CU_HEADROOM > 0);
+  });
+});
+
+/**
+ * Earn-drain fix E1 (wrapper #523 / engine #275, #175 source reclassification):
+ * a refresh that fully nets a leg's loss now also books the netted support into
+ * the loss domain. Measured on the live swordcat replay: crank max +10.9k CU.
+ * Worst refresh = OTC trader 153k (positioned-refresh.ts notes) + 11k; worst
+ * accrual = Jimothy 162.6k. The planner must cover a full pack of these without
+ * a boost (a boost costs an extra simulation; at the 1.4M cap a worse cycle
+ * would prune a refresh and leave the market loss-stale).
+ */
+const E1_ACCRUE_WORST = 163_000;
+const E1_REFRESH_WORST = 153_000 + 11_000;
+const E1_LIQUIDATE = 200_000;
+const many = (n: number): PositionedPortfolio[] =>
+  Array.from({ length: n }, () => ({ pubkey: PublicKey.unique(), longLegs: 1, shortLegs: 0, isLp: false }));
+const e1Cost = (c: PlannedCrank): number =>
+  c.kind === "accrue" ? E1_ACCRUE_WORST : c.kind === "refresh" ? E1_REFRESH_WORST : c.kind === "catchup" ? 27_500 : E1_LIQUIDATE;
+
+describe("REFRESH_CRANK_CU after the E1 Earn-drain fix (+11k per fully-netted refresh)", () => {
+  it("is 145k: 7 refreshes per accrual tx and per follow-up tx", () => {
+    assert.equal(REFRESH_CRANK_CU, 145_000);
+    assert.equal(Math.floor((MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM - ACCRUE_CRANK_CU) / REFRESH_CRANK_CU), 7);
+    assert.equal(REFRESHES_PER_OVERFLOW_TX, 7);
+  });
+
+  it("every plan size 1..7 carries a limit that covers the E1 worst case (accrual + n worst refreshes)", () => {
+    for (let n = 1; n <= 7; n++) {
+      const plan = build()(many(n));
+      assert.equal(plan.cranks.filter((c) => c.kind === "refresh").length, n);
+      assert.ok(
+        plan.computeUnits >= E1_ACCRUE_WORST + n * E1_REFRESH_WORST + CB_IX_CU,
+        `n=${n}: limit ${plan.computeUnits} < worst ${E1_ACCRUE_WORST + n * E1_REFRESH_WORST + CB_IX_CU}`,
+      );
+      assert.ok(plan.computeUnits <= MAX_TX_CU);
+    }
+  });
+
+  it("a full pack at E1 worst costs lands on the FIRST simulation: no boost, nothing pruned", async () => {
+    const calls: CrankPlan[] = [];
+    const targets = many(9);
+    const r = await resolveCrankPlan(build(), targets, meteredSim(e1Cost, calls), undefined, refreshPruneBudget(targets.length));
+    assert.equal(r.sim.err, null, `reverted: ${JSON.stringify(r.sim.err)}`);
+    assert.equal(r.plan.cranks.filter((c) => c.kind === "refresh").length, 7);
+    assert.equal(r.plan.overflow.length, 2, "the rest go to a follow-up tx");
+    assert.equal(r.pruned.length, 0);
+    assert.equal(calls.length, 1, "fits the planned budget without a boost");
+    assert.ok(r.plan.computeUnits < MAX_TX_CU);
+  });
+
+  it("the old 130k x 8 packing could not hold the E1 worst case even at the 1.4M re-sim", () => {
+    const oldPacked = Math.floor((MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM - ACCRUE_CRANK_CU) / 130_000);
+    assert.equal(oldPacked, 8);
+    assert.ok(E1_ACCRUE_WORST + oldPacked * E1_REFRESH_WORST + CB_IX_CU > MAX_TX_CU);
+    assert.ok(E1_ACCRUE_WORST + 7 * E1_REFRESH_WORST + CB_IX_CU <= ACCRUE_CRANK_CU + 7 * REFRESH_CRANK_CU + ACCRUAL_TX_CU_HEADROOM);
+  });
+
+  it("a full follow-up chunk at E1 worst costs plus one liquidation fits its own limit", async () => {
+    for (const c of chunkOverflowTargets(many(15))) {
+      const plan = planRefreshTx({ owner, market, targets: c, liquidateTargets: [c[0].pubkey] });
+      assert.equal(plan.cranks.filter((k) => k.kind === "liquidate").length, 1);
+      assert.ok(plan.computeUnits <= MAX_TX_CU);
+      const sim = await meteredSim(e1Cost)(plan);
+      assert.equal(sim.err, null, `chunk of ${c.length}: ${JSON.stringify(sim.err)}`);
+    }
+    assert.ok(REFRESHES_PER_OVERFLOW_TX * E1_REFRESH_WORST + E1_LIQUIDATE + CB_IX_CU <= MAX_TX_CU);
+    assert.ok(LIQUIDATE_CRANK_CU >= E1_LIQUIDATE);
   });
 });
 

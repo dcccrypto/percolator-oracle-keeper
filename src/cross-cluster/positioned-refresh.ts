@@ -292,10 +292,21 @@ function buildPermissionlessCrankIx(
  * post-move peak, so an accrual-only plan exhausted its budget and reverted
  * ProgramFailedToComplete (OTC streaks, 2026-10-03/04). See
  * ACCRUAL_TX_CU_HEADROOM for the per-transaction margin on top.
+ *
+ * REFRESH_CRANK_CU 130k -> 145k (wrapper #523 / engine #275, the #175 Earn-drain
+ * fix "E1"): a refresh that fully nets a leg's loss now books the netted support
+ * into the loss domain (one extra backing add + recompute), measured on the
+ * swordcat/backpack live replays at up to +10.9k per refresh. Worst refresh is
+ * then ~153k + 11k = 164k. At 130k x 8 the packed plan's limit (1.34M) is below
+ * the worst 8-refresh cycle (163k + 8 x 164k = 1.475M, above even the 1.4M
+ * re-sim), so the last refresh is pruned; at 145k x 7 the planned limit
+ * (200k + 7 x 145k + 100k = 1.315M) covers the worst 7-refresh cycle
+ * (163k + 7 x 164k = 1.311M) with no boost. Capacity: 7 refreshes beside the
+ * accrual (an 8th positioned portfolio goes to a follow-up tx).
  */
 export const CATCHUP_CRANK_CU = 30_000;
 export const ACCRUE_CRANK_CU = 200_000;
-export const REFRESH_CRANK_CU = 130_000;
+export const REFRESH_CRANK_CU = 145_000;
 export const MAX_TX_CU = 1_400_000;
 /**
  * Extra CU on every accrual transaction, reserved before packing refreshes.
@@ -305,7 +316,7 @@ export const MAX_TX_CU = 1_400_000;
  * 162k + 151k + 110k = 423k. The headroom absorbs that per-transaction
  * variance and the sim-to-land race (an accrual simulated before a push
  * lands at ~61k but executes after it at ~157k). It costs at most one
- * refresh of capacity: 8 refreshes still fit beside the accrual.
+ * refresh of capacity: 7 refreshes fit beside the accrual (REFRESH_CRANK_CU 145k).
  */
 export const ACCRUAL_TX_CU_HEADROOM = 100_000;
 /** ExpireBackingBucket / FinalizeResetSide: one market-only state transition each (well under 40k CU). */
@@ -475,7 +486,7 @@ export function planRefreshTx(params: {
       cu += LIQUIDATE_CRANK_CU;
     }
   }
-  // The accrual tx's 1.4M budget absorbs per-refresh variance across 8 refreshes;
+  // The accrual tx's 1.4M budget absorbs per-refresh variance across 7 refreshes;
   // a short follow-up has no such slack (live 2026-10-02: a lone LP refresh hit
   // ComputationalBudgetExceeded at 130k), so it gets explicit headroom.
   return { cranks, overflow: [], computeUnits: cranks.length === 0 ? 0 : Math.min(MAX_TX_CU, cu + FOLLOWUP_CU_HEADROOM) };
