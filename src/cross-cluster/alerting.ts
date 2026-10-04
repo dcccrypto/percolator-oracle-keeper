@@ -57,6 +57,7 @@ export type AlertKind =
   | "fee-job-failed"
   | "adl-reduce-only"
   | "loss-stale"
+  | "loss-stale-prolonged"
   | "terminal-budget-unbooked"
   | "terminal-recovery-blocked-portfolios"
   | "terminal-pda-portfolio-closed"
@@ -99,6 +100,11 @@ export interface AlertThresholds {
   adlReduceOnlyCriticalSlots: number;
   /** Consecutive crank cycles a market may END loss-stale (stale count > 0 after the keeper's refreshes). */
   lossStaleCycles: number;
+  /**
+   * ms a market may stay loss-stale CONTINUOUSLY before a loud "loss-stale-prolonged" alert. Cycle counts
+   * (lossStaleCycles) are cadence-dependent; this is the wall-clock bound (opens revert Custom(21) the whole time).
+   */
+  lossStaleProlongedMs: number;
   /** K-1: consecutive push cycles ONE market may go without a landed push. */
   marketNoPushCycles: number;
   /** K-3: ms the breaker may keep the mark away from the source before alerting. */
@@ -119,6 +125,7 @@ export const DEFAULT_THRESHOLDS: AlertThresholds = {
   cooldownMs: 15 * 60_000,
   adlReduceOnlyCriticalSlots: 9_000, // ~1 hour
   lossStaleCycles: 3,
+  lossStaleProlongedMs: 5 * 60_000,
   marketNoPushCycles: 40, // ~1 min at the 1.5 s push cadence
   markLagMs: 120_000,
   markLagPct: 10,
@@ -149,6 +156,7 @@ export function thresholdsFromEnv(env: Env): AlertThresholds {
     cooldownMs: envInt(env, "ALERT_COOLDOWN_MS", DEFAULT_THRESHOLDS.cooldownMs),
     adlReduceOnlyCriticalSlots: envInt(env, "ALERT_ADL_REDUCE_ONLY_CRITICAL_SLOTS", DEFAULT_THRESHOLDS.adlReduceOnlyCriticalSlots),
     lossStaleCycles: envInt(env, "ALERT_LOSS_STALE_CYCLES", DEFAULT_THRESHOLDS.lossStaleCycles),
+    lossStaleProlongedMs: envInt(env, "ALERT_LOSS_STALE_PROLONGED_MS", DEFAULT_THRESHOLDS.lossStaleProlongedMs),
     marketNoPushCycles: envInt(env, "ALERT_MARKET_NO_PUSH_CYCLES", DEFAULT_THRESHOLDS.marketNoPushCycles),
     markLagMs: envInt(env, "ALERT_MARK_LAG_MS", DEFAULT_THRESHOLDS.markLagMs),
     markLagPct: envInt(env, "ALERT_MARK_LAG_PCT", DEFAULT_THRESHOLDS.markLagPct),
@@ -209,10 +217,15 @@ export interface CrankHealthStreaks {
   reduceOnlySince: { slot: bigint; ms: number; sinceBoot: boolean } | null;
   /** True once any sample with a decoded ADL state was seen for this market. */
   adlObserved: boolean;
+  /**
+   * Wall ms of the first cycle of the current CONTINUOUS loss-stale episode (null = not loss-stale).
+   * "Observed since": a keeper restart resets it. Optional so older literals still type-check.
+   */
+  lossStaleSince?: number | null;
 }
 
 export function freshStreaks(): CrankHealthStreaks {
-  return { lapsedCycles: 0, bankruptCycles: 0, reduceOnlySince: null, adlObserved: false };
+  return { lapsedCycles: 0, bankruptCycles: 0, reduceOnlySince: null, adlObserved: false, lossStaleSince: null };
 }
 
 const ADL_ONE_ = 1_000_000_000_000_000n;
@@ -314,6 +327,31 @@ export function evaluateCrankHealth(
       },
     });
   }
+  // Wall-clock bound on a continuous loss-stale episode. Cycles that end loss-stale extend it; the first
+  // clean cycle ends it. A loud, critical line so the operator is paged instead of finding out from users.
+  const lossStaleSince = lsc > 0 ? (prev.lossStaleSince ?? nowMs) : null;
+  if (lossStaleSince !== null && nowMs - lossStaleSince > t.lossStaleProlongedMs) {
+    const minutes = Math.floor((nowMs - lossStaleSince) / 60_000);
+    active.push({
+      kind: "loss-stale-prolonged",
+      severity: "critical",
+      subject: s.label,
+      message:
+        `LOSS-STALE for > ${Math.floor(t.lossStaleProlongedMs / 60_000)} min (~${minutes} min observed, ${lsc} consecutive cycles): ` +
+        `stale ${s.staleLong ?? "?"}L/${s.staleShort ?? "?"}S, positioned ${s.positioned ?? "?"}, overflow ${s.overflow ?? 0}. ` +
+        "Every risk-increasing trade reverts Custom(21) and users are told to wait; it is NOT clearing on its own.",
+      data: {
+        market: s.market,
+        lossStaleMinutes: minutes,
+        cycles: lsc,
+        staleLong: s.staleLong ?? null,
+        staleShort: s.staleShort ?? null,
+        positioned: s.positioned ?? null,
+        overflow: s.overflow ?? 0,
+        sinceMs: lossStaleSince,
+      },
+    });
+  }
   const lapsedCycles = s.lapsedBuckets > 0 ? prev.lapsedCycles + 1 : 0;
   if (lapsedCycles >= t.lapsedBucketCycles) {
     active.push({
@@ -335,7 +373,7 @@ export function evaluateCrankHealth(
       data: { bankrupt: s.bankruptFound, liquidated: s.bankruptLiquidated, cycles: bankruptCycles, market: s.market },
     });
   }
-  return { active, streaks: { lapsedCycles, bankruptCycles, reduceOnlySince, adlObserved: prev.adlObserved || !!s.adl } };
+  return { active, streaks: { lapsedCycles, bankruptCycles, reduceOnlySince, adlObserved: prev.adlObserved || !!s.adl, lossStaleSince } };
 }
 
 /** Compact JSON for the `[health]` line. */
