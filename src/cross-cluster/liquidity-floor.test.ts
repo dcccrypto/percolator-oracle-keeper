@@ -7,7 +7,11 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { PublicKey } from "@solana/web3.js";
+import { WSOL_MINT } from "@percolatorct/sdk";
 import { pumpswapQuoteDepthUsdE6 } from "./price-reader.ts";
+
+const USDC = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 
 /** Build a minimal SPL token-account buffer with `amount` at offset 64. */
 function vault(amount: bigint, len = 165): Uint8Array {
@@ -24,37 +28,37 @@ function vault(amount: bigint, len = 165): Uint8Array {
 
 describe("#100 pumpswapQuoteDepthUsdE6", () => {
   it("USD-stable quote: 1,500 USDC (6dp) -> $1,500", () => {
-    assert.equal(pumpswapQuoteDepthUsdE6(vault(1_500_000_000n), 6, false, undefined), 1_500_000_000n);
+    assert.equal(pumpswapQuoteDepthUsdE6(vault(1_500_000_000n), 6, USDC, undefined), 1_500_000_000n);
   });
 
   it("WSOL quote: 10 SOL (9dp) at $200 -> $2,000", () => {
     assert.equal(
-      pumpswapQuoteDepthUsdE6(vault(10_000_000_000n), 9, true, 200_000_000n),
+      pumpswapQuoteDepthUsdE6(vault(10_000_000_000n), 9, WSOL_MINT, 200_000_000n),
       2_000_000_000n,
     );
   });
 
   it("returns NULL for a WSOL pool with no SOL/USD rate — unknown, not fine", () => {
-    assert.equal(pumpswapQuoteDepthUsdE6(vault(10_000_000_000n), 9, true, undefined), null);
-    assert.equal(pumpswapQuoteDepthUsdE6(vault(10_000_000_000n), 9, true, 0n), null);
+    assert.equal(pumpswapQuoteDepthUsdE6(vault(10_000_000_000n), 9, WSOL_MINT, undefined), null);
+    assert.equal(pumpswapQuoteDepthUsdE6(vault(10_000_000_000n), 9, WSOL_MINT, 0n), null);
   });
 
   it("returns NULL for a truncated vault buffer", () => {
-    assert.equal(pumpswapQuoteDepthUsdE6(vault(1n, 40), 6, false, undefined), null);
+    assert.equal(pumpswapQuoteDepthUsdE6(vault(1n, 40), 6, USDC, undefined), null);
   });
 
   it("an empty vault is zero depth, not unknown", () => {
-    assert.equal(pumpswapQuoteDepthUsdE6(vault(0n), 6, false, undefined), 0n);
+    assert.equal(pumpswapQuoteDepthUsdE6(vault(0n), 6, USDC, undefined), 0n);
   });
 
   it("handles a 64-bit amount without truncating the high word", () => {
     // 2^33 raw units at 0dp — exercises the high u32 half.
-    assert.equal(pumpswapQuoteDepthUsdE6(vault(8_589_934_592n), 0, false, undefined),
+    assert.equal(pumpswapQuoteDepthUsdE6(vault(8_589_934_592n), 0, USDC, undefined),
       8_589_934_592n * 1_000_000n);
   });
 
   it("a thin pool measures far below a plausible floor", () => {
-    const depth = pumpswapQuoteDepthUsdE6(vault(25_000_000n), 6, false, undefined); // $25
+    const depth = pumpswapQuoteDepthUsdE6(vault(25_000_000n), 6, USDC, undefined); // $25
     assert.equal(depth, 25_000_000n);
     assert.ok(depth! < 1_000_000_000n, "$25 is below a $1,000 floor");
   });
