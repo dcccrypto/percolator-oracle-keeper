@@ -23,8 +23,9 @@ function clock(start = 1_000_000) {
 describe("crank liveness watchdog", () => {
   it("limit is the larger of N intervals and the floor", () => {
     const c = clock();
-    assert.equal(createCrankLiveness({ intervalMs: 20_000, now: c.now }).limitMs(), DEFAULT_LIVENESS_MIN_SILENCE_MS); // 40 s < 60 s floor
-    assert.equal(createCrankLiveness({ intervalMs: 45_000, now: c.now }).limitMs(), 90_000); // 2 intervals
+    assert.equal(createCrankLiveness({ intervalMs: 20_000, now: c.now }).limitMs(), DEFAULT_LIVENESS_MIN_SILENCE_MS); // 40 s < 120 s floor
+    assert.equal(DEFAULT_LIVENESS_MIN_SILENCE_MS, 120_000);
+    assert.equal(createCrankLiveness({ intervalMs: 70_000, now: c.now }).limitMs(), 140_000); // 2 intervals
     assert.equal(createCrankLiveness({ intervalMs: 20_000, intervals: 3, minSilenceMs: 1, now: c.now }).limitMs(), 60_000);
   });
 
@@ -71,7 +72,7 @@ describe("crank liveness watchdog", () => {
   });
 
   it("env: defaults, overrides, and garbage throws (a typo must not silently disable it)", () => {
-    assert.deepEqual(crankLivenessOptsFromEnv({}, 20_000), { intervalMs: 20_000, intervals: 2, minSilenceMs: 60_000 });
+    assert.deepEqual(crankLivenessOptsFromEnv({}, 20_000), { intervalMs: 20_000, intervals: 2, minSilenceMs: 120_000 });
     assert.deepEqual(
       crankLivenessOptsFromEnv({ CRANK_LIVENESS_INTERVALS: "3", CRANK_LIVENESS_MIN_SILENCE_MS: "90000" }, 20_000),
       { intervalMs: 20_000, intervals: 3, minSilenceMs: 90_000 },
@@ -133,5 +134,37 @@ describe("crank liveness watchdog", () => {
     // The loop only stops on SIGTERM/SIGINT; deliver it to the listeners it registered so the test process can end.
     process.emit("SIGTERM");
     await new Promise((r) => setTimeout(r, 150));
+  });
+
+  it("a loop that THROWS stops its own watchdog: the supervisor's restarted loop is not killed by the dead one (review MEDIUM)", async () => {
+    const quiet = new Proxy({}, { get: () => () => Promise.resolve(null) }) as unknown as Connection;
+    const mk = (label: string): Registry => ({
+      version: 1,
+      description: "t",
+      markets: [{ label, marketAddress: Keypair.generate().publicKey.toBase58(), poolAddress: Keypair.generate().publicKey.toBase58(), dexType: "pumpswap", assetIndex: 0, registeredAt: Date.now() }],
+    });
+    const good = new AlertSink({ thresholds: DEFAULT_THRESHOLDS, log: () => undefined, logError: () => undefined });
+    const bad = new AlertSink({ thresholds: DEFAULT_THRESHOLDS, log: () => undefined, logError: () => undefined });
+    bad.reconcile = async () => {
+      throw new Error("boom");
+    };
+    let deadFired = 0;
+    let healthyFired = 0;
+    let controlFired = 0;
+    const A = createCrankLiveness({ intervalMs: 50, intervals: 2, minSilenceMs: 1, onStall: () => deadFired++ });
+    await startRecoveryCrankLoop(quiet, Keypair.generate(), mk("A"), { intervalMs: 50, dryRun: true }, bad, undefined, A).catch(() => undefined);
+    // Negative control: a watchdog that is armed and never stopped DOES fire in this window, so the harness can see an orphan.
+    const C = createCrankLiveness({ intervalMs: 50, intervals: 2, minSilenceMs: 1, onStall: () => controlFired++ });
+    const stopC = C.start();
+    // The supervisor restarts with a new watchdog.
+    const B = createCrankLiveness({ intervalMs: 50, intervals: 2, minSilenceMs: 1, onStall: () => healthyFired++ });
+    void startRecoveryCrankLoop(quiet, Keypair.generate(), mk("B"), { intervalMs: 50, dryRun: true }, good, undefined, B);
+    await new Promise((r) => setTimeout(r, 1_500));
+    stopC();
+    process.emit("SIGTERM");
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(deadFired, 0, "the dead loop's watchdog was stopped with it");
+    assert.equal(healthyFired, 0, "the restarted loop is healthy");
+    assert.ok(controlFired > 0, "control: an unstopped watchdog would have fired");
   });
 });

@@ -684,6 +684,14 @@ async function fetchPushAuthMarkGenerationFields(
 // restart or another pusher is covered by the max with chain.
 const lastSentObservationSequence = new Map<string, bigint>();
 
+/** Forget nonce, quarantine and terminal-log state of every market not in `keep` (deregistered). */
+export function pruneAuthMarkPusherState(keep: ReadonlySet<string>): void {
+  for (const m of [...quarantinedUntil.keys()]) if (!keep.has(m)) quarantinedUntil.delete(m);
+  for (const m of [...quarantineStrikes.keys()]) if (!keep.has(m)) quarantineStrikes.delete(m);
+  for (const m of [...lastSentObservationSequence.keys()]) if (!keep.has(m)) lastSentObservationSequence.delete(m);
+  for (const m of [...terminalLogged]) if (!keep.has(m)) terminalLogged.delete(m);
+}
+
 /**
  * Next nonce for `key`, given `chainNext` (= chain watermark + 1, as
  * parsePushAuthMarkGenerationFields returns it): strictly above both the chain

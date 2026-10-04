@@ -1335,6 +1335,9 @@ export async function startRecoveryCrankLoop(
   );
 
   let cycleCount = 0;
+  // The watchdog must die with THIS loop however it ends. The supervisor in cross-cluster.ts restarts a
+  // loop that threw with a NEW watchdog; an orphaned one would exit(1) ~limit later against a healthy loop.
+  try {
   while (!stopping) {
     const cycleStart = Date.now();
     liveness.beat();
@@ -1396,6 +1399,8 @@ export async function startRecoveryCrankLoop(
       await new Promise((r) => setTimeout(r, remaining));
     }
   }
-  stopLiveness();
+  } finally {
+    stopLiveness();
+  }
   console.log("[cranker] Recovery crank loop stopped.");
 }

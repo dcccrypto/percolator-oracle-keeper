@@ -24,7 +24,7 @@ import { readAllPoolPricesE6 } from "./price-reader.ts";
 import { createMarkSmoother } from "./mark-smoother.ts";
 import { checkCircuitBreaker, markGap, recordMarkInForce } from "../circuit-breaker.ts";
 import type { CircuitBreakerState } from "../circuit-breaker.ts";
-import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets } from "./auth-mark-pusher.ts";
+import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets, pruneAuthMarkPusherState } from "./auth-mark-pusher.ts";
 import { evaluateMarketPush, evaluatePushCycle, getAlertSink } from "./alerting.ts";
 import type { Alert, MarketPushSample } from "./alerting.ts";
 import { getCrankRefreshHealth, isPushHeld, pruneCrankRefreshHealth } from "./refresh-coordination.ts";
@@ -1025,6 +1025,11 @@ export function pruneDeregisteredMarkets(
     removed.push(addr);
   }
   for (const addr of pruneCrankRefreshHealth(keep)) if (!removed.includes(addr)) removed.push(addr);
+  // Module-level per-market maps: authority latches, breaker state, nonce / quarantine / terminal-log.
+  for (const m of [...authorityChecked]) if (!keep.has(m)) authorityChecked.delete(m);
+  for (const m of [...notPushable]) if (!keep.has(m)) notPushable.delete(m);
+  for (const m of [...crossClusterCircuitBreakerStates.keys()]) if (!keep.has(m)) crossClusterCircuitBreakerStates.delete(m);
+  pruneAuthMarkPusherState(keep);
   return removed;
 }
 

@@ -26,7 +26,7 @@
  *   CRANK_ENABLED          "false" disables the recovery crank loop + crank-on-boot (default: true)
  *   CRANK_INTERVAL_MS       recovery crank cycle interval ms (default: 20000)
  *   CRANK_LIVENESS_INTERVALS      exit 1 if the crank loop is silent for more than this many intervals (default 2; 0 disables)
- *   CRANK_LIVENESS_MIN_SILENCE_MS floor on that limit in ms (default 60000)
+ *   CRANK_LIVENESS_MIN_SILENCE_MS floor on that limit in ms (default 120000)
  *   ALERT_LOSS_STALE_PROLONGED_MS loud critical alert once a market is loss-stale this long (default 300000 = 5 min)
  *   LP_FEE_CRANK_ENABLED    "false" disables the tag 78 LP-fee crank job (default: true)
  *   STAKE_FEE_PUSH_ENABLED  "false" disables the tag 87 -> stake AccrueFees job (default: true)

@@ -97,4 +97,15 @@ describe("retired market leaves /health", () => {
     assert.deepEqual(pruneDeregisteredMarkets(state, registry), []);
     assert.equal(state.stats.size, 0, "re-added by the next cycle's newMarketStat, not resurrected stale");
   });
+
+  it("also forgets the module-level nonce / quarantine / authority / breaker state of a deregistered market (review nit)", async () => {
+    const ap = await import("./auth-mark-pusher.ts");
+    assert.equal(typeof ap.pruneAuthMarkPusherState, "function");
+    // Must not throw on an empty keep-set or with unknown markets.
+    ap.pruneAuthMarkPusherState(new Set());
+    ap.pruneAuthMarkPusherState(new Set(["SOL11111"]));
+    const m = entry("A9u1KkM9", "OTC/USDC");
+    const state = { stats: new Map([[m.marketAddress, newMarketStat(m)]]), terminalMarkets: new Set<string>(), landedThisCycle: new Set<string>() };
+    assert.deepEqual(pruneDeregisteredMarkets(state, { markets: [] }), [m.marketAddress]);
+  });
 });

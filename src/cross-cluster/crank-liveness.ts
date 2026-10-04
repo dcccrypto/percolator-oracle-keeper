@@ -13,10 +13,9 @@
  * Every settled market crank and every finished cycle calls `beat()`. A watchdog timer (unref'd, so it never
  * keeps the process alive) checks the silence; past the limit it logs a loud line and exits non-zero.
  *
- * Limit = max(intervals x intervalMs, minSilenceMs). The floor only matters for sub-30 s intervals: a restart
- * costs ~30-60 s of pushes, so a slow-but-alive cycle must not trip it. Defaults: 2 intervals, 60 s floor.
+ * Limit = max(intervals x intervalMs, minSilenceMs). A restart costs ~30-60 s of pushes, so a slow-but-alive cycle must not trip it. Defaults: 2 intervals, 120 s floor (a devnet/Helius slowdown where every market takes >60 s must not restart a live keeper).
  *   CRANK_LIVENESS_INTERVALS         intervals of silence tolerated (default 2; 0 disables the watchdog)
- *   CRANK_LIVENESS_MIN_SILENCE_MS    floor on the limit (default 60000)
+ *   CRANK_LIVENESS_MIN_SILENCE_MS    floor on the limit (default 120000)
  */
 
 export interface CrankLivenessOptions {
@@ -46,7 +45,7 @@ export interface CrankLiveness {
 }
 
 export const DEFAULT_LIVENESS_INTERVALS = 2;
-export const DEFAULT_LIVENESS_MIN_SILENCE_MS = 60_000;
+export const DEFAULT_LIVENESS_MIN_SILENCE_MS = 120_000;
 
 export function createCrankLiveness(opts: CrankLivenessOptions): CrankLiveness {
   const now = opts.now ?? Date.now;
