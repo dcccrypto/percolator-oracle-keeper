@@ -960,7 +960,7 @@ export async function resolveCrankPlan(
 // ── Overflow refreshes (2026-10-02 Percolator outage) ───────────────────────
 //
 // A market with more positioned portfolios than one transaction can refresh
-// (8 at 130k CU each under the 1.4M cap, after the accrual and its headroom) used to leave the
+// (7 at 145k CU each under the 1.4M cap, after the accrual and its headroom) used to leave the
 // rest stale: stale_account_count stayed > 0, loss_stale held, and every
 // risk-increasing trade reverted Custom(21) indefinitely (Percolator 9EPm8nB8,
 // 12 positioned, locked for opens from ~18:55Z). The rest now go out as

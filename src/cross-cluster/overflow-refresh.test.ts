@@ -27,6 +27,7 @@ import {
   LIQUIDATE_CRANK_CU,
   MAX_TX_CU,
   REFRESHES_PER_OVERFLOW_TX,
+  REFRESH_CRANK_CU,
   chunkOverflowTargets,
   decodeMarketRefreshState,
   planCrankTx,
@@ -121,12 +122,12 @@ describe("chunking the overflow", () => {
         assert.ok(tx.serialize({ requireAllSignatures: false, verifySignatures: false }).length <= 1232);
       }
     }
-    assert.ok(REFRESHES_PER_OVERFLOW_TX * 130_000 + LIQUIDATE_CRANK_CU <= MAX_TX_CU);
+    assert.ok(REFRESHES_PER_OVERFLOW_TX * REFRESH_CRANK_CU + LIQUIDATE_CRANK_CU <= MAX_TX_CU);
   });
 
   it("a lone follow-up refresh gets CU headroom (live: one LP refresh exceeded a bare 130k)", () => {
     const one = planRefreshTx({ owner, market: MARKET, targets: many(1) });
-    assert.ok(one.computeUnits >= 130_000 + FOLLOWUP_CU_HEADROOM);
+    assert.ok(one.computeUnits >= REFRESH_CRANK_CU + FOLLOWUP_CU_HEADROOM);
     assert.equal(planRefreshTx({ owner, market: MARKET, targets: [] }).computeUnits, 0);
   });
 
