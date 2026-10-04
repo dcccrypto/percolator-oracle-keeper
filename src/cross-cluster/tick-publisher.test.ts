@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildTickBodies, createTickPublisher, TICK_MAX_PER_REQUEST, type TickInput } from "./tick-publisher.ts";
+import { buildTickBodies, createTickPublisher, TICK_MAX_PER_REQUEST, validateTickIngestUrl, type TickInput } from "./tick-publisher.ts";
 import { publishLandedTicks } from "./keeper-loop.ts";
 
 const inp = (n: number, oracle: bigint | null = 5n): TickInput => ({
@@ -53,7 +53,7 @@ test("publisher: single in-flight, second batch dropped and counted", async () =
   let release!: () => void;
   let calls = 0;
   const gate = new Promise<void>((r) => (release = r));
-  const p = createTickPublisher({ url: "u", key: "k", fetchImpl: (async () => { calls++; await gate; return new Response("ok"); }) as typeof fetch });
+  const p = createTickPublisher({ url: "https://u.example/t", key: "k", fetchImpl: (async () => { calls++; await gate; return new Response("ok"); }) as typeof fetch });
   p.publish([inp(1)], 1, 1);
   p.publish([inp(2), inp(3)], 2, 2);
   assert.equal(calls, 1);
@@ -74,7 +74,7 @@ test("publisher: errors, HTTP failures and timeouts are swallowed, counted, key 
     return new Promise<Response>((_, rej) => init.signal!.addEventListener("abort", () => rej(new DOMException("t", "TimeoutError"))));
   }) as unknown as typeof fetch;
   let t = 0;
-  const p = createTickPublisher({ url: "u", key: "sekrit", timeoutMs: 20, fetchImpl: f, now: () => (t += 61_000), log: (m) => logs.push(m) });
+  const p = createTickPublisher({ url: "https://u.example/t", key: "sekrit", timeoutMs: 20, fetchImpl: f, now: () => (t += 61_000), log: (m) => logs.push(m) });
   for (mode = 0; mode < 3; mode++) {
     assert.doesNotThrow(() => p.publish([inp(1)], 1, 1));
     await new Promise((r) => setTimeout(r, 60));
@@ -86,7 +86,7 @@ test("publisher: errors, HTTP failures and timeouts are swallowed, counted, key 
 
 test("publisher: log is rate limited to one line per 60s", async () => {
   const logs: string[] = [];
-  const p = createTickPublisher({ url: "u", key: "k", now: () => 5, log: (m) => logs.push(m), fetchImpl: (async () => { throw new Error("x"); }) as typeof fetch });
+  const p = createTickPublisher({ url: "https://u.example/t", key: "k", now: () => 5, log: (m) => logs.push(m), fetchImpl: (async () => { throw new Error("x"); }) as typeof fetch });
   for (let i = 0; i < 4; i++) { p.publish([inp(1)], 1, 1); await tick(); }
   assert.equal(p.counters().failed, 4);
   assert.ok(logs.length <= 1);
@@ -108,4 +108,27 @@ test("keeper-loop landed path: only landed markets reach the publisher, with raw
   assert.equal(got.length, 1, "no signature => nothing landed => no publish");
   const boom = { ...pub, publish: () => { throw new Error("x"); } };
   assert.doesNotThrow(() => publishLandedTicks(boom, pushes, { pushedMarkets: ["A"], signature: "s" }, () => null, 5n, 1));
+});
+
+test("url: https accepted; http only for loopback (negative controls: remote http, garbage, other schemes refused)", () => {
+  assert.equal(validateTickIngestUrl("https://price-ws.example.app/ingest/ticks"), "https://price-ws.example.app/ingest/ticks");
+  for (const ok of ["http://localhost:8787/ingest/ticks", "http://127.0.0.1:8787/x", "http://[::1]:8787/x"]) {
+    assert.equal(validateTickIngestUrl(ok), ok);
+  }
+  for (const bad of ["http://price-ws.example.app/ingest/ticks", "http://10.0.0.5/x", "http://localhost.evil.com/x", "ftp://x/y", "ws://localhost/x", "not a url", "//host/x"]) {
+    assert.throws(() => validateTickIngestUrl(bad), /TICK_INGEST_URL/, bad);
+  }
+});
+
+test("publisher: a non-https url fails closed at startup (throws), and the message leaks neither key nor path/query", () => {
+  const key = "super-secret-key-123";
+  assert.throws(
+    () => createTickPublisher({ url: "http://price-ws.example.app/ingest/ticks?token=abc", key }),
+    (e: Error) => /must be https/.test(e.message) && !e.message.includes(key) && !e.message.includes("token=abc") && !e.message.includes("/ingest"),
+  );
+  assert.throws(() => createTickPublisher({ url: "garbage", key }), /not a valid URL/);
+  // control: https and loopback construct fine and are enabled; unset url stays a silent no-op
+  assert.equal(createTickPublisher({ url: "https://x/y", key }).enabled, true);
+  assert.equal(createTickPublisher({ url: "http://localhost:8787/y", key }).enabled, true);
+  assert.equal(createTickPublisher({ url: "", key }).enabled, false);
 });

@@ -14,6 +14,27 @@ export const TICK_MAX_PER_REQUEST = 200;
 const DEFAULT_TIMEOUT_MS = 1500;
 const LOG_EVERY_MS = 60_000;
 
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+
+/**
+ * The bearer key travels in this request, so the URL must be https. Plain http is accepted ONLY for
+ * loopback hosts (local development). Throws at startup (same fail-fast style as env-utils.ts) with a
+ * message that never contains the key or the URL's path/query.
+ */
+export function validateTickIngestUrl(raw: string): string {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error("TICK_INGEST_URL is not a valid URL");
+  }
+  if (u.protocol === "https:") return raw;
+  if (u.protocol === "http:" && LOOPBACK_HOSTS.has(u.hostname)) return raw;
+  throw new Error(
+    `TICK_INGEST_URL must be https (http is allowed only for localhost); got ${u.protocol}//${u.hostname}`,
+  );
+}
+
 export interface TickInput {
   marketAddress: string;
   assetIndex: number;
@@ -98,6 +119,8 @@ export function createTickPublisher(opts: TickPublisherOptions = {}): TickPublis
   const now = opts.now ?? Date.now;
   const log = opts.log ?? ((m: string) => console.warn(m));
   const enabled = url !== "" && key !== "";
+  // Fail closed at startup: never send the bearer key over a non-https link.
+  if (url !== "") validateTickIngestUrl(url);
   const c: TickPublisherCounters = { enabled, sent: 0, dropped: 0, failed: 0, lastOkMs: null };
   let inFlight = false;
   let lastLogAt = 0;
