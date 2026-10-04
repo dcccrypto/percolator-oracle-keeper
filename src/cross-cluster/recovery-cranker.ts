@@ -130,6 +130,8 @@ import {
   selectPositionedPortfolios,
 } from "./positioned-refresh.ts";
 import { holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coordination.ts";
+import { createCrankLiveness, crankLivenessOptsFromEnv } from "./crank-liveness.ts";
+import type { CrankLiveness } from "./crank-liveness.ts";
 import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
 import { decodeAdlState } from "./adl-state.ts";
@@ -1308,6 +1310,7 @@ export async function startRecoveryCrankLoop(
   config: CrankLoopConfig,
   sink: AlertSink = getAlertSink(),
   bootStates?: Map<string, CrankMarketState>,
+  liveness: CrankLiveness = createCrankLiveness(crankLivenessOptsFromEnv(process.env, config.intervalMs)),
 ): Promise<void> {
   const states = new Map<string, CrankMarketState>(
     registry.markets.map((m) => [m.marketAddress, bootStates?.get(m.marketAddress) ?? freshCrankMarketState()]),
@@ -1322,9 +1325,24 @@ export async function startRecoveryCrankLoop(
   process.on("SIGINT", () => { stopping = true; });
   process.on("SIGTERM", () => { stopping = true; });
 
+  // K3 (2026-10-01): a hung crank call stalled this loop for 35 min with the process, pushes and /health all
+  // looking fine. Exit non-zero if nothing settles for > 2 intervals so Railway restarts the service.
+  liveness.beat();
+  const stopLiveness = liveness.start();
+  const limitMs = liveness.limitMs();
+  console.log(
+    `[cranker] liveness watchdog: ${limitMs === null ? "disabled" : `exit 1 after ${Math.round(limitMs / 1000)}s of silence`}`,
+  );
+
   let cycleCount = 0;
   while (!stopping) {
     const cycleStart = Date.now();
+    liveness.beat();
+    // A market the registry dropped (retired) leaves the cranker's own state too.
+    {
+      const live = new Set(registry.markets.map((m) => m.marketAddress));
+      for (const addr of [...states.keys()]) if (!live.has(addr)) states.delete(addr);
+    }
     // G8: crank every market in the cycle CONCURRENTLY instead of sequentially
     // (was a `for...await` loop — N markets meant N sequential RPC round-trips
     // per cycle, so cycle wall-time grew linearly with registry size). Each
@@ -1350,11 +1368,15 @@ export async function startRecoveryCrankLoop(
           // Defense in depth: crankOneMarket already isolates errors per-market,
           // but never let an unexpected throw kill the whole loop.
           console.error(`[cranker] ${m.label}: unexpected error — ${err instanceof Error ? err.message : String(err)}`);
+        } finally {
+          liveness.beat();
         }
       }),
     );
     cycleCount++;
+    liveness.beat();
     await reportCrankHealth(registry, states, cycleCount, sink);
+    liveness.beat();
     if (cycleCount % HEALTH_SUMMARY_EVERY_CYCLES === 0) {
       const summary = registry.markets
         .map((m) => {
@@ -1374,5 +1396,6 @@ export async function startRecoveryCrankLoop(
       await new Promise((r) => setTimeout(r, remaining));
     }
   }
+  stopLiveness();
   console.log("[cranker] Recovery crank loop stopped.");
 }

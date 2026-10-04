@@ -27,7 +27,7 @@ import type { CircuitBreakerState } from "../circuit-breaker.ts";
 import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets } from "./auth-mark-pusher.ts";
 import { evaluateMarketPush, evaluatePushCycle, getAlertSink } from "./alerting.ts";
 import type { Alert, MarketPushSample } from "./alerting.ts";
-import { getCrankRefreshHealth, isPushHeld } from "./refresh-coordination.ts";
+import { getCrankRefreshHealth, isPushHeld, pruneCrankRefreshHealth } from "./refresh-coordination.ts";
 import type { CrankRefreshHealth } from "./refresh-coordination.ts";
 import {
   type WalletBalanceState,
@@ -671,6 +671,10 @@ async function runCycle(
   state: LoopState,
   config: LoopConfig,
 ): Promise<void> {
+  // A market register-poll just dropped leaves /health with it.
+  for (const addr of pruneDeregisteredMarkets(state, registry)) {
+    console.log(`[keeper] ${addr.slice(0, 8)}… no longer registered — removed from /health`);
+  }
   // Ensure stat entries exist.
   for (const entry of registry.markets) {
     if (!state.stats.has(entry.marketAddress)) {
@@ -1002,6 +1006,28 @@ export function advanceNoPushStreaks(
  * and not when the hot-reloaded registry no longer lists it (stats are never
  * pruned, so a de-registered market would otherwise alert forever).
  */
+/**
+ * Drop every per-market record of a market the registry no longer lists (retired in Supabase and removed
+ * by register-poll). `stats` was never pruned, so a retired market stayed on /health with a frozen
+ * "last push 59s ago" / crank sample, which reads as alive. Returns the addresses removed.
+ */
+export function pruneDeregisteredMarkets(
+  state: Pick<LoopState, "stats" | "terminalMarkets" | "landedThisCycle">,
+  registry: Pick<Registry, "markets">,
+): string[] {
+  const keep = new Set(registry.markets.map((m) => m.marketAddress));
+  const removed: string[] = [];
+  for (const addr of [...state.stats.keys()]) {
+    if (keep.has(addr)) continue;
+    state.stats.delete(addr);
+    state.terminalMarkets.delete(addr);
+    state.landedThisCycle.delete(addr);
+    removed.push(addr);
+  }
+  for (const addr of pruneCrankRefreshHealth(keep)) if (!removed.includes(addr)) removed.push(addr);
+  return removed;
+}
+
 function pushExpected(state: LoopState, registry: Registry, market: string): boolean {
   return !state.terminalMarkets.has(market) && registry.markets.some((m) => m.marketAddress === market);
 }

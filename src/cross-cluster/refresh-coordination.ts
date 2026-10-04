@@ -75,6 +75,26 @@ export function getCrankRefreshHealth(market: string): CrankRefreshHealth | unde
   return refreshHealth.get(market);
 }
 
+/**
+ * Forget the refresh health (and any push hold) of every market not in `keep`. A market the registry
+ * dropped (retired in Supabase) must also leave /health: its last crank sample would otherwise sit there
+ * forever, looking alive. Returns the markets removed.
+ */
+export function pruneCrankRefreshHealth(keep: ReadonlySet<string>): string[] {
+  const removed: string[] = [];
+  for (const m of [...refreshHealth.keys()]) {
+    if (keep.has(m)) continue;
+    refreshHealth.delete(m);
+    removed.push(m);
+  }
+  for (const m of [...holds.keys()]) {
+    if (keep.has(m)) continue;
+    holds.delete(m);
+    if (!removed.includes(m)) removed.push(m);
+  }
+  return removed;
+}
+
 /** Test hook. */
 export function resetRefreshCoordination(): void {
   holds.clear();
