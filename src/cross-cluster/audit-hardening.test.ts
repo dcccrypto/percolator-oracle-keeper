@@ -94,7 +94,16 @@ function makeMeteoraPool(activeId: number, binStep: number): Uint8Array {
   const dv = new DataView(buf.buffer);
   dv.setInt32(76, activeId, true);
   dv.setUint16(80, binStep, true);
+  // Quote = USDC: a non-USD, non-WSOL quote is refused before pricing.
+  new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").toBuffer().copy(buf, 120);
   return buf;
+}
+
+/** Minimal WSOL-quoted pumpswap pool (quote mint @75) so it reaches pass 2. */
+function makeWsolPumpPool(): Buffer {
+  const b = Buffer.alloc(400);
+  new PublicKey("So11111111111111111111111111111111111111112").toBuffer().copy(b, 75);
+  return b;
 }
 
 describe("pumpswap vault-batch failure is contained to pumpswap markets", () => {
@@ -121,7 +130,7 @@ describe("pumpswap vault-batch failure is contained to pumpswap markets", () => 
           return Promise.resolve(
             ctx(100, [
               { owner: METEORA_OWNER, data: Buffer.from(makeMeteoraPool(0, 100)) },
-              { owner: PUMPSWAP_OWNER, data: Buffer.alloc(400) },
+              { owner: PUMPSWAP_OWNER, data: makeWsolPumpPool() },
             ]),
           );
         }
@@ -140,6 +149,7 @@ describe("pumpswap vault-batch failure is contained to pumpswap markets", () => 
     assert.ok(met !== undefined && met > 0n, "pass-1 meteora price was discarded");
     // …and only the pumpswap market goes unpriced this cycle.
     assert.equal(out.get(pumpswapEntry.poolAddress), undefined);
+    assert.ok(batchCall > 1, "pass 2 (the failing vault batch) must actually run");
   });
 });
 
