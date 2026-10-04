@@ -121,6 +121,8 @@ import {
   isAssetLossStale,
   marketHasPositions,
   parseInstructionError,
+  isComputeExhaustion,
+  MAX_TX_CU,
   chunkOverflowTargets,
   planCrankTx,
   planRefreshTx,
@@ -612,6 +614,10 @@ export async function crankOneMarket(
       state.consecutiveReverts++;
       state.lastRevertCode = code;
       state.lastErrorMsg = `revert ${code != null ? `Custom(${code})` : JSON.stringify(resolved.sim.err)}`;
+      if (isComputeExhaustion(resolved.sim.err, resolved.sim.logs)) {
+        // Not deep-stale drift: the plan ran out of compute even at the transaction maximum.
+        state.lastErrorMsg += ` — compute exhausted at ${resolved.plan.computeUnits} CU (${resolved.plan.cranks.length} cranks)`;
+      }
       // 19=EngineStale, 21=EngineLockActive = the deep-stale signature. A fresh /
       // lightly-stale market cranks CLEAN (only a rotting one reverts every cycle),
       // so escalate loudly once it persists.
@@ -896,8 +902,19 @@ export async function resolveCrankPlan(
   const pruned: { pubkey: PublicKey; code: number | null; repair?: LivenessRepair }[] = [];
   let repairDrops = 0;
   for (;;) {
-    const plan = build(remaining);
-    const sim = await simulate(plan);
+    let plan = build(remaining);
+    let sim = await simulate(plan);
+    // Compute exhaustion is not an engine verdict on the failing instruction:
+    // the whole transaction ran out of budget, and the instruction it stopped
+    // at is just the one the meter reached. Pruning it (the old behaviour)
+    // shrank the budget with it and cascaded to an accrual-only plan that was
+    // itself under-budget (OTC 2026-10-03/04: ProgramFailedToComplete at the
+    // accrual, streaks of 3-8 cycles). Re-simulate the SAME plan once at the
+    // transaction maximum; only a failure there is attributed to an instruction.
+    if (sim.err && plan.computeUnits < MAX_TX_CU && isComputeExhaustion(sim.err, sim.logs)) {
+      plan = { ...plan, computeUnits: MAX_TX_CU };
+      sim = await simulate(plan);
+    }
     if (!sim.err) return { plan, sim, pruned };
     const ie = parseInstructionError(sim.err);
     const crank = ie && ie.index >= 1 ? plan.cranks[ie.index - 1] : undefined;
