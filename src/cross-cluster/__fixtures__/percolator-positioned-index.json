@@ -1,0 +1,98 @@
+[
+ {
+  "pubkey": "3nvRBDAyjXkQ7ohAaXL9PC9DADbPTbapfMeHxXwepxMv",
+  "fixture": "percolator-pf-3nvRBDAy",
+  "longLegs": 1,
+  "shortLegs": 0,
+  "isLp": false,
+  "bankrupt": false
+ },
+ {
+  "pubkey": "7HwbcQ6kiU78YZ3o5uymiTy2pjMRXggKhPYnJshRMApT",
+  "fixture": "percolator-pf-7HwbcQ6k",
+  "longLegs": 1,
+  "shortLegs": 0,
+  "isLp": false,
+  "bankrupt": false
+ },
+ {
+  "pubkey": "7o3gwUXz18HALKQAkN6sNghGj4AfK3GfkzdxupSsxU7o",
+  "fixture": "percolator-pf-7o3gwUXz",
+  "longLegs": 0,
+  "shortLegs": 1,
+  "isLp": false,
+  "bankrupt": false
+ },
+ {
+  "pubkey": "7tMe5XZnZBRzE2fwDz2RMKtHxMmB7Gv7GyctxBQsgZan",
+  "fixture": "percolator-pf-7tMe5XZn",
+  "longLegs": 1,
+  "shortLegs": 0,
+  "isLp": false,
+  "bankrupt": false
+ },
+ {
+  "pubkey": "7vQ3GhwgBJ8QyxZVELMAbb9qc7wyy2AKb9mUaYu5zduu",
+  "fixture": "percolator-pf-7vQ3Ghwg",
+  "longLegs": 0,
+  "shortLegs": 1,
+  "isLp": false,
+  "bankrupt": false
+ },
+ {
+  "pubkey": "8QLz6KhUX61ccA24mcmrsK5V1DmgrUZKz27KN1nNU7VP",
+  "fixture": "percolator-pf-8QLz6KhU",
+  "longLegs": 1,
+  "shortLegs": 0,
+  "isLp": false,
+  "bankrupt": false
+ },
+ {
+  "pubkey": "A2td8VSeSbZbvqPvEYqiMcE3VW86obNTQEyWEVfJhBmY",
+  "fixture": "percolator-pf-A2td8VSe",
+  "longLegs": 1,
+  "shortLegs": 0,
+  "isLp": false,
+  "bankrupt": false
+ },
+ {
+  "pubkey": "DeFm3AXu6cNmYnoAyVGd3tWR7WbVMmSuc3uH7sFbCHeQ",
+  "fixture": "percolator-pf-DeFm3AXu",
+  "longLegs": 1,
+  "shortLegs": 0,
+  "isLp": false,
+  "bankrupt": false
+ },
+ {
+  "pubkey": "EQMstVV8Smt53NEaxeNLNdZFbuVyuXzanQNL9ujowg7u",
+  "fixture": "percolator-pf-EQMstVV8",
+  "longLegs": 0,
+  "shortLegs": 1,
+  "isLp": false,
+  "bankrupt": false
+ },
+ {
+  "pubkey": "F9YYtzdytRapfTdT4xjeHdMxnUxp1ess1ZJKbxSB7yP9",
+  "fixture": "percolator-pf-F9YYtzdy",
+  "longLegs": 0,
+  "shortLegs": 1,
+  "isLp": true,
+  "bankrupt": false
+ },
+ {
+  "pubkey": "FebDwbxRhhPToEE6fACvZ8AgdTUhHz1wiYLcUt5bohfD",
+  "fixture": "percolator-pf-FebDwbxR",
+  "longLegs": 1,
+  "shortLegs": 0,
+  "isLp": false,
+  "bankrupt": false
+ },
+ {
+  "pubkey": "J43pWxNZUkYuaJZDxBdEdJZTUs4ikRhPGKnLqoQuJAsJ",
+  "fixture": "percolator-pf-J43pWxNZ",
+  "longLegs": 1,
+  "shortLegs": 0,
+  "isLp": false,
+  "bankrupt": false
+ }
+]

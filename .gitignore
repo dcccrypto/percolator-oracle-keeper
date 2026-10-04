@@ -12,3 +12,4 @@ logs/
 !package.json
 !tsconfig.json
 !registry.json
+!src/cross-cluster/__fixtures__/*.json

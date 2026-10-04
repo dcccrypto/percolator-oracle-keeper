@@ -475,7 +475,7 @@ export function planRefreshTx(params: {
       cu += LIQUIDATE_CRANK_CU;
     }
   }
-  // The accrual tx's 1.4M budget absorbs per-refresh variance across ~9 refreshes;
+  // The accrual tx's 1.4M budget absorbs per-refresh variance across 8 refreshes;
   // a short follow-up has no such slack (live 2026-10-02: a lone LP refresh hit
   // ComputationalBudgetExceeded at 130k), so it gets explicit headroom.
   return { cranks, overflow: [], computeUnits: cranks.length === 0 ? 0 : Math.min(MAX_TX_CU, cu + FOLLOWUP_CU_HEADROOM) };
@@ -504,11 +504,6 @@ export function chunkOverflowTargets(
 }
 
 /**
- * Parse `{"InstructionError":[idx,{"Custom":n}]}` from a simulation error.
- * Returns the instruction index (in the full transaction, compute-budget ix
- * included) and the custom code, if present.
- */
-/**
  * True when a simulation/transaction failed because an instruction ran out of
  * compute: the runtime reports a BPF program that hits its CU meter as
  * `ProgramFailedToComplete` (log: "exceeded CUs meter at BPF instruction"),
@@ -528,6 +523,11 @@ export function isComputeExhaustion(err: unknown, logs?: ReadonlyArray<string> |
   return logs.some((l) => /exceeded CUs meter|exceeded maximum compute|computational budget exceeded/i.test(l));
 }
 
+/**
+ * Parse `{"InstructionError":[idx,{"Custom":n}]}` from a simulation error.
+ * Returns the instruction index (in the full transaction, compute-budget ix
+ * included) and the custom code, if present.
+ */
 export function parseInstructionError(err: unknown): { index: number; custom: number | null } | null {
   if (!err || typeof err !== "object" || !("InstructionError" in err)) return null;
   const ie = (err as { InstructionError: unknown }).InstructionError;
