@@ -22,6 +22,7 @@ import type { Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
 import { readAllPoolPricesE6 } from "./price-reader.ts";
 import { createMarkSmoother } from "./mark-smoother.ts";
+import { createTickPublisher, type TickPublisher, type TickInput } from "./tick-publisher.ts";
 import { checkCircuitBreaker, markGap, recordMarkInForce } from "../circuit-breaker.ts";
 import type { CircuitBreakerState } from "../circuit-breaker.ts";
 import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets, pruneAuthMarkPusherState } from "./auth-mark-pusher.ts";
@@ -74,6 +75,8 @@ export interface LoopConfig {
    * so `last_good_oracle_slot` stops advancing and the tag 39 stale window can run.
    */
   withholdPush?: (marketAddress: string) => boolean;
+  /** Chart tick publisher (default: built from TICK_INGEST_URL/KEY; a no-op when unset). */
+  tickPublisher?: TickPublisher;
 }
 
 interface MarketStat {
@@ -213,6 +216,8 @@ interface LoopState {
   terminalMarkets: Set<string>;
   /** K-1: markets whose push landed (or dry-ran) this cycle. Reset every cycle. */
   landedThisCycle: Set<string>;
+  /** Chart tick publisher; no-op unless TICK_INGEST_URL + TICK_INGEST_KEY are set. */
+  tickPublisher: TickPublisher;
 }
 
 /**
@@ -232,6 +237,33 @@ export function landedPushes<T extends { marketAddress: string; priceE6: bigint 
   const pushed = new Set(res.pushedMarkets);
   const terminal = new Set(res.terminalMarkets ?? []);
   return pushes.filter((p) => pushed.has(p.marketAddress) && !terminal.has(p.marketAddress));
+}
+
+/**
+ * Publish this cycle's LANDED pushes (mark + raw pool price) to the tick publisher.
+ * Only markets in `landedPushes(...)` are published; never throws.
+ */
+export function publishLandedTicks(
+  publisher: TickPublisher,
+  pushes: ReadonlyArray<{ marketAddress: string; assetIndex: number; priceE6: bigint }>,
+  res: { pushedMarkets: ReadonlyArray<string>; terminalMarkets?: ReadonlyArray<string>; signature?: string | null },
+  rawByMarket: (marketAddress: string) => bigint | null,
+  slot: bigint,
+  landedMs: number,
+): void {
+  try {
+    const landed = landedPushes(pushes, res);
+    if (landed.length === 0) return;
+    const inputs: TickInput[] = landed.map((p) => ({
+      marketAddress: p.marketAddress,
+      assetIndex: p.assetIndex,
+      markE6: p.priceE6,
+      oracleE6: rawByMarket(p.marketAddress),
+    }));
+    publisher.publish(inputs, slot, landedMs);
+  } catch {
+    // never let chart telemetry disturb the push loop
+  }
 }
 
 /** P3 exhausted-backing gate: skip the push when the hook says to withhold it. */
@@ -388,6 +420,7 @@ function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Regis
       uptimeSec,
       cycleCount: state.cycleCount,
       timeoutCount: state.timeoutCount,
+      tickPublisher: state.tickPublisher.counters(),
       lastCycleAgo:
         state.lastCycleAt !== null
           ? `${Math.floor((Date.now() - state.lastCycleAt) / 1000)}s`
@@ -963,6 +996,19 @@ async function runCycle(
         }
       }
     }
+    if (!config.dryRun) {
+      publishLandedTicks(
+        state.tickPublisher,
+        pushes,
+        res,
+        (m) => {
+          const raw = state.stats.get(m)?.lastRawPriceE6 ?? 0n;
+          return raw > 0n ? raw : null;
+        },
+        nowSlot,
+        stamp,
+      );
+    }
     if (res.pushed && res.signature) {
       state.lastSuccessfulPushAt = stamp;
       console.log(`[loop] batched push × ${res.count}: sig=${res.signature.slice(0, 16)}…`);
@@ -1141,6 +1187,7 @@ export async function startKeeperLoop(
     lastCycleAt: null,
     cycleCount: 0,
     timeoutCount: 0,
+    tickPublisher: config.tickPublisher ?? createTickPublisher(),
     lastSuccessfulPushAt: null,
     consecutiveBatchReadFailures: 0,
     wallet: createWalletBalanceState(),

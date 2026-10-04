@@ -82,3 +82,11 @@ Required Railway environment variables:
 ## Architecture
 
 Previously part of `percolator-launch/bots/oracle-keeper/`. Extracted to standalone repo for cleaner architecture. The oracle-keeper is a backend service; the frontend lives in [percolator-launch](https://github.com/dcccrypto/percolator-launch).
+
+## Chart tick publisher (optional)
+
+When `TICK_INGEST_URL` and `TICK_INGEST_KEY` are both set, each cycle's *landed* pushes are POSTed
+(`authorization: Bearer <key>`) as wire v1 `{v:1,src:"keeper",sentMs,ticks:[{slab,assetIndex,slot,landedMs,markE6,oracleE6}]}`
+(max 200 ticks/request; `markE6` = published AuthMark, `oracleE6` = raw pool price or null). Fire-and-forget with a
+single request in flight (extra batches are dropped and counted), `TICK_PUBLISH_TIMEOUT_MS` timeout (default 1500).
+Counters appear under `tickPublisher` in `/health`. Unset = no-op; on-chain behaviour is never affected.
