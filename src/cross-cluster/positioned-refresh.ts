@@ -281,11 +281,33 @@ function buildPermissionlessCrankIx(
 
 // ── Transaction plan ──────────────────────────────────────────────────────
 
-/** Measured on devnet: bounded catch-up crank ~22k CU, full accrual ~77k, refresh ~97-104k. */
+/**
+ * Per-crank CU estimates used to size the accrual transaction.
+ *
+ * Re-measured on devnet 2026-10-04 (wrapper 7c906e45 / engine 35ddd692), from
+ * landed keeper cranks: catch-up ~27.5k; full accrual ~61k when the mark has
+ * not moved, but 120k-162.6k right after a mark move (OTC 157k on every
+ * up-tick, Jimothy 162.6k, backpack 152.4k); refresh 92k-153k (OTC trader
+ * Haf5hMma 108k-151k). The old accrual estimate (150k) was BELOW the
+ * post-move peak, so an accrual-only plan exhausted its budget and reverted
+ * ProgramFailedToComplete (OTC streaks, 2026-10-03/04). See
+ * ACCRUAL_TX_CU_HEADROOM for the per-transaction margin on top.
+ */
 export const CATCHUP_CRANK_CU = 30_000;
-export const ACCRUE_CRANK_CU = 150_000;
+export const ACCRUE_CRANK_CU = 200_000;
 export const REFRESH_CRANK_CU = 130_000;
 export const MAX_TX_CU = 1_400_000;
+/**
+ * Extra CU on every accrual transaction, reserved before packing refreshes.
+ * Refresh estimates are averages (an LP refresh ~92-110k, a trader refresh
+ * up to ~153k): a plan with few refreshes has no averaging slack, so a
+ * 2-refresh OTC plan sized at exactly the sum of estimates (410k) ran out at
+ * 162k + 151k + 110k = 423k. The headroom absorbs that per-transaction
+ * variance and the sim-to-land race (an accrual simulated before a push
+ * lands at ~61k but executes after it at ~157k). It costs at most one
+ * refresh of capacity: 8 refreshes still fit beside the accrual.
+ */
+export const ACCRUAL_TX_CU_HEADROOM = 100_000;
 /** ExpireBackingBucket / FinalizeResetSide: one market-only state transition each (well under 40k CU). */
 export const REPAIR_CU = 40_000;
 /** Measured on devnet (ANSEM, 2026-09-29): liquidating a bankrupt leg ~200k CU. */
@@ -396,26 +418,32 @@ export function planCrankTx(params: {
   }
   if (!catchupAllowsRefresh(catchup)) {
     // Too far behind to finish this cycle: catch-up cranks only.
-    return { cranks, overflow: [], computeUnits: Math.min(MAX_TX_CU, repairCu + catchup * CATCHUP_CRANK_CU) };
+    return {
+      cranks,
+      overflow: [],
+      computeUnits: Math.min(MAX_TX_CU, repairCu + catchup * CATCHUP_CRANK_CU + ACCRUAL_TX_CU_HEADROOM),
+    };
   }
   cranks.push({ kind: "accrue", portfolio: lpPortfolio, ix: buildObservationCrankIx(owner, market, lpPortfolio) });
   let cu = repairCu + catchup * CATCHUP_CRANK_CU + ACCRUE_CRANK_CU;
+  /** Packing ceiling: the headroom is reserved, never spent on another refresh. */
+  const packCap = MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM;
 
   const ordered = [...refreshTargets].sort((x, y) => Number(x.isLp) - Number(y.isLp));
   const overflow: PositionedPortfolio[] = [];
   for (const p of ordered) {
-    if (cu + REFRESH_CRANK_CU > MAX_TX_CU) {
+    if (cu + REFRESH_CRANK_CU > packCap) {
       overflow.push(p);
       continue;
     }
     cranks.push({ kind: "refresh", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
     cu += REFRESH_CRANK_CU;
-    if (!p.isLp && (params.liquidateTargets ?? []).some((t) => t.equals(p.pubkey)) && cu + LIQUIDATE_CRANK_CU <= MAX_TX_CU) {
+    if (!p.isLp && (params.liquidateTargets ?? []).some((t) => t.equals(p.pubkey)) && cu + LIQUIDATE_CRANK_CU <= packCap) {
       cranks.push({ kind: "liquidate", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
       cu += LIQUIDATE_CRANK_CU;
     }
   }
-  return { cranks, overflow, computeUnits: Math.min(MAX_TX_CU, cu) };
+  return { cranks, overflow, computeUnits: Math.min(MAX_TX_CU, cu + ACCRUAL_TX_CU_HEADROOM) };
 }
 
 // ── Overflow refreshes (follow-up transactions) ──────────────────────────
@@ -480,6 +508,26 @@ export function chunkOverflowTargets(
  * Returns the instruction index (in the full transaction, compute-budget ix
  * included) and the custom code, if present.
  */
+/**
+ * True when a simulation/transaction failed because an instruction ran out of
+ * compute: the runtime reports a BPF program that hits its CU meter as
+ * `ProgramFailedToComplete` (log: "exceeded CUs meter at BPF instruction"),
+ * and older runtimes as `ComputationalBudgetExceeded`. Neither is an engine
+ * verdict on the instruction, so the cranker must not treat it as "the engine
+ * rejected this refresh". `ProgramFailedToComplete` without logs is treated
+ * as exhaustion too: the only response is one re-simulation at a larger
+ * budget, which a genuine panic simply fails again.
+ */
+export function isComputeExhaustion(err: unknown, logs?: ReadonlyArray<string> | null): boolean {
+  if (!err || typeof err !== "object" || !("InstructionError" in err)) return false;
+  const ie = (err as { InstructionError: unknown }).InstructionError;
+  if (!Array.isArray(ie)) return false;
+  if (ie[1] === "ComputationalBudgetExceeded") return true;
+  if (ie[1] !== "ProgramFailedToComplete") return false;
+  if (!logs || logs.length === 0) return true;
+  return logs.some((l) => /exceeded CUs meter|exceeded maximum compute|computational budget exceeded/i.test(l));
+}
+
 export function parseInstructionError(err: unknown): { index: number; custom: number | null } | null {
   if (!err || typeof err !== "object" || !("InstructionError" in err)) return null;
   const ie = (err as { InstructionError: unknown }).InstructionError;
