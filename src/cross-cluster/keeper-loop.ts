@@ -146,6 +146,16 @@ export function recordRawPrice(
 }
 
 /**
+ * The /health `lastError` for a market whose pool produced no price this cycle:
+ * the reader's specific refusal reason when it gave one (e.g. a non-USD quote,
+ * which never self-heals), else the generic message.
+ */
+export function noPoolPriceReason(skipReasons: ReadonlyMap<string, string>, poolAddress: string): string {
+  const why = skipReasons.get(poolAddress);
+  return why ? `no pool price this cycle: ${why}` : "no pool price this cycle";
+}
+
+/**
  * Record a push that LANDED for one market, and clear its last error.
  *
  * `lastErrorMsg` used to be sticky: a transient cold-start condition (the mark
@@ -705,6 +715,7 @@ async function runCycle(
 
   // ── 2. Read ALL pool prices in ONE getMultipleAccounts (DEX-pool source) ────
   let prices: Map<string, bigint>;
+  const priceSkipReasons = new Map<string, string>();
   try {
     prices = await readAllPoolPricesE6(
       mainnetConn,
@@ -713,6 +724,7 @@ async function runCycle(
       // SOL/USD reference for WSOL-quoted (pumpswap) pools when no SOL/USDC
       // market is registered — see the param's doc comment.
       process.env.SOL_USD_REFERENCE_POOL,
+      priceSkipReasons,
     );
   } catch (err) {
     const msg = (err instanceof Error ? err.message : String(err)).slice(0, 160);
@@ -750,7 +762,7 @@ async function runCycle(
     const stat = state.stats.get(entry.marketAddress)!;
     if (rawPriceE6 === undefined || rawPriceE6 <= 0n) {
       stat.totalErrors++;
-      stat.lastErrorMsg = "no pool price this cycle";
+      stat.lastErrorMsg = noPoolPriceReason(priceSkipReasons, entry.poolAddress);
       stat.sourcePriceE6 = 0n;
       continue;
     }

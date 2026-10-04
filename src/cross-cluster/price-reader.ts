@@ -129,6 +129,11 @@ export function quoteIsNotUsdOrWsol(quoteMint: PublicKey): boolean {
   return !quoteMint.equals(WSOL_MINT) && raydiumPriceIsNotUsd(quoteMint);
 }
 
+/** The /health-facing reason a pool was refused by quoteIsNotUsdOrWsol. */
+export function nonUsdQuoteSkipReason(dex: string, quoteMint: PublicKey): string {
+  return `${dex} quote mint ${quoteMint.toBase58()} is neither WSOL nor a USD stable — price is not USD, refused`;
+}
+
 export function meteoraWsolPriceToUsdE6(
   poolData: Uint8Array,
   decimals: { base: number; quote: number },
@@ -863,6 +868,13 @@ export async function readAllPoolPricesE6(
    * a registered SOL/USDC market still wins and this costs nothing when present.
    */
   solUsdReferencePool?: string,
+  /**
+   * Optional sink for WHY a pool was refused, keyed by poolAddress. Filled for
+   * the permanent refusals (quote neither WSOL nor a USD stable) so the keeper
+   * can surface the real reason in /health `lastError` (and the K-1 no-push
+   * alert) instead of the generic "no pool price this cycle".
+   */
+  skipReasons?: Map<string, string>,
 ): Promise<Map<string, bigint>> {
   const out = new Map<string, bigint>();
   if (entries.length === 0) return out;
@@ -942,6 +954,7 @@ export async function readAllPoolPricesE6(
             `[price-reader] ${entry.label}: meteora quote mint ${parsed.quoteMint.toBase58()} ` +
               `is neither WSOL nor a USD stable — price is not USD. Refusing to price it.`,
           );
+          skipReasons?.set(entry.poolAddress, nonUsdQuoteSkipReason("meteora", parsed.quoteMint));
           continue;
         }
         if (!decimalsCache.has(entry.poolAddress)) {
@@ -984,6 +997,7 @@ export async function readAllPoolPricesE6(
             `[price-reader] ${entry.label}: pumpswap quote mint ${parsed.quoteMint.toBase58()} ` +
               `is neither WSOL nor a USD stable — price is not USD. Refusing to price it.`,
           );
+          skipReasons?.set(entry.poolAddress, nonUsdQuoteSkipReason("pumpswap", parsed.quoteMint));
           continue;
         }
         if (!parsed.baseVault || !parsed.quoteVault) continue;
