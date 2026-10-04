@@ -703,6 +703,124 @@ function recordSentObservationSequence(p: AuthMarkPushItem): void {
 /** PercolatorError::EngineStale — the wrapper's error for a non-increasing observation_sequence. */
 const ENGINE_STALE_CUSTOM = 19;
 
+// ── Late-duplicate Custom(19) (landed reverts, 2026-10-04) ────────────────────
+//
+// The self-race above is fixed (no two cycles propose the same nonce), yet
+// ~2.6-4.6% of LANDED push txs still reverted `[1,{"Custom":19}]`, in every
+// chunk, with no preflight failure logged. Measured on chain (the 1000 most
+// recent txs touching Percolator 9EPm8nB8, 03:52Z-04:16Z, deployment 7b8998ac):
+//   - 46 of 1000 failed, all `InstructionError [1, Custom(19)]` (ix 1 is just
+//     the first market of the atomic chunk; every market in it shares the fate);
+//   - ZERO had a nonce equal to another tx's -- the nonces are unique;
+//   - in all 46 a tx with a HIGHER nonce for the same markets had already landed
+//     (the failing tx landed 1-13 slots after its successor);
+//   - landing age (landing slot - nowSlot) is 4-5 slots for a normal push (p99 9,
+//     none in 10-11) but 12-22 slots for every failure: the failures are
+//     delayed copies, not first deliveries.
+// Cycles are 1.5s (~4 slots) apart, so cycle N is still in flight when N+1 is
+// sent. If N is dropped on first delivery, the RPC node's `maxRetries`
+// rebroadcast puts a copy on chain seconds later, AFTER N+1 has advanced the
+// watermark: the copy is `proposed <= current` -> EngineStale. It is harmless to
+// prices (N+1, fresher, already landed -- verified for all 598 failed pushes) but
+// wastes a fee, shows up as a failed tx, and is invisible to the keeper (it sends
+// with skipPreflight and never looks at the outcome), which is how it was
+// misread as "the cycle's price update was lost for the whole chunk".
+//
+// A stale push has no value once its successor is in flight, so never let the
+// node resend it: maxRetries 0. The next cycle (1.5s) is the retry.
+export const PUSH_SEND_OPTIONS = { skipPreflight: true, maxRetries: 0 } as const;
+
+/** One landed-or-not push tx we are still waiting to hear about. */
+interface InFlightPush {
+  signature: string;
+  sentAtMs: number;
+  items: Array<{ key: string; market: string; seq: bigint }>;
+}
+const inFlightPushes: InFlightPush[] = [];
+const MAX_IN_FLIGHT_PUSHES = 64;
+/** Do not ask about a tx until it has had time to land. */
+const PUSH_STATUS_MIN_AGE_MS = 4_000;
+/** A signature unknown to the cluster this long after sending is treated as dropped. */
+const PUSH_STATUS_GIVE_UP_MS = 90_000;
+const LATE_DUPLICATE_LOG_EVERY_MS = 60_000;
+
+/** Observed outcomes of pushes this process sent (read back from chain). */
+export const pushLandingStats = {
+  landedOk: 0,
+  /** Custom(19) on a tx whose markets were all already superseded by a higher nonce we sent: benign. */
+  lateDuplicateReverts: 0,
+  /** Any other landed revert, including Custom(19) on a nonce nothing superseded: needs a human. */
+  otherReverts: 0,
+  /** Never landed (dropped, or unknown after PUSH_STATUS_GIVE_UP_MS). */
+  unlanded: 0,
+};
+let lastLateDuplicateLogMs = 0;
+let lateDuplicatesSinceLog = 0;
+
+/** Test hook. */
+export function resetPushLandingState(): void {
+  inFlightPushes.length = 0;
+  pushLandingStats.landedOk = 0;
+  pushLandingStats.lateDuplicateReverts = 0;
+  pushLandingStats.otherReverts = 0;
+  pushLandingStats.unlanded = 0;
+  lastLateDuplicateLogMs = 0;
+  lateDuplicatesSinceLog = 0;
+}
+
+/**
+ * Read back what happened to the push txs we sent: one batched
+ * `getSignatureStatuses` over the ones old enough to have landed (no RPC at all
+ * when there are none). A landed push revert is classified rather than ignored:
+ * Custom(19) on markets we have since pushed a higher nonce for is the benign
+ * late duplicate described above (counted, summarised once a minute); anything
+ * else is logged loudly. Never throws.
+ */
+export async function reconcilePushOutcomes(devnetConn: Connection, nowMs: number = Date.now()): Promise<void> {
+  try {
+    const due = inFlightPushes.filter((f) => nowMs - f.sentAtMs >= PUSH_STATUS_MIN_AGE_MS);
+    if (due.length === 0) return;
+    const { value } = await devnetConn.getSignatureStatuses(due.map((f) => f.signature));
+    due.forEach((f, i) => {
+      const st = value[i];
+      if (!st) {
+        if (nowMs - f.sentAtMs < PUSH_STATUS_GIVE_UP_MS) return; // may still land
+        pushLandingStats.unlanded++;
+      } else if (!st.err) {
+        pushLandingStats.landedOk++;
+      } else {
+        const failing = parseFailingPush(st.err, f.items.length);
+        const superseded =
+          failing !== null &&
+          failing.custom === ENGINE_STALE_CUSTOM &&
+          f.items.every((it) => (lastSentObservationSequence.get(it.key) ?? 0n) > it.seq);
+        if (superseded) {
+          pushLandingStats.lateDuplicateReverts++;
+          lateDuplicatesSinceLog++;
+        } else {
+          pushLandingStats.otherReverts++;
+          console.error(
+            `[push] LANDED REVERT ${f.signature.slice(0, 16)}… ${JSON.stringify(st.err).slice(0, 100)} — ` +
+              `markets: ${f.items.map((it) => it.market.slice(0, 8) + "…").join(", ")}; not a superseded late duplicate`,
+          );
+        }
+      }
+      const at = inFlightPushes.indexOf(f);
+      if (at >= 0) inFlightPushes.splice(at, 1);
+    });
+    if (lateDuplicatesSinceLog > 0 && nowMs - lastLateDuplicateLogMs >= LATE_DUPLICATE_LOG_EVERY_MS) {
+      console.log(
+        `[push] ${lateDuplicatesSinceLog} landed push tx(s) reverted Custom(19) as late duplicates of already-superseded ` +
+          `pushes (a higher nonce landed first; no price update lost; totals ${JSON.stringify(pushLandingStats)})`,
+      );
+      lateDuplicatesSinceLog = 0;
+      lastLateDuplicateLogMs = nowMs;
+    }
+  } catch {
+    // Observability only: an RPC failure here must never touch the push path.
+  }
+}
+
 /**
  * Parse a simulate `err` of the real RPC shape `{"InstructionError":[i,{"Custom":n}]}`
  * into the offending push's position within `chunkLen` pushes (ix 0 is the
@@ -748,6 +866,9 @@ export async function pushAuthMarkBatch(
   if (pushes.length === 0) {
     return { pushed: false, count: 0, pushedMarkets: [], skippedMarkets: [] };
   }
+
+  // Read back the outcome of earlier cycles' txs (no-op unless some are old enough).
+  void reconcilePushOutcomes(devnetConn);
 
   // Drop markets currently quarantined for repeated reverts, so they cannot be
   // batched with healthy ones and freeze their prices. They re-enter
@@ -889,11 +1010,14 @@ export async function pushAuthMarkBatch(
     const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
     tx.sign(keeper);
     try {
-      const signature = await devnetConn.sendRawTransaction(tx.serialize(), {
-        skipPreflight: true,
-        maxRetries: 2,
-      });
+      const signature = await devnetConn.sendRawTransaction(tx.serialize(), PUSH_SEND_OPTIONS);
       firstSig ??= signature;
+      inFlightPushes.push({
+        signature,
+        sentAtMs: Date.now(),
+        items: chunk.map((p) => ({ key: pushGenerationKey(p), market: p.marketAddress, seq: p.observationSequence })),
+      });
+      if (inFlightPushes.length > MAX_IN_FLIGHT_PUSHES) inFlightPushes.splice(0, inFlightPushes.length - MAX_IN_FLIGHT_PUSHES);
       for (const p of chunk) {
         pushedMarkets.push(p.marketAddress);
         // A clean push clears any accumulated strikes…

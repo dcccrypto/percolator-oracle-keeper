@@ -274,6 +274,25 @@ const REVERT_ALERT_THRESHOLD = 3;
 /** Log a full per-market health summary every N cycles so the loop is never silently "healthy". */
 const HEALTH_SUMMARY_EVERY_CYCLES = 30;
 
+/**
+ * What to tell the operator after a reverted crank, per cause. Only the
+ * engine's own staleness codes (19 EngineStale, 21 EngineLockActive) mean the
+ * accrual is drifting toward deep-stale; a compute-exhausted plan is a
+ * budgeting problem, and anything else is unclassified.
+ */
+export function revertAdvice(code: number | null, computeExhausted: boolean): string {
+  if (computeExhausted) {
+    return (
+      "The plan ran out of compute even at the transaction maximum, so the engine clock is not advancing " +
+      "while this persists: check the per-crank CU estimates against measured cost."
+    );
+  }
+  if (code === 19 || code === 21) {
+    return "Engine accrual is drifting toward an unrecoverable deep-stale state — investigate / re-seed if this persists.";
+  }
+  return "Unclassified revert (not compute exhaustion, not an engine staleness code) — investigate the simulation logs.";
+}
+
 /** Parse a Solana "custom program error: 0xNN" (or {"Custom":NN}) code out of an error/sim result. */
 function parseCustomErrorCode(errLike: unknown): number | null {
   const text =
@@ -614,8 +633,8 @@ export async function crankOneMarket(
       state.consecutiveReverts++;
       state.lastRevertCode = code;
       state.lastErrorMsg = `revert ${code != null ? `Custom(${code})` : JSON.stringify(resolved.sim.err)}`;
-      if (isComputeExhaustion(resolved.sim.err, resolved.sim.logs)) {
-        // Not deep-stale drift: the plan ran out of compute even at the transaction maximum.
+      const computeExhausted = isComputeExhaustion(resolved.sim.err, resolved.sim.logs);
+      if (computeExhausted) {
         state.lastErrorMsg += ` — compute exhausted at ${resolved.plan.computeUnits} CU (${resolved.plan.cranks.length} cranks)`;
       }
       // 19=EngineStale, 21=EngineLockActive = the deep-stale signature. A fresh /
@@ -623,10 +642,7 @@ export async function crankOneMarket(
       // so escalate loudly once it persists.
       if (state.consecutiveReverts === 1 || state.consecutiveReverts % REVERT_ALERT_THRESHOLD === 0) {
         const tag = state.consecutiveReverts >= REVERT_ALERT_THRESHOLD ? "[cranker][ALERT]" : "[cranker][REVERT]";
-        console.warn(
-          `${tag} ${label}: crank ${state.lastErrorMsg} (${state.consecutiveReverts}× consecutive). ` +
-            `Engine accrual is drifting toward an unrecoverable deep-stale state — investigate / re-seed if this persists.`,
-        );
+        console.warn(`${tag} ${label}: crank ${state.lastErrorMsg} (${state.consecutiveReverts}× consecutive). ${revertAdvice(code, computeExhausted)}`);
       }
       return;
     }
@@ -942,7 +958,7 @@ export async function resolveCrankPlan(
 // ── Overflow refreshes (2026-10-02 Percolator outage) ───────────────────────
 //
 // A market with more positioned portfolios than one transaction can refresh
-// (~9 at 130k CU each under the 1.4M cap, after the accrual) used to leave the
+// (8 at 130k CU each under the 1.4M cap, after the accrual and its headroom) used to leave the
 // rest stale: stale_account_count stayed > 0, loss_stale held, and every
 // risk-increasing trade reverted Custom(21) indefinitely (Percolator 9EPm8nB8,
 // 12 positioned, locked for opens from ~18:55Z). The rest now go out as
