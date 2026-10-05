@@ -132,3 +132,52 @@ When supported (tick every `P2B_TICK_MS`, one batched snapshot read per tick):
 
 Independent of the gate: tag 78 on a bound vault appends `[7]` ext and `[8]` vault LP once the registry ext
 flag (byte 161) is set (it is 0 on every pre-P2b program). See `.env.example` for every knob.
+
+## Transaction v1 for the PushAuthMark batch (`TX_V1`, default off)
+
+`TX_V1` switches the per-cycle PushAuthMark batch to Solana v1 transactions (SIMD-0385 format, SIMD-0296
+4,096-byte limit) via the SDK encoder (`src/cross-cluster/tx-v1.ts`). Off, the keeper sends exactly the legacy
+bytes it sent before (pinned by a golden test against the pre-v1 commit).
+
+| `TX_V1` | Behaviour |
+|---------|-----------|
+| `off` (default) | Legacy txs, 13 markets per tx (1,232-byte limit). |
+| `auto` | v1 while the devnet feature gate reports it active; on a FORMAT rejection (JSON-RPC code -32602 / -32015 only, never message text) or a v1 loaded-size error in preflight, the unsent markets go out in legacy and v1 is suspended for `TX_V1_RETRY_AFTER_REJECT_MS`. Program errors never fall back or resend. |
+| `on` | Requires the cluster to REPORT v1: a cluster without it is a config error, so no push that cycle (fail closed, loud). A runtime v1 rejection (format, or a v1 budget error in preflight) never skips a cycle: that cycle falls back to legacy and logs an error, and the next cycle tries v1 again (no suspension). For testing a cluster; use `auto` in production. |
+
+Measured on devnet (48 live markets, read-only simulateTransaction): legacy 4 txs per cycle (1,142 / 1,142 / 1,142 /
+854 B); v1 with the defaults (16 markets/tx, 128 KiB heap) 3 txs (1,350 B each, ~83,000 CU vs a 138,000 limit, loaded
+2,503,697 B); v1 with `TX_V1_PUSH_MAX_MARKETS=0` 1 tx (3,686 B, 249,701 CU vs 394,000, loaded 3,590,545 B). The heap
+bit costs ~24.5 CU per push. A v1 tx is atomic like a legacy chunk: preflight still excludes a reverting
+market and re-sends the rest in the same cycle, but a revert that only shows up on-chain (after a clean
+preflight) affects every market in the tx. Blast-radius controls (security review K-1):
+- `TX_V1_PUSH_MAX_MARKETS` (default **16**, about the legacy 13) caps markets per v1 tx; `0` = all that fit, only
+  when set explicitly.
+- When a v1 preflight stops at push p, pushes 0..p-1 (proven clean by that same simulate) are SENT at once, before
+  any isolation work on the rest.
+- `TX_V1_ISOLATION_MAX_SIMS` (default 8) caps the re-simulations spent isolating reverting markets per cycle; past
+  it, the rest of that chunk waits for the next cycle (not struck).
+- A v1 tx that LANDS and reverts (anything but the benign late-duplicate Custom(19)) suspends v1 for
+  `TX_V1_RETRY_AFTER_REJECT_MS`, under `auto` and `on`, logged as an error; `/health.txV1.suspendedKind` = `landing`.
+- A v1 CU error that names its instruction (security review K-3) moves only THAT market to legacy for the cycle
+  (the pushes before it are sent in v1, v1 is kept for the rest; its legacy preflight strikes it if it really
+  reverts). A budget error that names no market (loaded size), or budget errors on more than 2 distinct markets in
+  one cycle, suspend v1 as before. v1 chunks also split when the summed loaded-accounts size would pass
+  `TX_V1_LOADED_ACCOUNTS_BYTES` (or, derived, 64 MiB including the 1.25 headroom).
+
+Landing proof (security review K-2): for the first `TX_V1_CANARY_CYCLES` (default 5) v1 cycles, and again after
+every landing suspension, the cycle waits up to `TX_V1_CANARY_TIMEOUT_MS` (default 10000) for
+`getSignatureStatuses` to show each v1 tx confirmed. A v1 tx the last status read still reports absent suspends v1
+(landing) and exactly its markets are re-pushed in legacy with the same observation sequence; a tx seen processed
+but unconfirmed, or a status read that fails, is never re-pushed. `/health.txV1.canary` shows
+`{required, active, passed, failures, lastResult}` and `/health.txV1.landing` shows
+`{v1TxsSent, v1LandedOk, sentSinceLastLandedOk, stalled}`; `stalled` (and one error log) when 20 v1 txs have been
+sent since the last v1 tx was seen landed OK.
+
+Other knobs: `TX_V1_PUSH_CU_PER_MARKET` (8000), `TX_V1_PUSH_CU_BASE`
+(10000), `TX_V1_LOADED_ACCOUNTS_BYTES` (unset = 1.25 x (2,000,000 + sum of slab bytes + 64 each)),
+`TX_V1_LOADED_OVERHEAD_BYTES` (2000000), `TX_V1_HEAP_BYTES` (131072: the wrapper's heap by contract, #176; 0 =
+none, explicitly), `TX_V1_PRIORITY_FEE_LAMPORTS` (0; a TOTAL per tx in lamports, digits only, at most 1,000,000 =
+0.001 SOL, which at one tx per 1.5 s is already ~57.6 SOL/day; the SDK encoder also refuses more than 0.01 SOL). `/health` gains a `txV1` block
+(last cycle's tx count vs the legacy baseline, fallbacks) only when `TX_V1` is not off. Cranks and refreshes
+stay legacy (they are CU-bound: v1 would not add a single refresh per tx).

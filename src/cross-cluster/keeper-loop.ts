@@ -30,6 +30,7 @@ import { evaluateMarketPush, evaluatePushCycle, getAlertSink } from "./alerting.
 import type { Alert, MarketPushSample } from "./alerting.ts";
 import { getCrankRefreshHealth, isPushHeld, pruneCrankRefreshHealth } from "./refresh-coordination.ts";
 import { p2bHealthFields } from "./p2b-health.ts";
+import { txV1HealthFields } from "./tx-v1.ts";
 import type { CrankRefreshHealth } from "./refresh-coordination.ts";
 import {
   type WalletBalanceState,
@@ -431,6 +432,9 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       markets,
       // v2.1 (P2b), additive: `earnVaults` + `p2b`. `{}` (nothing added) unless the wrapper supports P2b.
       ...p2bHealthFields(),
+      // TX_V1, additive and LAST: `txV1` (push tx format, last cycle's tx count vs the legacy
+      // baseline, fallbacks) only when TX_V1 is not off, so the default /health is unchanged.
+      ...txV1HealthFields(),
     });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(payload);
