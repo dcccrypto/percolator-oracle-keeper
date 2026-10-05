@@ -57,6 +57,8 @@ import {
   deriveLpVaultRegistry,
   deriveLpBackingLedger,
   parseLpVaultRegistry,
+  deriveVaultLpExtP2b,
+  withCrankFeesBoundTailP2b,
 } from "@percolatorct/sdk";
 import { SystemProgram } from "@solana/web3.js";
 import type { Registry } from "./registry.ts";
@@ -65,22 +67,11 @@ import { confirmBySignature, customCodeOf } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
 import { decodeTerminalState, isTerminalFlat, marketMode } from "./market-state.ts";
-import { deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
+import { decodeVaultLpState, deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
+import { isP2bSupported } from "./p2b-feature.ts";
 
-/**
- * P3 bound-vault flag: `LpVaultRegistryV16._reserved[VAULT_LP_REGISTRY_BOUND_FLAG_IDX = 0]`
- * (struct offset 144 => absolute 160; layout identical on v18.2 6377376a and P3 b2b2559e).
- * 0 = unbound, 1 = bound; any other byte is InvalidAccountData on-chain
- * (`registry_vault_lp_bound`, b2b2559e v16_program.rs:5733), so it is reported, not guessed.
- */
-export const LP_VAULT_REGISTRY_BOUND_FLAG_OFF = 16 + 144;
-export function lpVaultRegistryBound(data: Uint8Array): boolean {
-  if (data.length <= LP_VAULT_REGISTRY_BOUND_FLAG_OFF) return false;
-  const b = data[LP_VAULT_REGISTRY_BOUND_FLAG_OFF];
-  if (b === 0) return false;
-  if (b === 1) return true;
-  throw new Error(`LP-vault registry bound flag is ${b} (only 0/1 are valid)`);
-}
+import { lpVaultRegistryBound, lpVaultRegistryExtFlag } from "./registry-flags.ts";
+export { LP_VAULT_REGISTRY_BOUND_FLAG_OFF, lpVaultRegistryBound } from "./registry-flags.ts";
 
 /**
  * Fallback only. v17 vaults are DUAL-DOMAIN: the vault serves both pots of its
@@ -207,22 +198,114 @@ export async function crankLpFeesOnce(
     return "skipped";
   }
 
+  // P2b (#526): once the registry's ext flag (byte 161) is set, a BOUND vault's tag 78 REQUIRES the
+  // tail [7] vault_lp_ext (w) and [8] vault LP portfolio (w) (fail closed). The flag is 0 on every
+  // pre-P2b program, so for them `ext` stays null and the transaction is byte-identical to before.
+  let ext: BoundExtTail | null = null;
+  if (bound && lpVaultRegistryExtFlag(new Uint8Array(registryInfo.data))) {
+    const t = await resolveExtTail(devnetConn, market);
+    if ("error" in t) return { error: t.error };
+    ext = t;
+  }
+
+  const attempt = (tail: BoundExtTail | null) =>
+    sendCrankFeesOnce(devnetConn, keeper, { market, registry, ledger, siblingLedger, domainIdx, bound, resolvedHarvest, tail }, marketAddress, confirmOpts, observe);
+  let out = await attempt(ext);
+  // Race: a tag 103 (this keeper's, or anyone's: it is permissionless) can create the ext and raise
+  // the flag between our registry read and our send. The program then refuses the old 7-account
+  // shape. Only on a failure, and only where the P2b program is known (the gate), re-read the
+  // registry fresh and retry once with the tail. On today's programs this branch never runs.
+  if (typeof out === "object" && bound && ext === null && isP2bSupported()) {
+    try {
+      const [fresh] = (await devnetConn.getMultipleAccountsInfo([registry], "confirmed")) as Array<{ data: Buffer } | null>;
+      if (fresh && lpVaultRegistryExtFlag(new Uint8Array(fresh.data))) {
+        const t = await resolveExtTail(devnetConn, market);
+        if (!("error" in t)) out = await attempt(t);
+      }
+    } catch {
+      // keep the first outcome
+    }
+  }
+  return out;
+}
+
+/** The tag-78 ext tail of a bound vault once the registry ext flag is set. */
+export interface BoundExtTail {
+  vaultLpExt: PublicKey;
+  lpPortfolio: PublicKey;
+}
+
+/** Derive the ext PDA and read the vault LP portfolio from `vault_lp_state`. One extra read, only when the ext flag is set. */
+async function resolveExtTail(
+  conn: Pick<LpFeeConnection, "getMultipleAccountsInfo">,
+  market: PublicKey,
+): Promise<BoundExtTail | { error: string }> {
+  try {
+    const [si] = (await conn.getMultipleAccountsInfo([deriveVaultLpState(WRAPPER_PROGRAM_ID, market)], "confirmed")) as Array<{ data: Buffer } | null>;
+    const st = si ? decodeVaultLpState(new Uint8Array(si.data)) : null;
+    if (!st) return { error: "ext tail: vault_lp_state unreadable (cannot resolve the vault LP portfolio for tag 78 [8])" };
+    return { vaultLpExt: deriveVaultLpExtP2b(WRAPPER_PROGRAM_ID, market)[0], lpPortfolio: st.lpPortfolio };
+  } catch (err) {
+    return { error: `ext tail read failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}` };
+  }
+}
+
+/** The tag-78 instruction for one market (exported for the account-list tests). */
+export function buildCrankFeesIx(p: {
+  keeper: PublicKey;
+  market: PublicKey;
+  registry: PublicKey;
+  ledger: PublicKey;
+  siblingLedger: PublicKey;
+  domainIdx: number;
+  bound: boolean;
+  tail: BoundExtTail | null;
+}): TransactionInstruction {
+  const base = new TransactionInstruction({
+    programId: WRAPPER_PROGRAM_ID,
+    keys: buildAccountMetas(ACCOUNTS_LP_VAULT_CRANK_FEES, {
+      cranker: p.keeper,
+      market: p.market,
+      registry: p.registry,
+      ledger: p.ledger,
+      siblingLedger: p.siblingLedger,
+      systemProgram: SystemProgram.programId,
+    }).concat(p.bound ? [{ pubkey: deriveVaultLpState(WRAPPER_PROGRAM_ID, p.market), isSigner: false, isWritable: true }] : []),
+    data: Buffer.from(encodeLpVaultCrankFees({ domain: p.domainIdx })),
+  });
+  if (!p.bound || !p.tail) return base;
+  // The SDK helper takes the 6-account base and appends [6] state, [7] ext, [8] vault LP.
+  const six = new TransactionInstruction({ programId: base.programId, keys: base.keys.slice(0, 6), data: base.data });
+  return withCrankFeesBoundTailP2b(six, {
+    programId: WRAPPER_PROGRAM_ID,
+    market: p.market,
+    registryDomain: p.domainIdx,
+    lpPortfolio: p.tail.lpPortfolio,
+    vaultLpExt: p.tail.vaultLpExt,
+  });
+}
+
+async function sendCrankFeesOnce(
+  devnetConn: LpFeeConnection,
+  keeper: Keypair,
+  p: {
+    market: PublicKey;
+    registry: PublicKey;
+    ledger: PublicKey;
+    siblingLedger: PublicKey;
+    domainIdx: number;
+    bound: boolean;
+    resolvedHarvest: boolean;
+    tail: BoundExtTail | null;
+  },
+  marketAddress: string,
+  confirmOpts?: ConfirmOptions,
+  observe?: { seniorDrawLogs: string[] },
+): Promise<"cranked" | "no-fees" | "skipped" | { error: string }> {
+  const { market, ledger, bound, resolvedHarvest } = p;
   const tx = new Transaction();
   tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT }));
-  tx.add(
-    new TransactionInstruction({
-      programId: WRAPPER_PROGRAM_ID,
-      keys: buildAccountMetas(ACCOUNTS_LP_VAULT_CRANK_FEES, {
-        cranker: keeper.publicKey,
-        market,
-        registry,
-        ledger,
-        siblingLedger,
-        systemProgram: SystemProgram.programId,
-      }).concat(bound ? [{ pubkey: deriveVaultLpState(WRAPPER_PROGRAM_ID, market), isSigner: false, isWritable: true }] : []),
-      data: Buffer.from(encodeLpVaultCrankFees({ domain: domainIdx })),
-    }),
-  );
+  tx.add(buildCrankFeesIx({ keeper: keeper.publicKey, market, registry: p.registry, ledger, siblingLedger: p.siblingLedger, domainIdx: p.domainIdx, bound, tail: p.tail }));
 
   try {
     const { blockhash, lastValidBlockHeight } = await devnetConn.getLatestBlockhash("confirmed");
