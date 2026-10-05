@@ -35,8 +35,9 @@
  *   STAKE_FEE_MIN_PUSH_ATOMS  smallest staker leg worth a transaction (default: 1)
  *   TERMINAL_INSURANCE_ENABLED "false" disables the post-resolve stake tag-29 wind-down job (default: true)
  *   ALERT_TERMINAL_BUDGET_CYCLES cycles a resolved stake-bound market may hold a budget before alerting (default: 3)
- *   WRAPPER_PROGRAM_ID / STAKE_PROGRAM_ID / MATCHER_PROGRAM_ID  program ids (default: SDK
- *                           constants; PROGRAM_ID is a legacy alias for the wrapper) — see program-ids.ts
+ *   KEEPER_DEVNET_V21       "1" = Devnet v2.1 program set (5NGgnU2j…) + registry.v21.json; unset/"0" = v1 (ETDLAdi). See program-ids.ts
+ *   WRAPPER_PROGRAM_ID / STAKE_PROGRAM_ID / MATCHER_PROGRAM_ID / NFT_PROGRAM_ID  program ids (default: the
+ *                           pinned set selected by KEEPER_DEVNET_V21; PROGRAM_ID is a legacy alias for the wrapper) — see program-ids.ts
  *   DEVNET_RPC_ORIGIN       Origin header for an Origin-restricted devnet RPC key (optional)
  *   KEEPER_ALERT_WEBHOOK_URL  https webhook for [ALERT] lines (optional; Slack/Discord-compatible `text`)
  *   ALERT_SLOT_LAG_WARN / ALERT_SLOT_LAG_CRITICAL / ALERT_CRANK_REVERTS / ALERT_ZERO_PUSH_CYCLES /
@@ -48,6 +49,14 @@
  *   REGISTER_SOURCE_URL     GET endpoint polled for wizard-registered markets (unset = disabled)
  *   REGISTER_POLL_INTERVAL_MS  register-poll interval ms (default: 30000)
  *   REGISTRY_RELOAD_INTERVAL_MS  G6 registry.json hot-reload interval ms (default: 15000)
+ *   P2B_FEATURES            v2.1 (P2b) layer: "auto" (default; one cached tag-103 probe decides) | "on" | "off".
+ *                           A strict no-op against today's programs. See cross-cluster/p2b-feature.ts, plus:
+ *   P2B_PROBE_SUPPORTED_TTL_MS (3600000) / P2B_PROBE_UNSUPPORTED_TTL_MS (21600000) / P2B_PROBE_RETRY_MS (60000)
+ *   P2B_TICK_MS (20000)     v2.1 loop tick
+ *   P2B_ALLOCATE_INTERVAL_MS (60000) / P2B_ALLOCATE_JITTER_PCT (25) / P2B_ALLOCATE_CU (600000)   tag 103 pacing
+ *   P2B_WIND_DOWN_MAX_PER_MARKET (3) / _MAX_PER_CYCLE (8) / _MAX_SIMS (6) / _MAX_MARK_AGE_SLOTS (140) / _CU (600000) / _COOLDOWN_MS (60000)   tag 104
+ *   HEDGED_LOCKOUT_UTIL_BPS (9000) / HEDGED_LOCKOUT_FLAT_BPS (300) / HEDGED_LOCKOUT_INTERVAL_MS (30000)
+ *   EARN_GAP_INTERVAL_MS (60000) / EARN_GAP_ALERT_BPS (100) / EARN_GAP_ALERT_CYCLES (3)   R3-M1 par-E3 gap
  *
  * CLI flags:
  *   --dry-run             same as DRY_RUN=true
@@ -56,7 +65,7 @@ import { Connection, Keypair } from "@solana/web3.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { loadRegistry } from "./cross-cluster/registry.ts";
+import { DEFAULT_REGISTRY_FILE, loadRegistryForProgramSet } from "./cross-cluster/registry.ts";
 import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
@@ -79,13 +88,27 @@ import { WRAPPER_PROGRAM_ID as CFG_WRAPPER_PROGRAM_ID } from "./program-ids.ts";
 import type { FeeJob } from "./cross-cluster/fee-jobs.ts";
 import { getAlertSink } from "./cross-cluster/alerting.ts";
 import type { AlertSink } from "./cross-cluster/alerting.ts";
-import { describeProgramIds } from "./program-ids.ts";
+import { describeProgramIds, PROGRAM_IDS_RESOLVED } from "./program-ids.ts";
 import { devnetConnectionConfig } from "./rpc-headers.ts";
 import type { ConnectionConfig } from "@solana/web3.js";
 import { startRegisterPollLoop, pollOnce } from "./cross-cluster/register-poll.ts";
 import { startRegistrationStream, type RegistrationStream } from "./cross-cluster/registration-stream.ts";
 import { startRegistryReloadLoop } from "./cross-cluster/registry-reload.ts";
 import { WRAPPER_PROGRAM_ID } from "./cross-cluster/auth-mark-pusher.ts";
+import { P2bFeatureGate, makeTag103Probe, p2bGateConfigFromEnv, setP2bGate } from "./cross-cluster/p2b-feature.ts";
+import type { P2bGateConfig } from "./cross-cluster/p2b-feature.ts";
+import { VaultLpAllocator, allocateConfigFromEnv } from "./cross-cluster/p2b-allocate.ts";
+import type { AllocateConfig } from "./cross-cluster/p2b-allocate.ts";
+import { AdlWindDownRunner, selectLegHolders, windDownConfigFromEnv } from "./cross-cluster/p2b-wind-down.ts";
+import type { WindDownConfig } from "./cross-cluster/p2b-wind-down.ts";
+import { hedgedLockoutThresholdsFromEnv } from "./cross-cluster/p2b-hedged-lockout.ts";
+import type { HedgedLockoutThresholds } from "./cross-cluster/p2b-hedged-lockout.ts";
+import { EarnGapMonitor, earnGapConfigFromEnv } from "./cross-cluster/p2b-earn-gap.ts";
+import type { EarnGapConfig } from "./cross-cluster/p2b-earn-gap.ts";
+import { P2bLoop, p2bLoopConfigFromEnv, startP2bLoop } from "./cross-cluster/p2b-loop.ts";
+import type { P2bLoopConfig } from "./cross-cluster/p2b-loop.ts";
+import { setP2bHealthProvider } from "./cross-cluster/p2b-health.ts";
+import { fetchMarketPortfolios } from "./cross-cluster/recovery-cranker.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -174,6 +197,12 @@ let JUNIOR_WATCH_CONFIG: JuniorWatchConfig;
 let BANKRUPT_CLOSE_CONFIG: BankruptCloseWatchConfig;
 let ALERT_SINK: AlertSink;
 let DEVNET_CONN_CONFIG: ConnectionConfig;
+let P2B_GATE_CONFIG: P2bGateConfig;
+let P2B_ALLOCATE_CONFIG: AllocateConfig;
+let P2B_WIND_DOWN_CONFIG: WindDownConfig;
+let P2B_HEDGED_THRESHOLDS: HedgedLockoutThresholds;
+let P2B_EARN_GAP_CONFIG: EarnGapConfig;
+let P2B_LOOP_CONFIG: P2bLoopConfig;
 try {
   // Ops-track config fails fast with everything else: a malformed alert
   // threshold, webhook URL or fee-job knob must stop boot, not surface as a
@@ -192,6 +221,13 @@ try {
     "BALANCE_CHECK_INTERVAL_MS",
     30_000,
   );
+  // v2.1 (P2b) layer config: a typo fails boot here, not inside a background loop.
+  P2B_GATE_CONFIG = p2bGateConfigFromEnv(process.env);
+  P2B_ALLOCATE_CONFIG = allocateConfigFromEnv(process.env, false);
+  P2B_WIND_DOWN_CONFIG = windDownConfigFromEnv(process.env, false);
+  P2B_HEDGED_THRESHOLDS = hedgedLockoutThresholdsFromEnv(process.env);
+  P2B_EARN_GAP_CONFIG = earnGapConfigFromEnv(process.env);
+  P2B_LOOP_CONFIG = p2bLoopConfigFromEnv(process.env, MIN_KEEPER_BALANCE_LAMPORTS, BALANCE_CHECK_INTERVAL_MS);
 } catch (err) {
   console.error(`[fatal] ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
@@ -289,9 +325,11 @@ let registrationStream: RegistrationStream | null = null;
 // just slower. 30s is fine for that role; it does not gate launch latency.
 const REGISTER_POLL_INTERVAL_MS = parseInt(process.env.REGISTER_POLL_INTERVAL_MS ?? "30000", 10);
 
+// v2.1 cutover: the default registry file follows the program set
+// (registry.json for v1 — unchanged — and registry.v21.json for KEEPER_DEVNET_V21=1).
 const REGISTRY_PATH =
   process.env.REGISTRY_PATH ??
-  path.resolve(__dirname, "..", "registry.json");
+  path.resolve(__dirname, "..", DEFAULT_REGISTRY_FILE[PROGRAM_IDS_RESOLVED.programSet]);
 
 // G6 — registry.json hot-reload, so a re-seed is picked up live without a
 // restart. See cross-cluster/registry-reload.ts for the full rationale.
@@ -299,7 +337,7 @@ const REGISTRY_RELOAD_INTERVAL_MS = parseInt(process.env.REGISTRY_RELOAD_INTERVA
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
 const keeper = loadKeypair();
-const registry = loadRegistry(REGISTRY_PATH);
+const registry = loadRegistryForProgramSet(REGISTRY_PATH, PROGRAM_IDS_RESOLVED.programSet);
 
 if (registry.markets.length === 0) {
   console.warn(
@@ -485,6 +523,57 @@ const vaultLpCranker =
   }
 }
 
+// v2.1 (P2b) layer: tag 103 allocation cranks, tag 104 ADL wind-down, the hedged-lockout alert and
+// the R3-M1 par-E3 gap in /health. A STRICT NO-OP until the feature gate sees a wrapper that
+// decodes tag 103 (one cached simulation probe; see cross-cluster/p2b-feature.ts), so shipping
+// this keeper before the v2.1 re-seed changes nothing. Same "concurrent, never awaited, never
+// throws out of scope" pattern as the loops above. P2B_FEATURES=off does not even create it.
+if (P2B_GATE_CONFIG.mode !== "off") {
+  const gate = new P2bFeatureGate(
+    P2B_GATE_CONFIG,
+    makeTag103Probe({ conn: devnetConn, keeper, programId: CFG_WRAPPER_PROGRAM_ID, markets: () => registry.markets }),
+  );
+  setP2bGate(gate);
+  const p2bLoop: P2bLoop = new P2bLoop(P2B_LOOP_CONFIG, {
+    conn: devnetConn,
+    keeper,
+    programId: CFG_WRAPPER_PROGRAM_ID,
+    registry,
+    gate,
+    sink: ALERT_SINK,
+    allocator: new VaultLpAllocator(
+      { ...P2B_ALLOCATE_CONFIG, dryRun: DRY_RUN },
+      { programId: CFG_WRAPPER_PROGRAM_ID, conn: devnetConn, keeper, walletLow: () => p2bLoop.walletLow(), onUnsupported: () => gate.reportUnsupported() },
+    ),
+    windDown: new AdlWindDownRunner(
+      { ...P2B_WIND_DOWN_CONFIG, dryRun: DRY_RUN },
+      {
+        programId: CFG_WRAPPER_PROGRAM_ID,
+        conn: devnetConn,
+        keeper,
+        walletLow: () => p2bLoop.walletLow(),
+        fetchHolders: async (market, assetIndex) =>
+          selectLegHolders(
+            (await fetchMarketPortfolios(devnetConn, market)).map((a) => ({ pubkey: a.pubkey, data: a.account.data })),
+            assetIndex,
+          ),
+        // SPL mint: decimals is the byte at offset 44 (COption<Pubkey> 36 + supply 8)
+        mintDecimals: async (mint) => {
+          const info = await devnetConn.getAccountInfo(mint, "confirmed");
+          if (!info || info.data.length < 45) throw new Error(`collateral mint ${mint.toBase58()} unreadable`);
+          return info.data[44];
+        },
+      },
+    ),
+    earnGap: new EarnGapMonitor(P2B_EARN_GAP_CONFIG, CFG_WRAPPER_PROGRAM_ID),
+    hedged: P2B_HEDGED_THRESHOLDS,
+  });
+  setP2bHealthProvider(() => p2bLoop.healthFields());
+  void startP2bLoop(p2bLoop, P2B_LOOP_CONFIG).catch((err: unknown) => {
+    console.error(`[p2b] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`);
+  });
+}
+
 // Registration-poll loop — same "runs concurrently, never awaited, never allowed to
 // throw out of this scope" pattern as the recovery cranker above. Mutates `registry`
 // in place (addMarket + saveRegistry), and it's the SAME registry object passed to
@@ -507,9 +596,11 @@ if (SUPABASE_URL && SUPABASE_ANON_KEY) {
     },
     registryPath: REGISTRY_PATH,
     intervalMs: REGISTER_POLL_INTERVAL_MS,
-    // Owner filter: only admit markets owned by the current wrapper (WRAPPER_PROGRAM_ID
-    // = PROGRAM_IDS_V17.percolator). Keeps retired-wrapper entries out of the
-    // atomic push batch (they revert it with IncorrectProgramId).
+    // Owner filter: only admit markets owned by the SELECTED wrapper (program-ids.ts:
+    // ETDLAdi with KEEPER_DEVNET_V21 off, 5NGgnU2j with it on, or the env override).
+    // Keeps retired-wrapper entries out of the atomic push batch (they revert it
+    // with IncorrectProgramId), and keeps the v1 and v2.1 keepers from adopting
+    // each other's markets from the shared Supabase `markets` table.
     connection: devnetConn,
     expectedOwner: WRAPPER_PROGRAM_ID,
   };

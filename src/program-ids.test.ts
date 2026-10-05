@@ -12,7 +12,10 @@ describe("resolveProgramIds", () => {
     assert.equal(ids.wrapper.toBase58(), PROGRAM_IDS_V17.percolator);
     assert.equal(ids.stake.toBase58(), PROGRAM_IDS_V17.vault);
     assert.equal(ids.matcher.toBase58(), PROGRAM_IDS_V17.matcher);
-    assert.match(ids.source.wrapper, /^sdk/);
+    // v2.1 cutover: the switch-OFF defaults are the pinned ETDLAdi literals, which equal
+    // the SDK constants at the current pin (asserted above) but no longer follow the SDK.
+    assert.match(ids.source.wrapper, /^builtin PROGRAM_IDS_DEVNET_V1/);
+    assert.equal(ids.programSet, "v1");
   });
   it("WRAPPER_PROGRAM_ID / STAKE_PROGRAM_ID override", () => {
     const ids = resolveProgramIds({ WRAPPER_PROGRAM_ID: KEY, STAKE_PROGRAM_ID: KEY });

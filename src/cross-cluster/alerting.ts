@@ -23,8 +23,12 @@
  *                    its pool by 40–160% for ~3h45m and the LP was emptied)
  *   - source frozen   the raw pool price has not changed for hours (dead pool
  *                    or a DLMM active bin that never moves)
+ *   - hedged lockout  (P2b v2.1, p2b-hedged-lockout.ts) both sides of a growth asset at >= 90%
+ *                    of N_cap while the vault LP is near flat
+ *   - earn par-E3 gap (P2b v2.1, p2b-earn-gap.ts) a non-bound Earn vault exits priced > N bps
+ *                    below its entry price for several cycles (R3-M1)
  *   - ADL reduce-only  a_long/a_short != ADL_ONE (F-3/R2): opens revert
- *                    Custom(21) until one whole side exits; reported with the
+ *                    Custom(21) (Custom(120) on the P2b program) until one whole side exits; reported with the
  *                    observed duration and both sides' OI so an abandoned
  *                    position is visible
  *
@@ -65,7 +69,9 @@ export type AlertKind =
   | "vault-lp-junior-release-pending"
   | "bankrupt-close-expiring"
   | "p3-senior-draw"
-  | "p3-senior-backing-exhausted";
+  | "p3-senior-backing-exhausted"
+  | "hedged-lockout"
+  | "earn-par-e3-gap";
 
 export interface Alert {
   kind: AlertKind;

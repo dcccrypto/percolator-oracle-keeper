@@ -29,6 +29,7 @@ import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets, pruneAu
 import { evaluateMarketPush, evaluatePushCycle, getAlertSink } from "./alerting.ts";
 import type { Alert, MarketPushSample } from "./alerting.ts";
 import { getCrankRefreshHealth, isPushHeld, pruneCrankRefreshHealth } from "./refresh-coordination.ts";
+import { p2bHealthFields } from "./p2b-health.ts";
 import type { CrankRefreshHealth } from "./refresh-coordination.ts";
 import {
   type WalletBalanceState,
@@ -334,7 +335,7 @@ export function pricingHealthStatus(
 
 // ── Health server ─────────────────────────────────────────────────────────────
 
-function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Registry) {
+export function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Registry) {
   return (req: http.IncomingMessage, res: http.ServerResponse): void => {
     if (req.url !== "/health" && req.url !== "/") {
       res.writeHead(404);
@@ -428,6 +429,8 @@ function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Regis
       dryRun: config.dryRun,
       intervalMs: config.intervalMs,
       markets,
+      // v2.1 (P2b), additive: `earnVaults` + `p2b`. `{}` (nothing added) unless the wrapper supports P2b.
+      ...p2bHealthFields(),
     });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(payload);

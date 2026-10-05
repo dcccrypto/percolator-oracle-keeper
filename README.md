@@ -79,6 +79,23 @@ Required Railway environment variables:
 - `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` — for market auto-discovery
 - `HEALTH_AUTH_TOKEN` — for secured health checks
 
+## Devnet v2.1 fresh-ID cutover: two keepers
+
+v2.1 ships as a fresh program-ID set; the ETDLAdi world is not upgraded and its markets become close-only.
+The program set is chosen by one explicit switch, `KEEPER_DEVNET_V21` (`src/program-ids.ts`):
+
+| `KEEPER_DEVNET_V21` | wrapper / stake / matcher / nft | default registry (Railway) |
+|---|---|---|
+| unset / `0` (default) | `ETDLAdi…` / `VmpVUArR…` / `EDKKgRaV…` / `EMYT15LZ…` (pinned literals, independent of the SDK defaults) | `/data/registry.relaunch.json` |
+| `1` | `5NGgnU2j…` / `A6DVNubv…` / `DfTxJUT5…` / `DWUNq2iY…` | `/data/registry.v21.json`, seeded from `deploy/registry.v21.seed.json` (TO-FILL from the Phase 3 `newmarkets` output) |
+
+- The existing relaunch service (`relaunch-live`) keeps running unchanged with the switch off, so v1 markets keep
+  oracle pushes and cranks and their exits keep working.
+- v2.1 runs as a SECOND Railway service from the same image with `KEEPER_DEVNET_V21=1`, its own `/data` volume and
+  `WRAPPER_PROGRAM_ID=5NGgnU2j315Ci2tso8VJDEthaVExuiKG3tn4xnur28xe` (the launcher requires it). One replica per service.
+- A v2.1 ID without the switch, or a v1 ID with it, fails boot. A registry is tagged `"programSet": "v21"`; each keeper
+  refuses to boot or hot-reload the other world's registry. The register-poll owner filter follows the selected wrapper.
+
 ## Architecture
 
 Previously part of `percolator-launch/bots/oracle-keeper/`. Extracted to standalone repo for cleaner architecture. The oracle-keeper is a backend service; the frontend lives in [percolator-launch](https://github.com/dcccrypto/percolator-launch).
@@ -90,3 +107,28 @@ When `TICK_INGEST_URL` and `TICK_INGEST_KEY` are both set, each cycle's *landed*
 (max 200 ticks/request; `markE6` = published AuthMark, `oracleE6` = raw pool price or null). Fire-and-forget with a
 single request in flight (extra batches are dropped and counted), `TICK_PUBLISH_TIMEOUT_MS` timeout (default 1500).
 Counters appear under `tickPublisher` in `/health`. Unset = no-op; on-chain behaviour is never affected.
+
+## v2.1 (P2b) layer — feature-detected, no-op on today's programs
+
+The keeper carries the client side of the v2.1 wrapper (percolator-prog #524/#525/#526) behind a feature
+gate (`src/cross-cluster/p2b-feature.ts`). There is no on-chain version byte, so `P2B_FEATURES=auto`
+(default) runs one cached probe: a SIMULATED tag-103 (`VaultLpAllocate`) on a bound market.
+`InvalidInstructionData` means the program predates P2b (cached 6 h, logged once, everything below stays
+OFF); any `Custom(n)` (including 100 = no room) or success means supported. `on` skips the probe, `off`
+never creates the loop.
+
+When supported (tick every `P2B_TICK_MS`, one batched snapshot read per tick):
+
+- **Tag 103 allocation cranks** (`p2b-allocate.ts`): per bound, Live market with no senior draw
+  outstanding, paced ~60 s +-25%, simulated first, sent only on a clean simulation (`Custom(100)` = skip).
+- **Tag 104 AdlWindDown** (`p2b-wind-down.ts`): for ADL reduce-only assets, one arming call per episode,
+  then closes of the reduce-only side's legs once the episode expired or the side is dust; mark-age and
+  per-cycle bounds; refusals 21/27/16/22 are classified and counted.
+- **Hedged-lockout alert** (`p2b-hedged-lockout.ts`): both sides of a growth asset >= 90% of N_cap while the
+  vault LP is within 3% of flat.
+- **R3-M1** (`p2b-earn-gap.ts`): `/health` gains `earnVaults[]` (par - E3 gap per non-bound Earn vault,
+  bigints as strings) and an alert when the gap exceeds `EARN_GAP_ALERT_BPS` for `EARN_GAP_ALERT_CYCLES`;
+  the refresh prune budget no longer caps below the positioned set.
+
+Independent of the gate: tag 78 on a bound vault appends `[7]` ext and `[8]` vault LP once the registry ext
+flag (byte 161) is set (it is 0 on every pre-P2b program). See `.env.example` for every knob.

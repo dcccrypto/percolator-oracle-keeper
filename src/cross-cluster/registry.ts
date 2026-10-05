@@ -77,6 +77,58 @@ export interface Registry {
   version: number;
   description: string;
   markets: MarketEntry[];
+  /**
+   * Which program-ID world these markets belong to (Devnet v2.1 fresh-ID cutover,
+   * 2026-10-05). Absent = "v1" (every registry written before the cutover).
+   * A v2.1 keeper (KEEPER_DEVNET_V21=1) only runs from a registry tagged "v21",
+   * so it can never push or crank v1 slabs under the v2.1 wrapper, and vice versa.
+   */
+  programSet?: "v1" | "v21";
+}
+
+/** Default registry file for each program set, relative to the repo root. */
+export const DEFAULT_REGISTRY_FILE: Readonly<Record<"v1" | "v21", string>> = Object.freeze({
+  v1: "registry.json",
+  v21: "registry.v21.json",
+});
+
+/** The registry's program set; an untagged registry is v1. */
+export function registryProgramSet(registry: Pick<Registry, "programSet">): "v1" | "v21" {
+  return registry.programSet ?? "v1";
+}
+
+/**
+ * Throws when a registry belongs to a different program set than the keeper
+ * runs. With the switch off and an untagged registry this is a no-op, which is
+ * every deployment before the cutover.
+ */
+export function assertRegistryProgramSet(
+  registry: Pick<Registry, "programSet">,
+  expected: "v1" | "v21",
+  registryPath: string,
+): void {
+  const actual = registryProgramSet(registry);
+  if (actual !== expected) {
+    throw new Error(
+      `registry ${registryPath} is programSet "${actual}" but this keeper runs program set "${expected}" ` +
+        `(KEEPER_DEVNET_V21=${expected === "v21" ? "1" : "off"}). Point REGISTRY_PATH at the ${expected} registry ` +
+        `(default ${DEFAULT_REGISTRY_FILE[expected]}); a keeper must never push/crank the other world's slabs.`,
+    );
+  }
+}
+
+/**
+ * Boot-time load for a given program set. A missing v21 file starts empty and
+ * TAGGED "v21" (so register-poll's first save writes the tag); anything on disk
+ * must match the set.
+ */
+export function loadRegistryForProgramSet(registryPath: string, expected: "v1" | "v21"): Registry {
+  const reg = loadRegistry(registryPath);
+  if (expected === "v21" && !fs.existsSync(registryPath)) {
+    return { ...reg, programSet: "v21", description: "Devnet v2.1 keeper (fresh-ID wrapper 5NGgnU2j)" };
+  }
+  assertRegistryProgramSet(reg, expected, registryPath);
+  return reg;
 }
 
 const REGISTRY_VERSION = 1;

@@ -136,6 +136,8 @@ import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio }
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
 import { decodeAdlState } from "./adl-state.ts";
 import { isTerminalMarket } from "./market-state.ts";
+import { isLockFamilyCode } from "./lock-codes.ts";
+import { isP2bSupported } from "./p2b-feature.ts";
 import { reportSeniorDraw } from "./vault-lp-crank.ts";
 import type { AdlState } from "./adl-state.ts";
 import type { LivenessRepair } from "./liveness-repair.ts";
@@ -289,7 +291,7 @@ export function revertAdvice(code: number | null, computeExhausted: boolean): st
       "while this persists: check the per-crank CU estimates against measured cost."
     );
   }
-  if (code === 19 || code === 21) {
+  if (code === 19 || isLockFamilyCode(code)) {
     return "Engine accrual is drifting toward an unrecoverable deep-stale state — investigate / re-seed if this persists.";
   }
   return "Unclassified revert (not compute exhaustion, not an engine staleness code) — investigate the simulation logs.";
@@ -363,7 +365,7 @@ export function isLpVaultPortfolio(data: Uint8Array): boolean {
  * null if none exists yet (e.g. a brand-new market with no LP vault) — the
  * caller should skip cranking that market until discovery succeeds.
  */
-function fetchMarketPortfolios(conn: Connection, market: PublicKey) {
+export function fetchMarketPortfolios(conn: Connection, market: PublicKey) {
   return conn.getProgramAccounts(WRAPPER_PROGRAM_ID, {
     filters: [
       { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
@@ -639,7 +641,7 @@ export async function crankOneMarket(
       if (computeExhausted) {
         state.lastErrorMsg += ` — compute exhausted at ${resolved.plan.computeUnits} CU (${resolved.plan.cranks.length} cranks)`;
       }
-      // 19=EngineStale, 21=EngineLockActive = the deep-stale signature. A fresh /
+      // 19=EngineStale, 21=EngineLockActive (or 120/121/122 on the P2b program, which split 21) = the deep-stale signature. A fresh /
       // lightly-stale market cranks CLEAN (only a rotting one reverts every cycle),
       // so escalate loudly once it persists.
       if (state.consecutiveReverts === 1 || state.consecutiveReverts % REVERT_ALERT_THRESHOLD === 0) {
@@ -885,8 +887,16 @@ export const MAX_REFRESH_PRUNES = 3;
  * returns Custom(22) (NoAction), so a budget of 3 gave up before reaching the
  * stale one (live 2026-10-02: Percolator pruned=12 with 1L still stale).
  */
-export function refreshPruneBudget(targets: number): number {
-  return Math.min(MAX_REFRESH_PRUNE_BUDGET, Math.max(MAX_REFRESH_PRUNES, targets));
+export function refreshPruneBudget(targets: number, opts: { uncapped?: boolean } = {}): number {
+  const scaled = Math.max(MAX_REFRESH_PRUNES, targets);
+  // R3-M1 (P2b): on a P2b program every open portfolio must be TOUCHED each cycle (the Earn exit's
+  // touch-order skim is bounded by what is left stale), so the budget must never drop a refresh
+  // merely because the set outgrew the cap: above MAX_REFRESH_PRUNE_BUDGET positioned portfolios
+  // the capped budget used to drop every remaining refresh (even a stale one) after 16 NoAction
+  // rejections. Uncapped it is one prune per target, i.e. each target is simulated (refreshed or
+  // genuinely rejected by the engine) before the cycle degrades. Today's programs keep the cap.
+  const uncapped = opts.uncapped ?? isP2bSupported();
+  return uncapped ? scaled : Math.min(MAX_REFRESH_PRUNE_BUDGET, scaled);
 }
 export const MAX_REFRESH_PRUNE_BUDGET = 16;
 /** Optional instructions (<= 2 expiries + 2 finalizes, plus liquidations) dropped before giving up. */
