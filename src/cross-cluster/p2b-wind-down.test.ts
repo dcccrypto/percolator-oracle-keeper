@@ -326,6 +326,57 @@ describe("runner: closing", () => {
   });
 });
 
+describe("runner: cooldown after a turn that sent nothing", () => {
+  it("every holder refused -> the market is left alone for cooldownMs (no holder scan, no simulation), then retried", async () => {
+    let now = 1_000_000;
+    const c = fakeConn({ sims: [{ err: ie({ Custom: 21 }) }] });
+    let fetches = 0;
+    const r = new AdlWindDownRunner({ ...DEFAULT_WIND_DOWN_CONFIG, cooldownMs: 60_000 }, {
+      programId: PROGRAM, conn: c.conn as never, keeper: KEEPER,
+      fetchHolders: async () => { fetches++; return [holder(1, "short")]; },
+      mintDecimals: async () => 6, now: () => now, log: () => undefined,
+    });
+    const s = snap(roMarket({ episodeSince: BigInt(NOW - 9000) }));
+    await r.runMarket(s);
+    assert.equal(fetches, 1);
+    now += 20_000;
+    assert.deepEqual(await r.runMarket(s), { kind: "skipped", why: "cooldown" });
+    assert.equal(fetches, 1, "no second getProgramAccounts inside the cooldown");
+    assert.equal(c.count("simulateTransaction"), 1);
+    assert.equal(r.stats.skippedCooldown, 1);
+    now += 41_000;
+    await r.runMarket(s);
+    assert.equal(fetches, 2, "retried after the cooldown");
+  });
+
+  it("a turn that SENT does not cool down (the next tick keeps closing)", async () => {
+    let now = 1_000_000;
+    const c = fakeConn({ sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    const r = new AdlWindDownRunner({ ...DEFAULT_WIND_DOWN_CONFIG, cooldownMs: 60_000, maxSendsPerMarket: 1 }, {
+      programId: PROGRAM, conn: c.conn as never, keeper: KEEPER,
+      fetchHolders: async () => [holder(1, "short"), holder(2, "short")],
+      mintDecimals: async () => 6, now: () => now, log: () => undefined, confirm: { statusRetries: 0, statusRetryDelayMs: 1 },
+    });
+    const s = snap(roMarket({ episodeSince: BigInt(NOW - 9000) }));
+    await r.runMarket(s);
+    now += 20_000;
+    const out = await r.runMarket(s);
+    assert.equal(out.kind, "acted");
+    assert.equal(c.sent.length, 2);
+  });
+
+  it("no holders: also cooled down", async () => {
+    let now = 5;
+    const c = fakeConn();
+    let fetches = 0;
+    const r = new AdlWindDownRunner(DEFAULT_WIND_DOWN_CONFIG, { programId: PROGRAM, conn: c.conn as never, keeper: KEEPER, fetchHolders: async () => { fetches++; return []; }, mintDecimals: async () => 6, now: () => now, log: () => undefined });
+    const s = snap(roMarket({ episodeSince: BigInt(NOW - 9000) }));
+    await r.runMarket(s);
+    await r.runMarket(s);
+    assert.equal(fetches, 1);
+  });
+});
+
 describe("selectLegHolders (real v18 portfolio bytes)", () => {
   it("finds the SOL LP's short leg on asset 0 with its live (portfolio_id, position_epoch)", () => {
     const data = new Uint8Array(fx("sol-lp-portfolio-v18"));
@@ -336,12 +387,23 @@ describe("selectLegHolders (real v18 portfolio bytes)", () => {
     assert.deepEqual([hs[0].longLegs, hs[0].shortLegs, hs[0].isLp, hs[0].portfolioId, hs[0].positionEpoch], [0, 1, true, p.portfolioId, p.matcherPositionEpoch]);
     assert.equal(selectLegHolders([{ pubkey: pk, data }], 3).length, 0, "no leg on asset 3");
   });
+
+  it("a NON-zero live binding is read through (the fixture's own epoch is 0, so patch id 777 / epoch 42)", () => {
+    const b = Buffer.from(fx("sol-lp-portfolio-v18"));
+    b.writeBigUInt64LE(1n | (42n << 1n), 9531); // control: enabled bit | position_epoch << 1
+    b.writeBigUInt64LE(777n, 9539); // portfolio_id
+    const p = parsePortfolioV17(new Uint8Array(b));
+    assert.deepEqual([p.portfolioId, p.matcherPositionEpoch], [777n, 42n], "sanity: the patch lands where the SDK reads");
+    const hs = selectLegHolders([{ pubkey: Keypair.generate().publicKey, data: new Uint8Array(b) }], 0);
+    assert.deepEqual([hs[0].portfolioId, hs[0].positionEpoch], [777n, 42n]);
+  });
 });
 
 describe("windDownConfigFromEnv", () => {
   it("defaults", () => {
     const c = windDownConfigFromEnv({}, false);
     assert.deepEqual([c.maxSendsPerMarket, c.maxSendsPerCycle, c.maxSimsPerMarket, c.maxMarkAgeSlots, c.computeUnits], [3, 8, 6, 140, 600_000]);
+    assert.equal(c.cooldownMs, 60_000);
   });
   it("the mark-age knob cannot exceed the program's own 150-slot bound; garbage is rejected", () => {
     assert.throws(() => windDownConfigFromEnv({ P2B_WIND_DOWN_MAX_MARK_AGE_SLOTS: "151" }, false), /P2B_WIND_DOWN_MAX_MARK_AGE_SLOTS/);

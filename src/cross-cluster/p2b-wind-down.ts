@@ -218,6 +218,11 @@ export interface WindDownConfig {
   maxSimsPerMarket: number;
   maxMarkAgeSlots: number;
   computeUnits: number;
+  /**
+   * After a turn that sent nothing (every holder refused, or no effect), leave the market alone this
+   * long: bounds the holder lookup (getProgramAccounts) and the simulations in a stuck state.
+   */
+  cooldownMs: number;
   dryRun: boolean;
 }
 
@@ -227,6 +232,7 @@ export const DEFAULT_WIND_DOWN_CONFIG: WindDownConfig = {
   maxSimsPerMarket: 6,
   maxMarkAgeSlots: DEFAULT_WIND_DOWN_MAX_MARK_AGE_SLOTS,
   computeUnits: RECOMMENDED_CU_P3.tradeCpi,
+  cooldownMs: 60_000,
   dryRun: false,
 };
 
@@ -240,7 +246,7 @@ function envInt(env: Env, name: string, fallback: number, min: number, max: numb
   return n;
 }
 
-/** P2B_WIND_DOWN_MAX_PER_MARKET (3), _MAX_PER_CYCLE (8), _MAX_SIMS (6), _MAX_MARK_AGE_SLOTS (140), _CU (600000). */
+/** P2B_WIND_DOWN_MAX_PER_MARKET (3), _MAX_PER_CYCLE (8), _MAX_SIMS (6), _MAX_MARK_AGE_SLOTS (140), _CU (600000), _COOLDOWN_MS (60000). */
 export function windDownConfigFromEnv(env: Env, dryRun: boolean): WindDownConfig {
   const d = DEFAULT_WIND_DOWN_CONFIG;
   const maxMarkAge = envInt(env, "P2B_WIND_DOWN_MAX_MARK_AGE_SLOTS", d.maxMarkAgeSlots, 1, ADL_WIND_DOWN_MAX_MARK_AGE_SLOTS);
@@ -250,6 +256,7 @@ export function windDownConfigFromEnv(env: Env, dryRun: boolean): WindDownConfig
     maxSimsPerMarket: envInt(env, "P2B_WIND_DOWN_MAX_SIMS", d.maxSimsPerMarket, 1, 256),
     maxMarkAgeSlots: maxMarkAge,
     computeUnits: envInt(env, "P2B_WIND_DOWN_CU", d.computeUnits, 50_000, 1_400_000),
+    cooldownMs: envInt(env, "P2B_WIND_DOWN_COOLDOWN_MS", d.cooldownMs, 0, 3_600_000),
     dryRun,
   };
 }
@@ -294,6 +301,7 @@ export interface WindDownStats {
   skippedStaleMark: number;
   skippedCap: number;
   skippedWalletLow: number;
+  skippedCooldown: number;
   refusals: Record<RefusalClass, number>;
 }
 
@@ -313,17 +321,19 @@ export interface WindDownDeps {
   walletLow?: () => boolean;
   confirm?: ConfirmOptions;
   log?: (line: string) => void;
+  now?: () => number;
 }
 
 export type WindDownMarketResult =
   | { kind: "none" }
-  | { kind: "skipped"; why: "wallet-low" | "no-holders" | "cap" | "stale-mark" | "wait" | "unreadable" }
+  | { kind: "skipped"; why: "wallet-low" | "no-holders" | "cap" | "stale-mark" | "wait" | "cooldown" | "unreadable" }
   | { kind: "acted"; armed: number; closed: number; sims: number; sent: number };
 
 /** The tag-104 runner. One instance per process; `beginCycle()` resets the global send cap. */
 export class AdlWindDownRunner {
   private cycleSends = 0;
   private readonly decimals = new Map<string, number>();
+  private readonly cooldownUntil = new Map<string, number>();
   readonly stats: WindDownStats = {
     cycles: 0,
     closeOnlyMarkets: 0,
@@ -335,6 +345,7 @@ export class AdlWindDownRunner {
     skippedStaleMark: 0,
     skippedCap: 0,
     skippedWalletLow: 0,
+    skippedCooldown: 0,
     refusals: { "lagging-or-pending-mark": 0, "oracle-stale": 0, "stale-binding": 0, "not-in-adl": 0, other: 0, compute: 0 },
   };
 
@@ -395,8 +406,18 @@ export class AdlWindDownRunner {
       this.stats.skippedWalletLow++;
       return { kind: "skipped", why: "wallet-low" };
     }
+    const key = snap.ref.marketAddress;
+    const now = (this.deps.now ?? Date.now)();
+    const cd = this.cooldownUntil.get(key);
+    if (cd !== undefined && now < cd) {
+      this.stats.skippedCooldown++;
+      return { kind: "skipped", why: "cooldown" };
+    }
     const holders = await this.deps.fetchHolders(snap.market, assetIndex);
-    if (holders.length === 0) return { kind: "skipped", why: "no-holders" };
+    if (holders.length === 0) {
+      this.cooldownUntil.set(key, now + this.cfg.cooldownMs);
+      return { kind: "skipped", why: "no-holders" };
+    }
 
     let sims = 0;
     let sent = 0;
@@ -435,6 +456,9 @@ export class AdlWindDownRunner {
       if (decision.kind === "arm") break; // one observation is enough
     }
     if (capped) this.stats.skippedCap++;
+    // a turn that sent nothing (all refused / no effect) must not repeat the holder scan every tick
+    if (sent === 0 && !capped) this.cooldownUntil.set(key, now + this.cfg.cooldownMs);
+    else this.cooldownUntil.delete(key);
     this.stats.armed += armed;
     this.stats.closed += closed;
     return { kind: "acted", armed, closed, sims, sent };
