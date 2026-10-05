@@ -1,0 +1,428 @@
+/**
+ * TX_V1: PushAuthMark batches as Solana v1 transactions (SIMD-0385 / SIMD-0296), flag-gated,
+ * with legacy fallback ONLY on a format rejection (or a v1 budget error found in preflight).
+ *
+ * Negative controls:
+ *   - TX_V1=off sends byte-identical legacy txs: the sha256 of every wire is pinned to the
+ *     output of the BASE commit's pusher (32cc1399) run through the same harness
+ *     (tx-v1-test-helpers.ts legacyGoldenScenarios).
+ *   - An on-chain error never causes a fallback or a resend; TX_V1=on never downgrades.
+ *
+ * Wires are decoded with web3.js 1.99 (VersionedTransaction.deserialize), independent of the
+ * SDK encoder that produced them.
+ *
+ * Run with: node --import tsx/esm --test src/cross-cluster/tx-v1.test.ts
+ */
+import { describe, it, beforeEach } from "node:test";
+import assert from "node:assert/strict";
+import { MessageV1, VersionedTransaction } from "@solana/web3.js";
+import { TX_V1_FEATURE_ID } from "@percolatorct/sdk";
+import {
+  pushAuthMarkBatch,
+  parseFailingPush,
+  getQuarantinedMarkets,
+  reconcilePushOutcomes,
+  pushLandingStats,
+  resetPushLandingState,
+  WRAPPER_PROGRAM_ID,
+} from "./auth-mark-pusher.ts";
+import {
+  parseTxV1Settings,
+  resetTxV1ForTests,
+  txV1Stats,
+  DEFAULT_PUSH_CU_BASE,
+  DEFAULT_PUSH_CU_PER_MARKET,
+  DEFAULT_LOADED_OVERHEAD_BYTES,
+  LOADED_HEADROOM,
+} from "./tx-v1.ts";
+import {
+  GOLDEN_BLOCKHASH,
+  GOLDEN_NOW_SLOT,
+  legacyGoldenScenarios,
+  marketAccount,
+  marketsInWire,
+  seededKeypair,
+  seededMarkets,
+} from "./tx-v1-test-helpers.ts";
+
+const WRAPPER = WRAPPER_PROGRAM_ID.toBase58();
+const keeper = seededKeypair(7, 0);
+/** Slab tail so the loaded-size model sees a realistic size (live slabs are 33,900 B). */
+const SLAB_EXTRA = 1_000;
+
+/** Produced by the BASE commit 32cc1399 (pre-v1 pusher) via legacyGoldenScenarios. */
+const GOLDEN = {
+  clean30: {
+    sent: [
+      "ffdca0d49b9fff5221e3743983916624a22e1fc2a58e3559e977e026ebef55ba",
+      "b801c53cb4d717d657f9c8f4fe3d45c9263fc4a9cd51426c6422c2e1034d34b2",
+      "d02390118041b67de2dfafb1ea24446fc3a342f696d37f2dea2267902a8c6c0d",
+    ],
+    pushed: 30,
+    skipped: [] as string[],
+  },
+  locked30: {
+    sent: [
+      "50d5b7a71b55d90846d51348dc0255e8c27e3e4a42059500a1870a12484d1373",
+      "32d5d6b24c84418fbc5fe9b442ddc37dad0bd4eb9b77758879aa1ef8540d3698",
+      "bcbde9fc349d76d09d071368108945ef11f7d20a379dad279b24cabb7c1d01cb",
+    ],
+    pushed: 29,
+    skipped: ["FKKG3EomrKWcFjd2UsKUZqKivKfHudiGfYk25a47sFzw"],
+  },
+  opaque15: {
+    sent: [
+      "8a1d32904498e1ffa6700fdb8332492594d9e2c4ac412b1dae4cedc41f2e5030",
+      "5c34292ebf63b19edbf3584875afc3c350ed90a879fcc35aa00207f4d724633d",
+      "f23c316577089dd11e4941c42da228df9179c62278f82f7d041307313b122b33",
+      "90435383880c3e80af9f08861943b963d77c5ef4aad96aef9b032400011a3f11",
+      "2cdd2fdea90bd85157cbe7c19e0321a225cc7f7b10149daa1b0a96171dfe140d",
+      "a288caccdc6f3b57765b16c62078ca772f2d49924e9165387b2af29db2ef7f11",
+      "cc420319a8f87ac5bb73374f7c38e0a3551f5bd3cac122723207e6ae1d2b5cd3",
+      "7423e130598a59002544957fb426b6d2effd4cc4176bbd49446f58a5f061f8af",
+      "a6f593a81b459a7bd83aac750e4e33fb99b945257ba852cfbd548969daa0fe66",
+      "dacecb560da403132ac9e61d16840bf419ba1817b700ecc7bccd0c638ca5a73f",
+      "d5a8229d8c63ff78571909b3524117fd0854caa38116c8357c1be7af03ff4188",
+      "19f57432b1a22e24bc4a2cf5e55fcf277addf6dc004e3f22df249f6a4c2b7a1e",
+      "ac918d53706adf11c3e4f1489af3a48e6f6ad897fb824f1d871efd2408f6463d",
+    ],
+    pushed: 14,
+    skipped: ["5hdx9nK358KWsmHH7gAPwKX8JYtXtJLhhARfcpZQHJ96"],
+  },
+};
+
+const FORMAT_REJECTION = "failed to deserialize transaction: unsupported transaction version";
+
+interface MockOpts {
+  markets: string[];
+  /** Feature gate account reports v1 active. */
+  v1Active?: boolean;
+  /** Markets that revert Custom(21) (in either format). */
+  locked?: Set<string>;
+  /** v1 simulate returns a JSON-RPC decode error. */
+  v1SimReject?: boolean;
+  /** v1 send throws a format rejection. */
+  v1SendReject?: boolean;
+  /** v1 simulate returns this tx error (e.g. a budget error). */
+  v1SimErr?: unknown;
+  /** Any send throws this (non-format) error. */
+  sendError?: string;
+}
+
+interface Attempt {
+  format: "v1" | "legacy";
+  wire: Uint8Array;
+  accepted: boolean;
+  markets: string[];
+}
+
+function mockConn(o: MockOpts) {
+  const attempts: Attempt[] = [];
+  const sims: Array<{ format: "v1" | "legacy"; markets: string[] }> = [];
+  const statuses = new Map<string, unknown>();
+  let featureReads = 0;
+  const evalPushes = (ms: string[], offset: number): unknown => {
+    const at = ms.findIndex((m) => o.locked?.has(m));
+    return at >= 0 ? { InstructionError: [at + offset, { Custom: 21 }] } : null;
+  };
+  const conn = {
+    commitment: "confirmed",
+    async getAccountInfo(pk: { equals(o: unknown): boolean }) {
+      if (pk.equals(TX_V1_FEATURE_ID)) {
+        featureReads++;
+        return o.v1Active ? { data: Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0, 0]) } : null;
+      }
+      return null;
+    },
+    async getMultipleAccountsInfo(pks: Array<{ toBase58(): string }>) {
+      return pks.map((pk) => (o.markets.includes(pk.toBase58()) ? { data: marketAccount(100n, SLAB_EXTRA) } : null));
+    },
+    async simulateTransaction(tx: { instructions: Array<{ keys: Array<{ pubkey: { toBase58(): string } }> }> }) {
+      const ms = tx.instructions.slice(1).map((ix) => ix.keys[1]!.pubkey.toBase58());
+      sims.push({ format: "legacy", markets: ms });
+      return { value: { err: evalPushes(ms, 1), logs: [] } };
+    },
+    async _rpcRequest(method: string, args: unknown[]) {
+      assert.equal(method, "simulateTransaction");
+      const wire = Buffer.from(args[0] as string, "base64");
+      assert.equal(wire[0], 0x81, "the raw simulate path is only used for v1");
+      if (o.v1SimReject) return { error: { code: -32602, message: FORMAT_REJECTION } };
+      const ms = marketsInWire(wire, WRAPPER);
+      sims.push({ format: "v1", markets: ms });
+      return { result: { value: { err: o.v1SimErr ?? evalPushes(ms, 0), logs: [] } } };
+    },
+    async sendRawTransaction(raw: Uint8Array) {
+      const wire = Uint8Array.from(raw);
+      const format = wire[0] === 0x81 ? "v1" : "legacy";
+      const a: Attempt = { format, wire, accepted: false, markets: marketsInWire(wire, WRAPPER) };
+      attempts.push(a);
+      if (format === "v1" && o.v1SendReject) throw new Error(`failed to send transaction: ${FORMAT_REJECTION}`);
+      if (o.sendError) throw new Error(o.sendError);
+      a.accepted = true;
+      return `sig${attempts.length}`;
+    },
+    async getSignatureStatuses(sigs: string[]) {
+      return { value: sigs.map((s) => statuses.get(s) ?? null) };
+    },
+  };
+  return {
+    conn,
+    attempts,
+    sims,
+    statuses,
+    accepted: () => attempts.filter((a) => a.accepted),
+    featureReads: () => featureReads,
+  };
+}
+
+const asPushes = (ms: string[]) => ms.map((m, i) => ({ marketAddress: m, assetIndex: 0, priceE6: 2_000_000n + BigInt(i) }));
+const cycle = (conn: unknown, ms: string[], slot = GOLDEN_NOW_SLOT) =>
+  pushAuthMarkBatch(conn as never, keeper, asPushes(ms), slot, GOLDEN_BLOCKHASH, false);
+const settings = (env: Record<string, string>) => resetTxV1ForTests(parseTxV1Settings(env));
+
+/** Every market of `ms` appears in exactly one accepted send. */
+function assertEachPushedOnce(accepted: Attempt[], ms: string[]): void {
+  const seen = accepted.flatMap((a) => a.markets);
+  assert.equal(seen.length, new Set(seen).size, "no market may be sent twice");
+  assert.deepEqual([...seen].sort(), [...ms].sort(), "every market sent exactly once");
+}
+
+beforeEach(() => resetTxV1ForTests());
+
+describe("TX_V1=off (default): legacy path unchanged", () => {
+  it("default settings are off", () => {
+    assert.equal(parseTxV1Settings({}).mode, "off");
+  });
+
+  it("sends byte-identical legacy txs to the base commit (golden sha256 from 32cc1399)", async () => {
+    resetTxV1ForTests();
+    const got = await legacyGoldenScenarios(pushAuthMarkBatch as never);
+    assert.deepEqual(got, GOLDEN);
+  });
+
+  it("does not read the feature gate or touch the raw transport when off", async () => {
+    const ms = seededMarkets(10, 5);
+    const m = mockConn({ markets: ms, v1Active: true });
+    await cycle(m.conn, ms);
+    assert.equal(m.featureReads(), 0);
+    assert.ok(m.attempts.every((a) => a.format === "legacy"));
+  });
+});
+
+describe("TX_V1=auto on a v1 cluster: fewer txs", () => {
+  it("39 markets: 3 legacy txs -> 1 v1 tx carrying all 39, budget in the config mask", async () => {
+    const ms = seededMarkets(11, 39);
+    settings({});
+    const legacy = mockConn({ markets: ms, v1Active: true });
+    await cycle(legacy.conn, ms);
+    assert.equal(legacy.accepted().length, 3, "legacy baseline: 13 + 13 + 13");
+
+    settings({ TX_V1: "auto" });
+    const v1 = mockConn({ markets: ms, v1Active: true });
+    const res = await cycle(v1.conn, ms, GOLDEN_NOW_SLOT + 1n);
+    assert.equal(v1.accepted().length, 1);
+    assert.equal(res.pushedMarkets.length, 39);
+    assert.deepEqual(v1.accepted()[0]!.markets, ms, "order preserved");
+    assert.deepEqual({ txs: txV1Stats.lastCycleTxs, baseline: txV1Stats.lastCycleBaselineTxs, format: txV1Stats.lastFormat }, { txs: 1, baseline: 3, format: "v1" });
+
+    const vt = VersionedTransaction.deserialize(v1.accepted()[0]!.wire);
+    assert.equal(vt.version, 1);
+    const msg = vt.message as MessageV1;
+    assert.ok(v1.accepted()[0]!.wire.length <= 4096);
+    const slabLen = marketAccount(100n, SLAB_EXTRA).length;
+    assert.deepEqual(
+      { ...msg.transactionConfig },
+      {
+        computeUnitLimit: DEFAULT_PUSH_CU_BASE + 39 * DEFAULT_PUSH_CU_PER_MARKET,
+        loadedAccountsDataSizeLimit: Math.ceil((DEFAULT_LOADED_OVERHEAD_BYTES + 39 * (slabLen + 64)) * LOADED_HEADROOM),
+        heapSize: null,
+        priorityFee: null,
+      },
+    );
+    // No ComputeBudget instruction in v1: every instruction is a push, same payload shape as legacy.
+    for (const [i, ix] of msg.compiledInstructions.entries()) {
+      assert.equal(msg.staticAccountKeys[ix.programIdIndex]!.toBase58(), WRAPPER);
+      assert.equal(ix.data.length, 35);
+      const dv = new DataView(ix.data.buffer, ix.data.byteOffset, ix.data.byteLength);
+      assert.equal(dv.getBigUint64(19, true), 2_000_000n + BigInt(i), "mark_e6");
+      assert.equal(dv.getBigUint64(11, true), GOLDEN_NOW_SLOT + 1n, "now_slot");
+    }
+  });
+
+  it("48 markets (the live devnet set size): 4 legacy txs -> 1 v1 tx", async () => {
+    const ms = seededMarkets(12, 48);
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: true });
+    await cycle(m.conn, ms);
+    assert.equal(m.accepted().length, 1);
+    assert.equal(txV1Stats.lastCycleBaselineTxs, 4);
+    assertEachPushedOnce(m.accepted(), ms);
+  });
+
+  it("TX_V1_PUSH_MAX_MARKETS caps markets per v1 tx (39 at 20 -> 20 + 19)", async () => {
+    const ms = seededMarkets(13, 39);
+    settings({ TX_V1: "auto", TX_V1_PUSH_MAX_MARKETS: "20" });
+    const m = mockConn({ markets: ms, v1Active: true });
+    await cycle(m.conn, ms);
+    assert.deepEqual(m.accepted().map((a) => a.markets.length), [20, 19]);
+    assert.ok(m.accepted().every((a) => a.format === "v1"));
+  });
+
+  it("auto on a cluster WITHOUT v1 stays legacy", async () => {
+    const ms = seededMarkets(14, 20);
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: false });
+    await cycle(m.conn, ms);
+    assert.ok(m.attempts.length > 0 && m.attempts.every((a) => a.format === "legacy"));
+  });
+});
+
+describe("fallback only on a FORMAT rejection, never lost or duplicated", () => {
+  it("v1 rejected at send: the same markets go out in legacy, each exactly once; v1 suspended next cycle", async () => {
+    const ms = seededMarkets(20, 39);
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: true, v1SendReject: true });
+    const res = await cycle(m.conn, ms);
+    assert.equal(m.attempts.filter((a) => a.format === "v1").length, 1, "one v1 attempt");
+    assert.ok(m.accepted().every((a) => a.format === "legacy"));
+    assert.equal(m.accepted().length, 3);
+    assertEachPushedOnce(m.accepted(), ms);
+    assert.equal(res.pushedMarkets.length, 39);
+    assert.equal(txV1Stats.fallbacks, 1);
+
+    const before = m.attempts.length;
+    await cycle(m.conn, ms, GOLDEN_NOW_SLOT + 1n);
+    assert.ok(m.attempts.slice(before).every((a) => a.format === "legacy"), "suspended: no v1 re-probe every cycle");
+  });
+
+  it("v1 rejected at preflight (JSON-RPC decode error): legacy, each market once, no v1 send", async () => {
+    const ms = seededMarkets(21, 30);
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: true, v1SimReject: true });
+    await cycle(m.conn, ms);
+    assert.equal(m.attempts.filter((a) => a.format === "v1").length, 0);
+    assertEachPushedOnce(m.accepted(), ms);
+    assert.equal(txV1Stats.fallbacks, 1);
+  });
+
+  it("a v1 BUDGET error in preflight re-sends in legacy and strikes no market", async () => {
+    const ms = seededMarkets(22, 26);
+    settings({ TX_V1: "auto", TX_V1_RETRY_AFTER_REJECT_MS: "0" });
+    for (let c = 0; c < 4; c++) {
+      const m = mockConn({ markets: ms, v1Active: true, v1SimErr: { InstructionError: [3, "ComputationalBudgetExceeded"] } });
+      await cycle(m.conn, ms, GOLDEN_NOW_SLOT + BigInt(c));
+      assertEachPushedOnce(m.accepted(), ms);
+      assert.ok(m.accepted().every((a) => a.format === "legacy"));
+    }
+    assert.deepEqual(getQuarantinedMarkets().filter((q) => ms.includes(q)), [], "budget errors are not market faults");
+  });
+});
+
+describe("an on-chain error never falls back or resends", () => {
+  it("a reverting market is excluded (v1 ix index, no ComputeBudget offset); the rest go in ONE v1 tx", async () => {
+    const ms = seededMarkets(30, 39);
+    const bad = ms[17]!;
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: true, locked: new Set([bad]) });
+    const res = await cycle(m.conn, ms);
+    assert.equal(m.accepted().length, 1);
+    assert.equal(m.accepted()[0]!.format, "v1");
+    assert.deepEqual(m.accepted()[0]!.markets, ms.filter((x) => x !== bad), "exactly the culprit excluded");
+    assert.deepEqual(res.skippedMarkets, [bad]);
+    assert.equal(txV1Stats.fallbacks, 0);
+    assert.ok(m.attempts.every((a) => a.format === "v1"));
+  });
+
+  it("a non-format send error is recorded and NOT resent in any format", async () => {
+    const ms = seededMarkets(31, 39);
+    settings({ TX_V1: "auto" });
+    const m = mockConn({
+      markets: ms,
+      v1Active: true,
+      sendError: "failed to send transaction: Transaction simulation failed: Error processing Instruction 4: custom program error: 0x15",
+    });
+    const res = await cycle(m.conn, ms);
+    assert.equal(m.attempts.length, 1, "one attempt, no resend");
+    assert.equal(res.pushedMarkets.length, 0);
+    assert.equal(res.skippedMarkets.length, 39);
+    assert.equal(txV1Stats.fallbacks, 0);
+  });
+
+  it("a network error on a v1 send is not resent (it may have been accepted)", async () => {
+    const ms = seededMarkets(32, 10);
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: true, sendError: "fetch failed" });
+    await cycle(m.conn, ms);
+    assert.equal(m.attempts.length, 1);
+    assert.equal(txV1Stats.fallbacks, 0);
+  });
+});
+
+describe("TX_V1=on fails closed", () => {
+  it("cluster without v1: nothing simulated, nothing sent, every market skipped", async () => {
+    const ms = seededMarkets(40, 12);
+    settings({ TX_V1: "on" });
+    const m = mockConn({ markets: ms, v1Active: false });
+    const res = await cycle(m.conn, ms);
+    assert.equal(m.attempts.length, 0);
+    assert.equal(m.sims.length, 0);
+    assert.deepEqual([...res.skippedMarkets].sort(), [...ms].sort());
+    assert.equal(txV1Stats.failClosedCycles, 1);
+  });
+
+  it("a format rejection under TX_V1=on is NOT downgraded to legacy", async () => {
+    const ms = seededMarkets(41, 12);
+    settings({ TX_V1: "on" });
+    const m = mockConn({ markets: ms, v1Active: true, v1SendReject: true });
+    const res = await cycle(m.conn, ms);
+    assert.equal(m.attempts.filter((a) => a.format === "legacy").length, 0);
+    assert.equal(res.pushedMarkets.length, 0);
+  });
+});
+
+describe("landed v1 reverts are classified with the v1 instruction offset", () => {
+  it("a superseded Custom(19) at ix 0 of a v1 tx is a late duplicate, not an 'other' revert", async () => {
+    resetPushLandingState();
+    const ms = seededMarkets(50, 5);
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: true });
+    await cycle(m.conn, ms);
+    await cycle(m.conn, ms, GOLDEN_NOW_SLOT + 1n); // higher nonces sent for the same markets
+    assert.equal(m.accepted().length, 2);
+    m.statuses.set("sig1", { err: { InstructionError: [0, { Custom: 19 }] } });
+    m.statuses.set("sig2", { err: null });
+    await reconcilePushOutcomes(m.conn as never, Date.now() + 10_000);
+    assert.deepEqual({ late: pushLandingStats.lateDuplicateReverts, other: pushLandingStats.otherReverts, ok: pushLandingStats.landedOk }, { late: 1, other: 0, ok: 1 });
+  });
+});
+
+describe("parsing", () => {
+  it("parseFailingPush: v1 offset 0 maps ix i to push i; legacy default unchanged", () => {
+    assert.deepEqual(parseFailingPush({ InstructionError: [0, { Custom: 19 }] }, 3, 0), { position: 0, custom: 19 });
+    assert.deepEqual(parseFailingPush({ InstructionError: [2, { Custom: 21 }] }, 3, 0), { position: 2, custom: 21 });
+    assert.equal(parseFailingPush({ InstructionError: [3, { Custom: 21 }] }, 3, 0), null);
+    assert.equal(parseFailingPush({ InstructionError: [0, { Custom: 19 }] }, 3), null, "legacy: ix 0 is ComputeBudget");
+  });
+
+  it("parseTxV1Settings validates", () => {
+    assert.equal(parseTxV1Settings({ TX_V1: "auto" }).mode, "auto");
+    assert.equal(parseTxV1Settings({ TX_V1: "ON" }).mode, "on");
+    assert.throws(() => parseTxV1Settings({ TX_V1: "yes please" }), /TX_V1/);
+    assert.throws(() => parseTxV1Settings({ TX_V1_HEAP_BYTES: "1000" }), /TX_V1_HEAP_BYTES/);
+    assert.throws(() => parseTxV1Settings({ TX_V1_PUSH_MAX_MARKETS: "65" }), /TX_V1_PUSH_MAX_MARKETS/);
+    assert.throws(() => parseTxV1Settings({ TX_V1_PUSH_CU_PER_MARKET: "10" }), /TX_V1_PUSH_CU_PER_MARKET/);
+    assert.equal(parseTxV1Settings({ TX_V1_LOADED_ACCOUNTS_BYTES: "5000000" }).loadedAccountsBytes, 5_000_000);
+  });
+});
+
+describe("/health", () => {
+  it("adds `txV1` only when TX_V1 is not off", async () => {
+    const { txV1HealthFields } = await import("./tx-v1.ts");
+    resetTxV1ForTests();
+    assert.deepEqual(txV1HealthFields(), {});
+    settings({ TX_V1: "auto" });
+    const h = txV1HealthFields() as { txV1: { mode: string; lastCycleTxs: number; lastCycleBaselineTxs: number } };
+    assert.equal(h.txV1.mode, "auto");
+    assert.ok("lastCycleTxs" in h.txV1 && "lastCycleBaselineTxs" in h.txV1);
+  });
+});

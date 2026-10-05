@@ -132,3 +132,25 @@ When supported (tick every `P2B_TICK_MS`, one batched snapshot read per tick):
 
 Independent of the gate: tag 78 on a bound vault appends `[7]` ext and `[8]` vault LP once the registry ext
 flag (byte 161) is set (it is 0 on every pre-P2b program). See `.env.example` for every knob.
+
+## Transaction v1 for the PushAuthMark batch (`TX_V1`, default off)
+
+`TX_V1` switches the per-cycle PushAuthMark batch to Solana v1 transactions (SIMD-0385 format, SIMD-0296
+4,096-byte limit) via the SDK encoder (`src/cross-cluster/tx-v1.ts`). Off, the keeper sends exactly the legacy
+bytes it sent before (pinned by a golden test against the pre-v1 commit).
+
+| `TX_V1` | Behaviour |
+|---------|-----------|
+| `off` (default) | Legacy txs, 13 markets per tx (1,232-byte limit). |
+| `auto` | v1 while the devnet feature gate reports it active; on a FORMAT rejection (or a v1 CU / loaded-size error in preflight) the unsent markets go out in legacy and v1 is suspended for `TX_V1_RETRY_AFTER_REJECT_MS`. Program errors never fall back or resend. |
+| `on` | v1 only. A cluster without v1, or a v1 rejection, means no push that cycle (fail closed). |
+
+Measured on devnet (48 live markets): legacy 4 txs per cycle (1,142 / 1,142 / 1,142 / 854 B), v1 1 tx (3,682 B,
+247,773 CU, loaded 3,590,545 B). A v1 tx is atomic like a legacy chunk: preflight still excludes a reverting
+market and re-sends the rest in the same cycle, but a revert that only shows up on-chain (after a clean
+preflight) now affects every market in the tx instead of its 13-market chunk. `TX_V1_PUSH_MAX_MARKETS` caps
+markets per v1 tx (0 = all that fit). Other knobs: `TX_V1_PUSH_CU_PER_MARKET` (8000), `TX_V1_PUSH_CU_BASE`
+(10000), `TX_V1_LOADED_ACCOUNTS_BYTES` (unset = 1.25 x (2,000,000 + sum of slab bytes + 64 each)),
+`TX_V1_LOADED_OVERHEAD_BYTES` (2000000), `TX_V1_HEAP_BYTES` (0, like legacy). `/health` gains a `txV1` block
+(last cycle's tx count vs the legacy baseline, fallbacks) only when `TX_V1` is not off. Cranks and refreshes
+stay legacy (they are CU-bound: v1 would not add a single refresh per tx).

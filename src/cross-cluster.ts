@@ -57,6 +57,11 @@
  *   P2B_WIND_DOWN_MAX_PER_MARKET (3) / _MAX_PER_CYCLE (8) / _MAX_SIMS (6) / _MAX_MARK_AGE_SLOTS (140) / _CU (600000) / _COOLDOWN_MS (60000)   tag 104
  *   HEDGED_LOCKOUT_UTIL_BPS (9000) / HEDGED_LOCKOUT_FLAT_BPS (300) / HEDGED_LOCKOUT_INTERVAL_MS (30000)
  *   EARN_GAP_INTERVAL_MS (60000) / EARN_GAP_ALERT_BPS (100) / EARN_GAP_ALERT_CYCLES (3)   R3-M1 par-E3 gap
+ *   TX_V1                   PushAuthMark tx format: "off" (default; legacy, byte-identical to before) | "auto" (v1 when the
+ *                           cluster reports it, legacy fallback on a format rejection) | "on" (v1 only; fails closed). See cross-cluster/tx-v1.ts, plus:
+ *   TX_V1_PUSH_MAX_MARKETS (0 = all that fit) / TX_V1_PUSH_CU_PER_MARKET (8000) / TX_V1_PUSH_CU_BASE (10000) /
+ *   TX_V1_LOADED_ACCOUNTS_BYTES (unset = derived per tx) / TX_V1_LOADED_OVERHEAD_BYTES (2000000) / TX_V1_HEAP_BYTES (0) /
+ *   TX_V1_RETRY_AFTER_REJECT_MS (600000)
  *
  * CLI flags:
  *   --dry-run             same as DRY_RUN=true
@@ -109,6 +114,7 @@ import { P2bLoop, p2bLoopConfigFromEnv, startP2bLoop } from "./cross-cluster/p2b
 import type { P2bLoopConfig } from "./cross-cluster/p2b-loop.ts";
 import { setP2bHealthProvider } from "./cross-cluster/p2b-health.ts";
 import { fetchMarketPortfolios } from "./cross-cluster/recovery-cranker.ts";
+import { configureTxV1, parseTxV1Settings } from "./cross-cluster/tx-v1.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -265,6 +271,18 @@ const DRY_RUN =
 
 const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "7000", 10);
 
+// Transaction v1 (SIMD-0385/0296) for the PushAuthMark batch. Parsed at boot so a typo in
+// TX_V1 or an out-of-range knob fails startup instead of silently picking a format.
+const TX_V1_SETTINGS = (() => {
+  try {
+    return parseTxV1Settings(process.env);
+  } catch (err) {
+    console.error(`[fatal] ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+})();
+configureTxV1(TX_V1_SETTINGS);
+
 // Cadence footgun (runbook fresh-id-redeploy-plan §8): the mark smoother only
 // publishes once its window SPANS 5/6 of CC_MARK_WINDOW_MS, and samples older
 // than the window are evicted — so some interval/window pairs can never push
@@ -397,6 +415,7 @@ console.log(`  registry:  ${REGISTRY_PATH} (${registry.markets.length} markets)`
 console.log(`  mode:      ${DRY_RUN ? "DRY-RUN (no on-chain writes)" : "LIVE"}`);
 console.log(`  interval:  ${CC_INTERVAL_MS}ms`);
 for (const line of describeProgramIds()) console.log(`  program:   ${line}`);
+console.log(`  tx format: TX_V1=${TX_V1_SETTINGS.mode} ${JSON.stringify({ ...TX_V1_SETTINGS, mode: undefined })}`);
 console.log(`  alerts:    webhook ${process.env.KEEPER_ALERT_WEBHOOK_URL ? "ON" : "off"}; thresholds ${JSON.stringify(ALERT_SINK.thresholds)}`);
 console.log(
   `  cranker:   ${CRANK_ENABLED ? `every ${CRANK_INTERVAL_MS}ms` : "disabled (CRANK_ENABLED=false)"}`,

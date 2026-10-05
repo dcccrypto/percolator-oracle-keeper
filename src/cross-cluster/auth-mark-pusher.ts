@@ -49,6 +49,22 @@ import {
 } from "@percolatorct/sdk";
 import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
 import { isLiveMarket, isTerminalMarket } from "./market-state.ts";
+import {
+  buildV1Wire,
+  fallbackAllowed,
+  getTxV1Settings,
+  isFormatRejection,
+  isV1BudgetError,
+  ixOffsetFor,
+  loadedAccountsLimit,
+  noteV1Fallback,
+  pushComputeUnits,
+  resolveSendFormat,
+  simulateWire,
+  txV1Stats,
+  v1Size,
+  type KeeperTxFormat,
+} from "./tx-v1.ts";
 
 /**
  * B20 (E2E 2026-09-30): Resolved markets and CloseSlab tombstones are never
@@ -498,7 +514,12 @@ type AuthMarkPushInput = { marketAddress: string; assetIndex: number; priceE6: b
  * fields could not be read never reaches this shape (it is reported via
  * `skippedMarkets` instead — see `pushAuthMarkBatch`).
  */
-type AuthMarkPushItem = AuthMarkPushInput & { marketId: bigint; observationSequence: bigint };
+type AuthMarkPushItem = AuthMarkPushInput & {
+  marketId: bigint;
+  observationSequence: bigint;
+  /** Slab data length from the same read (sizes the v1 loaded-accounts-data limit). */
+  accountDataLen?: number;
+};
 
 /**
  * Build one PushAuthMark tx for a slice of markets and return it with its
@@ -593,6 +614,102 @@ function chunkPushes(
   return chunks;
 }
 
+/** The PushAuthMark instructions of a chunk, in order (shared by both formats). */
+function pushInstructions(keeper: Keypair, pushes: AuthMarkPushItem[], nowSlot: bigint): TransactionInstruction[] {
+  return pushes.map((p) =>
+    buildPushAuthMarkIx(
+      keeper.publicKey,
+      new PublicKey(p.marketAddress),
+      p.assetIndex,
+      p.marketId,
+      nowSlot,
+      p.priceE6,
+      p.observationSequence,
+    ),
+  );
+}
+
+/**
+ * v1 budget for a push chunk: CU from the measured per-push cost (NOT the legacy 200k per
+ * push, which would cap a v1 tx at 7 markets under the 1.4M ceiling), and a loaded-accounts
+ * limit sized from the slabs actually read this cycle.
+ */
+function v1PushBudget(pushes: AuthMarkPushItem[]): { computeUnitLimit: number; loadedAccountsDataSizeLimit: number } {
+  const seen = new Map<string, number>();
+  for (const p of pushes) seen.set(p.marketAddress, p.accountDataLen ?? 0);
+  return {
+    computeUnitLimit: pushComputeUnits(pushes.length),
+    loadedAccountsDataSizeLimit: loadedAccountsLimit([...seen.values()]),
+  };
+}
+
+/** Build + sign one v1 PushAuthMark tx. */
+function buildPushTxV1(
+  keeper: Keypair,
+  pushes: AuthMarkPushItem[],
+  nowSlot: bigint,
+  blockhash: { blockhash: string },
+): Uint8Array {
+  return buildV1Wire({
+    payer: keeper.publicKey,
+    signers: [keeper],
+    instructions: pushInstructions(keeper, pushes, nowSlot),
+    blockhash: blockhash.blockhash,
+    ...v1PushBudget(pushes),
+  });
+}
+
+/**
+ * v1 counterpart of {@link chunkPushes}: same greedy, order-preserving, measured-size split,
+ * against the 4,096-byte v1 limit (exact size, so no margin), the v1 address/instruction
+ * limits, the 1.4M CU ceiling at the v1 per-push budget, and TX_V1_PUSH_MAX_MARKETS.
+ */
+function chunkPushesV1(
+  keeper: Keypair,
+  pushes: AuthMarkPushItem[],
+  nowSlot: bigint,
+  blockhash: { blockhash: string },
+): AuthMarkPushItem[][] {
+  const { pushMaxMarkets: max, pushCuBase, pushCuPerMarket } = getTxV1Settings();
+  // Encode every push once; candidates are index ranges over this array.
+  const ixs = pushInstructions(keeper, pushes, nowSlot);
+  const fits = (start: number, end: number): boolean => {
+    const n = end - start;
+    if (max > 0 && n > max) return false;
+    const candidate = pushes.slice(start, end);
+    const budget = v1PushBudget(candidate);
+    if (budget.computeUnitLimit < pushCuBase + n * pushCuPerMarket) return false;
+    return (
+      v1Size({ payer: keeper.publicKey, instructions: ixs.slice(start, end), blockhash: blockhash.blockhash, ...budget }) !==
+      Number.POSITIVE_INFINITY
+    );
+  };
+  const chunks: AuthMarkPushItem[][] = [];
+  let start = 0;
+  for (let i = 0; i < pushes.length; i++) {
+    if (i === start || fits(start, i + 1)) continue;
+    chunks.push(pushes.slice(start, i));
+    start = i;
+  }
+  if (start < pushes.length) chunks.push(pushes.slice(start));
+  return chunks;
+}
+
+const legacyChunkCountByN = new Map<number, number>();
+/** Number of legacy chunks {@link chunkPushes} makes for `pushes` (cached by count: all pushes share one shape). */
+function legacyChunkCount(
+  keeper: Keypair,
+  pushes: AuthMarkPushItem[],
+  nowSlot: bigint,
+  blockhash: { blockhash: string; lastValidBlockHeight: number },
+): number {
+  const hit = legacyChunkCountByN.get(pushes.length);
+  if (hit !== undefined) return hit;
+  const n = chunkPushes(keeper, pushes, nowSlot, blockhash).length;
+  legacyChunkCountByN.set(pushes.length, n);
+  return n;
+}
+
 /** Composite key — the same market address can (in principle) carry more than one asset index. */
 function pushGenerationKey(p: { marketAddress: string; assetIndex: number }): string {
   return `${p.marketAddress}:${p.assetIndex}`;
@@ -615,7 +732,7 @@ async function fetchPushAuthMarkGenerationFields(
   devnetConn: Connection,
   pushes: AuthMarkPushInput[],
   terminal: Set<string>,
-): Promise<Map<string, { marketId: bigint; observationSequence: bigint }>> {
+): Promise<Map<string, { marketId: bigint; observationSequence: bigint; accountDataLen: number }>> {
   const uniqueAddrs = [...new Set(pushes.map((p) => p.marketAddress))];
   // "processed", not "confirmed" (#Custom19, 2026-09-28): the watermark this
   // reads is advanced ONLY by this keeper's own pushes, which land ~1-3 slots
@@ -632,7 +749,7 @@ async function fetchPushAuthMarkGenerationFields(
     if (info) dataByAddr.set(addr, new Uint8Array(info.data));
   });
 
-  const result = new Map<string, { marketId: bigint; observationSequence: bigint }>();
+  const result = new Map<string, { marketId: bigint; observationSequence: bigint; accountDataLen: number }>();
   for (const p of pushes) {
     const key = pushGenerationKey(p);
     if (result.has(key)) continue;
@@ -649,6 +766,7 @@ async function fetchPushAuthMarkGenerationFields(
       result.set(key, {
         marketId: fields.marketId,
         observationSequence: nextObservationSequence(key, fields.observationSequence),
+        accountDataLen: data.length,
       });
     }
   }
@@ -743,6 +861,8 @@ interface InFlightPush {
   signature: string;
   sentAtMs: number;
   items: Array<{ key: string; market: string; seq: bigint }>;
+  /** Index of the first push ix in this tx (legacy 1: ComputeBudget at 0; v1 0). */
+  ixOffset: number;
 }
 const inFlightPushes: InFlightPush[] = [];
 const MAX_IN_FLIGHT_PUSHES = 64;
@@ -797,7 +917,7 @@ export async function reconcilePushOutcomes(devnetConn: Connection, nowMs: numbe
       } else if (!st.err) {
         pushLandingStats.landedOk++;
       } else {
-        const failing = parseFailingPush(st.err, f.items.length);
+        const failing = parseFailingPush(st.err, f.items.length, f.ixOffset);
         const superseded =
           failing !== null &&
           failing.custom === ENGINE_STALE_CUSTOM &&
@@ -831,19 +951,22 @@ export async function reconcilePushOutcomes(devnetConn: Connection, nowMs: numbe
 
 /**
  * Parse a simulate `err` of the real RPC shape `{"InstructionError":[i,{"Custom":n}]}`
- * into the offending push's position within `chunkLen` pushes (ix 0 is the
- * ComputeBudget ix, so push k is ix k+1). Returns null for any other shape
+ * into the offending push's position within `chunkLen` pushes. In a legacy tx ix 0
+ * is the ComputeBudget ix, so push k is ix k+1 (`ixOffset` 1, the default); a v1
+ * tx carries its budget in the config mask, so push k is ix k (`ixOffset` 0).
+ * Returns null for any other shape
  * (InsufficientFundsForFee, AccountNotFound, a non-push index, …) so the caller
  * falls back to per-market isolation instead of blaming the wrong market.
  */
 export function parseFailingPush(
   simErr: unknown,
   chunkLen: number,
+  ixOffset: number = 1,
 ): { position: number; custom: number | null } | null {
   if (typeof simErr !== "object" || simErr === null) return null;
   const ie = (simErr as { InstructionError?: unknown }).InstructionError;
   if (!Array.isArray(ie) || ie.length !== 2 || typeof ie[0] !== "number") return null;
-  const position = ie[0] - 1;
+  const position = ie[0] - ixOffset;
   if (!Number.isInteger(position) || position < 0 || position >= chunkLen) return null;
   const detail = ie[1] as { Custom?: unknown } | unknown;
   const custom =
@@ -924,7 +1047,12 @@ export async function pushAuthMarkBatch(
       missingGeneration.push(p.marketAddress);
       continue;
     }
-    pushable.push({ ...p, marketId: fields.marketId, observationSequence: fields.observationSequence });
+    pushable.push({
+      ...p,
+      marketId: fields.marketId,
+      observationSequence: fields.observationSequence,
+      accountDataLen: fields.accountDataLen,
+    });
   }
   if (missingGeneration.length > 0) {
     console.warn(
@@ -942,11 +1070,32 @@ export async function pushAuthMarkBatch(
     };
   }
 
-  const chunks = chunkPushes(keeper, pushable, nowSlot, blockhash);
+  // ── Format for this cycle (TX_V1; default off = the legacy path, byte-identical) ──
+  const decision = await resolveSendFormat(devnetConn);
+  if (decision.format === null) {
+    // TX_V1=on and the cluster does not report v1: FAIL CLOSED (no legacy send).
+    txV1Stats.failClosedCycles++;
+    console.error(`[push][TX_V1] ${decision.reason} — not pushing this cycle (set TX_V1=auto to allow legacy)`);
+    return {
+      pushed: false,
+      count: 0,
+      pushedMarkets: [],
+      skippedMarkets: pushes.map((p) => p.marketAddress).filter((m) => !terminal.has(m)),
+      terminalMarkets,
+    };
+  }
+  const startFormat: KeeperTxFormat = decision.format;
+  const chunkFor = (format: KeeperTxFormat, items: AuthMarkPushItem[]): AuthMarkPushItem[][] =>
+    format === "v1" ? chunkPushesV1(keeper, items, nowSlot, blockhash) : chunkPushes(keeper, items, nowSlot, blockhash);
+  const chunks = chunkFor(startFormat, pushable);
+  // Pre-v1 tx count for the same push set (observability, and the v1 EngineStale refresh
+  // budget). Every PushAuthMark has the same shape, so the legacy chunk count depends only on
+  // the number of pushes: cached by count instead of re-serializing every cycle.
+  const baselineTxs = startFormat === "v1" ? legacyChunkCount(keeper, pushable, nowSlot, blockhash) : chunks.length;
 
   if (dryRun) {
     console.log(
-      `[DRY-RUN] PushAuthMark × ${pushable.length} in ${chunks.length} tx(s) @ slot ${nowSlot} ` +
+      `[DRY-RUN] PushAuthMark × ${pushable.length} in ${chunks.length} tx(s) [${startFormat}, baseline ${baselineTxs}] @ slot ${nowSlot} ` +
         `(${pushable.map((p) => `$${(Number(p.priceE6) / 1e6).toFixed(4)}`).join(", ")})`,
     );
     return {
@@ -961,6 +1110,7 @@ export async function pushAuthMarkBatch(
   let firstSig: string | undefined;
   const pushedMarkets: string[] = [];
   const errors: string[] = [];
+  let txsSent = 0;
 
   /**
    * Preflight one tx so an ON-CHAIN revert is visible before we send.
@@ -973,18 +1123,41 @@ export async function pushAuthMarkBatch(
    * EngineLockActive, a non-increasing observation_sequence -> EngineStale, or a
    * junk slab -> Unauthorized), so one bad market silently froze the price for
    * every market batched with it (the 2026-07-13 outage shape).
+   *
+   * v1: same simulate options through the connection's own transport. Two v1-only
+   * outcomes are returned as V1_UNUSABLE instead of an error: a FORMAT rejection
+   * (the node cannot take v1) and a v1 BUDGET error (our CU / loaded-accounts limit
+   * too low). Neither is a market fault, so neither may strike a market.
    */
-  const preflight = async (chunk: AuthMarkPushItem[]): Promise<unknown> => {
-    const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
-    tx.sign(keeper);
+  const V1_UNUSABLE = Symbol("v1-unusable");
+  const preflight = async (chunk: AuthMarkPushItem[], format: KeeperTxFormat): Promise<unknown> => {
     let simErr: unknown = null;
-    try {
-      const sim = await devnetConn.simulateTransaction(tx);
-      simErr = sim.value.err;
-    } catch {
-      // A simulate that cannot even run (RPC hiccup) must not drop the push —
-      // fall through and send, which is the old behaviour.
-      simErr = null;
+    if (format === "legacy") {
+      const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
+      tx.sign(keeper);
+      try {
+        const sim = await devnetConn.simulateTransaction(tx);
+        simErr = sim.value.err;
+      } catch {
+        // A simulate that cannot even run (RPC hiccup) must not drop the push —
+        // fall through and send, which is the old behaviour.
+        simErr = null;
+      }
+    } else {
+      try {
+        const sim = await simulateWire(devnetConn, buildPushTxV1(keeper, chunk, nowSlot, blockhash));
+        simErr = sim.err;
+        if (simErr && isV1BudgetError(simErr, sim.logs)) {
+          v1Unusable(`v1 budget: ${JSON.stringify(simErr).slice(0, 100)}`);
+          return V1_UNUSABLE;
+        }
+      } catch (err) {
+        if (isFormatRejection(err)) {
+          v1Unusable(`v1 format rejected in preflight: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`);
+          return V1_UNUSABLE;
+        }
+        simErr = null; // same as legacy: an RPC hiccup falls through to the send
+      }
     }
     // BlockhashNotFound is NOT a program revert. On a load-balanced devnet RPC
     // pool (the padre endpoint) the node that runs simulateTransaction often lags
@@ -996,6 +1169,12 @@ export async function pushAuthMarkBatch(
       simErr = null;
     }
     return simErr;
+  };
+
+  /** Latch v1 off (auto) for the cooldown; the caller re-sends the unsent items in legacy. */
+  const v1Unusable = (reason: string): void => {
+    noteV1Fallback(reason);
+    console.warn(`[push][TX_V1] ${reason} — ${fallbackAllowed() ? "falling back to legacy" : "TX_V1=on: NOT falling back (fail closed)"}`);
   };
 
   /** Record a proven revert against ONE market (strikes -> quarantine). */
@@ -1013,17 +1192,32 @@ export async function pushAuthMarkBatch(
     errors.push(`${bad.marketAddress.slice(0, 8)}…: ${JSON.stringify(simErr).slice(0, 80)}`);
   };
 
-  /** Submit a chunk that preflighted clean. Fire-and-forget on confirmation. */
-  const send = async (chunk: AuthMarkPushItem[]): Promise<void> => {
-    const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
-    tx.sign(keeper);
+  /**
+   * Submit a chunk that preflighted clean. Fire-and-forget on confirmation.
+   * Returns false only when a v1 send was rejected for FORMAT reasons (nothing was
+   * accepted, so the caller may re-send those markets in legacy without a double-send).
+   * Any other send error is recorded and NOT retried, exactly as before.
+   */
+  const send = async (chunk: AuthMarkPushItem[], format: KeeperTxFormat): Promise<boolean> => {
+    let wire: Uint8Array;
+    if (format === "legacy") {
+      const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
+      tx.sign(keeper);
+      wire = tx.serialize();
+    } else {
+      wire = buildPushTxV1(keeper, chunk, nowSlot, blockhash);
+    }
+    txsSent++;
     try {
-      const signature = await devnetConn.sendRawTransaction(tx.serialize(), PUSH_SEND_OPTIONS);
+      const signature = await devnetConn.sendRawTransaction(wire, PUSH_SEND_OPTIONS);
+      if (format === "v1") txV1Stats.v1TxsSent++;
+      else txV1Stats.legacyTxsSent++;
       firstSig ??= signature;
       inFlightPushes.push({
         signature,
         sentAtMs: Date.now(),
         items: chunk.map((p) => ({ key: pushGenerationKey(p), market: p.marketAddress, seq: p.observationSequence })),
+        ixOffset: ixOffsetFor(format),
       });
       if (inFlightPushes.length > MAX_IN_FLIGHT_PUSHES) inFlightPushes.splice(0, inFlightPushes.length - MAX_IN_FLIGHT_PUSHES);
       for (const p of chunk) {
@@ -1036,8 +1230,14 @@ export async function pushAuthMarkBatch(
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (format === "v1" && isFormatRejection(err)) {
+        txsSent--; // never accepted: not a tx
+        v1Unusable(`v1 format rejected at send: ${msg.slice(0, 120)}`);
+        return false;
+      }
       errors.push(`${chunk.length} market(s): ${msg.slice(0, 120)}`);
     }
+    return true;
   };
 
   /**
@@ -1063,44 +1263,54 @@ export async function pushAuthMarkBatch(
    * Push one chunk so that ONE failing market can never black out the rest.
    *
    * On a preflight revert the real RPC error names the failing instruction
-   * (`{"InstructionError":[i,{"Custom":n}]}`, ix 0 = ComputeBudget, so push i-1).
+   * (`{"InstructionError":[i,{"Custom":n}]}`; legacy: ix 0 = ComputeBudget, so push
+   * i-1; v1: push i).
    * - Custom(19) EngineStale -> re-read the nonces once and retry the SAME chunk
    *   (a stale observation_sequence is a keeper-side race, not a bad market, so
    *   it must not cost the market a cycle or a quarantine strike).
    * - anything else -> exclude exactly that market (strike it) and re-preflight
    *   the remainder as ONE tx, in the same cycle.
    * - an error that does not name a push ix -> fall back to one-at-a-time.
+   *
+   * Returns the markets NOT yet resolved (neither sent nor struck) when v1 became
+   * unusable mid-chunk; the caller re-sends exactly those in legacy. [] otherwise.
    */
-  const pushChunk = async (chunk: AuthMarkPushItem[]): Promise<void> => {
+  const pushChunk = async (chunk: AuthMarkPushItem[], format: KeeperTxFormat): Promise<AuthMarkPushItem[]> => {
     let pending = chunk;
-    let refreshed = false;
+    // One EngineStale nonce refresh per chunk, as before. A v1 chunk replaces several legacy
+    // chunks, so it gets one refresh per legacy chunk it replaces (same total budget per cycle).
+    let refreshesLeft = format === "legacy" ? 1 : Math.max(1, Math.round((baselineTxs * chunk.length) / pushable.length));
+    const maxIterations = chunk.length + refreshesLeft;
+    const offset = ixOffsetFor(format);
     // Each non-refresh iteration removes one market, so this is bounded.
-    for (let guard = 0; pending.length > 0 && guard <= chunk.length + 1; guard++) {
-      const simErr = await preflight(pending);
+    for (let guard = 0; pending.length > 0 && guard <= maxIterations; guard++) {
+      const simErr = await preflight(pending, format);
+      if (simErr === V1_UNUSABLE) return pending;
       if (!simErr) {
-        await send(pending);
-        return;
+        return (await send(pending, format)) ? [] : pending;
       }
-      const failing = parseFailingPush(simErr, pending.length);
+      const failing = parseFailingPush(simErr, pending.length, offset);
       if (failing === null) {
         if (pending.length === 1) {
           strike(pending[0], simErr);
-          return;
+          return [];
         }
         console.warn(
           `[push] chunk of ${pending.length} reverted in preflight (${JSON.stringify(simErr).slice(0, 80)}) ` +
             `— retrying individually to isolate the bad market`,
         );
-        for (const single of pending) {
-          const singleErr = await preflight([single]);
+        for (let i = 0; i < pending.length; i++) {
+          const single = pending[i];
+          const singleErr = await preflight([single], format);
+          if (singleErr === V1_UNUSABLE) return pending.slice(i);
           if (singleErr) strike(single, singleErr);
-          else await send([single]);
+          else if (!(await send([single], format))) return pending.slice(i);
         }
-        return;
+        return [];
       }
       const culprit = pending[failing.position];
-      if (failing.custom === ENGINE_STALE_CUSTOM && !refreshed) {
-        refreshed = true;
+      if (failing.custom === ENGINE_STALE_CUSTOM && refreshesLeft > 0) {
+        refreshesLeft--;
         const next = await refreshSequences(pending);
         if (next) {
           console.warn(
@@ -1120,10 +1330,35 @@ export async function pushAuthMarkBatch(
         );
       }
     }
+    return [];
   };
 
-  for (const chunk of chunks) {
-    await pushChunk(chunk);
+  let format = startFormat;
+  let queue = chunks;
+  while (queue.length > 0) {
+    const chunk = queue[0]!;
+    queue = queue.slice(1);
+    const unsent = await pushChunk(chunk, format);
+    if (unsent.length > 0) {
+      // v1 became unusable: re-plan everything not yet sent in legacy (auto), or stop (on).
+      const rest = [...unsent, ...queue.flat()];
+      if (!fallbackAllowed()) {
+        errors.push(`${rest.length} market(s): TX_V1=on and v1 unusable — not sent (fail closed)`);
+        break;
+      }
+      format = "legacy";
+      queue = chunkFor("legacy", rest);
+    }
+  }
+
+  txV1Stats.lastFormat = startFormat;
+  txV1Stats.lastCycleTxs = txsSent;
+  txV1Stats.lastCycleBaselineTxs = baselineTxs;
+  if (startFormat === "v1" || format !== startFormat) {
+    console.log(
+      `[push] push cycle: ${txsSent} txs (baseline ${baselineTxs}) format=${startFormat}` +
+        `${format !== startFormat ? `->${format}` : ""} markets=${pushable.length}`,
+    );
   }
 
   if (errors.length > 0) {
