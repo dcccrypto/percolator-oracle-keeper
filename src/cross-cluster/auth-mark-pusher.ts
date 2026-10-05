@@ -1199,17 +1199,16 @@ export async function pushAuthMarkBatch(
    * Any other send error is recorded and NOT retried, exactly as before.
    */
   const send = async (chunk: AuthMarkPushItem[], format: KeeperTxFormat): Promise<boolean> => {
-    let wire: Uint8Array;
-    if (format === "legacy") {
-      const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
-      tx.sign(keeper);
-      wire = tx.serialize();
-    } else {
-      wire = buildPushTxV1(keeper, chunk, nowSlot, blockhash);
-    }
-    txsSent++;
+    const legacyTx = format === "legacy" ? buildPushTx(keeper, chunk, nowSlot, blockhash).tx : null;
+    legacyTx?.sign(keeper);
+    let attempted = false;
     try {
+      // Serialize INSIDE the try, as before: an oversized legacy tx throws here and is
+      // recorded as this chunk's error instead of escaping the cycle.
+      const wire = legacyTx ? legacyTx.serialize() : buildPushTxV1(keeper, chunk, nowSlot, blockhash);
+      attempted = true;
       const signature = await devnetConn.sendRawTransaction(wire, PUSH_SEND_OPTIONS);
+      txsSent++;
       if (format === "v1") txV1Stats.v1TxsSent++;
       else txV1Stats.legacyTxsSent++;
       firstSig ??= signature;
@@ -1230,11 +1229,12 @@ export async function pushAuthMarkBatch(
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (format === "v1" && isFormatRejection(err)) {
-        txsSent--; // never accepted: not a tx
+      if (attempted && format === "v1" && isFormatRejection(err)) {
+        // Never accepted by the node: not a sent tx, and safe to re-send in legacy.
         v1Unusable(`v1 format rejected at send: ${msg.slice(0, 120)}`);
         return false;
       }
+      if (attempted) txsSent++; // a send that may have been accepted counts as a tx
       errors.push(`${chunk.length} market(s): ${msg.slice(0, 120)}`);
     }
     return true;
