@@ -56,6 +56,14 @@ export interface RegisterPollConfig {
    * atomic PushAuthMark batch with IncorrectProgramId (the whole batch reverts).
    */
   expectedOwner?: PublicKey;
+  /**
+   * v1 wind-down: admit NOTHING new and prune nothing. Every poll (periodic or
+   * Realtime-triggered) returns before the DB is even queried, so the existing
+   * registry keeps being priced and cranked exactly as it is. Off by default.
+   */
+  freezeIntake?: boolean;
+  /** Market addresses retired by the OI=0 pass; never re-admitted by this poll. */
+  isRetired?: (marketAddress: string) => boolean;
 }
 
 /** Loosely-typed shape of one entry from GET /api/playground/registered-markets. */
@@ -256,6 +264,10 @@ async function runPollOnce(registry: Registry, config: RegisterPollConfig): Prom
   // This used to GET the Vercel blob. The row already carried everything needed
   // and the keeper was already subscribed to Realtime on that table, so the blob
   // was a second store the notification pointed away from.
+  if (config.freezeIntake) {
+    // Logged once per process by the caller; silent here so a 30s poll does not spam.
+    return 0;
+  }
   if (!config.db) {
     console.warn("[register-poll] no db config — cannot resolve the market list");
     return 0;
@@ -294,7 +306,7 @@ async function runPollOnce(registry: Registry, config: RegisterPollConfig): Prom
   // abort the entire reconcile rather than act on partial information — an
   // unverified market must never be added, and a verified one must never be
   // dropped just because we could not check it.
-  let admitted = desired;
+  let admitted = config.isRetired ? desired.filter((m) => !config.isRetired!(m.marketAddress)) : desired;
   if (config.connection && config.expectedOwner && desired.length > 0) {
     try {
       // Chunked: getMultipleAccountsInfo rejects more than 100 keys, and a
@@ -309,7 +321,9 @@ async function runPollOnce(registry: Registry, config: RegisterPollConfig): Prom
           )),
         );
       }
+      const checked = new Set(admitted);
       admitted = desired.filter((m, i) => {
+        if (!checked.has(m)) return false;
         const owner = infos[i]?.owner ?? null;
         if (!owner) {
           console.warn(`[register-poll] ${m.marketAddress.slice(0, 8)}… not found on-chain — not admitted`);
