@@ -279,7 +279,7 @@ export class VaultLpAllocator {
     const c = await confirmBySignature(conn, sig, blockhash, lastValidBlockHeight, this.deps.confirm);
     if (c.status === "landed") {
       this.stats.landed++;
-      this.log(`[p2b-allocate] ${snap.ref.label}: tag 103 landed sig=${sig.slice(0, 16)}…`);
+      this.log(`[p2b-allocate] ${snap.ref.label}: tag 103 landed sig=${sig.slice(0, 16)}… (simulated ${sim.value.unitsConsumed ?? "?"} CU of ${this.cfg.computeUnits})`);
       return "sent";
     }
     if (c.status === "failed" && c.code === VAULT_LP_ALLOCATE_REFUSED) {

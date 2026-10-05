@@ -43,6 +43,8 @@ interface Script {
   state?: Uint8Array | null;
   /** Throw from sendRawTransaction when this returns an error for the decoded tx. */
   sendError?: (tx: Transaction) => Error | null;
+  /** simulateTransaction error by the tag-78 instruction's account count (the resolved-harvest gate simulates first). */
+  simError?: (nKeys: number) => unknown;
 }
 
 function rig(s: Script) {
@@ -61,7 +63,9 @@ function rig(s: Script) {
       if (keys.length === 2 && keys[0].equals(MARKET)) return [{ data: s.market }, { data: LEDGER }];
       return keys.map(() => null);
     },
-    async simulateTransaction(vtx: { message: { staticAccountKeys: PublicKey[] } }) {
+    async simulateTransaction(vtx: { message: { compiledInstructions: Array<{ accountKeyIndexes: number[] }> } }) {
+      const err = s.simError?.(vtx.message.compiledInstructions[1].accountKeyIndexes.length);
+      if (err) return { value: { err, logs: [], accounts: null } };
       // resolved harvest gate: post-state differs -> "changes"
       return { value: { err: null, logs: [], accounts: [{ data: [Buffer.alloc(8, 1).toString("base64"), "base64"] }, { data: [Buffer.alloc(240, 9).toString("base64"), "base64"] }] } };
     },
@@ -220,6 +224,23 @@ describe("race: a tag 103 creates the ext between our registry read and our send
     assert.ok(typeof out === "object" && /insufficient account keys/.test(out.error));
     assert.equal(r.attempts.length, 1);
     assert.deepEqual(r.reads, ["registry+market"], "the RPC pattern is exactly the legacy one");
+  });
+
+  it("the Resolved terminal-flat path races the same way: the harvest simulation refuses the old shape, one retry carries the tail", async () => {
+    setP2bGate(new P2bFeatureGate({ ...DEFAULT_P2B_GATE_CONFIG, mode: "on" }, async () => "supported"));
+    try {
+      const r = rig({
+        registries: [registryBytes({ bound: true, ext: false }), registryBytes({ bound: true, ext: true })],
+        state: vaultLpStateBytes({ lp: LP }),
+        market: flatResolved(),
+        simError: (n) => (n < 9 ? { InstructionError: [1, "NotEnoughAccountKeys"] } : null),
+      });
+      assert.equal(await crankLpFeesOnce(r.conn as never, KEEPER, MARKET.toBase58(), false), "cranked");
+      assert.equal(r.attempts.length, 1, "nothing was sent with the old shape (the simulation gate refused it)");
+      assert.equal(crankIx(r.attempts[0]).keys.length, 9);
+    } finally {
+      setP2bGate(null);
+    }
   });
 
   it("an unbound market never retries", async () => {

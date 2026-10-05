@@ -284,7 +284,7 @@ export function classifyWindDownError(err: unknown, logs?: ReadonlyArray<string>
 /** What a successful simulation of tag 104 logged: "closed" (104, 1, ...), "armed" (104, 0, ...) or nothing recognisable. */
 export function windDownSimEffect(logs: ReadonlyArray<string> | null | undefined): "closed" | "armed" | "none" {
   for (const l of logs ?? []) {
-    const m = l.match(/Program log: 0x68, 0x([01]),/);
+    const m = l.match(/0x68, 0x([01]),/);
     if (m) return m[1] === "1" ? "closed" : "armed";
   }
   return "none";
@@ -507,7 +507,7 @@ export class AdlWindDownRunner {
       this.log(`[p2b-wind-down] ${snap.ref.label}: tag 104 (${want}) ${c.status === "failed" ? "landed but failed on chain" : "not landed"} sig=${sig.slice(0, 16)}…`);
       return "failed";
     }
-    this.log(`[p2b-wind-down] ${snap.ref.label}: tag 104 (${want}) landed on ${h.pubkey.toBase58().slice(0, 8)}… sig=${sig.slice(0, 16)}…`);
+    this.log(`[p2b-wind-down] ${snap.ref.label}: tag 104 (${want}) landed on ${h.pubkey.toBase58().slice(0, 8)}… sig=${sig.slice(0, 16)}… (simulated ${sim.value.unitsConsumed ?? "?"} CU of ${this.cfg.computeUnits})`);
     return want === "close" ? "sent-closed" : "sent-armed";
   }
 }
