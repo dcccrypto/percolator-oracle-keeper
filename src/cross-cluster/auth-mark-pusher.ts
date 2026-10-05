@@ -51,7 +51,6 @@ import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
 import { isLiveMarket, isTerminalMarket } from "./market-state.ts";
 import {
   buildV1Wire,
-  fallbackAllowed,
   getTxV1Settings,
   isFormatRejection,
   isV1BudgetError,
@@ -1172,10 +1171,18 @@ export async function pushAuthMarkBatch(
     return simErr;
   };
 
-  /** Latch v1 off (auto) for the cooldown; the caller re-sends the unsent items in legacy. */
+  /**
+   * Latch v1 off for the cooldown (auto) and re-send the unsent items in legacy. TX_V1=on also
+   * falls back for THIS cycle (a push cycle is never skipped for a runtime rejection) but is
+   * not suspended, so the next cycle tries v1 again; it logs as an error since `on` asserted v1.
+   */
   const v1Unusable = (reason: string): void => {
     noteV1Fallback(reason);
-    console.warn(`[push][TX_V1] ${reason} — ${fallbackAllowed() ? "falling back to legacy" : "TX_V1=on: NOT falling back (fail closed)"}`);
+    if (getTxV1Settings().mode === "on") {
+      console.error(`[push][TX_V1] ${reason} — TX_V1=on: falling back to legacy for THIS cycle (v1 retried next cycle)`);
+    } else {
+      console.warn(`[push][TX_V1] ${reason} — falling back to legacy`);
+    }
   };
 
   /** Record a proven revert against ONE market (strikes -> quarantine). */
@@ -1345,12 +1352,8 @@ export async function pushAuthMarkBatch(
     queue = queue.slice(1);
     const unsent = await pushChunk(chunk, format);
     if (unsent.length > 0) {
-      // v1 became unusable: re-plan everything not yet sent in legacy (auto), or stop (on).
+      // v1 became unusable: re-plan everything not yet sent in legacy (auto and on alike).
       const rest = [...unsent, ...queue.flat()];
-      if (!fallbackAllowed()) {
-        errors.push(`${rest.length} market(s): TX_V1=on and v1 unusable — not sent (fail closed)`);
-        break;
-      }
       format = "legacy";
       queue = chunkFor("legacy", rest);
     }

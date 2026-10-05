@@ -443,7 +443,7 @@ describe("format rejection is classified by JSON-RPC CODE only (SDK-3)", () => {
   });
 });
 
-describe("TX_V1=on fails closed", () => {
+describe("TX_V1=on: fails closed only on detection; a runtime rejection never skips a cycle (K-4)", () => {
   it("cluster without v1: nothing simulated, nothing sent, every market skipped", async () => {
     const ms = seededMarkets(40, 12);
     settings({ TX_V1: "on" });
@@ -455,13 +455,31 @@ describe("TX_V1=on fails closed", () => {
     assert.equal(txV1Stats.failClosedCycles, 1);
   });
 
-  it("a format rejection under TX_V1=on is NOT downgraded to legacy", async () => {
+  it("a send-time format rejection under TX_V1=on falls back to legacy for THAT cycle; the next cycle tries v1 again", async () => {
     const ms = seededMarkets(41, 12);
     settings({ TX_V1: "on" });
     const m = mockConn({ markets: ms, v1Active: true, v1SendReject: true });
     const res = await cycle(m.conn, ms);
-    assert.equal(m.attempts.filter((a) => a.format === "legacy").length, 0);
-    assert.equal(res.pushedMarkets.length, 0);
+    assert.equal(m.attempts.filter((a) => a.format === "v1").length, 1, "one v1 attempt");
+    assert.ok(m.accepted().length > 0 && m.accepted().every((a) => a.format === "legacy"));
+    assertEachPushedOnce(m.accepted(), ms);
+    assert.equal(res.pushedMarkets.length, 12, "no market skipped");
+    assert.equal(txV1Stats.fallbacks, 1);
+    const before = m.attempts.length;
+    await cycle(m.conn, ms, GOLDEN_NOW_SLOT + 1n);
+    assert.equal(m.attempts[before]!.format, "v1", "on is not suspended: v1 is tried again next cycle");
+  });
+
+  it("a preflight format rejection or v1 budget error under TX_V1=on still pushes every market (legacy)", async () => {
+    const ms = seededMarkets(42, 20);
+    for (const o of [{ v1SimReject: true }, { v1SimErr: "MaxLoadedAccountsDataSizeExceeded" }]) {
+      settings({ TX_V1: "on" });
+      const m = mockConn({ markets: ms, v1Active: true, ...o });
+      const res = await cycle(m.conn, ms);
+      assert.equal(m.attempts.filter((a) => a.format === "v1").length, 0);
+      assertEachPushedOnce(m.accepted(), ms);
+      assert.equal(res.pushedMarkets.length, 20, JSON.stringify(o));
+    }
   });
 });
 

@@ -7,8 +7,10 @@
  *
  *   - `TX_V1=off|auto|on` (default `off`). `auto` uses v1 only while the cluster reports the
  *     v1 feature gate active (`detectTxV1Support`, cached per connection) and no v1 tx has been
- *     rejected for FORMAT reasons recently. `on` requires v1 and FAILS CLOSED (no legacy
- *     send) when the cluster does not report it active.
+ *     rejected for FORMAT reasons recently. `on` requires the cluster to REPORT v1 (a cluster
+ *     that does not is a config error: no push that cycle, loud), but a runtime rejection never
+ *     skips a push cycle: that cycle falls back to legacy, loudly, and the next cycle tries v1
+ *     again (no suspension for `on`).
  *   - Fallback is ONLY for format rejections (the node/cluster could not take the bytes, so
  *     nothing was accepted and resending in legacy cannot double-send) and for v1 budget
  *     misconfiguration found in PREFLIGHT (compute or loaded-accounts limit too low — the tx was
@@ -238,11 +240,6 @@ export function noteV1Fallback(reason: string, nowMs: number = Date.now()): void
   txV1Stats.fallbacks++;
   suspendedUntilMs = nowMs + settings.retryAfterRejectMs;
   lastSuspendReason = reason.slice(0, 200);
-}
-
-/** Whether a fallback to legacy is allowed (`on` forbids it: fail closed instead). */
-export function fallbackAllowed(): boolean {
-  return settings.mode !== "on";
 }
 
 /** Instruction index of the first payload ix: legacy txs carry a ComputeBudget ix at 0. */

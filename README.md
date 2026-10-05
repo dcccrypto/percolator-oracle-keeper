@@ -143,7 +143,7 @@ bytes it sent before (pinned by a golden test against the pre-v1 commit).
 |---------|-----------|
 | `off` (default) | Legacy txs, 13 markets per tx (1,232-byte limit). |
 | `auto` | v1 while the devnet feature gate reports it active; on a FORMAT rejection (or a v1 CU / loaded-size error in preflight) the unsent markets go out in legacy and v1 is suspended for `TX_V1_RETRY_AFTER_REJECT_MS`. Program errors never fall back or resend. |
-| `on` | v1 only. A cluster without v1, or a v1 rejection, means no push that cycle (fail closed). |
+| `on` | Requires the cluster to REPORT v1: a cluster without it is a config error, so no push that cycle (fail closed, loud). A runtime v1 rejection (format, or a v1 budget error in preflight) never skips a cycle: that cycle falls back to legacy and logs an error, and the next cycle tries v1 again (no suspension). For testing a cluster; use `auto` in production. |
 
 Measured on devnet (48 live markets): legacy 4 txs per cycle (1,142 / 1,142 / 1,142 / 854 B), v1 1 tx (3,682 B,
 247,773 CU, loaded 3,590,545 B). A v1 tx is atomic like a legacy chunk: preflight still excludes a reverting
