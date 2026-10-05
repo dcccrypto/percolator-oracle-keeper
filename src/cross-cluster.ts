@@ -48,10 +48,17 @@
  *   REGISTER_SOURCE_URL     GET endpoint polled for wizard-registered markets (unset = disabled)
  *   REGISTER_POLL_INTERVAL_MS  register-poll interval ms (default: 30000)
  *   REGISTRY_RELOAD_INTERVAL_MS  G6 registry.json hot-reload interval ms (default: 15000)
+ *   KEEPER_FREEZE_INTAKE    "1": v1 wind-down; admit no new market (poll, Realtime, registry.json additions), prune nothing
+ *   KEEPER_RETIRE_ENABLED   "1": run the per-market retire pass (OI = 0 and nothing inside); DRY-RUN unless KEEPER_RETIRE_APPLY=1
+ *   KEEPER_RETIRE_APPLY / KEEPER_RETIRE_INTERVAL_MS (default 600000) / KEEPER_RETIRE_THRESHOLD_UNITS (whole tokens, default 1)
+ *   KEEPER_RETIRE_CONFIRM_READS (consecutive passes, default 3, min 2) / KEEPER_RETIRE_MIN_AGE_MS (default 86400000)
+ *   KEEPER_RETIRE_HARD_DATE ISO date; past it a market that still holds OI or funds retires only if
+ *                           KEEPER_RETIRE_HARD_CONFIRM repeats the same date (retire.ts)
  *
  * CLI flags:
  *   --dry-run             same as DRY_RUN=true
  */
+import { RetiredSet, readMarketEconomics, retireConfigFromEnv, startRetireLoop } from "./cross-cluster/retire.ts";
 import { Connection, Keypair } from "@solana/web3.js";
 import fs from "fs";
 import path from "path";
@@ -494,8 +501,15 @@ const vaultLpCranker =
 // rather than the Vercel blob, so Supabase config — not REGISTER_SOURCE_URL — is
 // what gates registration. The blob was a second store that the Realtime
 // notification this keeper already subscribes to pointed away from.
+// v1 wind-down: KEEPER_FREEZE_INTAKE=1 admits no new market (poll, Realtime, registry.json
+// additions) and prunes nothing; the existing registry keeps being priced and cranked.
+const FREEZE_INTAKE = process.env.KEEPER_FREEZE_INTAKE === "1" || process.env.KEEPER_FREEZE_INTAKE === "true";
+const RETIRED = new RetiredSet(`${REGISTRY_PATH}.retired.json`);
+if (FREEZE_INTAKE) console.log("[cross-cluster] KEEPER_FREEZE_INTAKE on: no new market will be admitted");
 if (SUPABASE_URL && SUPABASE_ANON_KEY) {
   const registerPollConfig = {
+    freezeIntake: FREEZE_INTAKE,
+    isRetired: RETIRED.has,
     db: {
       supabaseUrl: SUPABASE_URL,
       supabaseAnonKey: SUPABASE_ANON_KEY,
@@ -519,7 +533,7 @@ if (SUPABASE_URL && SUPABASE_ANON_KEY) {
   // for the next tick. It TRIGGERS the poll rather than replacing it — one code
   // path still admits a market, and if the socket drops the loop below covers
   // it. See cross-cluster/registration-stream.ts.
-  {
+  if (!FREEZE_INTAKE) {
     registrationStream = startRegistrationStream({
       supabaseUrl: SUPABASE_URL,
       supabaseAnonKey: SUPABASE_ANON_KEY,
@@ -552,11 +566,28 @@ if (SUPABASE_URL && SUPABASE_ANON_KEY) {
 void startRegistryReloadLoop(registry, {
   registryPath: REGISTRY_PATH,
   intervalMs: REGISTRY_RELOAD_INTERVAL_MS,
+  freezeIntake: FREEZE_INTAKE,
 }).catch((err) => {
   console.error(
     `[registry-reload] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
   );
 });
+
+// Per-market retire at OI = 0 (retire.ts). Off unless KEEPER_RETIRE_ENABLED=1; dry-run unless
+// KEEPER_RETIRE_APPLY=1 (and never applied while the keeper itself is in DRY_RUN).
+if (process.env.KEEPER_RETIRE_ENABLED === "1") {
+  void startRetireLoop(
+    registry,
+    {
+      read: (m) => readMarketEconomics(devnetConn, m, CFG_WRAPPER_PROGRAM_ID),
+      cfg: retireConfigFromEnv(process.env, Date.now()),
+      apply: process.env.KEEPER_RETIRE_APPLY === "1" && !DRY_RUN,
+      registryPath: REGISTRY_PATH,
+      retired: RETIRED,
+    },
+    Number(process.env.KEEPER_RETIRE_INTERVAL_MS ?? 600_000) || 600_000,
+  ).catch((err) => console.error(`[retire] loop crashed (pricing unaffected): ${err instanceof Error ? err.message : String(err)}`));
+}
 
 // #100 — announce the liquidity floor's state. Off by default, because the value
 // is a policy call that depends on the depth of the markets actually listed, and
