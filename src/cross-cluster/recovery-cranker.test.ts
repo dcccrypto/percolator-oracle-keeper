@@ -35,7 +35,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { PublicKey } from "@solana/web3.js";
 import { buildCrankIx } from "./recovery-cranker.ts";
-import { IX_TAG, PROGRAM_IDS_V17, CRANK_OBSERVATION_DECODE_MAX } from "@percolatorct/sdk";
+import { IX_TAG, PROGRAM_IDS_DEVNET_V1, PROGRAM_IDS_V17, CRANK_OBSERVATION_DECODE_MAX } from "@percolatorct/sdk";
 
 const OWNER = PublicKey.unique();
 const MARKET = PublicKey.unique();
@@ -148,9 +148,10 @@ describe("buildCrankIx — PermissionlessCrank v18 (v16-migration) wire format",
     assert.notDeepEqual([...ix.data], [...oldShapeBadPayload]);
   });
 
-  it("targets the v17 wrapper program", () => {
+  it("targets the v1 (ETDLAdi) wrapper the keeper resolves at runtime, not the SDK's moved v2.1 default", () => {
     const ix = buildCrankIx(OWNER, MARKET, PORTFOLIO);
-    assert.equal(ix.programId.toBase58(), PROGRAM_IDS_V17.percolator);
+    assert.equal(ix.programId.toBase58(), PROGRAM_IDS_DEVNET_V1.percolator);
+    assert.notEqual(ix.programId.toBase58(), PROGRAM_IDS_V17.percolator);
   });
 
   // 2026-07-17 fresh devnet triple cutover: the assertion above re-imports
