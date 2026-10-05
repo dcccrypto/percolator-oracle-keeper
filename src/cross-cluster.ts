@@ -50,8 +50,10 @@
  *   REGISTRY_RELOAD_INTERVAL_MS  G6 registry.json hot-reload interval ms (default: 15000)
  *   KEEPER_FREEZE_INTAKE    "1": v1 wind-down; admit no new market (poll, Realtime, registry.json additions), prune nothing
  *   KEEPER_RETIRE_ENABLED   "1": run the per-market retire pass (OI = 0 and nothing inside); DRY-RUN unless KEEPER_RETIRE_APPLY=1
- *   KEEPER_RETIRE_APPLY / KEEPER_RETIRE_INTERVAL_MS (default 600000) / KEEPER_RETIRE_THRESHOLD_ATOMS (default 1000000)
- *   KEEPER_RETIRE_HARD_DATE ISO date after which every market is retired regardless of contents (retire.ts)
+ *   KEEPER_RETIRE_APPLY / KEEPER_RETIRE_INTERVAL_MS (default 600000) / KEEPER_RETIRE_THRESHOLD_UNITS (whole tokens, default 1)
+ *   KEEPER_RETIRE_CONFIRM_READS (consecutive passes, default 3, min 2) / KEEPER_RETIRE_MIN_AGE_MS (default 86400000)
+ *   KEEPER_RETIRE_HARD_DATE ISO date; past it a market that still holds OI or funds retires only if
+ *                           KEEPER_RETIRE_HARD_CONFIRM repeats the same date (retire.ts)
  *
  * CLI flags:
  *   --dry-run             same as DRY_RUN=true
