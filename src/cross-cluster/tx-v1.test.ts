@@ -124,6 +124,8 @@ interface Attempt {
 function mockConn(o: MockOpts) {
   const attempts: Attempt[] = [];
   const sims: Array<{ format: "v1" | "legacy"; markets: string[] }> = [];
+  /** Simulates and sends in call order ("sim:<n markets>" / "send:<n markets>"). */
+  const events: string[] = [];
   const statuses = new Map<string, unknown>();
   let featureReads = 0;
   const evalPushes = (ms: string[], offset: number): unknown => {
@@ -145,6 +147,7 @@ function mockConn(o: MockOpts) {
     async simulateTransaction(tx: { instructions: Array<{ keys: Array<{ pubkey: { toBase58(): string } }> }> }) {
       const ms = tx.instructions.slice(1).map((ix) => ix.keys[1]!.pubkey.toBase58());
       sims.push({ format: "legacy", markets: ms });
+      events.push(`sim:${ms.length}`);
       return { value: { err: evalPushes(ms, 1), logs: [] } };
     },
     async _rpcRequest(method: string, args: unknown[]) {
@@ -160,6 +163,7 @@ function mockConn(o: MockOpts) {
       if (o.v1SimReject) return { error: { code: FORMAT_REJECTION_CODE, message: FORMAT_REJECTION } };
       const ms = marketsInWire(wire, WRAPPER);
       sims.push({ format: "v1", markets: ms });
+      events.push(`sim:${ms.length}`);
       return { result: { value: { err: o.v1SimErr ?? evalPushes(ms, 0), logs: [] } } };
     },
     async sendRawTransaction(raw: Uint8Array) {
@@ -167,6 +171,7 @@ function mockConn(o: MockOpts) {
       const format = wire[0] === 0x81 ? "v1" : "legacy";
       const a: Attempt = { format, wire, accepted: false, markets: marketsInWire(wire, WRAPPER) };
       attempts.push(a);
+      events.push(`send:${a.markets.length}`);
       if (format === "v1" && o.v1SendReject) {
         // Exactly what web3.js 1.99 sendEncodedTransaction does with a JSON-RPC error reply:
         // ask the transport, then throw a SendTransactionError carrying only the MESSAGE.
@@ -187,6 +192,7 @@ function mockConn(o: MockOpts) {
     conn,
     attempts,
     sims,
+    events,
     statuses,
     accepted: () => attempts.filter((a) => a.accepted),
     featureReads: () => featureReads,
@@ -235,7 +241,7 @@ describe("TX_V1=auto on a v1 cluster: fewer txs", () => {
     await cycle(legacy.conn, ms);
     assert.equal(legacy.accepted().length, 3, "legacy baseline: 13 + 13 + 13");
 
-    settings({ TX_V1: "auto" });
+    settings({ TX_V1: "auto", TX_V1_PUSH_MAX_MARKETS: "0" });
     const v1 = mockConn({ markets: ms, v1Active: true });
     const res = await cycle(v1.conn, ms, GOLDEN_NOW_SLOT + 1n);
     assert.equal(v1.accepted().length, 1);
@@ -267,13 +273,24 @@ describe("TX_V1=auto on a v1 cluster: fewer txs", () => {
     }
   });
 
-  it("48 markets (the live devnet set size): 4 legacy txs -> 1 v1 tx", async () => {
+  it("48 markets (the live devnet set size), TX_V1_PUSH_MAX_MARKETS=0: 4 legacy txs -> 1 v1 tx", async () => {
     const ms = seededMarkets(12, 48);
-    settings({ TX_V1: "auto" });
+    settings({ TX_V1: "auto", TX_V1_PUSH_MAX_MARKETS: "0" });
     const m = mockConn({ markets: ms, v1Active: true });
     await cycle(m.conn, ms);
     assert.equal(m.accepted().length, 1);
     assert.equal(txV1Stats.lastCycleBaselineTxs, 4);
+    assertEachPushedOnce(m.accepted(), ms);
+  });
+
+  it("K-1(b): TX_V1_PUSH_MAX_MARKETS defaults to 16 (48 markets -> 16 + 16 + 16); 0 is explicit only", async () => {
+    assert.equal(parseTxV1Settings({}).pushMaxMarkets, 16);
+    assert.equal(parseTxV1Settings({ TX_V1_PUSH_MAX_MARKETS: "0" }).pushMaxMarkets, 0);
+    const ms = seededMarkets(15, 48);
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: true });
+    await cycle(m.conn, ms);
+    assert.deepEqual(m.accepted().map((a) => a.markets.length), [16, 16, 16]);
     assertEachPushedOnce(m.accepted(), ms);
   });
 
@@ -337,23 +354,54 @@ describe("fallback only on a FORMAT rejection, never lost or duplicated", () => 
 });
 
 describe("an on-chain error never falls back or resends", () => {
-  it("a reverting market is excluded (v1 ix index, no ComputeBudget offset); the rest go in ONE v1 tx", async () => {
+  it("K-1(a): a reverting market is excluded (v1 ix index); the prefix its simulate proved is SENT FIRST, then the rest", async () => {
     const ms = seededMarkets(30, 39);
     const bad = ms[17]!;
-    settings({ TX_V1: "auto" });
+    settings({ TX_V1: "auto", TX_V1_PUSH_MAX_MARKETS: "0" });
     const m = mockConn({ markets: ms, v1Active: true, locked: new Set([bad]) });
     const res = await cycle(m.conn, ms);
-    assert.equal(m.accepted().length, 1);
-    assert.equal(m.accepted()[0]!.format, "v1");
-    assert.deepEqual(m.accepted()[0]!.markets, ms.filter((x) => x !== bad), "exactly the culprit excluded");
+    assert.deepEqual(
+      m.accepted().map((a) => a.markets),
+      [ms.slice(0, 17), ms.slice(18)],
+      "proven prefix 0..16, culprit 17 excluded, remainder 18..38",
+    );
+    assert.deepEqual(m.events, ["sim:39", "send:17", "sim:21", "send:21"], "the prefix goes out before the remainder is re-simulated");
     assert.deepEqual(res.skippedMarkets, [bad]);
     assert.equal(txV1Stats.fallbacks, 0);
     assert.ok(m.attempts.every((a) => a.format === "v1"));
   });
 
+  it("K-1(a): several bad markets: each proven prefix is sent before the next isolation simulate", async () => {
+    const ms = seededMarkets(34, 16);
+    const bad = new Set([ms[3]!, ms[9]!, ms[10]!]);
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: true, locked: bad });
+    const res = await cycle(m.conn, ms);
+    assert.deepEqual(m.events, ["sim:16", "send:3", "sim:12", "send:5", "sim:6", "sim:5", "send:5"]);
+    assertEachPushedOnce(m.accepted(), ms.filter((x) => !bad.has(x)));
+    assert.deepEqual([...res.skippedMarkets].sort(), [...bad].sort());
+  });
+
+  it("K-1(c): isolation re-simulations are capped per cycle; the rest waits (not struck, not quarantined)", async () => {
+    const ms = seededMarkets(35, 16);
+    const bad = new Set([ms[1]!, ms[3]!, ms[5]!, ms[7]!, ms[9]!]);
+    settings({ TX_V1: "auto", TX_V1_ISOLATION_MAX_SIMS: "2" });
+    const m = mockConn({ markets: ms, v1Active: true, locked: bad });
+    const res = await cycle(m.conn, ms);
+    assert.equal(m.sims.length, 3, "first simulate + 2 isolation re-simulations");
+    assert.deepEqual(m.accepted().map((a) => a.markets), [ms.slice(0, 1), ms.slice(2, 3), ms.slice(4, 5)]);
+    assert.equal(txV1Stats.lastCycleIsolationSims, 2);
+    assert.equal(txV1Stats.isolationCapHits, 1);
+    // ms[5] (bad) and everything after it wait for the next cycle; only the 3 PROVEN culprits were struck.
+    assert.equal(res.skippedMarkets.length, 16 - 3);
+    assert.deepEqual(getQuarantinedMarkets().filter((q) => ms.includes(q)), []);
+    assert.equal(parseTxV1Settings({}).isolationMaxSims, 8);
+    assert.throws(() => parseTxV1Settings({ TX_V1_ISOLATION_MAX_SIMS: "0" }), /TX_V1_ISOLATION_MAX_SIMS/);
+  });
+
   it("a non-format send error is recorded and NOT resent in any format", async () => {
     const ms = seededMarkets(31, 39);
-    settings({ TX_V1: "auto" });
+    settings({ TX_V1: "auto", TX_V1_PUSH_MAX_MARKETS: "0" });
     const m = mockConn({
       markets: ms,
       v1Active: true,
@@ -496,6 +544,42 @@ describe("landed v1 reverts are classified with the v1 instruction offset", () =
     m.statuses.set("sig2", { err: null });
     await reconcilePushOutcomes(m.conn as never, Date.now() + 10_000);
     assert.deepEqual({ late: pushLandingStats.lateDuplicateReverts, other: pushLandingStats.otherReverts, ok: pushLandingStats.landedOk }, { late: 1, other: 0, ok: 1 });
+    // The benign late duplicate must NOT suspend v1.
+    assert.equal(txV1Stats.landingSuspensions, 0);
+    const before = m.attempts.length;
+    await cycle(m.conn, ms, GOLDEN_NOW_SLOT + 2n);
+    assert.equal(m.attempts[before]!.format, "v1");
+  });
+
+  for (const mode of ["auto", "on"] as const) {
+    it(`K-1(d): any other LANDED v1 revert suspends v1 (${mode}); the next cycle is legacy`, async () => {
+      resetPushLandingState();
+      const ms = seededMarkets(51, 5);
+      settings({ TX_V1: mode });
+      const m = mockConn({ markets: ms, v1Active: true });
+      await cycle(m.conn, ms);
+      m.statuses.set("sig1", { err: { InstructionError: [2, { Custom: 21 }] } });
+      await reconcilePushOutcomes(m.conn as never, Date.now() + 10_000);
+      assert.equal(pushLandingStats.otherReverts, 1);
+      assert.equal(txV1Stats.landingSuspensions, 1);
+      const before = m.attempts.length;
+      await cycle(m.conn, ms, GOLDEN_NOW_SLOT + 1n);
+      assert.ok(m.attempts.length > before && m.attempts.slice(before).every((a) => a.format === "legacy"));
+      const h = (await import("./tx-v1.ts")).txV1HealthFields() as { txV1: { suspended: boolean; suspendedKind: string } };
+      assert.deepEqual({ s: h.txV1.suspended, k: h.txV1.suspendedKind }, { s: true, k: "landing" });
+    });
+  }
+
+  it("K-1(d): a landed LEGACY revert does not touch v1", async () => {
+    resetPushLandingState();
+    const ms = seededMarkets(52, 5);
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: false }); // auto on a cluster without v1 -> legacy
+    await cycle(m.conn, ms);
+    m.statuses.set("sig1", { err: { InstructionError: [2, { Custom: 21 }] } });
+    await reconcilePushOutcomes(m.conn as never, Date.now() + 10_000);
+    assert.equal(pushLandingStats.otherReverts, 1);
+    assert.equal(txV1Stats.landingSuspensions, 0);
   });
 });
 

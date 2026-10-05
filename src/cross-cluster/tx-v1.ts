@@ -61,8 +61,18 @@ export const LOADED_ACCOUNT_BASE_BYTES = 64;
 export interface TxV1Settings {
   /** TX_V1. */
   mode: TxV1Mode;
-  /** TX_V1_PUSH_MAX_MARKETS: max PushAuthMark markets per v1 tx; 0 = all that fit (bytes/accounts/CU). */
+  /**
+   * TX_V1_PUSH_MAX_MARKETS: max PushAuthMark markets per v1 tx (default 16, about the legacy 13 so an
+   * on-chain revert after a clean preflight costs a similar blast radius); 0 = all that fit
+   * (bytes/accounts/CU/loaded size), allowed only explicitly.
+   */
   pushMaxMarkets: number;
+  /**
+   * TX_V1_ISOLATION_MAX_SIMS: re-simulations per push cycle spent isolating reverting markets in v1
+   * (every simulate after a chunk's first). When spent, the rest of that chunk waits for the next
+   * cycle (not struck), so k bad markets cannot delay honest pushes by k round trips without bound.
+   */
+  isolationMaxSims: number;
   /** TX_V1_PUSH_CU_PER_MARKET: CU budgeted per PushAuthMark in a v1 tx (measured ~5.2k on devnet). */
   pushCuPerMarket: number;
   /** TX_V1_PUSH_CU_BASE: fixed CU added to every v1 push tx. */
@@ -98,7 +108,8 @@ export const LOADED_HEADROOM = 1.25;
 
 export const DEFAULT_TX_V1_SETTINGS: Readonly<TxV1Settings> = Object.freeze({
   mode: "off",
-  pushMaxMarkets: 0,
+  pushMaxMarkets: 16,
+  isolationMaxSims: 8,
   pushCuPerMarket: DEFAULT_PUSH_CU_PER_MARKET,
   pushCuBase: DEFAULT_PUSH_CU_BASE,
   loadedAccountsBytes: null,
@@ -140,7 +151,8 @@ export function parseTxV1Settings(env: Readonly<Record<string, string | undefine
   const loadedRaw = env.TX_V1_LOADED_ACCOUNTS_BYTES?.trim();
   return {
     mode,
-    pushMaxMarkets: intEnv(env, "TX_V1_PUSH_MAX_MARKETS", 0, 0, 64),
+    pushMaxMarkets: intEnv(env, "TX_V1_PUSH_MAX_MARKETS", DEFAULT_TX_V1_SETTINGS.pushMaxMarkets, 0, 64),
+    isolationMaxSims: intEnv(env, "TX_V1_ISOLATION_MAX_SIMS", DEFAULT_TX_V1_SETTINGS.isolationMaxSims, 1, 256),
     pushCuPerMarket: intEnv(env, "TX_V1_PUSH_CU_PER_MARKET", DEFAULT_PUSH_CU_PER_MARKET, 1_000, 200_000),
     pushCuBase: intEnv(env, "TX_V1_PUSH_CU_BASE", DEFAULT_PUSH_CU_BASE, 0, 200_000),
     loadedAccountsBytes:
@@ -154,8 +166,13 @@ export function parseTxV1Settings(env: Readonly<Record<string, string | undefine
 }
 
 let settings: TxV1Settings = { ...DEFAULT_TX_V1_SETTINGS };
-/** v1 suspended until this time (ms) after a fallback. */
+/** v1 suspended until this time (ms) after a fallback (format/budget REJECTION; honoured by auto only). */
 let suspendedUntilMs = 0;
+/**
+ * v1 suspended until this time (ms) on LANDING evidence (a landed v1 revert, an unlanded canary).
+ * Honoured by auto AND on: the v1 txs are being sent but are not producing marks.
+ */
+let landingSuspendedUntilMs = 0;
 let lastSuspendReason: string | null = null;
 
 /** Observability: /health `txV1` and the per-cycle log. */
@@ -172,6 +189,12 @@ export const txV1Stats = {
   fallbacks: 0,
   /** Cycles refused because TX_V1=on and the cluster does not report v1 active. */
   failClosedCycles: 0,
+  /** v1 suspensions on landing evidence (landed v1 revert / unlanded canary). */
+  landingSuspensions: 0,
+  /** v1 isolation re-simulations in the last cycle (capped by TX_V1_ISOLATION_MAX_SIMS). */
+  lastCycleIsolationSims: 0,
+  /** Cycles in which the isolation cap was hit (some markets waited for the next cycle). */
+  isolationCapHits: 0,
 };
 
 export function configureTxV1(s: TxV1Settings): void {
@@ -185,6 +208,7 @@ export function getTxV1Settings(): Readonly<TxV1Settings> {
 export function resetTxV1ForTests(s: TxV1Settings = { ...DEFAULT_TX_V1_SETTINGS }): void {
   settings = { ...s };
   suspendedUntilMs = 0;
+  landingSuspendedUntilMs = 0;
   lastSuspendReason = null;
   txV1Stats.lastFormat = null;
   txV1Stats.lastCycleTxs = 0;
@@ -193,6 +217,9 @@ export function resetTxV1ForTests(s: TxV1Settings = { ...DEFAULT_TX_V1_SETTINGS 
   txV1Stats.legacyTxsSent = 0;
   txV1Stats.fallbacks = 0;
   txV1Stats.failClosedCycles = 0;
+  txV1Stats.landingSuspensions = 0;
+  txV1Stats.lastCycleIsolationSims = 0;
+  txV1Stats.isolationCapHits = 0;
 }
 
 /** /health fields: `{ txV1: {...} }` when TX_V1 is auto/on, `{}` when off (default /health unchanged). */
@@ -201,8 +228,9 @@ export function txV1HealthFields(nowMs: number = Date.now()): Record<string, unk
   return {
     txV1: {
       mode: settings.mode,
-      suspended: nowMs < suspendedUntilMs,
-      suspendedReason: nowMs < suspendedUntilMs ? lastSuspendReason : null,
+      suspended: nowMs < Math.max(suspendedUntilMs, landingSuspendedUntilMs),
+      suspendedKind: nowMs < landingSuspendedUntilMs ? "landing" : nowMs < suspendedUntilMs ? "rejection" : null,
+      suspendedReason: nowMs < Math.max(suspendedUntilMs, landingSuspendedUntilMs) ? lastSuspendReason : null,
       ...txV1Stats,
     },
   };
@@ -228,10 +256,12 @@ export async function resolveSendFormat(
     // Explicitly required: never silently downgrade. A cluster/RPC that does not report v1
     // means "do not send", and is loud.
     if (!supported) return { format: null, reason: "TX_V1=on but the cluster does not report Transaction v1 active (or the feature read failed)" };
+    // Landing evidence (landed v1 revert / unlanded canary) suspends v1 even under `on`.
+    if (nowMs < landingSuspendedUntilMs) return { format: "legacy" };
     return { format: "v1" };
   }
   if (!supported) return { format: "legacy" };
-  if (nowMs < suspendedUntilMs) return { format: "legacy" };
+  if (nowMs < Math.max(suspendedUntilMs, landingSuspendedUntilMs)) return { format: "legacy" };
   return { format: "v1" };
 }
 
@@ -240,6 +270,21 @@ export function noteV1Fallback(reason: string, nowMs: number = Date.now()): void
   txV1Stats.fallbacks++;
   suspendedUntilMs = nowMs + settings.retryAfterRejectMs;
   lastSuspendReason = reason.slice(0, 200);
+}
+
+/**
+ * Suspend v1 (auto AND on) for `TX_V1_RETRY_AFTER_REJECT_MS` on LANDING evidence: a v1 tx landed
+ * and reverted for a reason other than the benign late duplicate, or a canary v1 tx never landed.
+ * Loud: this is the case the preflight cannot see.
+ */
+export function suspendV1ForLanding(reason: string, nowMs: number = Date.now()): void {
+  txV1Stats.landingSuspensions++;
+  landingSuspendedUntilMs = nowMs + settings.retryAfterRejectMs;
+  lastSuspendReason = reason.slice(0, 200);
+  console.error(
+    `[push][TX_V1] ${lastSuspendReason} — v1 SUSPENDED for ${Math.round(settings.retryAfterRejectMs / 60_000)}min ` +
+      `(legacy until then, mode=${settings.mode})`,
+  );
 }
 
 /** Instruction index of the first payload ix: legacy txs carry a ComputeBudget ix at 0. */

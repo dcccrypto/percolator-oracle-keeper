@@ -61,6 +61,7 @@ import {
   resolveSendFormat,
   sendWire,
   simulateWire,
+  suspendV1ForLanding,
   txV1Stats,
   v1Size,
   type KeeperTxFormat,
@@ -863,6 +864,8 @@ interface InFlightPush {
   items: Array<{ key: string; market: string; seq: bigint }>;
   /** Index of the first push ix in this tx (legacy 1: ComputeBudget at 0; v1 0). */
   ixOffset: number;
+  /** Format the tx was sent in (a landed v1 revert suspends v1). */
+  format: KeeperTxFormat;
 }
 const inFlightPushes: InFlightPush[] = [];
 const MAX_IN_FLIGHT_PUSHES = 64;
@@ -931,6 +934,16 @@ export async function reconcilePushOutcomes(devnetConn: Connection, nowMs: numbe
             `[push] LANDED REVERT ${f.signature.slice(0, 16)}… ${JSON.stringify(st.err).slice(0, 100)} — ` +
               `markets: ${f.items.map((it) => it.market.slice(0, 8) + "…").join(", ")}; not a superseded late duplicate`,
           );
+          // K-1(d): a v1 tx is atomic over up to TX_V1_PUSH_MAX_MARKETS markets, and a revert that
+          // only shows at landing (after a clean preflight) took ALL of them down. Go back to
+          // legacy's 13-market blast radius for the suspension window. The benign late duplicate
+          // above never gets here.
+          if (f.format === "v1") {
+            suspendV1ForLanding(
+              `landed v1 revert ${f.signature.slice(0, 16)}… ${JSON.stringify(st.err).slice(0, 80)} over ${f.items.length} market(s)`,
+              nowMs,
+            );
+          }
         }
       }
       const at = inFlightPushes.indexOf(f);
@@ -1111,6 +1124,28 @@ export async function pushAuthMarkBatch(
   const pushedMarkets: string[] = [];
   const errors: string[] = [];
   let txsSent = 0;
+  // K-1(c): v1 isolation re-simulations left this cycle.
+  let isolationSimsLeft = getTxV1Settings().isolationMaxSims;
+  let isolationSims = 0;
+  let isolationCapHit = false;
+  /** Spend one v1 isolation re-simulation; false (and the rest waits for next cycle) when spent. */
+  const takeIsolationSim = (waiting: AuthMarkPushItem[]): boolean => {
+    if (isolationSimsLeft > 0) {
+      isolationSimsLeft--;
+      isolationSims++;
+      return true;
+    }
+    if (!isolationCapHit) {
+      isolationCapHit = true;
+      txV1Stats.isolationCapHits++;
+    }
+    console.warn(
+      `[push][TX_V1] isolation cap (TX_V1_ISOLATION_MAX_SIMS=${getTxV1Settings().isolationMaxSims}) reached — ` +
+        `${waiting.length} market(s) wait for the next cycle (not struck)`,
+    );
+    errors.push(`${waiting.length} market(s): v1 isolation cap reached, deferred to next cycle`);
+    return false;
+  };
 
   /**
    * Preflight one tx so an ON-CHAIN revert is visible before we send.
@@ -1229,6 +1264,7 @@ export async function pushAuthMarkBatch(
         sentAtMs: Date.now(),
         items: chunk.map((p) => ({ key: pushGenerationKey(p), market: p.marketAddress, seq: p.observationSequence })),
         ixOffset: ixOffsetFor(format),
+        format,
       });
       if (inFlightPushes.length > MAX_IN_FLIGHT_PUSHES) inFlightPushes.splice(0, inFlightPushes.length - MAX_IN_FLIGHT_PUSHES);
       for (const p of chunk) {
@@ -1284,6 +1320,14 @@ export async function pushAuthMarkBatch(
    *   the remainder as ONE tx, in the same cycle.
    * - an error that does not name a push ix -> fall back to one-at-a-time.
    *
+   * v1 only (legacy is unchanged, byte for byte):
+   * - K-1(a) a simulate that stops at push p PROVES pushes 0..p-1 clean in that state, so
+   *   that prefix is SENT at once, before any isolation work on the rest. Honest markets
+   *   ahead of a bad one never wait for it.
+   * - K-1(c) every re-simulation after the chunk's first spends one of the cycle's
+   *   TX_V1_ISOLATION_MAX_SIMS; when spent, what is left of the chunk waits for the next
+   *   cycle (not struck).
+   *
    * Returns the markets NOT yet resolved (neither sent nor struck) when v1 became
    * unusable mid-chunk; the caller re-sends exactly those in legacy. [] otherwise.
    */
@@ -1294,8 +1338,10 @@ export async function pushAuthMarkBatch(
     let refreshesLeft = format === "legacy" ? 1 : Math.max(1, Math.round((baselineTxs * chunk.length) / pushable.length));
     const maxIterations = chunk.length + refreshesLeft;
     const offset = ixOffsetFor(format);
+    const v1 = format === "v1";
     // Each non-refresh iteration removes one market, so this is bounded.
     for (let guard = 0; pending.length > 0 && guard <= maxIterations; guard++) {
+      if (v1 && guard > 0 && !takeIsolationSim(pending)) return [];
       const simErr = await preflight(pending, format);
       if (simErr === V1_UNUSABLE) return pending;
       if (!simErr) {
@@ -1313,6 +1359,7 @@ export async function pushAuthMarkBatch(
         );
         for (let i = 0; i < pending.length; i++) {
           const single = pending[i];
+          if (v1 && !takeIsolationSim(pending.slice(i))) return [];
           const singleErr = await preflight([single], format);
           if (singleErr === V1_UNUSABLE) return pending.slice(i);
           if (singleErr) strike(single, singleErr);
@@ -1320,7 +1367,15 @@ export async function pushAuthMarkBatch(
         }
         return [];
       }
-      const culprit = pending[failing.position];
+      let position = failing.position;
+      if (v1 && position > 0) {
+        // K-1(a): this simulate ran pushes 0..position-1 successfully: send them now.
+        const prefix = pending.slice(0, position);
+        if (!(await send(prefix, format))) return pending; // format rejection: all of it goes legacy
+        pending = pending.slice(position);
+        position = 0;
+      }
+      const culprit = pending[position];
       if (failing.custom === ENGINE_STALE_CUSTOM && refreshesLeft > 0) {
         refreshesLeft--;
         const next = await refreshSequences(pending);
@@ -1334,7 +1389,7 @@ export async function pushAuthMarkBatch(
         }
       }
       strike(culprit, simErr);
-      pending = pending.filter((_, i) => i !== failing.position);
+      pending = pending.filter((_, i) => i !== position);
       if (pending.length > 0) {
         console.warn(
           `[push] ${culprit.marketAddress.slice(0, 8)}… reverted in preflight ` +
@@ -1360,6 +1415,7 @@ export async function pushAuthMarkBatch(
   }
 
   txV1Stats.lastFormat = startFormat;
+  txV1Stats.lastCycleIsolationSims = isolationSims;
   txV1Stats.lastCycleTxs = txsSent;
   txV1Stats.lastCycleBaselineTxs = baselineTxs;
   if (startFormat === "v1" || format !== startFormat) {

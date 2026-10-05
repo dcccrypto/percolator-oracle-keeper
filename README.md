@@ -148,8 +148,17 @@ bytes it sent before (pinned by a golden test against the pre-v1 commit).
 Measured on devnet (48 live markets): legacy 4 txs per cycle (1,142 / 1,142 / 1,142 / 854 B), v1 1 tx (3,682 B,
 247,773 CU, loaded 3,590,545 B). A v1 tx is atomic like a legacy chunk: preflight still excludes a reverting
 market and re-sends the rest in the same cycle, but a revert that only shows up on-chain (after a clean
-preflight) now affects every market in the tx instead of its 13-market chunk. `TX_V1_PUSH_MAX_MARKETS` caps
-markets per v1 tx (0 = all that fit). Other knobs: `TX_V1_PUSH_CU_PER_MARKET` (8000), `TX_V1_PUSH_CU_BASE`
+preflight) affects every market in the tx. Blast-radius controls (security review K-1):
+- `TX_V1_PUSH_MAX_MARKETS` (default **16**, about the legacy 13) caps markets per v1 tx; `0` = all that fit, only
+  when set explicitly.
+- When a v1 preflight stops at push p, pushes 0..p-1 (proven clean by that same simulate) are SENT at once, before
+  any isolation work on the rest.
+- `TX_V1_ISOLATION_MAX_SIMS` (default 8) caps the re-simulations spent isolating reverting markets per cycle; past
+  it, the rest of that chunk waits for the next cycle (not struck).
+- A v1 tx that LANDS and reverts (anything but the benign late-duplicate Custom(19)) suspends v1 for
+  `TX_V1_RETRY_AFTER_REJECT_MS`, under `auto` and `on`, logged as an error; `/health.txV1.suspendedKind` = `landing`.
+
+Other knobs: `TX_V1_PUSH_CU_PER_MARKET` (8000), `TX_V1_PUSH_CU_BASE`
 (10000), `TX_V1_LOADED_ACCOUNTS_BYTES` (unset = 1.25 x (2,000,000 + sum of slab bytes + 64 each)),
 `TX_V1_LOADED_OVERHEAD_BYTES` (2000000), `TX_V1_HEAP_BYTES` (0, like legacy). `/health` gains a `txV1` block
 (last cycle's tx count vs the legacy baseline, fallbacks) only when `TX_V1` is not off. Cranks and refreshes
