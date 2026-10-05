@@ -106,6 +106,8 @@ import { EarnGapMonitor, earnGapConfigFromEnv } from "./cross-cluster/p2b-earn-g
 import type { EarnGapConfig } from "./cross-cluster/p2b-earn-gap.ts";
 import { P2bLoop, p2bLoopConfigFromEnv, startP2bLoop } from "./cross-cluster/p2b-loop.ts";
 import type { P2bLoopConfig } from "./cross-cluster/p2b-loop.ts";
+import { CapacitySnapshotter, capacitySnapshotConfigFromEnv, createSupabaseSnapshotSink, startCapacitySnapshotLoop } from "./cross-cluster/capacity-snapshots.ts";
+import type { CapacitySnapshotConfig } from "./cross-cluster/capacity-snapshots.ts";
 import { setP2bHealthProvider } from "./cross-cluster/p2b-health.ts";
 import { fetchMarketPortfolios } from "./cross-cluster/recovery-cranker.ts";
 
@@ -202,6 +204,7 @@ let P2B_WIND_DOWN_CONFIG: WindDownConfig;
 let P2B_HEDGED_THRESHOLDS: HedgedLockoutThresholds;
 let P2B_EARN_GAP_CONFIG: EarnGapConfig;
 let P2B_LOOP_CONFIG: P2bLoopConfig;
+let CAPACITY_SNAPSHOT_CONFIG: CapacitySnapshotConfig;
 try {
   // Ops-track config fails fast with everything else: a malformed alert
   // threshold, webhook URL or fee-job knob must stop boot, not surface as a
@@ -227,6 +230,7 @@ try {
   P2B_HEDGED_THRESHOLDS = hedgedLockoutThresholdsFromEnv(process.env);
   P2B_EARN_GAP_CONFIG = earnGapConfigFromEnv(process.env);
   P2B_LOOP_CONFIG = p2bLoopConfigFromEnv(process.env, MIN_KEEPER_BALANCE_LAMPORTS, BALANCE_CHECK_INTERVAL_MS);
+  CAPACITY_SNAPSHOT_CONFIG = capacitySnapshotConfigFromEnv(process.env);
 } catch (err) {
   console.error(`[fatal] ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
@@ -568,6 +572,20 @@ if (P2B_GATE_CONFIG.mode !== "off") {
   setP2bHealthProvider(() => p2bLoop.healthFields());
   void startP2bLoop(p2bLoop, P2B_LOOP_CONFIG).catch((err: unknown) => {
     console.error(`[p2b] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`);
+  });
+}
+
+// Growth telemetry (market_capacity_snapshots). OFF unless KEEPER_CAPACITY_SNAPSHOTS=1; read-only on
+// chain, growth markets only, never throws out of scope (cross-cluster/capacity-snapshots.ts).
+if (CAPACITY_SNAPSHOT_CONFIG.enabled) {
+  const snapshotter = new CapacitySnapshotter(CAPACITY_SNAPSHOT_CONFIG, {
+    conn: devnetConn,
+    programId: CFG_WRAPPER_PROGRAM_ID,
+    markets: () => registry.markets.map((m) => ({ marketAddress: m.marketAddress, label: m.label, assetIndex: m.assetIndex ?? 0 })),
+    sink: createSupabaseSnapshotSink(CAPACITY_SNAPSHOT_CONFIG),
+  });
+  void startCapacitySnapshotLoop(snapshotter, CAPACITY_SNAPSHOT_CONFIG).catch((err: unknown) => {
+    console.error(`[capacity] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`);
   });
 }
 

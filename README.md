@@ -115,3 +115,14 @@ When supported (tick every `P2B_TICK_MS`, one batched snapshot read per tick):
 
 Independent of the gate: tag 78 on a bound vault appends `[7]` ext and `[8]` vault LP once the registry ext
 flag (byte 161) is set (it is 0 on every pre-P2b program). See `.env.example` for every knob.
+
+## Capacity snapshots (growth telemetry, optional, OFF by default)
+
+`KEEPER_CAPACITY_SNAPSHOTS=1` (plus `SUPABASE_URL` https and `SUPABASE_SERVICE_ROLE_KEY`; boot fails fast if
+either is missing) starts a read-only loop (`src/cross-cluster/capacity-snapshots.ts`) that every
+`CAPACITY_SNAPSHOT_INTERVAL_MS` (default 300000) inserts one row per growth market into Supabase
+`market_capacity_snapshots` (N_cap, utilisation and max leverage per side, Earn principal/NAV/NAV per share,
+allocated capital, junior, cushion, OI, fee income, ADL/h-lock flags). A market is snapshotted only if it is
+bound to a vault LP and its growth record decodes, so every market of today's programs is skipped. The
+loop never throws into the push/crank loops. Table: percolator-launch
+`supabase/migrations/20261005000000_market_capacity_snapshots.sql` (apply it first; RLS on, no policies).
