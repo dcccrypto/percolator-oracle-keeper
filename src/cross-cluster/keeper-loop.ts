@@ -335,7 +335,7 @@ export function pricingHealthStatus(
 
 // ── Health server ─────────────────────────────────────────────────────────────
 
-function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Registry) {
+export function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Registry) {
   return (req: http.IncomingMessage, res: http.ServerResponse): void => {
     if (req.url !== "/health" && req.url !== "/") {
       res.writeHead(404);

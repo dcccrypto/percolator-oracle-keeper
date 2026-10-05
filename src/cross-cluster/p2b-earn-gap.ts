@@ -75,7 +75,7 @@ export class EarnGapMonitor {
   private readonly records = new Map<string, EarnVaultHealth>();
   private readonly streak = new Map<string, number>();
   private readonly loggedErrors = new Set<string>();
-  private lastRunAt = 0;
+  private lastRunAt: number | null = null;
 
   constructor(
     private readonly cfg: EarnGapConfig,
@@ -86,7 +86,7 @@ export class EarnGapMonitor {
 
   /** Is the slow cadence up? */
   isDue(): boolean {
-    return this.now() - this.lastRunAt >= this.cfg.intervalMs;
+    return this.lastRunAt === null || this.now() - this.lastRunAt >= this.cfg.intervalMs;
   }
 
   /** Current /health records (a copy), in insertion order. */
