@@ -55,7 +55,9 @@ import {
   isFormatRejection,
   isV1BudgetError,
   ixOffsetFor,
+  loadedAccountsFit,
   loadedAccountsLimit,
+  V1_BUDGET_MARKETS_PER_CYCLE,
   noteV1Fallback,
   pushComputeUnits,
   resolveSendFormat,
@@ -636,12 +638,17 @@ function pushInstructions(keeper: Keypair, pushes: AuthMarkPushItem[], nowSlot: 
  * limit sized from the slabs actually read this cycle.
  */
 function v1PushBudget(pushes: AuthMarkPushItem[]): { computeUnitLimit: number; loadedAccountsDataSizeLimit: number } {
-  const seen = new Map<string, number>();
-  for (const p of pushes) seen.set(p.marketAddress, p.accountDataLen ?? 0);
   return {
     computeUnitLimit: pushComputeUnits(pushes.length),
-    loadedAccountsDataSizeLimit: loadedAccountsLimit([...seen.values()]),
+    loadedAccountsDataSizeLimit: loadedAccountsLimit(slabDataLens(pushes)),
   };
+}
+
+/** Data length of each distinct slab a set of pushes loads. */
+function slabDataLens(pushes: AuthMarkPushItem[]): number[] {
+  const seen = new Map<string, number>();
+  for (const p of pushes) seen.set(p.marketAddress, p.accountDataLen ?? 0);
+  return [...seen.values()];
 }
 
 /** Build + sign one v1 PushAuthMark tx. */
@@ -678,6 +685,8 @@ function chunkPushesV1(
     const n = end - start;
     if (max > 0 && n > max) return false;
     const candidate = pushes.slice(start, end);
+    // K-3: the summed loaded-accounts size must fit the configured / 64 MiB limit.
+    if (!loadedAccountsFit(slabDataLens(candidate))) return false;
     const budget = v1PushBudget(candidate);
     if (budget.computeUnitLimit < pushCuBase + n * pushCuPerMarket) return false;
     return (
@@ -1126,6 +1135,25 @@ export async function pushAuthMarkBatch(
   let txsSent = 0;
   // K-1(c): v1 isolation re-simulations left this cycle.
   let isolationSimsLeft = getTxV1Settings().isolationMaxSims;
+  // K-3: markets moved out of v1 this cycle by an attributed budget error; pushed in legacy
+  // (which carries the long-standing 200k CU per push) after the v1 chunks. Their legacy
+  // preflight strikes them if they really revert.
+  const legacyOnly: AuthMarkPushItem[] = [];
+  const budgetMarkets = new Set<string>();
+  /** Route one budget-hit market to legacy; false when the per-cycle threshold is exceeded (v1 off). */
+  const routeBudgetToLegacy = (item: AuthMarkPushItem, err: unknown): boolean => {
+    budgetMarkets.add(item.marketAddress);
+    if (budgetMarkets.size > V1_BUDGET_MARKETS_PER_CYCLE) {
+      v1Unusable(`v1 budget errors on ${budgetMarkets.size} markets this cycle (last ${JSON.stringify(err).slice(0, 80)})`);
+      return false;
+    }
+    console.warn(
+      `[push][TX_V1] ${item.marketAddress.slice(0, 8)}… hit the v1 budget (${JSON.stringify(err).slice(0, 80)}) — ` +
+        `pushed in legacy this cycle; v1 kept for the rest`,
+    );
+    legacyOnly.push(item);
+    return true;
+  };
   let isolationSims = 0;
   let isolationCapHit = false;
   /** Spend one v1 isolation re-simulation; false (and the rest waits for next cycle) when spent. */
@@ -1165,6 +1193,14 @@ export async function pushAuthMarkBatch(
    * too low). Neither is a market fault, so neither may strike a market.
    */
   const V1_UNUSABLE = Symbol("v1-unusable");
+  /** A v1 budget error that names ONE push (K-3): `position` within the simulated chunk. */
+  interface V1BudgetHit {
+    readonly v1Budget: true;
+    readonly position: number;
+    readonly err: unknown;
+  }
+  const isBudgetHit = (x: unknown): x is V1BudgetHit =>
+    typeof x === "object" && x !== null && (x as { v1Budget?: unknown }).v1Budget === true;
   const preflight = async (chunk: AuthMarkPushItem[], format: KeeperTxFormat): Promise<unknown> => {
     let simErr: unknown = null;
     if (format === "legacy") {
@@ -1183,6 +1219,10 @@ export async function pushAuthMarkBatch(
         const sim = await simulateWire(devnetConn, buildPushTxV1(keeper, chunk, nowSlot, blockhash));
         simErr = sim.err;
         if (simErr && isV1BudgetError(simErr, sim.logs)) {
+          // K-3: an instruction-level budget error names the push it hit; that market is moved
+          // out of v1 (the caller decides). A tx-level one (loaded size) names nobody: v1 off.
+          const at = parseFailingPush(simErr, chunk.length, ixOffsetFor("v1"));
+          if (at !== null) return { v1Budget: true, position: at.position, err: simErr } satisfies V1BudgetHit;
           v1Unusable(`v1 budget: ${JSON.stringify(simErr).slice(0, 100)}`);
           return V1_UNUSABLE;
         }
@@ -1344,6 +1384,16 @@ export async function pushAuthMarkBatch(
       if (v1 && guard > 0 && !takeIsolationSim(pending)) return [];
       const simErr = await preflight(pending, format);
       if (simErr === V1_UNUSABLE) return pending;
+      if (isBudgetHit(simErr)) {
+        // K-3: pushes before the one that hit the budget ran clean: send them (K-1(a)).
+        if (simErr.position > 0) {
+          if (!(await send(pending.slice(0, simErr.position), format))) return pending;
+          pending = pending.slice(simErr.position);
+        }
+        if (!routeBudgetToLegacy(pending[0]!, simErr.err)) return pending;
+        pending = pending.slice(1);
+        continue;
+      }
       if (!simErr) {
         return (await send(pending, format)) ? [] : pending;
       }
@@ -1362,7 +1412,9 @@ export async function pushAuthMarkBatch(
           if (v1 && !takeIsolationSim(pending.slice(i))) return [];
           const singleErr = await preflight([single], format);
           if (singleErr === V1_UNUSABLE) return pending.slice(i);
-          if (singleErr) strike(single, singleErr);
+          if (isBudgetHit(singleErr)) {
+            if (!routeBudgetToLegacy(single, singleErr.err)) return pending.slice(i);
+          } else if (singleErr) strike(single, singleErr);
           else if (!(await send([single], format))) return pending.slice(i);
         }
         return [];
@@ -1412,6 +1464,9 @@ export async function pushAuthMarkBatch(
       format = "legacy";
       queue = chunkFor("legacy", rest);
     }
+  }
+  if (legacyOnly.length > 0) {
+    for (const c of chunkFor("legacy", legacyOnly)) await pushChunk(c, "legacy");
   }
 
   txV1Stats.lastFormat = startFormat;

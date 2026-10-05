@@ -303,10 +303,33 @@ export function pushComputeUnits(n: number): number {
  */
 export function loadedAccountsLimit(accountDataBytes: readonly number[]): number {
   if (settings.loadedAccountsBytes !== null) return settings.loadedAccountsBytes;
-  const data = accountDataBytes.reduce((s, b) => s + b + LOADED_ACCOUNT_BASE_BYTES, 0);
-  const want = Math.ceil((settings.loadedOverheadBytes + data) * LOADED_HEADROOM);
+  const want = Math.ceil(loadedAccountsNeed(accountDataBytes) * LOADED_HEADROOM);
   return Math.max(1, Math.min(TX_MAX_LOADED_ACCOUNTS_DATA_BYTES, want));
 }
+
+/** Loaded-accounts-data bytes a v1 push tx over these data accounts needs (before headroom). */
+export function loadedAccountsNeed(accountDataBytes: readonly number[]): number {
+  return settings.loadedOverheadBytes + accountDataBytes.reduce((s, b) => s + b + LOADED_ACCOUNT_BASE_BYTES, 0);
+}
+
+/**
+ * Whether one v1 tx over these data accounts stays inside the loaded-accounts limit: the
+ * configured TX_V1_LOADED_ACCOUNTS_BYTES, or (derived) the 64 MiB protocol cap including
+ * LOADED_HEADROOM. {@link loadedAccountsLimit} silently clamps to the cap, so the chunker must
+ * split instead of building a tx whose limit is below what it loads.
+ */
+export function loadedAccountsFit(accountDataBytes: readonly number[]): boolean {
+  const need = loadedAccountsNeed(accountDataBytes);
+  if (settings.loadedAccountsBytes !== null) return need <= settings.loadedAccountsBytes;
+  return Math.ceil(need * LOADED_HEADROOM) <= TX_MAX_LOADED_ACCOUNTS_DATA_BYTES;
+}
+
+/**
+ * K-3: at most this many DISTINCT markets per cycle may be excluded from v1 for a budget error
+ * that names their instruction; one more means the budget model itself is off (or the
+ * attribution is not to be trusted under a cumulative CU meter) and v1 is suspended instead.
+ */
+export const V1_BUDGET_MARKETS_PER_CYCLE = 2;
 
 /** Compile + sign a v1 tx. Throws if a v1 limit is exceeded (4096 B, 64 accounts, 64 ix). */
 export function buildV1Wire(p: {

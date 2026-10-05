@@ -112,6 +112,10 @@ interface MockOpts {
   v1SimErr?: unknown;
   /** Any send throws this (non-format) error. */
   sendError?: string;
+  /** v1 simulate: these markets exceed the CU meter at their own instruction (ComputationalBudgetExceeded). */
+  v1BudgetMarkets?: Set<string>;
+  /** Slab tail bytes (default SLAB_EXTRA). */
+  slabExtra?: number;
 }
 
 interface Attempt {
@@ -142,7 +146,7 @@ function mockConn(o: MockOpts) {
       return null;
     },
     async getMultipleAccountsInfo(pks: Array<{ toBase58(): string }>) {
-      return pks.map((pk) => (o.markets.includes(pk.toBase58()) ? { data: marketAccount(100n, SLAB_EXTRA) } : null));
+      return pks.map((pk) => (o.markets.includes(pk.toBase58()) ? { data: marketAccount(100n, o.slabExtra ?? SLAB_EXTRA) } : null));
     },
     async simulateTransaction(tx: { instructions: Array<{ keys: Array<{ pubkey: { toBase58(): string } }> }> }) {
       const ms = tx.instructions.slice(1).map((ix) => ix.keys[1]!.pubkey.toBase58());
@@ -164,6 +168,11 @@ function mockConn(o: MockOpts) {
       const ms = marketsInWire(wire, WRAPPER);
       sims.push({ format: "v1", markets: ms });
       events.push(`sim:${ms.length}`);
+      const budgetAt = ms.findIndex((x) => o.v1BudgetMarkets?.has(x));
+      const lockedAt = ms.findIndex((x) => o.locked?.has(x));
+      if (budgetAt >= 0 && (lockedAt < 0 || budgetAt < lockedAt)) {
+        return { result: { value: { err: { InstructionError: [budgetAt, "ComputationalBudgetExceeded"] }, logs: [] } } };
+      }
       return { result: { value: { err: o.v1SimErr ?? evalPushes(ms, 0), logs: [] } } };
     },
     async sendRawTransaction(raw: Uint8Array) {
@@ -340,16 +349,91 @@ describe("fallback only on a FORMAT rejection, never lost or duplicated", () => 
     assert.equal(txV1Stats.fallbacks, 1);
   });
 
-  it("a v1 BUDGET error in preflight re-sends in legacy and strikes no market", async () => {
+  it("a tx-level v1 BUDGET error (loaded size: names no market) in preflight re-sends in legacy and strikes no market", async () => {
     const ms = seededMarkets(22, 26);
     settings({ TX_V1: "auto", TX_V1_RETRY_AFTER_REJECT_MS: "0" });
     for (let c = 0; c < 4; c++) {
-      const m = mockConn({ markets: ms, v1Active: true, v1SimErr: { InstructionError: [3, "ComputationalBudgetExceeded"] } });
+      const m = mockConn({ markets: ms, v1Active: true, v1SimErr: "MaxLoadedAccountsDataSizeExceeded" });
       await cycle(m.conn, ms, GOLDEN_NOW_SLOT + BigInt(c));
       assertEachPushedOnce(m.accepted(), ms);
       assert.ok(m.accepted().every((a) => a.format === "legacy"));
     }
     assert.deepEqual(getQuarantinedMarkets().filter((q) => ms.includes(q)), [], "budget errors are not market faults");
+  });
+});
+
+describe("K-3: a budget error is attributed to its market, not a global switch", () => {
+  it("one market over the CU meter: prefix sent in v1, that market in legacy, the rest stays v1; no suspension, no strike", async () => {
+    const ms = seededMarkets(23, 16);
+    const heavy = ms[5]!;
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: true, v1BudgetMarkets: new Set([heavy]) });
+    const res = await cycle(m.conn, ms);
+    assert.deepEqual(
+      m.accepted().map((a) => [a.format, a.markets]),
+      [
+        ["v1", ms.slice(0, 5)],
+        ["v1", ms.slice(6)],
+        ["legacy", [heavy]],
+      ],
+    );
+    assertEachPushedOnce(m.accepted(), ms);
+    assert.equal(res.pushedMarkets.length, 16);
+    assert.equal(txV1Stats.fallbacks, 0, "v1 is kept for the other markets");
+    assert.deepEqual(getQuarantinedMarkets().filter((q) => ms.includes(q)), []);
+    const before = m.attempts.length;
+    await cycle(m.conn, ms, GOLDEN_NOW_SLOT + 1n);
+    assert.equal(m.attempts[before]!.format, "v1", "not suspended");
+  });
+
+  it("budget errors on more than 2 (V1_BUDGET_MARKETS_PER_CYCLE) distinct markets in one cycle suspend v1", async () => {
+    const ms = seededMarkets(24, 16);
+    const heavy = new Set([ms[2]!, ms[6]!, ms[11]!]);
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: true, v1BudgetMarkets: heavy });
+    const res = await cycle(m.conn, ms);
+    assertEachPushedOnce(m.accepted(), ms);
+    assert.equal(res.pushedMarkets.length, 16);
+    assert.equal(txV1Stats.fallbacks, 1);
+    // Sent in v1: the three proven prefixes (each proven before its budget hit); everything else legacy.
+    assert.deepEqual(m.accepted().filter((a) => a.format === "v1").map((a) => a.markets), [ms.slice(0, 2), ms.slice(3, 6), ms.slice(7, 11)]);
+    const before = m.attempts.length;
+    await cycle(m.conn, ms, GOLDEN_NOW_SLOT + 1n);
+    assert.ok(m.attempts.slice(before).every((a) => a.format === "legacy"), "suspended");
+  });
+
+  it("chunkPushesV1 splits when the summed loaded-accounts size would exceed the configured limit", async () => {
+    const extra = 5_000_000;
+    const slab = marketAccount(100n, extra).length;
+    const ms = seededMarkets(25, 8);
+    // overhead 2,000,000 + 3 x (slab + 64) fits 20,000,000; 4 do not.
+    settings({ TX_V1: "auto", TX_V1_PUSH_MAX_MARKETS: "0", TX_V1_LOADED_ACCOUNTS_BYTES: "20000000" });
+    assert.ok(2_000_000 + 3 * (slab + 64) <= 20_000_000 && 2_000_000 + 4 * (slab + 64) > 20_000_000);
+    const m = mockConn({ markets: ms, v1Active: true, slabExtra: extra });
+    await cycle(m.conn, ms);
+    assert.deepEqual(m.accepted().map((a) => a.markets.length), [3, 3, 2]);
+    assertEachPushedOnce(m.accepted(), ms);
+  });
+
+  it("chunkPushesV1 splits when the DERIVED limit (with headroom) would pass the 64 MiB cap", async () => {
+    const extra = 100_000;
+    const slab = marketAccount(100n, extra).length;
+    const overhead = 53_000_000;
+    const max = Math.floor((64 * 1024 * 1024) / LOADED_HEADROOM - overhead) / (slab + 64);
+    const per = Math.floor(max);
+    assert.ok(per >= 2 && per < 20);
+    const ms = seededMarkets(26, 20);
+    settings({ TX_V1: "auto", TX_V1_PUSH_MAX_MARKETS: "0", TX_V1_LOADED_OVERHEAD_BYTES: String(overhead) });
+    const m = mockConn({ markets: ms, v1Active: true, slabExtra: extra });
+    await cycle(m.conn, ms);
+    const sizes = m.accepted().map((a) => a.markets.length);
+    assert.ok(sizes.every((n) => n <= per) && sizes[0] === per, JSON.stringify({ sizes, per }));
+    for (const a of m.accepted()) {
+      const cfg = (VersionedTransaction.deserialize(a.wire).message as MessageV1).transactionConfig;
+      assert.ok((cfg.loadedAccountsDataSizeLimit ?? 0) <= 64 * 1024 * 1024);
+      assert.ok((cfg.loadedAccountsDataSizeLimit ?? 0) >= overhead + a.markets.length * (slab + 64), "limit covers what it loads");
+    }
+    assertEachPushedOnce(m.accepted(), ms);
   });
 });
 

@@ -157,6 +157,11 @@ preflight) affects every market in the tx. Blast-radius controls (security revie
   it, the rest of that chunk waits for the next cycle (not struck).
 - A v1 tx that LANDS and reverts (anything but the benign late-duplicate Custom(19)) suspends v1 for
   `TX_V1_RETRY_AFTER_REJECT_MS`, under `auto` and `on`, logged as an error; `/health.txV1.suspendedKind` = `landing`.
+- A v1 CU error that names its instruction (security review K-3) moves only THAT market to legacy for the cycle
+  (the pushes before it are sent in v1, v1 is kept for the rest; its legacy preflight strikes it if it really
+  reverts). A budget error that names no market (loaded size), or budget errors on more than 2 distinct markets in
+  one cycle, suspend v1 as before. v1 chunks also split when the summed loaded-accounts size would pass
+  `TX_V1_LOADED_ACCOUNTS_BYTES` (or, derived, 64 MiB including the 1.25 headroom).
 
 Other knobs: `TX_V1_PUSH_CU_PER_MARKET` (8000), `TX_V1_PUSH_CU_BASE`
 (10000), `TX_V1_LOADED_ACCOUNTS_BYTES` (unset = 1.25 x (2,000,000 + sum of slab bytes + 64 each)),
