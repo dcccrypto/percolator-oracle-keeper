@@ -10,13 +10,17 @@
  *     rejected for FORMAT reasons recently. `on` requires the cluster to REPORT v1 (a cluster
  *     that does not is a config error: no push that cycle, loud), but a runtime rejection never
  *     skips a push cycle: that cycle falls back to legacy, loudly, and the next cycle tries v1
- *     again (no suspension for `on`).
+ *     again (no rejection suspension for `on`).
  *   - Fallback is ONLY for format rejections (the node/cluster could not take the bytes, so
  *     nothing was accepted and resending in legacy cannot double-send) and for v1 budget
  *     misconfiguration found in PREFLIGHT (compute or loaded-accounts limit too low — the tx was
- *     only simulated). A program error never triggers a fallback or a resend.
+ *     only simulated). A budget error that names one push moves only that market to legacy
+ *     (K-3). A program error never triggers a fallback or a resend.
  *   - After a fallback, v1 is suspended for `TX_V1_RETRY_AFTER_REJECT_MS` so a node that cannot
- *     take v1 is not re-probed every 1.5 s cycle.
+ *     take v1 is not re-probed every 1.5 s cycle (auto).
+ *   - Landing evidence suspends v1 under auto AND on for the same window: a landed v1 revert
+ *     other than the benign late-duplicate Custom(19) (K-1(d)), or a canary v1 tx that never
+ *     showed up (K-2, the first TX_V1_CANARY_CYCLES v1 cycles wait for confirmation).
  *
  * Simulation goes through the Connection's own JSON-RPC transport (`_rpcRequest`) so the
  * keeper's configured headers (DEVNET_RPC_ORIGIN) apply, exactly like the legacy

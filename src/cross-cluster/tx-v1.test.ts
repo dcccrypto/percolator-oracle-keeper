@@ -6,7 +6,9 @@
  *   - TX_V1=off sends byte-identical legacy txs: the sha256 of every wire is pinned to the
  *     output of the BASE commit's pusher (32cc1399) run through the same harness
  *     (tx-v1-test-helpers.ts legacyGoldenScenarios).
- *   - An on-chain error never causes a fallback or a resend; TX_V1=on never downgrades.
+ *   - An on-chain error never causes a fallback or a resend.
+ *   - Security review 2026-10-05 fixes (K-1..K-5, SDK-3 adoption): each has a test that fails
+ *     with the fix reverted (mutation-checked, see the commit messages).
  *
  * Wires are decoded with web3.js 1.99 (VersionedTransaction.deserialize), independent of the
  * SDK encoder that produced them.
