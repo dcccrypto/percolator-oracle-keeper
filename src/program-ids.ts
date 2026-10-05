@@ -38,6 +38,63 @@
 import { PublicKey } from "@solana/web3.js";
 import { PROGRAM_IDS, PROGRAM_IDS_V17 } from "@percolatorct/sdk";
 
+/**
+ * Program-ID SETS, pinned here as literals (Devnet v2.1 fresh-ID cutover, 2026-10-05).
+ *
+ * v2.1 ships as a FRESH program-ID set (runbook deploy-runbook-v21 §5.2): the
+ * ETDLAdi world is not upgraded; its markets stay on their rules, close-only.
+ * Two keepers therefore run side by side after cutover:
+ *   - the existing relaunch keeper (Railway `relaunch-live`, set "v1", switch OFF)
+ *     keeps pushing marks and cranking the v1 markets so exits keep working;
+ *   - a SECOND keeper service with KEEPER_DEVNET_V21=1 (set "v21") serves the
+ *     re-seeded v2.1 markets.
+ *
+ * Why literals and not the SDK constants: SDK 9.0.0 moves its devnet defaults
+ * to the v2.1 IDs. Re-pinning the SDK must not silently move the switch-OFF
+ * keeper onto programs that are not deployed yet, so the OFF set is the literal
+ * ETDLAdi set (identical to PROGRAM_IDS_V17 at the current SDK pin), and the
+ * v2.1 set is reachable only through the explicit switch.
+ */
+export interface ProgramIdSet {
+  wrapper: string;
+  stake: string;
+  matcher: string;
+  nft: string;
+}
+
+/** v1 = the ETDLAdi relaunch world (2026-09-30). Default; close-only after the v2.1 cutover. */
+export const PROGRAM_IDS_DEVNET_V1: Readonly<ProgramIdSet> = Object.freeze({
+  wrapper: "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB",
+  stake: "VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w",
+  matcher: "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX",
+  nft: "EMYT15LZWaP7Mmmm245kQPbrTyVjG16yZiU9kfNTF3GZ",
+});
+
+/** v2.1 = the fresh-ID world (ledger v21-fresh-ids-2026-10-05). Selected only by KEEPER_DEVNET_V21=1. */
+export const PROGRAM_IDS_DEVNET_V21: Readonly<ProgramIdSet> = Object.freeze({
+  wrapper: "5NGgnU2j315Ci2tso8VJDEthaVExuiKG3tn4xnur28xe",
+  stake: "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE",
+  matcher: "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam",
+  nft: "DWUNq2iYh6Sdgdv3qv7aWJNJGhoK25FqyQrqDUrDD9zs",
+});
+
+export type ProgramSetName = "v1" | "v21";
+
+/**
+ * The explicit v2.1 switch. Unset, blank or "0" = "v1" (today's behaviour);
+ * "1" = "v21". Anything else fails boot: a typo must not pick a world.
+ */
+export function resolveProgramSet(env: Readonly<Record<string, string | undefined>>): ProgramSetName {
+  const raw = env.KEEPER_DEVNET_V21?.trim() ?? "";
+  if (raw === "" || raw === "0") return "v1";
+  if (raw === "1") return "v21";
+  throw new Error(`KEEPER_DEVNET_V21="${raw}" must be "1" (v2.1 program set) or unset/"0" (v1, ETDLAdi)`);
+}
+
+export function programIdSet(name: ProgramSetName): Readonly<ProgramIdSet> {
+  return name === "v21" ? PROGRAM_IDS_DEVNET_V21 : PROGRAM_IDS_DEVNET_V1;
+}
+
 export interface ProgramIds {
   /** The Percolator wrapper (market/slab owner). */
   wrapper: PublicKey;
@@ -47,17 +104,21 @@ export interface ProgramIds {
   matcher: PublicKey;
   /** percolator-nft. Its `["mint_authority"]` PDA is the owner of NFT-escrowed portfolios. */
   nft: PublicKey;
+  /** Which pinned set supplied the defaults (KEEPER_DEVNET_V21). */
+  programSet: ProgramSetName;
   /** Where each value came from, for the boot log. */
   source: { wrapper: string; stake: string; matcher: string; nft: string };
   /** Env IDs accepted only because KEEPER_ALLOW_PROGRAM_ID_OVERRIDE=1. */
   overridden: string[];
 }
 
-/** Every program ID the SDK build knows about. */
+/** Every program ID the SDK build knows about, plus the two pinned devnet sets above. */
 export function sdkKnownProgramIds(): Set<string> {
   const out = new Set<string>();
   for (const net of Object.values(PROGRAM_IDS)) for (const v of Object.values(net)) out.add(v);
   for (const v of Object.values(PROGRAM_IDS_V17)) out.add(v);
+  for (const v of Object.values(PROGRAM_IDS_DEVNET_V1)) out.add(v);
+  for (const v of Object.values(PROGRAM_IDS_DEVNET_V21)) out.add(v);
   return out;
 }
 
@@ -96,11 +157,44 @@ export function resolveProgramIds(env: Env): ProgramIds {
   const matcherEnv = nonEmpty(env.MATCHER_PROGRAM_ID);
   const nftEnv = nonEmpty(env.NFT_PROGRAM_ID);
 
+  const programSet = resolveProgramSet(env);
+  const set = programIdSet(programSet);
+  const other = programIdSet(programSet === "v21" ? "v1" : "v21");
+  const setLabel = programSet === "v21" ? "PROGRAM_IDS_DEVNET_V21" : "PROGRAM_IDS_DEVNET_V1";
+
+  // Cross-world guard: an env ID from the OTHER pinned set is a half-finished
+  // cutover (e.g. the v1 keeper's .env edited to the v2.1 wrapper without the
+  // switch, or the v2.1 service still carrying ETDLAdi). Refuse rather than run
+  // a keeper whose wrapper and stake/matcher/nft disagree.
+  const crossChecks: Array<[string, string | undefined, keyof ProgramIdSet]> = [
+    ["WRAPPER_PROGRAM_ID", wrapperEnv, "wrapper"],
+    ["PROGRAM_ID", wrapperEnv ? undefined : legacyEnv, "wrapper"],
+    ["STAKE_PROGRAM_ID", stakeEnv, "stake"],
+    ["MATCHER_PROGRAM_ID", matcherEnv, "matcher"],
+    ["NFT_PROGRAM_ID", nftEnv, "nft"],
+  ];
+  for (const [name, v, slot] of crossChecks) {
+    if (!v) continue;
+    const t = v.trim();
+    if (Object.values(other).includes(t)) {
+      throw new Error(
+        `${name}=${t} belongs to the ${programSet === "v21" ? "v1 (ETDLAdi)" : "v2.1"} program set but ` +
+          `KEEPER_DEVNET_V21 selects ${programSet}. ` +
+          (programSet === "v1"
+            ? "Set KEEPER_DEVNET_V21=1 to run the v2.1 keeper."
+            : "Unset it (or KEEPER_DEVNET_V21) to run the v1 keeper."),
+      );
+    }
+    if (Object.values(set).includes(t) && set[slot] !== t) {
+      throw new Error(`${name}=${t} is the ${setLabel} id of a different program (expected ${set[slot]} for ${slot})`);
+    }
+  }
+
   const wrapperSrc = wrapperEnv
     ? { v: wrapperEnv, s: "env WRAPPER_PROGRAM_ID" }
     : legacyEnv
       ? { v: legacyEnv, s: "env PROGRAM_ID" }
-      : { v: PROGRAM_IDS_V17.percolator, s: "sdk PROGRAM_IDS_V17.percolator" };
+      : { v: set.wrapper, s: `builtin ${setLabel}.wrapper` };
 
   const known = sdkKnownProgramIds();
   const allowOverride = env.KEEPER_ALLOW_PROGRAM_ID_OVERRIDE?.trim() === "1";
@@ -127,21 +221,16 @@ export function resolveProgramIds(env: Env): ProgramIds {
 
   return {
     overridden,
+    programSet,
     wrapper: parseKey(wrapperSrc.s, wrapperSrc.v),
-    stake: parseKey(
-      stakeEnv ? "STAKE_PROGRAM_ID" : "sdk PROGRAM_IDS_V17.vault",
-      stakeEnv ?? PROGRAM_IDS_V17.vault,
-    ),
-    matcher: parseKey(
-      matcherEnv ? "MATCHER_PROGRAM_ID" : "sdk PROGRAM_IDS_V17.matcher",
-      matcherEnv ?? PROGRAM_IDS_V17.matcher,
-    ),
-    nft: parseKey(nftEnv ? "NFT_PROGRAM_ID" : "sdk PROGRAM_IDS_V17.nft", nftEnv ?? PROGRAM_IDS_V17.nft),
+    stake: parseKey(stakeEnv ? "STAKE_PROGRAM_ID" : `builtin ${setLabel}.stake`, stakeEnv ?? set.stake),
+    matcher: parseKey(matcherEnv ? "MATCHER_PROGRAM_ID" : `builtin ${setLabel}.matcher`, matcherEnv ?? set.matcher),
+    nft: parseKey(nftEnv ? "NFT_PROGRAM_ID" : `builtin ${setLabel}.nft`, nftEnv ?? set.nft),
     source: {
-      nft: nftEnv ? "env NFT_PROGRAM_ID" : "sdk PROGRAM_IDS_V17.nft",
+      nft: nftEnv ? "env NFT_PROGRAM_ID" : `builtin ${setLabel}.nft`,
       wrapper: wrapperSrc.s,
-      stake: stakeEnv ? "env STAKE_PROGRAM_ID" : "sdk PROGRAM_IDS_V17.vault",
-      matcher: matcherEnv ? "env MATCHER_PROGRAM_ID" : "sdk PROGRAM_IDS_V17.matcher",
+      stake: stakeEnv ? "env STAKE_PROGRAM_ID" : `builtin ${setLabel}.stake`,
+      matcher: matcherEnv ? "env MATCHER_PROGRAM_ID" : `builtin ${setLabel}.matcher`,
     },
   };
 }
@@ -161,6 +250,7 @@ export const NFT_PROGRAM_ID: PublicKey = PROGRAM_IDS_RESOLVED.nft;
 
 export function describeProgramIds(ids: ProgramIds = PROGRAM_IDS_RESOLVED): string[] {
   return [
+    `program set=${ids.programSet}${ids.programSet === "v21" ? " (KEEPER_DEVNET_V21=1)" : " (v1 / ETDLAdi; KEEPER_DEVNET_V21 off)"}`,
     ...(ids.overridden.length ? [`OVERRIDE (KEEPER_ALLOW_PROGRAM_ID_OVERRIDE=1, not in the SDK tables): ${ids.overridden.join(", ")}`] : []),
     `wrapper=${ids.wrapper.toBase58()} (${ids.source.wrapper})`,
     `stake=${ids.stake.toBase58()} (${ids.source.stake})`,

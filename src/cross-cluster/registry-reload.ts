@@ -37,7 +37,7 @@
  * latency to one interval with no such platform-dependent failure mode.
  */
 import fs from "fs";
-import { loadRegistry } from "./registry.ts";
+import { assertRegistryProgramSet, loadRegistry, registryProgramSet } from "./registry.ts";
 import type { MarketEntry, Registry } from "./registry.ts";
 
 export interface RegistryReloadConfig {
@@ -73,6 +73,9 @@ export function reloadRegistryOnce(
     if (!Array.isArray(onDisk.markets)) {
       throw new Error("loaded registry has no markets array");
     }
+    // v2.1 cutover: never hot-load the other world's registry into a running
+    // keeper (an untagged file on both sides = v1 = unchanged behaviour).
+    assertRegistryProgramSet(onDisk, registryProgramSet(registry), registryPath);
   } catch (err) {
     console.warn(
       `[registry-reload] failed to read/parse ${registryPath} — keeping current in-memory registry: ` +

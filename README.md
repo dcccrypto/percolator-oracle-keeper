@@ -79,6 +79,23 @@ Required Railway environment variables:
 - `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` — for market auto-discovery
 - `HEALTH_AUTH_TOKEN` — for secured health checks
 
+## Devnet v2.1 fresh-ID cutover: two keepers
+
+v2.1 ships as a fresh program-ID set; the ETDLAdi world is not upgraded and its markets become close-only.
+The program set is chosen by one explicit switch, `KEEPER_DEVNET_V21` (`src/program-ids.ts`):
+
+| `KEEPER_DEVNET_V21` | wrapper / stake / matcher / nft | default registry (Railway) |
+|---|---|---|
+| unset / `0` (default) | `ETDLAdi…` / `VmpVUArR…` / `EDKKgRaV…` / `EMYT15LZ…` (pinned literals, independent of the SDK defaults) | `/data/registry.relaunch.json` |
+| `1` | `5NGgnU2j…` / `A6DVNubv…` / `DfTxJUT5…` / `DWUNq2iY…` | `/data/registry.v21.json`, seeded from `deploy/registry.v21.seed.json` (TO-FILL from the Phase 3 `newmarkets` output) |
+
+- The existing relaunch service (`relaunch-live`) keeps running unchanged with the switch off, so v1 markets keep
+  oracle pushes and cranks and their exits keep working.
+- v2.1 runs as a SECOND Railway service from the same image with `KEEPER_DEVNET_V21=1`, its own `/data` volume and
+  `WRAPPER_PROGRAM_ID=5NGgnU2j315Ci2tso8VJDEthaVExuiKG3tn4xnur28xe` (the launcher requires it). One replica per service.
+- A v2.1 ID without the switch, or a v1 ID with it, fails boot. A registry is tagged `"programSet": "v21"`; each keeper
+  refuses to boot or hot-reload the other world's registry. The register-poll owner filter follows the selected wrapper.
+
 ## Architecture
 
 Previously part of `percolator-launch/bots/oracle-keeper/`. Extracted to standalone repo for cleaner architecture. The oracle-keeper is a backend service; the frontend lives in [percolator-launch](https://github.com/dcccrypto/percolator-launch).

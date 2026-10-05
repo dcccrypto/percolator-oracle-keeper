@@ -35,8 +35,9 @@
  *   STAKE_FEE_MIN_PUSH_ATOMS  smallest staker leg worth a transaction (default: 1)
  *   TERMINAL_INSURANCE_ENABLED "false" disables the post-resolve stake tag-29 wind-down job (default: true)
  *   ALERT_TERMINAL_BUDGET_CYCLES cycles a resolved stake-bound market may hold a budget before alerting (default: 3)
- *   WRAPPER_PROGRAM_ID / STAKE_PROGRAM_ID / MATCHER_PROGRAM_ID  program ids (default: SDK
- *                           constants; PROGRAM_ID is a legacy alias for the wrapper) — see program-ids.ts
+ *   KEEPER_DEVNET_V21       "1" = Devnet v2.1 program set (5NGgnU2j…) + registry.v21.json; unset/"0" = v1 (ETDLAdi). See program-ids.ts
+ *   WRAPPER_PROGRAM_ID / STAKE_PROGRAM_ID / MATCHER_PROGRAM_ID / NFT_PROGRAM_ID  program ids (default: the
+ *                           pinned set selected by KEEPER_DEVNET_V21; PROGRAM_ID is a legacy alias for the wrapper) — see program-ids.ts
  *   DEVNET_RPC_ORIGIN       Origin header for an Origin-restricted devnet RPC key (optional)
  *   KEEPER_ALERT_WEBHOOK_URL  https webhook for [ALERT] lines (optional; Slack/Discord-compatible `text`)
  *   ALERT_SLOT_LAG_WARN / ALERT_SLOT_LAG_CRITICAL / ALERT_CRANK_REVERTS / ALERT_ZERO_PUSH_CYCLES /
@@ -64,7 +65,7 @@ import { Connection, Keypair } from "@solana/web3.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { loadRegistry } from "./cross-cluster/registry.ts";
+import { DEFAULT_REGISTRY_FILE, loadRegistryForProgramSet } from "./cross-cluster/registry.ts";
 import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
@@ -87,7 +88,7 @@ import { WRAPPER_PROGRAM_ID as CFG_WRAPPER_PROGRAM_ID } from "./program-ids.ts";
 import type { FeeJob } from "./cross-cluster/fee-jobs.ts";
 import { getAlertSink } from "./cross-cluster/alerting.ts";
 import type { AlertSink } from "./cross-cluster/alerting.ts";
-import { describeProgramIds } from "./program-ids.ts";
+import { describeProgramIds, PROGRAM_IDS_RESOLVED } from "./program-ids.ts";
 import { devnetConnectionConfig } from "./rpc-headers.ts";
 import type { ConnectionConfig } from "@solana/web3.js";
 import { startRegisterPollLoop, pollOnce } from "./cross-cluster/register-poll.ts";
@@ -324,9 +325,11 @@ let registrationStream: RegistrationStream | null = null;
 // just slower. 30s is fine for that role; it does not gate launch latency.
 const REGISTER_POLL_INTERVAL_MS = parseInt(process.env.REGISTER_POLL_INTERVAL_MS ?? "30000", 10);
 
+// v2.1 cutover: the default registry file follows the program set
+// (registry.json for v1 — unchanged — and registry.v21.json for KEEPER_DEVNET_V21=1).
 const REGISTRY_PATH =
   process.env.REGISTRY_PATH ??
-  path.resolve(__dirname, "..", "registry.json");
+  path.resolve(__dirname, "..", DEFAULT_REGISTRY_FILE[PROGRAM_IDS_RESOLVED.programSet]);
 
 // G6 — registry.json hot-reload, so a re-seed is picked up live without a
 // restart. See cross-cluster/registry-reload.ts for the full rationale.
@@ -334,7 +337,7 @@ const REGISTRY_RELOAD_INTERVAL_MS = parseInt(process.env.REGISTRY_RELOAD_INTERVA
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
 const keeper = loadKeypair();
-const registry = loadRegistry(REGISTRY_PATH);
+const registry = loadRegistryForProgramSet(REGISTRY_PATH, PROGRAM_IDS_RESOLVED.programSet);
 
 if (registry.markets.length === 0) {
   console.warn(
@@ -593,9 +596,11 @@ if (SUPABASE_URL && SUPABASE_ANON_KEY) {
     },
     registryPath: REGISTRY_PATH,
     intervalMs: REGISTER_POLL_INTERVAL_MS,
-    // Owner filter: only admit markets owned by the current wrapper (WRAPPER_PROGRAM_ID
-    // = PROGRAM_IDS_V17.percolator). Keeps retired-wrapper entries out of the
-    // atomic push batch (they revert it with IncorrectProgramId).
+    // Owner filter: only admit markets owned by the SELECTED wrapper (program-ids.ts:
+    // ETDLAdi with KEEPER_DEVNET_V21 off, 5NGgnU2j with it on, or the env override).
+    // Keeps retired-wrapper entries out of the atomic push batch (they revert it
+    // with IncorrectProgramId), and keeps the v1 and v2.1 keepers from adopting
+    // each other's markets from the shared Supabase `markets` table.
     connection: devnetConn,
     expectedOwner: WRAPPER_PROGRAM_ID,
   };

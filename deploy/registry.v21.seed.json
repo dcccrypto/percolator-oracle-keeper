@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "programSet": "v21",
+  "description": "Devnet v2.1 keeper (fresh-ID wrapper 5NGgnU2j315Ci2tso8VJDEthaVExuiKG3tn4xnur28xe) - TO-FILL from the Phase 3 seed output",
+  "_TO_FILL": [
+    "EMPTY ON PURPOSE. Do not invent slabs. Fill `markets` ONLY from the Phase 3 seed script's `newmarkets` JSON after the v2.1 deploy + re-seed (founder GO-D).",
+    "One entry per seeded market, same shape as deploy/registry.relaunch.seed.json: label, marketAddress (v2.1 slab, owner must be 5NGgnU2j...), poolAddress (mainnet DEX pool), dexType (raydium-clmm | meteora-dlmm | pumpswap), assetIndex, symbol, collateral (sim-USDC DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC), mainnetCa, and lpPortfolio if the seed output has it.",
+    "Leaving this empty is also valid: with SUPABASE_URL/SUPABASE_ANON_KEY set, register-poll admits v2.1 rows whose on-chain owner is 5NGgnU2j... (owner filter follows the selected wrapper).",
+    "Keep `programSet: v21`: the keeper refuses to boot (or hot-reload) a registry whose programSet differs from KEEPER_DEVNET_V21."
+  ],
+  "markets": []
+}
