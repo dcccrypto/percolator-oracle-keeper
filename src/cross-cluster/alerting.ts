@@ -209,6 +209,17 @@ export interface CrankHealthSample {
   overflowRefreshed?: number;
   /** Consecutive cycles the market ENDED loss-stale (Custom(21) for every open while it lasts). */
   lossStaleCycles?: number;
+  /** Drift-layout markets: continuous-sweep coverage (positioned-sweep.ts). */
+  sweep?: {
+    coverageRatio: number | null;
+    covered: boolean;
+    blocksRiskIncrease: boolean;
+    laggardLong: number;
+    laggardShort: number;
+    pace: string;
+    k: number;
+    txsSent: number;
+  };
 }
 
 /** Streak counters carried between cycles, per market. */
@@ -397,6 +408,18 @@ export function crankHealthRecord(s: CrankHealthSample): Record<string, string |
     ...(s.positioned ? { pos: s.positioned } : {}),
     ...(s.overflow ? { ovf: s.overflow, ovfOk: s.overflowRefreshed ?? 0 } : {}),
     lsc: s.lossStaleCycles ?? 0,
+    ...(s.sweep
+      ? {
+          cov: s.sweep.coverageRatio,
+          cvd: Number(s.sweep.covered),
+          blk: Number(s.sweep.blocksRiskIncrease),
+          lgL: s.sweep.laggardLong,
+          lgS: s.sweep.laggardShort,
+          pace: s.sweep.pace,
+          k: s.sweep.k,
+          stx: s.sweep.txsSent,
+        }
+      : {}),
     ...(s.adl?.reduceOnly
       ? { ro: 1, aL: frac(s.adl.aLong), aS: frac(s.adl.aShort), oiL: s.adl.oiEffLong.toString(), oiS: s.adl.oiEffShort.toString() }
       : {}),

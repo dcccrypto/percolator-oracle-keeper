@@ -31,6 +31,7 @@ import type { Alert, MarketPushSample } from "./alerting.ts";
 import { getCrankRefreshHealth, isPushHeld, pruneCrankRefreshHealth } from "./refresh-coordination.ts";
 import { p2bHealthFields } from "./p2b-health.ts";
 import type { CrankRefreshHealth } from "./refresh-coordination.ts";
+import type { SweepHealth } from "./positioned-sweep.ts";
 import {
   type WalletBalanceState,
   createWalletBalanceState,
@@ -273,11 +274,16 @@ export function publishLandedTicks(
  * has ended loss-stale (stale count > 0 after the keeper's refreshes) for
  * ALERT_LOSS_STALE_CYCLES cycles: every risk-increasing trade reverts Custom(21).
  */
-export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<string, string | number | null> {
+export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<string, string | number | boolean | null> {
   if (!h) return { crankStatus: null };
   return {
+    ...(h.sweep ? sweepHealthFields(h.sweep) : {}),
     crankStatus: h.status,
-    lossStale: h.postStaleLong !== null ? Number(h.postStaleLong + (h.postStaleShort ?? 0) > 0) : Number(h.staleLong + h.staleShort > 0),
+    // Sweep markets carry stale portfolios by design (every accrual re-stales them); there
+    // `lossStale` means what users feel: a risk-increasing order would be refused now.
+    lossStale: h.sweep
+      ? Number(h.sweep.blocksRiskIncrease)
+      : h.postStaleLong !== null ? Number(h.postStaleLong + (h.postStaleShort ?? 0) > 0) : Number(h.staleLong + h.staleShort > 0),
     lossStaleCycles: h.lossStaleCycles,
     staleLong: h.staleLong,
     staleShort: h.staleShort,
@@ -288,6 +294,38 @@ export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<str
     overflowRefreshed: h.overflowRefreshed,
     overflowError: h.overflowError,
     crankHealthAgo: `${Math.floor((Date.now() - h.updatedAt) / 1000)}s`,
+  };
+}
+
+/**
+ * Sweep (drift-layout market) fields for /health: `sweepCoverageRatio` is
+ * max(bound/available) over both sides (null = infinite: a bound faces zero
+ * insurance), `sweepCovered` the engine's coverage verdict, and
+ * `sweepBlocksRiskIncrease` whether an open would be refused right now.
+ */
+export function sweepHealthFields(s: SweepHealth): Record<string, string | number | boolean | null> {
+  return {
+    sweepPace: s.pace,
+    sweepCoverageRatio: s.coverageRatio,
+    sweepCovered: s.covered,
+    sweepBlocksRiskIncrease: s.blocksRiskIncrease,
+    sweepRelaxedEligible: s.relaxedEligible,
+    sweepIneligibleReason: s.ineligibleReason,
+    sweepBoundLong: s.boundLong,
+    sweepBoundShort: s.boundShort,
+    sweepAvailableLongDomain: s.availableLongDomain,
+    sweepAvailableShortDomain: s.availableShortDomain,
+    sweepStaleLong: s.staleLong,
+    sweepStaleShort: s.staleShort,
+    sweepLaggardLong: s.laggardLong,
+    sweepLaggardShort: s.laggardShort,
+    sweepK: s.k,
+    sweepTxsPlanned: s.txsPlanned,
+    sweepTxsSent: s.txsSent,
+    sweepRefreshed: s.refreshed,
+    sweepPruned: s.pruned,
+    sweepPositioned: s.positioned,
+    sweepUnvisited: s.neverVisited,
   };
 }
 

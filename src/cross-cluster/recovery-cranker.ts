@@ -130,6 +130,19 @@ import {
   selectPositionedPortfolios,
 } from "./positioned-refresh.ts";
 import { holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coordination.ts";
+import {
+  decodeSweepMarketState,
+  evaluateCoverage,
+  markVisited,
+  planSweepPace,
+  planSweepTx,
+  pruneVisits,
+  selectSweepBatch,
+  sweepConfigFromEnv,
+  sweepEnabledFromEnv,
+  sweepHealth,
+} from "./positioned-sweep.ts";
+import type { SweepConfig, SweepCoverage, SweepHealth, SweepPace, SweepPlan } from "./positioned-sweep.ts";
 import { createCrankLiveness, crankLivenessOptsFromEnv } from "./crank-liveness.ts";
 import type { CrankLiveness } from "./crank-liveness.ts";
 import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
@@ -207,6 +220,12 @@ interface CrankMarketState {
   lossStaleCycles: number;
   /** Last overflow (follow-up refresh) summary logged, so steady-state cycles stay quiet. */
   lastOverflowSummary: string | null;
+  /** Sweep (drift-layout markets): base58 -> sequence number of the portfolio's last visit. */
+  sweepVisits: Map<string, number>;
+  /** Sweep visit sequence counter (one per landed sweep transaction). */
+  sweepSeq: number;
+  /** Last sweep summary logged, so steady-state cycles stay quiet. */
+  lastSweepSummary: string | null;
 }
 
 /** What one crank attempt saw — feeds alerting.ts. */
@@ -230,6 +249,8 @@ export interface CrankObservation {
   overflowRefreshed: number;
   /** Consecutive cycles the market ended loss-stale (set by the cranker after its cranks). */
   lossStaleCycles: number;
+  /** Sweep health (drift-layout markets only; absent on legacy markets). */
+  sweep?: SweepHealth;
 }
 
 export function freshCrankMarketState(): CrankMarketState {
@@ -257,6 +278,9 @@ export function freshCrankMarketState(): CrankMarketState {
     benignNoProgress: 0,
     lossStaleCycles: 0,
     lastOverflowSummary: null,
+    sweepVisits: new Map(),
+    sweepSeq: 0,
+    lastSweepSummary: null,
   };
 }
 
@@ -479,6 +503,8 @@ export async function crankOneMarket(
   /** Stale counts after this cycle's cranks; null = unknown (revert, no simulation). */
   let postStale: MarketRefreshState | null = null;
   let overflowError: string | null = null;
+  /** Sweep markets: whether a risk-increasing order would be refused at the end of this cycle (null = legacy market). */
+  let sweepBlocked: boolean | null = null;
 
   try {
     // One read gives both the market state and the slot it was read at.
@@ -512,9 +538,15 @@ export async function crankOneMarket(
       }
     }
     const catchup = pre ? catchupCrankCount(BigInt(acct.context.slot) - pre.slotLast, pre.maxAccrualDtSlots) : 0;
-    const targets = pre && marketHasPositions(pre) && catchupAllowsRefresh(catchup)
+    const positionedAll = pre && marketHasPositions(pre) && catchupAllowsRefresh(catchup)
       ? await positionedPortfoliosFor(devnetConn, market, label, pre, state)
       : [];
+    // Drift-layout market (v21-funding-scale program): continuous round-robin sweep of
+    // k portfolios per transaction instead of refreshing every positioned portfolio
+    // in the accrual's slot. Legacy / unknown layout: sweepCtx stays null and the
+    // cycle below is byte-for-byte the previous behaviour.
+    const sweepCtx = pre ? sweepContextFor(acct.value.data, positionedAll, state, sweepCfg) : null;
+    const targets = sweepCtx ? sweepCtx.firstBatch : positionedAll;
 
     // Liveness repairs (lapsed Fresh backing bucket, side stuck in ResetPending):
     // states no crank can leave, which revert every crank Custom(19) or every
@@ -528,28 +560,43 @@ export async function crankOneMarket(
     const obs = observeMarket(acct.value.data, BigInt(acct.context.slot), pre, repairs);
     state.obs = obs;
     if (pre) observed = obs;
+    if (sweepCtx) {
+      // Until this cycle's cranks prove otherwise, the market is as the pre-crank read says.
+      sweepBlocked = sweepCtx.coverage.blocksRiskIncrease;
+      obs.sweep = sweepHealth(sweepCtx.coverage, sweepCtx.pace, {
+        txsSent: 0,
+        refreshed: 0,
+        pruned: 0,
+        positioned: sweepCtx.positioned.length,
+        neverVisited: sweepCtx.positioned.filter((p) => !state.sweepVisits.has(p.pubkey.toBase58())).length,
+      });
+    }
 
     // Bankrupt positioned portfolios found in a clean simulation's post-state;
     // they get a second crank (the engine's Liquidate step) in the same tx.
     let liquidateTargets: PublicKey[] = [];
 
     const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan =>
-      planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs, liquidateTargets });
+      sweepCtx
+        ? planSweepTx({ owner: keeper.publicKey, market, lpPortfolio, targets: t, cfg: sweepCfg, catchup, repairs, liquidateTargets })
+        : planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs, liquidateTargets });
 
     if (dryRun) {
       const plan = build(targets);
       console.log(
         `[cranker][DRY-RUN] ${label}: catchup=${catchup} accrue=${lpPortfolio.toBase58().slice(0, 8)}… ` +
-          `refresh=[${plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio.toBase58().slice(0, 8)).join(",")}]`,
+          `refresh=[${plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio.toBase58().slice(0, 8)).join(",")}]` +
+          (sweepCtx ? ` sweep=${sweepCtx.pace.level} k=${sweepCtx.pace.k} txs=${sweepCtx.pace.txs} ratio=${sweepCtx.coverage.ratio}` : ""),
       );
       return;
     }
 
-    obs.positioned = targets.length;
+    obs.positioned = positionedAll.length;
     // More positioned portfolios than one transaction can refresh: the rest go out
     // as follow-up transactions, which only land while the mark has not moved since
     // this accrual. Hold this market's pushes from now until they land (auto-expires).
-    if (build(targets).overflow.length > 0) {
+    // A sweep never holds pushes: every sweep transaction carries its own accrual.
+    if (!sweepCtx && build(targets).overflow.length > 0) {
       holdPushes(marketAddress, OVERFLOW_PUSH_HOLD_MS);
       held = true;
     }
@@ -693,7 +740,63 @@ export async function crankOneMarket(
     }
 
     let finalPost = decodePostState(resolved.sim.marketData);
-    if (plan.overflow.length > 0) {
+    if (sweepCtx) {
+      // Visited = refreshed in this tx, or shown not stale by the simulation (Custom(22) prune).
+      const visitedThisCycle = new Set<string>(targets.map((t) => t.pubkey.toBase58()));
+      const firstVisited = [
+        ...plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio),
+        ...resolved.pruned.filter((p) => !p.repair && p.code !== null).map((p) => p.pubkey),
+      ];
+      markVisited(state.sweepVisits, firstVisited, ++state.sweepSeq);
+      let lastMarketData: Uint8Array | null = resolved.sim.marketData;
+      let fu: SweepFollowupResult | null = null;
+      if (sweepCtx.pace.txs > 1) {
+        // Spread across slots: each follow-up is simulated only after the previous tx landed.
+        const mainLanded = await waitLanded(devnetConn, signature);
+        if (mainLanded === "landed") {
+          const fuBh = await withRpcRetry(label, () => devnetConn.getLatestBlockhash("processed"));
+          const toFuTx = (p: CrankPlan): Transaction => {
+            const t = new Transaction();
+            t.add(ComputeBudgetProgram.setComputeUnitLimit({ units: p.computeUnits }));
+            for (const c of p.cranks) t.add(c.ix);
+            t.recentBlockhash = fuBh.blockhash;
+            t.feePayer = keeper.publicKey;
+            t.sign(keeper);
+            return t;
+          };
+          fu = await runSweepFollowups(sweepCtx.pace.txs - 1, visitedThisCycle, {
+            pickBatch: (exclude) => selectSweepBatch(sweepCtx.positioned, state.sweepVisits, sweepCtx.pace.k, exclude),
+            plan: (t, accrue, liq) =>
+              planSweepTx({ owner: keeper.publicKey, market, lpPortfolio, targets: t, cfg: sweepCfg, accrue, liquidateTargets: liq }),
+            simulate: (p) => simulateWith(toFuTx(p), p),
+            send: (p) =>
+              withRpcRetry(label, () => devnetConn.sendRawTransaction(toFuTx(p).serialize(), { skipPreflight: true, maxRetries: 2 })),
+            waitLanded: (sig) => waitLanded(devnetConn, sig),
+            onVisited: (pks) => markVisited(state.sweepVisits, pks, ++state.sweepSeq),
+          });
+          if (fu.lastMarketData) lastMarketData = fu.lastMarketData;
+          obs.bankruptFound += fu.bankruptFound;
+          obs.bankruptLiquidated += fu.liquidated;
+        } else {
+          fu = emptySweepFollowup(`accrual tx ${mainLanded}`);
+        }
+      }
+      finalPost = decodePostState(lastMarketData);
+      const postSweep = lastMarketData ? decodeSweepMarketStateSafe(lastMarketData) : null;
+      const cov = postSweep ? evaluateCoverage(postSweep) : sweepCtx.coverage;
+      sweepBlocked = cov.blocksRiskIncrease;
+      const refreshed = plan.cranks.filter((c) => c.kind === "refresh").length + (fu?.refreshed ?? 0);
+      const pruned = resolved.pruned.filter((p) => !p.repair).length + (fu?.pruned.length ?? 0);
+      obs.sweep = sweepHealth(cov, sweepCtx.pace, {
+        txsSent: 1 + (fu?.txsSent ?? 0),
+        refreshed,
+        pruned,
+        positioned: sweepCtx.positioned.length,
+        neverVisited: sweepCtx.positioned.filter((p) => !state.sweepVisits.has(p.pubkey.toBase58())).length,
+      });
+      reportSweepOutcome(label, state, obs.sweep, fu?.error ?? null);
+      if (fu?.error) overflowError = `sweep: ${fu.error}`;
+    } else if (plan.overflow.length > 0) {
       obs.overflow = plan.overflow.length;
       // Follow-up refreshes: after the accrual lands, before the next push (held above).
       const accrual = await waitLanded(devnetConn, signature);
@@ -746,7 +849,7 @@ export async function crankOneMarket(
       }
       state.lastOverflowSummary = ovSummary;
     }
-    reportRefreshOutcome(label, pre, resolved, state, finalPost);
+    if (!sweepCtx) reportRefreshOutcome(label, pre, resolved, state, finalPost);
     postStale = finalPost;
   } catch (err) {
     state.totalErrors++;
@@ -766,7 +869,7 @@ export async function crankOneMarket(
     }
   } finally {
     if (held) releasePushes(marketAddress);
-    if (observed) publishRefreshHealth(marketAddress, state, observed, postStale, overflowError);
+    if (observed) publishRefreshHealth(marketAddress, state, observed, postStale, overflowError, sweepBlocked);
   }
 }
 
@@ -833,6 +936,184 @@ function decodePostState(data: Uint8Array | null): MarketRefreshState | null {
   } catch {
     return null;
   }
+}
+
+// ── Continuous sweep (drift-layout markets, positioned-sweep.ts) ─────────────
+
+/** Sweep sizing, read once at load (KEEPER_SWEEP_* env). */
+const sweepCfg: SweepConfig = sweepConfigFromEnv();
+const sweepEnabled: boolean = sweepEnabledFromEnv();
+
+function decodeSweepMarketStateSafe(data: Uint8Array) {
+  try {
+    return decodeSweepMarketState(data);
+  } catch {
+    return null;
+  }
+}
+
+export interface SweepContext {
+  coverage: SweepCoverage;
+  pace: SweepPace;
+  /** Every positioned portfolio of the market (the round-robin universe). */
+  positioned: PositionedPortfolio[];
+  /** The first sweep transaction's targets (the cycle's accrual transaction). */
+  firstBatch: PositionedPortfolio[];
+}
+
+/**
+ * The sweep context for one cycle, or null when the market is not drift layout
+ * (old program) or the sweep is disabled: the caller then keeps the legacy
+ * refresh-everything cycle.
+ */
+export function sweepContextFor(
+  data: Uint8Array,
+  positioned: ReadonlyArray<PositionedPortfolio>,
+  state: Pick<CrankMarketState, "sweepVisits">,
+  cfg: SweepConfig,
+  enabled: boolean = sweepEnabled,
+): SweepContext | null {
+  if (!enabled) return null;
+  const s = decodeSweepMarketStateSafe(data);
+  if (!s) return null;
+  if (positioned.length > 0) pruneVisits(state.sweepVisits, positioned);
+  const coverage = evaluateCoverage(s);
+  const pace = planSweepPace(coverage, positioned.length, cfg);
+  return {
+    coverage,
+    pace,
+    positioned: [...positioned],
+    firstBatch: selectSweepBatch(positioned, state.sweepVisits, pace.k),
+  };
+}
+
+export interface SweepFollowupDeps {
+  /** Next batch, least recently visited first, excluding what this cycle already took. */
+  pickBatch: (exclude: ReadonlySet<string>) => PositionedPortfolio[];
+  /** `[observation crank (if accrue), refresh x batch]` (+ liquidate cranks for `liq`). */
+  plan: (targets: ReadonlyArray<PositionedPortfolio>, accrue: boolean, liq: PublicKey[]) => SweepPlan;
+  simulate: (plan: CrankPlan) => Promise<SimOutcome>;
+  send: (plan: CrankPlan) => Promise<string>;
+  waitLanded: (signature: string) => Promise<LandOutcome>;
+  /** Portfolios visited by one landed tx (refreshed, or simulated not stale). */
+  onVisited: (pubkeys: PublicKey[]) => void;
+}
+
+export interface SweepFollowupResult {
+  txsSent: number;
+  txsLanded: number;
+  /** Of the landed txs, how many were refresh-only (an earlier tx had accrued the slot). */
+  refreshOnly: number;
+  refreshed: number;
+  liquidated: number;
+  bankruptFound: number;
+  pruned: { pubkey: PublicKey; code: number | null }[];
+  /** Simulated market post-state of the last landed tx. */
+  lastMarketData: Uint8Array | null;
+  error: string | null;
+}
+
+export function emptySweepFollowup(error: string | null = null): SweepFollowupResult {
+  return { txsSent: 0, txsLanded: 0, refreshOnly: 0, refreshed: 0, liquidated: 0, bankruptFound: 0, pruned: [], lastMarketData: null, error };
+}
+
+/**
+ * The cycle's extra sweep transactions, one at a time: each is simulated only
+ * after the previous one landed, so the simulation sees the real slot state.
+ * If the observation crank is rejected Custom(22) (the asset is already accrued
+ * in this slot because the previous sweep tx landed in it), the batch is sent
+ * refresh-only instead. Refreshes the simulation rejects are pruned (a
+ * non-stale portfolio counts as visited); a bankrupt post-refresh portfolio
+ * gets its liquidate crank. Stops at the first failure, or when every
+ * positioned portfolio has been taken this cycle. Never throws.
+ */
+export async function runSweepFollowups(
+  count: number,
+  takenThisCycle: Set<string>,
+  deps: SweepFollowupDeps,
+): Promise<SweepFollowupResult> {
+  const out = emptySweepFollowup();
+  try {
+    for (let i = 0; i < count; i++) {
+      const batch = deps.pickBatch(takenThisCycle);
+      if (batch.length === 0) break;
+      for (const p of batch) takenThisCycle.add(p.pubkey.toBase58());
+      let liquidate: PublicKey[] = [];
+      let accrue = true;
+      const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan => deps.plan(t, accrue, liquidate);
+      const onOptional = (c: PlannedCrank) => {
+        if (c.kind === "liquidate") liquidate = liquidate.filter((x) => !x.equals(c.portfolio));
+      };
+      const budget = refreshPruneBudget(batch.length, { uncapped: true });
+      let resolved = await resolveCrankPlan(build, batch, deps.simulate, onOptional, budget);
+      if (resolved.sim.err) {
+        const ie = parseInstructionError(resolved.sim.err);
+        const crank = ie && ie.index >= 1 ? resolved.plan.cranks[ie.index - 1] : undefined;
+        if (crank?.kind === "accrue" && ie?.custom === ENGINE_NON_PROGRESS) {
+          accrue = false;
+          resolved = await resolveCrankPlan(build, batch, deps.simulate, onOptional, budget);
+        }
+      }
+      if (!resolved.sim.err && resolved.sim.portfolioData) {
+        const bankrupt = [...resolved.sim.portfolioData.entries()]
+          .filter(([, d]) => isBankruptPortfolio(d))
+          .map(([pk]) => new PublicKey(pk));
+        if (bankrupt.length > 0) {
+          out.bankruptFound += bankrupt.length;
+          liquidate = bankrupt;
+          const remaining = batch.filter((t) => !resolved.pruned.some((p) => p.pubkey.equals(t.pubkey)));
+          const withLiq = await resolveCrankPlan(build, remaining, deps.simulate, onOptional, budget);
+          if (!withLiq.sim.err) resolved = { ...withLiq, pruned: [...resolved.pruned, ...withLiq.pruned] };
+          else liquidate = [];
+        }
+      }
+      const prunedNow = resolved.pruned.filter((p) => !p.repair);
+      for (const p of prunedNow) out.pruned.push({ pubkey: p.pubkey, code: p.code });
+      if (resolved.sim.err) {
+        const code = parseInstructionError(resolved.sim.err)?.custom ?? null;
+        out.error = `sweep simulation failed ${code !== null ? `Custom(${code})` : JSON.stringify(resolved.sim.err)}`;
+        break;
+      }
+      const notStale = prunedNow.filter((p) => p.code !== null).map((p) => p.pubkey);
+      const refreshes = resolved.plan.cranks.filter((c) => c.kind === "refresh");
+      if (refreshes.length === 0) {
+        if (notStale.length > 0) deps.onVisited(notStale);
+        continue; // nothing stale in this batch: no tx
+      }
+      const sig = await deps.send(resolved.plan);
+      out.txsSent++;
+      const landed = await deps.waitLanded(sig);
+      if (landed !== "landed") {
+        out.error = `sweep tx ${sig.slice(0, 12)}… ${landed}`;
+        break;
+      }
+      out.txsLanded++;
+      if (!accrue) out.refreshOnly++;
+      out.refreshed += refreshes.length;
+      out.liquidated += resolved.plan.cranks.filter((c) => c.kind === "liquidate").length;
+      if (resolved.sim.marketData) out.lastMarketData = resolved.sim.marketData;
+      deps.onVisited([...refreshes.map((c) => c.portfolio), ...notStale]);
+    }
+  } catch (err) {
+    out.error = `sweep send failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`;
+  }
+  return out;
+}
+
+function reportSweepOutcome(label: string, state: CrankMarketState, h: SweepHealth, error: string | null): void {
+  const summary =
+    `pace=${h.pace} k=${h.k} txs=${h.txsSent}/${h.txsPlanned} refreshed=${h.refreshed} pruned=${h.pruned} ` +
+    `positioned=${h.positioned} unvisited=${h.neverVisited} stale=${h.staleLong}L/${h.staleShort}S ` +
+    `laggards=${h.laggardLong}L/${h.laggardShort}S covered=${h.covered} ratio=${h.coverageRatio ?? "inf"}` +
+    `${h.relaxedEligible ? "" : ` ineligible=${h.ineligibleReason}`}${error ? ` error=${error}` : ""}`;
+  // Log on a change of regime, not every cycle (the counts move every cycle by design).
+  const regime = `${h.pace}|${h.covered}|${h.relaxedEligible}|${h.blocksRiskIncrease}|${error !== null}`;
+  if (h.blocksRiskIncrease || error) {
+    if (state.lastSweepSummary !== regime) console.warn(`[cranker][sweep] ${label}: orders would be refused or the sweep failed (${summary})`);
+  } else if (state.lastSweepSummary !== regime) {
+    console.log(`[cranker][sweep] ${label}: ${summary}`);
+  }
+  state.lastSweepSummary = regime;
 }
 
 function reportRefreshOutcome(
@@ -1113,8 +1394,17 @@ function publishRefreshHealth(
   obs: CrankObservation,
   post: MarketRefreshState | null,
   overflowError: string | null,
+  /**
+   * Drift-layout (sweep) markets: whether a risk-increasing order is refused at
+   * the end of the cycle. Stale portfolios are the steady state there (every
+   * accrual re-stales them with funding > 0); what blocks orders is a bound the
+   * insurance does not cover, so that is what the loss-stale streak counts.
+   * null = legacy market: the streak counts non-zero stale counts, as before.
+   */
+  sweepBlocked: boolean | null = null,
 ): void {
-  state.lossStaleCycles = endedLossStale(obs, post) ? state.lossStaleCycles + 1 : 0;
+  const ended = sweepBlocked !== null ? sweepBlocked : endedLossStale(obs, post);
+  state.lossStaleCycles = ended ? state.lossStaleCycles + 1 : 0;
   obs.lossStaleCycles = state.lossStaleCycles;
   setCrankRefreshHealth(marketAddress, {
     staleLong: obs.staleLong ?? 0,
@@ -1128,6 +1418,7 @@ function publishRefreshHealth(
     lossStaleCycles: state.lossStaleCycles,
     status: state.lossStaleCycles >= LOSS_STALE_ALERT_CYCLES ? "loss-stale" : "ok",
     updatedAt: Date.now(),
+    ...(obs.sweep ? { sweep: obs.sweep } : {}),
   });
 }
 

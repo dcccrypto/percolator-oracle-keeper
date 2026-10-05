@@ -43,6 +43,8 @@ export function isPushHeld(market: string, nowMs: number = Date.now()): boolean 
   return true;
 }
 
+import type { SweepHealth } from "./positioned-sweep.ts";
+
 export interface CrankRefreshHealth {
   /** stale_account_count_long/short at this cycle's pre-crank read. */
   staleLong: number;
@@ -63,6 +65,11 @@ export interface CrankRefreshHealth {
   /** "loss-stale" once lossStaleCycles reaches the alert threshold. */
   status: "ok" | "loss-stale";
   updatedAt: number;
+  /**
+   * Drift-layout markets (continuous sweep): bound-vs-insurance coverage, stale and
+   * laggard counts, pace. Absent on legacy markets, so their /health is unchanged.
+   */
+  sweep?: SweepHealth;
 }
 
 const refreshHealth = new Map<string, CrankRefreshHealth>();
