@@ -191,6 +191,11 @@ export interface PositionedPortfolio {
   longLegs: number;
   shortLegs: number;
   isLp: boolean;
+  /** Sum of `loss_weight` over the active legs on the asset (sweep ordering; absent on hand-built entries). */
+  lossWeight?: bigint;
+  /** Lowest `kf_epoch_snap` of the active long / short legs on the asset (null: no leg on that side). */
+  kfEpochSnapLong?: bigint | null;
+  kfEpochSnapShort?: bigint | null;
 }
 
 /**
@@ -214,13 +219,22 @@ export function selectPositionedPortfolios(
     }
     let longLegs = 0;
     let shortLegs = 0;
+    let lossWeight = 0n;
+    let kfEpochSnapLong: bigint | null = null;
+    let kfEpochSnapShort: bigint | null = null;
     for (const leg of parsed.legs) {
       if (!leg.active || leg.assetIndex !== assetIndex) continue;
-      if (leg.side === 0) longLegs++;
-      else shortLegs++;
+      lossWeight += leg.lossWeight;
+      if (leg.side === 0) {
+        longLegs++;
+        kfEpochSnapLong = kfEpochSnapLong === null || leg.kfEpochSnap < kfEpochSnapLong ? leg.kfEpochSnap : kfEpochSnapLong;
+      } else {
+        shortLegs++;
+        kfEpochSnapShort = kfEpochSnapShort === null || leg.kfEpochSnap < kfEpochSnapShort ? leg.kfEpochSnap : kfEpochSnapShort;
+      }
     }
     if (longLegs + shortLegs === 0) continue;
-    out.push({ pubkey, longLegs, shortLegs, isLp: parsed.matcherEnabled === true });
+    out.push({ pubkey, longLegs, shortLegs, isLp: parsed.matcherEnabled === true, lossWeight, kfEpochSnapLong, kfEpochSnapShort });
   }
   return out;
 }

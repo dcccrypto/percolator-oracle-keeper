@@ -27,7 +27,10 @@ import {
   decodeSweepMarketState,
   detectMarketLayout,
   driftEngineSlotBase,
+  driftTrackerWellFormed,
   evaluateCoverage,
+  freshSweepCursor,
+  isStaleAtRead,
   hiddenLossBound,
   markVisited,
   maxRefreshesPerSweepTx,
@@ -40,7 +43,7 @@ import {
   sweepFieldOffsets,
   sweepHealth,
 } from "./positioned-sweep.ts";
-import type { KfDriftSide, SweepConfig, SweepCoverage, SweepPlan } from "./positioned-sweep.ts";
+import type { KfDriftSide, SweepConfig, SweepCoverage, SweepCursor, SweepPlan } from "./positioned-sweep.ts";
 import { ACCRUE_CRANK_CU, MAX_TX_CU } from "./positioned-refresh.ts";
 import type { CrankPlan, PositionedPortfolio } from "./positioned-refresh.ts";
 import { runSweepFollowups, sweepContextFor } from "./recovery-cranker.ts";
@@ -244,8 +247,8 @@ describe("hidden-loss bound", () => {
   });
 
   it("generation term only (no laggards): ceil(stale_weight*drift_gen/(SWS*POS)) + 2*stale, ceil is exact", () => {
-    // stale_weight * drift_gen = 3 * SCALE exactly -> 3; + 2*4
-    assert.equal(hiddenLossBound(4n, { genEpoch: 0n, laggardCount: 0n, driftGen: 3n * SCALE, driftPrior: 999n * SCALE, staleWeight: 1n, laggardWeight: 999n }), 3n + 8n);
+    // stale_weight * drift_gen = 12 * SCALE exactly -> 12; + 2*4
+    assert.equal(hiddenLossBound(4n, { genEpoch: 0n, laggardCount: 0n, driftGen: 3n * SCALE, driftPrior: 999n * SCALE, staleWeight: 4n, laggardWeight: 999n }), 12n + 8n);
     // one atom above 3 * SCALE rounds up to 4
     assert.equal(hiddenLossBound(1n, { genEpoch: 0n, laggardCount: 0n, driftGen: 3n * SCALE + 1n, driftPrior: 0n, staleWeight: 1n, laggardWeight: 0n }), 4n + 2n);
     // a product below one SCALE still rounds up to 1
@@ -258,18 +261,25 @@ describe("hidden-loss bound", () => {
       laggardCount: 2n,
       driftGen: 10n * SCALE,
       driftPrior: 5n * SCALE + 1n,
-      staleWeight: 3n,
+      staleWeight: 5n,
       laggardWeight: 2n,
     };
-    // gen: 3*10 = 30; prior: ceil(2*(5*SCALE+1)/SCALE) = 11; + 2*5
-    assert.equal(hiddenLossBound(5n, d), 30n + 11n + 10n);
-    assert.equal(hiddenLossBound(5n, { ...d, laggardCount: 0n }), 30n + 10n);
+    // gen: 5*10 = 50; prior: ceil(2*(5*SCALE+1)/SCALE) = 11; + 2*5
+    assert.equal(hiddenLossBound(5n, d), 50n + 11n + 10n);
+    assert.equal(hiddenLossBound(5n, { ...d, laggardCount: 0n }), 50n + 10n);
   });
 
   it("does not overflow on u128-sized inputs (BigInt)", () => {
     const big = (1n << 128n) - 1n;
     const b = hiddenLossBound(1n, { genEpoch: 0n, laggardCount: 1n, driftGen: big, driftPrior: big, staleWeight: big, laggardWeight: big });
-    assert.ok(b > big);
+    assert.ok(b !== null && b > big);
+  });
+
+  it("S1 (engine 89403177): stale_weight < stale has NO bound (fail closed), not 2*stale", () => {
+    const d: KfDriftSide = { genEpoch: 0n, laggardCount: 0n, driftGen: 0n, driftPrior: 0n, staleWeight: 2n, laggardWeight: 0n };
+    assert.equal(hiddenLossBound(3n, d), null);
+    assert.equal(hiddenLossBound(2n, d), 4n); // weight == count: defined
+    assert.equal(hiddenLossBound(3n, { ...d, staleWeight: 0n }), null); // zeroed drift tail under a live cohort
   });
 });
 
@@ -340,6 +350,42 @@ describe("coverage (long bound vs SHORT domain, short bound vs LONG domain)", ()
     assert.equal(c.covered, false);
   });
 
+  it("S1: a zeroed drift tail under a live cohort is uncovered even with unlimited insurance", () => {
+    const c = evaluateCoverage(decode({ staleLong: 3n, budgetLong: 10n ** 18n, budgetShort: 10n ** 18n, insurance: 10n ** 18n }));
+    assert.equal(c.boundLong, null);
+    assert.equal(c.covered, false);
+    assert.equal(c.trackerMalformed, true);
+    assert.equal(c.ratio, Number.POSITIVE_INFINITY);
+    assert.equal(c.blocksRiskIncrease, true);
+    const h = sweepHealth(c, { level: "urgent", k: 10, txs: 1 }, { txsSent: 0, refreshed: 0, pruned: 0, positioned: 3, neverVisited: 3 });
+    assert.equal(h.boundLong, "uncovered");
+    assert.equal(h.coverageRatio, null);
+    assert.equal(h.trackerMalformed, true);
+  });
+
+  it("S1 tracker shape check (validate_kf_drift_shape): each violation fails closed", () => {
+    const ok: MarketSpec = { ...stale, budgetLong: 10_000n, budgetShort: 10_000n, kfEpochLong: 9n, kfEpochShort: 9n };
+    assert.equal(driftTrackerWellFormed(decode(ok)), true);
+    assert.equal(evaluateCoverage(decode(ok)).covered, true);
+    const bad: Array<[string, MarketSpec]> = [
+      ["laggards above the stale count", { ...ok, driftLong: { ...stale.driftLong, laggardCount: 2n, laggardWeight: 2n } }],
+      ["generation after the KF epoch", { ...ok, driftShort: { ...stale.driftShort, genEpoch: 10n } }],
+      ["laggard weight below laggard count", { ...ok, driftLong: { ...stale.driftLong, laggardCount: 1n, laggardWeight: 0n } }],
+      ["stale weight below stale count", { ...ok, driftShort: { ...stale.driftShort, staleWeight: 1n } }],
+    ];
+    for (const [why, spec] of bad) {
+      const c = evaluateCoverage(decode(spec));
+      assert.equal(c.trackerMalformed, true, why);
+      assert.equal(c.covered, false, why);
+      assert.equal(c.blocksRiskIncrease, true, why);
+    }
+    // the weight check only applies on a Normal side (weights are inexact otherwise; the
+    // relaxed path is unavailable there anyway)
+    const drained = evaluateCoverage(decode({ ...ok, modeLong: 1, driftLong: { ...stale.driftLong, laggardCount: 1n, laggardWeight: 0n } }));
+    assert.equal(drained.trackerMalformed, false);
+    assert.equal(drained.relaxedEligible, false);
+  });
+
   it("no stale legs: bound 0, ratio 0, covered, nothing blocked", () => {
     const c = evaluateCoverage(decode({ insurance: 0n }));
     assert.deepEqual([c.boundLong, c.boundShort, c.ratio, c.covered, c.blocksRiskIncrease], [0n, 0n, 0, true, false]);
@@ -379,21 +425,24 @@ const portfolios = (n: number, lpIndex = 0): PositionedPortfolio[] =>
 
 describe("sweepContextFor (old-layout fallback)", () => {
   it("legacy markets get no sweep context: the cranker keeps refresh-everything", () => {
-    const st = { sweepVisits: new Map<string, number>() };
+    const st = { sweepCursor: freshSweepCursor() };
     assert.equal(sweepContextFor(fixture("cate-market-v18"), portfolios(3), st, DEFAULT_SWEEP_CONFIG, true), null);
     assert.equal(sweepContextFor(fixture("percolator-market-v18-relaunch"), portfolios(12), st, DEFAULT_SWEEP_CONFIG, true), null);
   });
 
   it("KEEPER_SWEEP_ENABLED=false disables it on drift markets too", () => {
-    const st = { sweepVisits: new Map<string, number>() };
+    const st = { sweepCursor: freshSweepCursor() };
     assert.equal(sweepContextFor(driftMarket(), portfolios(3), st, DEFAULT_SWEEP_CONFIG, false), null);
     assert.equal(sweepEnabledFromEnv({ KEEPER_SWEEP_ENABLED: "false" }), false);
     assert.equal(sweepEnabledFromEnv({}), true);
   });
 
   it("drift markets get coverage, pace and the first round-robin batch", () => {
-    const st = { sweepVisits: new Map<string, number>() };
-    const ctx = sweepContextFor(driftMarket({ staleLong: 1n, staleShort: 1n }), portfolios(25), st, DEFAULT_SWEEP_CONFIG, true);
+    const st = { sweepCursor: freshSweepCursor() };
+    const ctx = sweepContextFor(
+      driftMarket({ staleLong: 1n, staleShort: 1n, driftLong: { staleWeight: 1n }, driftShort: { staleWeight: 1n } }),
+      portfolios(25), st, DEFAULT_SWEEP_CONFIG, true,
+    );
     assert.ok(ctx);
     assert.equal(ctx.positioned.length, 25);
     assert.equal(ctx.firstBatch.length, ctx.pace.k);
@@ -485,70 +534,123 @@ describe("planSweepTx", () => {
 
 // ── Round robin ───────────────────────────────────────────────────────────────
 
-describe("round-robin selection", () => {
-  it("covers every positioned portfolio exactly once per round of ceil(n/k) batches, then repeats", () => {
-    const all = portfolios(23, 5);
-    const visits = new Map<string, number>();
-    let seq = 0;
-    for (let round = 0; round < 3; round++) {
-      // one cranker cycle: the runner excludes what the cycle already took
+/** Positioned portfolios with explicit weights and long-leg epoch snaps. */
+const weighted = (ws: ReadonlyArray<bigint>, snap: bigint = 0n, lpIndex = -1): PositionedPortfolio[] =>
+  ws.map((w, i) => ({ pubkey: pk(i + 1), longLegs: 1, shortLegs: 0, isLp: i === lpIndex, lossWeight: w, kfEpochSnapLong: snap, kfEpochSnapShort: null }));
+const keys = (ps: ReadonlyArray<PositionedPortfolio>) => ps.map((p) => p.pubkey.toBase58());
+
+describe("sweep order (security review I2: heaviest stale first, every portfolio once per round)", () => {
+  it("orders by loss_weight descending within a batch's selection", () => {
+    const all = weighted([5n, 50n, 1n, 500n, 20n]);
+    const batch = selectSweepBatch(all, freshSweepCursor(), 3, new Set(), { long: 9n, short: 9n });
+    assert.deepEqual(keys(batch), keys([all[3], all[1], all[4]]));
+  });
+
+  it("stale at the read (kf_epoch_snap < kf_epoch) goes before not stale, whatever the weight", () => {
+    const all: PositionedPortfolio[] = [
+      { pubkey: pk(1), longLegs: 1, shortLegs: 0, isLp: false, lossWeight: 1_000n, kfEpochSnapLong: 9n, kfEpochSnapShort: null }, // current
+      { pubkey: pk(2), longLegs: 0, shortLegs: 1, isLp: false, lossWeight: 10n, kfEpochSnapLong: null, kfEpochSnapShort: 3n }, // stale short
+      { pubkey: pk(3), longLegs: 1, shortLegs: 0, isLp: false, lossWeight: 20n, kfEpochSnapLong: 8n, kfEpochSnapShort: null }, // stale long
+    ];
+    const epochs = { long: 9n, short: 4n };
+    assert.deepEqual(all.map((p) => isStaleAtRead(p, epochs)), [false, true, true]);
+    assert.deepEqual(keys(selectSweepBatch(all, freshSweepCursor(), 3, new Set(), epochs)), keys([all[2], all[1], all[0]]));
+    // no epochs / no snaps known: everyone counts as stale (weight order only)
+    assert.equal(isStaleAtRead(all[0], null), true);
+    assert.equal(isStaleAtRead({ pubkey: pk(9), longLegs: 1, shortLegs: 0, isLp: false }, epochs), true);
+  });
+
+  it("equal weights: least recently visited first; the LP still goes last in the tx", () => {
+    const all = weighted([7n, 7n, 7n, 7n], 0n, 0);
+    const cur = freshSweepCursor();
+    cur.visits.set(pk(2).toBase58(), -5);
+    cur.visits.set(pk(3).toBase58(), -9);
+    const batch = selectSweepBatch(all, cur, 3);
+    // never-visited pk(1) (LP, -1) and pk(4) (-1) after pk(3) (-9) and pk(2) (-5): pick -9, -5, then -1 by key
+    assert.equal(batch.length, 3);
+    assert.equal(keys(batch).includes(pk(3).toBase58()), true);
+    assert.equal(keys(batch).includes(pk(2).toBase58()), true);
+    const lpAt = batch.findIndex((p) => p.isLp);
+    assert.ok(lpAt === -1 || lpAt === batch.length - 1);
+  });
+
+  it("per cycle (runner excludes what it took): every positioned portfolio exactly once, heaviest batch first", () => {
+    const n = 23;
+    const ws = Array.from({ length: n }, (_, i) => BigInt(((i * 7919) % 101) + 1));
+    const all = weighted(ws);
+    const cur = freshSweepCursor();
+    for (let cycle = 0; cycle < 4; cycle++) {
       const taken = new Set<string>();
       const seen = new Map<string, number>();
-      for (let i = 0; i < Math.ceil(23 / 10); i++) {
-        const batch = selectSweepBatch(all, visits, 10, taken);
+      const batchWeights: bigint[] = [];
+      for (let i = 0; i < Math.ceil(n / 10); i++) {
+        const batch = selectSweepBatch(all, cur, 10, taken);
+        batchWeights.push(batch.reduce((a, p) => a + (p.lossWeight ?? 0n), 0n));
         for (const p of batch) {
-          seen.set(p.pubkey.toBase58(), (seen.get(p.pubkey.toBase58()) ?? 0) + 1);
-          taken.add(p.pubkey.toBase58());
+          const key = p.pubkey.toBase58();
+          seen.set(key, (seen.get(key) ?? 0) + 1);
+          taken.add(key);
         }
-        markVisited(visits, batch.map((p) => p.pubkey), ++seq);
+        markVisited(cur, batch.map((p) => p.pubkey));
       }
-      assert.equal(seen.size, 23, `round ${round}`);
-      for (const n of seen.values()) assert.equal(n, 1);
+      assert.equal(seen.size, n, `cycle ${cycle}`);
+      for (const c of seen.values()) assert.equal(c, 1);
+      if (cycle === 0) assert.ok(batchWeights[0] >= batchWeights[1] && batchWeights[1] >= batchWeights[2], "heaviest first");
     }
   });
 
-  it("across cycles (one batch per cycle, no exclude) nobody waits more than ceil(n/k)+1 batches", () => {
+  it("starvation bound across cycles (one batch per cycle): a light laggard is reached every round, gap <= 2*ceil(n/k)-1", () => {
     const n = 23;
     const k = 10;
-    const all = portfolios(n);
-    const visits = new Map<string, number>();
+    // 22 heavy portfolios that are always stale, one very light one
+    const all = weighted([...Array(n - 1).fill(10n ** 12n), 1n]);
+    const light = pk(n).toBase58();
+    const cur = freshSweepCursor();
     const lastBatch = new Map<string, number>();
     let maxGap = 0;
-    for (let b = 1; b <= 60; b++) {
-      const batch = selectSweepBatch(all, visits, k);
-      assert.equal(batch.length, k);
+    let lightVisits = 0;
+    const B = 60;
+    for (let b = 1; b <= B; b++) {
+      const batch = selectSweepBatch(all, cur, k, new Set(), { long: 1_000n, short: 1_000n });
       for (const p of batch) {
         const key = p.pubkey.toBase58();
+        if (key === light) lightVisits++;
         maxGap = Math.max(maxGap, b - (lastBatch.get(key) ?? 0));
         lastBatch.set(key, b);
       }
-      markVisited(visits, batch.map((p) => p.pubkey), b);
+      markVisited(cur, batch.map((p) => p.pubkey));
     }
+    const round = Math.ceil(n / k);
     assert.equal(lastBatch.size, n);
-    assert.ok(maxGap <= Math.ceil(n / k) + 1, `max gap ${maxGap}`);
+    assert.ok(maxGap <= 2 * round - 1, `max gap ${maxGap}`);
+    assert.equal(lightVisits, B / round, "the light portfolio is visited exactly once per round");
   });
 
-  it("oldest visit first, never-visited before everything, LP last within a batch", () => {
-    const all = portfolios(5, 0);
-    const visits = new Map<string, number>([
-      [pk(2).toBase58(), 5],
-      [pk(3).toBase58(), 1],
-      [pk(4).toBase58(), 3],
-    ]);
-    const batch = selectSweepBatch(all, visits, 3);
-    // pk(1) (LP) and pk(5) never visited, then pk(3) (seq 1); LP moved to the end
-    assert.deepEqual(batch.map((p) => p.pubkey.toBase58()), [pk(5), pk(3), pk(1)].map((p) => p.toBase58()));
-    assert.equal(batch[batch.length - 1].isLp, true);
+  it("negative control: a pure weight order (no rounds) would starve the light portfolio", () => {
+    const all = weighted([...Array(22).fill(10n ** 12n), 1n]);
+    const pureWeight = [...all].sort((a, b) => ((b.lossWeight ?? 0n) > (a.lossWeight ?? 0n) ? 1 : -1)).slice(0, 10);
+    assert.equal(keys(pureWeight).includes(pk(23).toBase58()), false);
+  });
+
+  it("weight order shrinks the stale weight faster than index order in the first batch", () => {
+    const ws = Array.from({ length: 30 }, (_, i) => BigInt(i + 1));
+    const all = weighted(ws);
+    const byWeight = selectSweepBatch(all, freshSweepCursor(), 10).reduce((a, p) => a + (p.lossWeight ?? 0n), 0n);
+    const byIndex = all.slice(0, 10).reduce((a, p) => a + (p.lossWeight ?? 0n), 0n);
+    assert.equal(byWeight, ws.slice(20).reduce((a, w) => a + w, 0n));
+    assert.ok(byWeight > byIndex);
   });
 
   it("excludes what this cycle already took, and forgets portfolios that closed", () => {
     const all = portfolios(4);
-    const batch = selectSweepBatch(all, new Map(), 10, new Set([pk(1).toBase58(), pk(2).toBase58()]));
-    assert.deepEqual(batch.map((p) => p.pubkey.toBase58()).sort(), [pk(3), pk(4)].map((p) => p.toBase58()).sort());
-    assert.deepEqual(selectSweepBatch(all, new Map(), 0), []);
-    const visits = new Map<string, number>([[pk(1).toBase58(), 1], [pk(77).toBase58(), 2]]);
-    pruneVisits(visits, all);
-    assert.deepEqual([...visits.keys()], [pk(1).toBase58()]);
+    const batch = selectSweepBatch(all, freshSweepCursor(), 10, new Set([pk(1).toBase58(), pk(2).toBase58()]));
+    assert.deepEqual(keys(batch).sort(), keys([all[2], all[3]]).sort());
+    assert.deepEqual(selectSweepBatch(all, freshSweepCursor(), 0), []);
+    const cur = freshSweepCursor();
+    cur.visits.set(pk(1).toBase58(), 1);
+    cur.visits.set(pk(77).toBase58(), 2);
+    pruneVisits(cur, all);
+    assert.deepEqual([...cur.visits.keys()], [pk(1).toBase58()]);
   });
 });
 
@@ -556,7 +658,7 @@ describe("round-robin selection", () => {
 
 function cov(p: Partial<SweepCoverage>): SweepCoverage {
   return {
-    boundLong: 0n, boundShort: 0n, availableLongDomain: 100n, availableShortDomain: 100n, covered: true, ratio: 0,
+    boundLong: 0n, boundShort: 0n, trackerMalformed: false, availableLongDomain: 100n, availableShortDomain: 100n, covered: true, ratio: 0,
     relaxedEligible: true, ineligibleReason: null, staleLong: 5n, staleShort: 5n, laggardLong: 0n, laggardShort: 0n,
     blocksRiskIncrease: false, ...p,
   };
@@ -619,8 +721,7 @@ interface FakeChain {
   landResult: "landed" | "failed";
 }
 
-function fakeDeps(all: PositionedPortfolio[], chain: FakeChain, visits: Map<string, number>, k = 10): SweepFollowupDeps {
-  let seq = 0;
+function fakeDeps(all: PositionedPortfolio[], chain: FakeChain, visits: SweepCursor, k = 10): SweepFollowupDeps {
   return {
     pickBatch: (exclude) => selectSweepBatch(all, visits, k, exclude),
     plan: (t, accrue, liq) => planSweepTx({ owner: OWNER.publicKey, market: MARKET, lpPortfolio: LP, targets: t, cfg: DEFAULT_SWEEP_CONFIG, accrue, liquidateTargets: liq }),
@@ -636,14 +737,14 @@ function fakeDeps(all: PositionedPortfolio[], chain: FakeChain, visits: Map<stri
       return `sig${chain.sent.length}`.padEnd(20, "x");
     },
     waitLanded: async () => chain.landResult,
-    onVisited: (pks) => markVisited(visits, pks, ++seq),
+    onVisited: (pks) => markVisited(visits, pks),
   };
 }
 
 describe("runSweepFollowups", () => {
   it("sends [observation crank, refresh x k] txs until every portfolio was taken this cycle", async () => {
     const all = portfolios(27, 3);
-    const visits = new Map<string, number>();
+    const visits = freshSweepCursor();
     const chain: FakeChain = { notStale: new Set(), slotAccrued: false, sent: [], landResult: "landed" };
     const taken = new Set<string>();
     const r = await runSweepFollowups(8, taken, fakeDeps(all, chain, visits));
@@ -656,18 +757,18 @@ describe("runSweepFollowups", () => {
     }
     assert.equal(r.refreshed, 27);
     assert.equal(r.txsLanded, 3);
-    assert.equal(visits.size, 27);
+    assert.equal(visits.visits.size, 27);
     assert.equal(taken.size, 27);
   });
 
   it("respects the tx count (the pace) and continues where the cursor left off next cycle", async () => {
     const all = portfolios(30);
-    const visits = new Map<string, number>();
+    const visits = freshSweepCursor();
     const chain: FakeChain = { notStale: new Set(), slotAccrued: false, sent: [], landResult: "landed" };
     await runSweepFollowups(1, new Set(), fakeDeps(all, chain, visits));
-    assert.equal(visits.size, 10);
+    assert.equal(visits.visits.size, 10);
     await runSweepFollowups(2, new Set(), fakeDeps(all, chain, visits));
-    assert.equal(visits.size, 30);
+    assert.equal(visits.visits.size, 30);
     const firstTen = chain.sent[0].cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio.toBase58());
     const later = chain.sent.slice(1).flatMap((p) => p.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio.toBase58()));
     assert.equal(later.some((x) => firstTen.includes(x)), false);
@@ -675,7 +776,7 @@ describe("runSweepFollowups", () => {
 
   it("falls back to refresh-only when the slot is already accrued (observation crank Custom(22))", async () => {
     const chain: FakeChain = { notStale: new Set(), slotAccrued: true, sent: [], landResult: "landed" };
-    const r = await runSweepFollowups(1, new Set(), fakeDeps(portfolios(5), chain, new Map()));
+    const r = await runSweepFollowups(1, new Set(), fakeDeps(portfolios(5), chain, freshSweepCursor()));
     assert.equal(r.error, null);
     assert.equal(r.refreshOnly, 1);
     assert.deepEqual(chain.sent[0].cranks.map((c) => c.kind), Array(5).fill("refresh"));
@@ -683,32 +784,32 @@ describe("runSweepFollowups", () => {
 
   it("prunes non-stale portfolios (Custom(22) on their refresh): visited, not sent", async () => {
     const all = portfolios(4);
-    const visits = new Map<string, number>();
+    const visits = freshSweepCursor();
     const chain: FakeChain = { notStale: new Set([pk(2).toBase58(), pk(4).toBase58()]), slotAccrued: false, sent: [], landResult: "landed" };
     const r = await runSweepFollowups(1, new Set(), fakeDeps(all, chain, visits));
     assert.equal(r.refreshed, 2);
     assert.deepEqual(r.pruned.map((p) => p.code), [22, 22]);
     assert.equal(chain.sent[0].cranks.filter((c) => c.kind === "refresh").length, 2);
-    assert.equal(visits.size, 4);
+    assert.equal(visits.visits.size, 4);
   });
 
   it("all of a batch not stale: no tx, still visited", async () => {
     const all = portfolios(2);
-    const visits = new Map<string, number>();
+    const visits = freshSweepCursor();
     const chain: FakeChain = { notStale: new Set(all.map((p) => p.pubkey.toBase58())), slotAccrued: false, sent: [], landResult: "landed" };
     const r = await runSweepFollowups(3, new Set(), fakeDeps(all, chain, visits));
     assert.equal(chain.sent.length, 0);
     assert.equal(r.error, null);
-    assert.equal(visits.size, 2);
+    assert.equal(visits.visits.size, 2);
   });
 
   it("stops at the first tx that does not land, and does not mark its targets visited", async () => {
-    const visits = new Map<string, number>();
+    const visits = freshSweepCursor();
     const chain: FakeChain = { notStale: new Set(), slotAccrued: false, sent: [], landResult: "failed" };
     const r = await runSweepFollowups(5, new Set(), fakeDeps(portfolios(30), chain, visits));
     assert.equal(chain.sent.length, 1);
     assert.match(r.error ?? "", /failed/);
-    assert.equal(visits.size, 0);
+    assert.equal(visits.visits.size, 0);
   });
 });
 
@@ -716,7 +817,7 @@ describe("runSweepFollowups", () => {
 
 describe("sweep health fields", () => {
   const coverage = evaluateCoverage(
-    decode({ staleLong: 1n, staleShort: 0n, driftLong: { driftGen: 100n * SCALE, staleWeight: 1n, laggardCount: 1n }, budgetShort: 51n }),
+    decode({ staleLong: 1n, staleShort: 0n, driftLong: { driftGen: 100n * SCALE, staleWeight: 1n, laggardCount: 1n, laggardWeight: 1n }, budgetShort: 51n }),
   );
   const h = sweepHealth(coverage, { level: "urgent", k: 10, txs: 3 }, { txsSent: 3, refreshed: 25, pruned: 1, positioned: 26, neverVisited: 0 });
 
@@ -742,12 +843,13 @@ describe("sweep health fields", () => {
     const legacy = crankHealthFields(base);
     assert.equal(Object.keys(legacy).some((k) => k.startsWith("sweep")), false);
     assert.equal(legacy.lossStale, 1);
-    const covered = sweepHealth(evaluateCoverage(decode({ staleLong: 1n })), { level: "relaxed", k: 10, txs: 1 }, {
+    const covered = sweepHealth(evaluateCoverage(decode({ staleLong: 1n, driftLong: { staleWeight: 1n } })), { level: "relaxed", k: 10, txs: 1 }, {
       txsSent: 1, refreshed: 10, pruned: 0, positioned: 26, neverVisited: 0,
     });
     const f = crankHealthFields({ ...base, sweep: covered });
     assert.equal(f.lossStale, 0); // stale, but covered: orders are admitted
     assert.equal(f.sweepCovered, true);
+    assert.equal(f.sweepTrackerMalformed, false);
     assert.equal(f.sweepPace, "relaxed");
     assert.equal(f.sweepStaleLong, 1);
     assert.equal(f.sweepLaggardLong, 0);

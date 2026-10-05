@@ -259,11 +259,17 @@ function satSub(a: bigint, b: bigint): bigint {
 }
 
 /**
- * `kernel_kf_hidden_loss_bound`: 0 with no stale legs, else
+ * `kernel_kf_hidden_loss_bound` (engine 89403177): 0 with no stale legs, else
  * `ceil(stale_weight*drift_gen/(SWS*POS)) + (laggards ? ceil(laggard_weight*drift_prior/(SWS*POS)) : 0) + 2*stale`.
+ *
+ * null = no bound (the engine returns None, i.e. uncovered). Security review S1:
+ * every stale leg carries `loss_weight >= 1`, so `stale_weight < stale` means the
+ * tracker does not describe the cohort (e.g. a zeroed drift tail under a live
+ * cohort); the engine fails closed instead of collapsing to `2 * stale`.
  */
-export function hiddenLossBound(stale: bigint, d: KfDriftSide): bigint {
+export function hiddenLossBound(stale: bigint, d: KfDriftSide): bigint | null {
   if (stale === 0n) return 0n;
+  if (d.staleWeight < stale) return null;
   const den = SOCIAL_WEIGHT_SCALE * POS_SCALE;
   const gen = ceilDiv(d.staleWeight * d.driftGen, den);
   const prior = d.laggardCount === 0n ? 0n : ceilDiv(d.laggardWeight * d.driftPrior, den);
@@ -284,13 +290,19 @@ export function availableDomainInsurance(s: SweepMarketState, side: "long" | "sh
 }
 
 export interface SweepCoverage {
-  /** Hidden-loss bound of the long side's stale legs (absorbed by the SHORT domain). */
-  boundLong: bigint;
+  /** Hidden-loss bound of the long side's stale legs (absorbed by the SHORT domain); null = no bound (uncovered, S1). */
+  boundLong: bigint | null;
   /** ... of the short side's stale legs (absorbed by the LONG domain). */
-  boundShort: bigint;
+  boundShort: bigint | null;
+  /**
+   * The drift tracker fails `validate_kf_drift_shape` (engine 89403177, S1): laggards
+   * above the stale count, a generation after the KF epoch, or (on a Normal side) a
+   * stale / laggard weight below its count. The engine never admits then.
+   */
+  trackerMalformed: boolean;
   availableLongDomain: bigint;
   availableShortDomain: bigint;
-  /** boundLong <= availableShortDomain && boundShort <= availableLongDomain. */
+  /** Tracker well-formed, both bounds defined, boundLong <= availableShortDomain && boundShort <= availableLongDomain. */
   covered: boolean;
   /** max(bound/available) over both sides; 0 with no stale legs, Infinity when a bound faces 0 insurance. */
   ratio: number;
@@ -314,8 +326,9 @@ export interface SweepCoverage {
   blocksRiskIncrease: boolean;
 }
 
-/** bound/available as a float; exact enough for pacing (BigInt ratio in parts per million). */
-export function boundRatio(bound: bigint, available: bigint): number {
+/** bound/available as a float; exact enough for pacing (BigInt ratio in parts per million). null bound = Infinity. */
+export function boundRatio(bound: bigint | null, available: bigint): number {
+  if (bound === null) return Number.POSITIVE_INFINITY;
   if (bound === 0n) return 0;
   if (available === 0n) return Number.POSITIVE_INFINITY;
   const ppm = (bound * 1_000_000n) / available;
@@ -332,12 +345,34 @@ function relaxedIneligibility(s: SweepMarketState): string | null {
   return null;
 }
 
+/**
+ * Mirror of the engine's `validate_kf_drift_shape` (89403177): laggards are a
+ * subset of the stale cohort, a generation never starts after the side's KF
+ * epoch, and on a Normal side every stale leg / laggard carries loss_weight >= 1.
+ */
+export function driftTrackerWellFormed(s: SweepMarketState): boolean {
+  const side = (stale: bigint, kfEpoch: bigint, mode: number, d: KfDriftSide): boolean =>
+    d.laggardCount <= stale &&
+    d.genEpoch <= kfEpoch &&
+    !(mode === SIDE_MODE_NORMAL && (d.staleWeight < stale || d.laggardWeight < d.laggardCount));
+  return (
+    side(s.staleLong, s.kfEpochLong, s.modeLong, s.driftLong) &&
+    side(s.staleShort, s.kfEpochShort, s.modeShort, s.driftShort)
+  );
+}
+
 export function evaluateCoverage(s: SweepMarketState): SweepCoverage {
   const boundLong = hiddenLossBound(s.staleLong, s.driftLong);
   const boundShort = hiddenLossBound(s.staleShort, s.driftShort);
   const availableLongDomain = availableDomainInsurance(s, "long");
   const availableShortDomain = availableDomainInsurance(s, "short");
-  const covered = boundLong <= availableShortDomain && boundShort <= availableLongDomain;
+  const trackerMalformed = !driftTrackerWellFormed(s);
+  const covered =
+    !trackerMalformed &&
+    boundLong !== null &&
+    boundShort !== null &&
+    boundLong <= availableShortDomain &&
+    boundShort <= availableLongDomain;
   const ratio = Math.max(boundRatio(boundLong, availableShortDomain), boundRatio(boundShort, availableLongDomain));
   const ineligibleReason = relaxedIneligibility(s);
   const relaxedEligible = ineligibleReason === null;
@@ -345,6 +380,7 @@ export function evaluateCoverage(s: SweepMarketState): SweepCoverage {
   return {
     boundLong,
     boundShort,
+    trackerMalformed,
     availableLongDomain,
     availableShortDomain,
     covered,
@@ -464,46 +500,151 @@ export function planSweepPace(cov: SweepCoverage | null, positioned: number, cfg
   return { level: "elevated", k: kCap, txs: cap(Math.ceil(full(kCap) / 2)) };
 }
 
-// ── Round-robin selection ─────────────────────────────────────────────────────
+// ── Sweep order: heaviest stale first, every portfolio once per round ─────────
 
 /**
- * Next `k` portfolios to refresh: least recently visited first (never visited =
- * oldest), ties broken by pubkey so the order is deterministic. `exclude` holds
- * what this cycle already visited. Within the batch non-LP portfolios go first
- * and the LP last (the order measured on devnet: the LP is re-staled by its own
- * accrual).
+ * Sweep cursor (per market). `visits`: base58 -> sequence number of the last
+ * visit. `roundStart`: a portfolio is DUE in the current round while its last
+ * visit is below it. A round ends when nothing is due; the next one starts at
+ * the next sequence number, making every positioned portfolio due again.
+ */
+export interface SweepCursor {
+  visits: Map<string, number>;
+  roundStart: number;
+  /** Sequence number of the last recorded visit batch. */
+  seq: number;
+  /**
+   * Set when a batch was topped up across a round boundary: the next recorded
+   * visit closes the old round, and the new round starts AFTER it, so every
+   * member of that batch (old-round tail and topped-up) is due again in the new
+   * round. Without this the old round's tail would silently count as visited in
+   * the new round too, and the lightest portfolio (always the tail) would be
+   * reached only every other round.
+   */
+  roundPending: boolean;
+}
+
+export function freshSweepCursor(): SweepCursor {
+  return { visits: new Map(), roundStart: 0, seq: 0, roundPending: false };
+}
+
+/** Market KF epochs at the read: a leg with `kf_epoch_snap` below its side's epoch is stale. */
+export interface SideEpochs {
+  long: bigint;
+  short: bigint;
+}
+
+/**
+ * True when the portfolio holds a stale leg at the read (`kf_epoch_snap <
+ * kf_epoch_<side>`). Unknown (no epochs, no snaps) counts as stale.
+ */
+export function isStaleAtRead(p: PositionedPortfolio, epochs: SideEpochs | null): boolean {
+  if (!epochs) return true;
+  const hasSnap = p.kfEpochSnapLong !== undefined || p.kfEpochSnapShort !== undefined;
+  if (!hasSnap) return true;
+  return (
+    (p.kfEpochSnapLong != null && p.kfEpochSnapLong < epochs.long) ||
+    (p.kfEpochSnapShort != null && p.kfEpochSnapShort < epochs.short)
+  );
+}
+
+/**
+ * Next batch of up to `k` portfolios (security review I2 of #277).
+ *
+ * The hidden-loss bound is weight-proportional (`stale_weight * drift / (SWS*POS)`),
+ * so refreshing the heaviest stale legs first shrinks it fastest. A pure weight
+ * order would starve light portfolios, and the generation only rotates once every
+ * positioned portfolio has been refreshed since it began. So the order is by
+ * ROUND: only portfolios not yet visited this round are eligible, and among them
+ *   1. stale at the read (`kf_epoch_snap < kf_epoch_<side>`) before not stale,
+ *   2. loss_weight descending,
+ *   3. least recently visited first, then pubkey (deterministic).
+ * Every portfolio is visited once per round, and a round is about ceil(n/k)
+ * batches, so no portfolio waits more than about two rounds (the starvation test
+ * pins 2*ceil(n/k) - 1). When fewer than k are due, the next round starts (mutates
+ * `cursor.roundStart`) and the batch is topped up from it. `exclude` holds what
+ * this cycle already took.
+ * Within the batch non-LP portfolios go first and the LP last (the order
+ * measured on devnet: the LP is re-staled by its own accrual).
  */
 export function selectSweepBatch(
   positioned: ReadonlyArray<PositionedPortfolio>,
-  lastVisited: ReadonlyMap<string, number>,
+  cursor: SweepCursor,
   k: number,
   exclude: ReadonlySet<string> = new Set(),
+  epochs: SideEpochs | null = null,
 ): PositionedPortfolio[] {
   if (k <= 0) return [];
-  const keyed = positioned
+  const candidates = positioned
     .map((p) => ({ p, key: p.pubkey.toBase58() }))
     .filter((x) => !exclude.has(x.key));
-  keyed.sort((a, b) => {
-    const va = lastVisited.get(a.key) ?? -1;
-    const vb = lastVisited.get(b.key) ?? -1;
-    if (va !== vb) return va - vb;
-    return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
-  });
-  return keyed
-    .slice(0, k)
-    .map((x) => x.p)
-    .sort((a, b) => Number(a.isLp) - Number(b.isLp));
+  if (candidates.length === 0) return [];
+  const last = (key: string) => cursor.visits.get(key) ?? -1;
+  const rank = (xs: typeof candidates) =>
+    xs
+      .map((x) => ({ ...x, stale: isStaleAtRead(x.p, epochs), w: x.p.lossWeight ?? 0n }))
+      .sort((a, b) => {
+        if (a.stale !== b.stale) return a.stale ? -1 : 1;
+        if (a.w !== b.w) return a.w > b.w ? -1 : 1;
+        const va = last(a.key);
+        const vb = last(b.key);
+        if (va !== vb) return va - vb;
+        return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+      });
+  let due = candidates.filter((x) => last(x.key) < cursor.roundStart);
+  if (due.length === 0) {
+    // Round complete: the next one starts with this batch.
+    cursor.roundStart = cursor.seq + 1;
+    cursor.roundPending = false;
+    due = candidates;
+  }
+  const picked = rank(due).slice(0, k);
+  if (picked.length < k) {
+    // The round is (or is about to be) complete: top the batch up from the next round's
+    // order, so a tx never goes out half-empty at a round boundary. The new round starts
+    // once this batch is recorded (see `roundPending`).
+    const inBatch = new Set(picked.map((x) => x.key));
+    const next = rank(candidates.filter((x) => !inBatch.has(x.key))).slice(0, k - picked.length);
+    if (next.length > 0) cursor.roundPending = true;
+    picked.push(...next);
+  }
+  return picked.map((x) => x.p).sort((a, b) => Number(a.isLp) - Number(b.isLp));
 }
 
-/** Record a visit (a refresh landed, or the simulation showed the portfolio was not stale). */
-export function markVisited(lastVisited: Map<string, number>, pubkeys: ReadonlyArray<PublicKey>, seq: number): void {
-  for (const pk of pubkeys) lastVisited.set(pk.toBase58(), seq);
+/**
+ * Record one batch of visits (refreshes that landed, or portfolios the
+ * simulation showed not stale). Closes a pending round boundary.
+ */
+export function markVisited(cursor: SweepCursor, pubkeys: ReadonlyArray<PublicKey>): void {
+  if (pubkeys.length === 0) return;
+  const seq = ++cursor.seq;
+  for (const pk of pubkeys) cursor.visits.set(pk.toBase58(), seq);
+  if (cursor.roundPending) {
+    cursor.roundStart = seq + 1;
+    cursor.roundPending = false;
+  }
 }
 
 /** Forget portfolios that are no longer positioned. */
-export function pruneVisits(lastVisited: Map<string, number>, positioned: ReadonlyArray<PositionedPortfolio>): void {
+export function pruneVisits(cursor: SweepCursor, positioned: ReadonlyArray<PositionedPortfolio>): void {
   const live = new Set(positioned.map((p) => p.pubkey.toBase58()));
-  for (const k of [...lastVisited.keys()]) if (!live.has(k)) lastVisited.delete(k);
+  for (const k of [...cursor.visits.keys()]) if (!live.has(k)) cursor.visits.delete(k);
+}
+
+/**
+ * Replace cached positioned entries with the weights / epoch snaps of fresh
+ * portfolio bytes (a simulation's post-state). Entries without data, or whose
+ * data no longer shows a position, are left as they are.
+ */
+export function refreshPositionedFrom(
+  positioned: PositionedPortfolio[],
+  fresh: ReadonlyArray<PositionedPortfolio>,
+): void {
+  const byKey = new Map(fresh.map((p) => [p.pubkey.toBase58(), p]));
+  for (let i = 0; i < positioned.length; i++) {
+    const f = byKey.get(positioned[i].pubkey.toBase58());
+    if (f) positioned[i] = f;
+  }
 }
 
 // ── Sweep transaction plan ────────────────────────────────────────────────────
@@ -587,9 +728,12 @@ export interface SweepHealth {
   /** max(bound/available); null when infinite (a bound faces zero insurance). */
   coverageRatio: number | null;
   covered: boolean;
+  /** Drift tracker fails the engine's shape check (S1): never admits. */
+  trackerMalformed: boolean;
   relaxedEligible: boolean;
   ineligibleReason: string | null;
   blocksRiskIncrease: boolean;
+  /** Decimal atoms, or "uncovered" when the engine has no bound (S1). */
   boundLong: string;
   boundShort: string;
   availableLongDomain: string;
@@ -618,11 +762,12 @@ export function sweepHealth(
     layout: "drift",
     coverageRatio: Number.isFinite(cov.ratio) ? Number(cov.ratio.toFixed(6)) : null,
     covered: cov.covered,
+    trackerMalformed: cov.trackerMalformed,
     relaxedEligible: cov.relaxedEligible,
     ineligibleReason: cov.ineligibleReason,
     blocksRiskIncrease: cov.blocksRiskIncrease,
-    boundLong: cov.boundLong.toString(),
-    boundShort: cov.boundShort.toString(),
+    boundLong: cov.boundLong === null ? "uncovered" : cov.boundLong.toString(),
+    boundShort: cov.boundShort === null ? "uncovered" : cov.boundShort.toString(),
     availableLongDomain: cov.availableLongDomain.toString(),
     availableShortDomain: cov.availableShortDomain.toString(),
     staleLong: Number(cov.staleLong),

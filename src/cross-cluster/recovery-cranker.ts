@@ -133,16 +133,18 @@ import { holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coor
 import {
   decodeSweepMarketState,
   evaluateCoverage,
+  freshSweepCursor,
   markVisited,
   planSweepPace,
   planSweepTx,
   pruneVisits,
+  refreshPositionedFrom,
   selectSweepBatch,
   sweepConfigFromEnv,
   sweepEnabledFromEnv,
   sweepHealth,
 } from "./positioned-sweep.ts";
-import type { SweepConfig, SweepCoverage, SweepHealth, SweepPace, SweepPlan } from "./positioned-sweep.ts";
+import type { SideEpochs, SweepConfig, SweepCoverage, SweepCursor, SweepHealth, SweepPace, SweepPlan } from "./positioned-sweep.ts";
 import { createCrankLiveness, crankLivenessOptsFromEnv } from "./crank-liveness.ts";
 import type { CrankLiveness } from "./crank-liveness.ts";
 import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
@@ -220,10 +222,8 @@ interface CrankMarketState {
   lossStaleCycles: number;
   /** Last overflow (follow-up refresh) summary logged, so steady-state cycles stay quiet. */
   lastOverflowSummary: string | null;
-  /** Sweep (drift-layout markets): base58 -> sequence number of the portfolio's last visit. */
-  sweepVisits: Map<string, number>;
-  /** Sweep visit sequence counter (one per landed sweep transaction). */
-  sweepSeq: number;
+  /** Sweep (drift-layout markets): last visit per portfolio + the current round (positioned-sweep.ts). */
+  sweepCursor: SweepCursor;
   /** Last sweep summary logged, so steady-state cycles stay quiet. */
   lastSweepSummary: string | null;
 }
@@ -278,8 +278,7 @@ export function freshCrankMarketState(): CrankMarketState {
     benignNoProgress: 0,
     lossStaleCycles: 0,
     lastOverflowSummary: null,
-    sweepVisits: new Map(),
-    sweepSeq: 0,
+    sweepCursor: freshSweepCursor(),
     lastSweepSummary: null,
   };
 }
@@ -568,7 +567,7 @@ export async function crankOneMarket(
         refreshed: 0,
         pruned: 0,
         positioned: sweepCtx.positioned.length,
-        neverVisited: sweepCtx.positioned.filter((p) => !state.sweepVisits.has(p.pubkey.toBase58())).length,
+        neverVisited: sweepCtx.positioned.filter((p) => !state.sweepCursor.visits.has(p.pubkey.toBase58())).length,
       });
     }
 
@@ -747,7 +746,9 @@ export async function crankOneMarket(
         ...plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio),
         ...resolved.pruned.filter((p) => !p.repair && p.code !== null).map((p) => p.pubkey),
       ];
-      markVisited(state.sweepVisits, firstVisited, ++state.sweepSeq);
+      markVisited(state.sweepCursor, firstVisited);
+      // Weights / epoch snaps / market epochs after the accrual tx steer the follow-ups' order.
+      let epochs: SideEpochs = learnFromSim(sweepCtx, resolved.sim) ?? sweepCtx.epochs;
       let lastMarketData: Uint8Array | null = resolved.sim.marketData;
       let fu: SweepFollowupResult | null = null;
       if (sweepCtx.pace.txs > 1) {
@@ -765,14 +766,17 @@ export async function crankOneMarket(
             return t;
           };
           fu = await runSweepFollowups(sweepCtx.pace.txs - 1, visitedThisCycle, {
-            pickBatch: (exclude) => selectSweepBatch(sweepCtx.positioned, state.sweepVisits, sweepCtx.pace.k, exclude),
+            pickBatch: (exclude) => selectSweepBatch(sweepCtx.positioned, state.sweepCursor, sweepCtx.pace.k, exclude, epochs),
             plan: (t, accrue, liq) =>
               planSweepTx({ owner: keeper.publicKey, market, lpPortfolio, targets: t, cfg: sweepCfg, accrue, liquidateTargets: liq }),
             simulate: (p) => simulateWith(toFuTx(p), p),
             send: (p) =>
               withRpcRetry(label, () => devnetConn.sendRawTransaction(toFuTx(p).serialize(), { skipPreflight: true, maxRetries: 2 })),
             waitLanded: (sig) => waitLanded(devnetConn, sig),
-            onVisited: (pks) => markVisited(state.sweepVisits, pks, ++state.sweepSeq),
+            onVisited: (pks) => markVisited(state.sweepCursor, pks),
+            onLanded: (sim) => {
+              epochs = learnFromSim(sweepCtx, sim) ?? epochs;
+            },
           });
           if (fu.lastMarketData) lastMarketData = fu.lastMarketData;
           obs.bankruptFound += fu.bankruptFound;
@@ -792,7 +796,7 @@ export async function crankOneMarket(
         refreshed,
         pruned,
         positioned: sweepCtx.positioned.length,
-        neverVisited: sweepCtx.positioned.filter((p) => !state.sweepVisits.has(p.pubkey.toBase58())).length,
+        neverVisited: sweepCtx.positioned.filter((p) => !state.sweepCursor.visits.has(p.pubkey.toBase58())).length,
       });
       reportSweepOutcome(label, state, obs.sweep, fu?.error ?? null);
       if (fu?.error) overflowError = `sweep: ${fu.error}`;
@@ -955,7 +959,9 @@ function decodeSweepMarketStateSafe(data: Uint8Array) {
 export interface SweepContext {
   coverage: SweepCoverage;
   pace: SweepPace;
-  /** Every positioned portfolio of the market (the round-robin universe). */
+  /** KF epochs at the read (a leg with kf_epoch_snap below its side's epoch is stale). */
+  epochs: SideEpochs;
+  /** Every positioned portfolio of the market (the sweep universe). */
   positioned: PositionedPortfolio[];
   /** The first sweep transaction's targets (the cycle's accrual transaction). */
   firstBatch: PositionedPortfolio[];
@@ -969,22 +975,41 @@ export interface SweepContext {
 export function sweepContextFor(
   data: Uint8Array,
   positioned: ReadonlyArray<PositionedPortfolio>,
-  state: Pick<CrankMarketState, "sweepVisits">,
+  state: Pick<CrankMarketState, "sweepCursor">,
   cfg: SweepConfig,
   enabled: boolean = sweepEnabled,
 ): SweepContext | null {
   if (!enabled) return null;
   const s = decodeSweepMarketStateSafe(data);
   if (!s) return null;
-  if (positioned.length > 0) pruneVisits(state.sweepVisits, positioned);
+  if (positioned.length > 0) pruneVisits(state.sweepCursor, positioned);
   const coverage = evaluateCoverage(s);
   const pace = planSweepPace(coverage, positioned.length, cfg);
+  const epochs: SideEpochs = { long: s.kfEpochLong, short: s.kfEpochShort };
   return {
     coverage,
     pace,
+    epochs,
     positioned: [...positioned],
-    firstBatch: selectSweepBatch(positioned, state.sweepVisits, pace.k),
+    firstBatch: selectSweepBatch(positioned, state.sweepCursor, pace.k, new Set(), epochs),
   };
+}
+
+/**
+ * Fold a clean simulation's post-state into the sweep context: refreshed
+ * portfolios' new loss weights / epoch snaps, and the market's KF epochs (the
+ * accrual in that tx bumped them). Returns the new epochs, or null if the market
+ * post-state did not decode.
+ */
+function learnFromSim(ctx: SweepContext, sim: SimOutcome): SideEpochs | null {
+  if (sim.portfolioData && sim.portfolioData.size > 0) {
+    const fresh = selectPositionedPortfolios(
+      [...sim.portfolioData.entries()].map(([pk, data]) => ({ pubkey: new PublicKey(pk), data })),
+    );
+    refreshPositionedFrom(ctx.positioned, fresh);
+  }
+  const post = sim.marketData ? decodeSweepMarketStateSafe(sim.marketData) : null;
+  return post ? { long: post.kfEpochLong, short: post.kfEpochShort } : null;
 }
 
 export interface SweepFollowupDeps {
@@ -997,6 +1022,8 @@ export interface SweepFollowupDeps {
   waitLanded: (signature: string) => Promise<LandOutcome>;
   /** Portfolios visited by one landed tx (refreshed, or simulated not stale). */
   onVisited: (pubkeys: PublicKey[]) => void;
+  /** The clean simulation of a tx that then landed (post-state of the market and refreshed portfolios). */
+  onLanded?: (sim: SimOutcome) => void;
 }
 
 export interface SweepFollowupResult {
@@ -1093,6 +1120,7 @@ export async function runSweepFollowups(
       out.liquidated += resolved.plan.cranks.filter((c) => c.kind === "liquidate").length;
       if (resolved.sim.marketData) out.lastMarketData = resolved.sim.marketData;
       deps.onVisited([...refreshes.map((c) => c.portfolio), ...notStale]);
+      deps.onLanded?.(resolved.sim);
     }
   } catch (err) {
     out.error = `sweep send failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`;

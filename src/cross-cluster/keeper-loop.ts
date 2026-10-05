@@ -310,6 +310,7 @@ export function sweepHealthFields(s: SweepHealth): Record<string, string | numbe
     sweepCovered: s.covered,
     sweepBlocksRiskIncrease: s.blocksRiskIncrease,
     sweepRelaxedEligible: s.relaxedEligible,
+    sweepTrackerMalformed: s.trackerMalformed,
     sweepIneligibleReason: s.ineligibleReason,
     sweepBoundLong: s.boundLong,
     sweepBoundShort: s.boundShort,

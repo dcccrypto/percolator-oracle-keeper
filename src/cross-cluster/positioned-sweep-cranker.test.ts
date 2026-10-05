@@ -232,11 +232,11 @@ describe("crankOneMarket on a drift-layout market (continuous sweep)", () => {
     assert.equal(f.lossStale, 0);
     assert.equal(f.sweepCovered, true);
     assert.equal(typeof f.sweepCoverageRatio, "number");
-    assert.equal(st.sweepVisits.size, 10);
+    assert.equal(st.sweepCursor.visits.size, 10);
 
     await crankOneMarket(chain.conn as never, KEEPER, ENTRY, st, false);
     assert.equal(chain.sends.length, 2);
-    assert.equal(st.sweepVisits.size, 12, "the 2 left over were taken first in cycle 2");
+    assert.equal(st.sweepCursor.visits.size, 12, "the 2 left over were taken first in cycle 2");
     const cycle2 = new Set(chain.sends[1].kinds);
     assert.deepEqual([...cycle2], ["obs", "refresh"]);
     // every portfolio refreshed since the generation began -> it rotated: drift_gen moved to
@@ -285,6 +285,6 @@ describe("crankOneMarket on a drift-layout market (continuous sweep)", () => {
     // detail; here only that the sweep does not engage on it.
     const st = freshCrankMarketState();
     assert.equal(decodeSweepMarketState(fx("percolator-market-v18-relaunch")), null);
-    assert.equal(st.sweepVisits.size, 0);
+    assert.equal(st.sweepCursor.visits.size, 0);
   });
 });
