@@ -274,8 +274,8 @@ describe("TX_V1=auto on a v1 cluster: fewer txs", () => {
       {
         computeUnitLimit: DEFAULT_PUSH_CU_BASE + 39 * DEFAULT_PUSH_CU_PER_MARKET,
         loadedAccountsDataSizeLimit: Math.ceil((DEFAULT_LOADED_OVERHEAD_BYTES + 39 * (slabLen + 64)) * LOADED_HEADROOM),
-        heapSize: null,
-        priorityFee: null,
+        heapSize: 131_072, // the wrapper's heap, by default (#176)
+        priorityFee: null, // TX_V1_PRIORITY_FEE_LAMPORTS defaults to 0
       },
     );
     // No ComputeBudget instruction in v1: every instruction is a push, same payload shape as legacy.
@@ -785,6 +785,54 @@ describe("landed v1 reverts are classified with the v1 instruction offset", () =
     await reconcilePushOutcomes(m.conn as never, Date.now() + 10_000);
     assert.equal(pushLandingStats.otherReverts, 1);
     assert.equal(txV1Stats.landingSuspensions, 0);
+  });
+});
+
+describe("K-5 priority fee and the wrapper heap in the v1 keeper tx", () => {
+  const configOf = (w: Uint8Array) => (VersionedTransaction.deserialize(w).message as MessageV1).transactionConfig;
+
+  it("TX_V1_PRIORITY_FEE_LAMPORTS is a TOTAL per tx, carried in the config mask; default 0 = no fee bits", async () => {
+    const ms = seededMarkets(70, 20);
+    settings({ TX_V1: "auto", TX_V1_PRIORITY_FEE_LAMPORTS: "25000" });
+    const m = mockConn({ markets: ms, v1Active: true });
+    await cycle(m.conn, ms);
+    assert.equal(m.accepted().length, 2);
+    for (const a of m.accepted()) assert.equal(BigInt(configOf(a.wire).priorityFee ?? -1), 25_000n, "same total for a 16- and a 4-market tx");
+    settings({ TX_V1: "auto" });
+    const z = mockConn({ markets: ms, v1Active: true });
+    await cycle(z.conn, ms, GOLDEN_NOW_SLOT + 1n);
+    assert.equal(configOf(z.accepted()[0]!.wire).priorityFee, null);
+  });
+
+  it("junk or an over-cap fee is refused at boot", () => {
+    assert.equal(parseTxV1Settings({}).priorityFeeLamports, 0);
+    assert.equal(parseTxV1Settings({ TX_V1_PRIORITY_FEE_LAMPORTS: "1000000" }).priorityFeeLamports, 1_000_000);
+    for (const junk of ["1e5", "0x10", "-1", "1.5", "abc", "5000 lamports", "1000001", "100000000000"]) {
+      assert.throws(() => parseTxV1Settings({ TX_V1_PRIORITY_FEE_LAMPORTS: junk }), /TX_V1_PRIORITY_FEE_LAMPORTS/, junk);
+    }
+  });
+
+  it("TX_V1_HEAP_BYTES defaults to 131072 (heap bit set); 0 explicitly clears it", async () => {
+    assert.equal(parseTxV1Settings({}).heapBytes, 131_072);
+    const ms = seededMarkets(71, 5);
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: true });
+    await cycle(m.conn, ms);
+    assert.equal(configOf(m.accepted()[0]!.wire).heapSize, 131_072);
+    settings({ TX_V1: "auto", TX_V1_HEAP_BYTES: "0" });
+    const z = mockConn({ markets: ms, v1Active: true });
+    await cycle(z.conn, ms, GOLDEN_NOW_SLOT + 1n);
+    assert.equal(configOf(z.accepted()[0]!.wire).heapSize, null);
+  });
+
+  it("with heap + the max fee, 48 markets at TX_V1_PUSH_MAX_MARKETS=0 still pack, every tx <= 4096 B", async () => {
+    const ms = seededMarkets(72, 48);
+    settings({ TX_V1: "auto", TX_V1_PUSH_MAX_MARKETS: "0", TX_V1_PRIORITY_FEE_LAMPORTS: "1000000" });
+    const m = mockConn({ markets: ms, v1Active: true });
+    await cycle(m.conn, ms);
+    assert.ok(m.accepted().every((a) => a.wire.length <= 4096 && a.format === "v1"));
+    assert.equal(m.accepted().length, 1, `sizes ${m.accepted().map((a) => a.wire.length)}`);
+    assertEachPushedOnce(m.accepted(), ms);
   });
 });
 

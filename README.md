@@ -145,8 +145,10 @@ bytes it sent before (pinned by a golden test against the pre-v1 commit).
 | `auto` | v1 while the devnet feature gate reports it active; on a FORMAT rejection (or a v1 CU / loaded-size error in preflight) the unsent markets go out in legacy and v1 is suspended for `TX_V1_RETRY_AFTER_REJECT_MS`. Program errors never fall back or resend. |
 | `on` | Requires the cluster to REPORT v1: a cluster without it is a config error, so no push that cycle (fail closed, loud). A runtime v1 rejection (format, or a v1 budget error in preflight) never skips a cycle: that cycle falls back to legacy and logs an error, and the next cycle tries v1 again (no suspension). For testing a cluster; use `auto` in production. |
 
-Measured on devnet (48 live markets): legacy 4 txs per cycle (1,142 / 1,142 / 1,142 / 854 B), v1 1 tx (3,682 B,
-247,773 CU, loaded 3,590,545 B). A v1 tx is atomic like a legacy chunk: preflight still excludes a reverting
+Measured on devnet (48 live markets, read-only simulateTransaction): legacy 4 txs per cycle (1,142 / 1,142 / 1,142 /
+854 B); v1 with the defaults (16 markets/tx, 128 KiB heap) 3 txs (1,350 B each, ~83,000 CU vs a 138,000 limit, loaded
+2,503,697 B); v1 with `TX_V1_PUSH_MAX_MARKETS=0` 1 tx (3,686 B, 249,701 CU vs 394,000, loaded 3,590,545 B). The heap
+bit costs ~24.5 CU per push. A v1 tx is atomic like a legacy chunk: preflight still excludes a reverting
 market and re-sends the rest in the same cycle, but a revert that only shows up on-chain (after a clean
 preflight) affects every market in the tx. Blast-radius controls (security review K-1):
 - `TX_V1_PUSH_MAX_MARKETS` (default **16**, about the legacy 13) caps markets per v1 tx; `0` = all that fit, only
@@ -174,6 +176,8 @@ sent since the last v1 tx was seen landed OK.
 
 Other knobs: `TX_V1_PUSH_CU_PER_MARKET` (8000), `TX_V1_PUSH_CU_BASE`
 (10000), `TX_V1_LOADED_ACCOUNTS_BYTES` (unset = 1.25 x (2,000,000 + sum of slab bytes + 64 each)),
-`TX_V1_LOADED_OVERHEAD_BYTES` (2000000), `TX_V1_HEAP_BYTES` (0, like legacy). `/health` gains a `txV1` block
+`TX_V1_LOADED_OVERHEAD_BYTES` (2000000), `TX_V1_HEAP_BYTES` (131072: the wrapper's heap by contract, #176; 0 =
+none, explicitly), `TX_V1_PRIORITY_FEE_LAMPORTS` (0; a TOTAL per tx in lamports, digits only, at most 1,000,000 =
+0.001 SOL, which at one tx per 1.5 s is already ~57.6 SOL/day; the SDK encoder also refuses more than 0.01 SOL). `/health` gains a `txV1` block
 (last cycle's tx count vs the legacy baseline, fallbacks) only when `TX_V1` is not off. Cranks and refreshes
 stay legacy (they are CU-bound: v1 would not add a single refresh per tx).

@@ -49,6 +49,8 @@ import {
   TX_MAX_LOADED_ACCOUNTS_DATA_BYTES,
   TX_V1_MIN_HEAP_BYTES,
   TX_V1_MAX_HEAP_BYTES,
+  MAX_PRIORITY_FEE_LAMPORTS,
+  V17_WRAPPER_HEAP_FRAME_BYTES,
   type TxV1Mode,
 } from "@percolatorct/sdk";
 
@@ -84,8 +86,17 @@ export interface TxV1Settings {
   loadedAccountsBytes: number | null;
   /** TX_V1_LOADED_OVERHEAD_BYTES: the non-slab part of a push tx's loaded size (payer + wrapper program + programdata). */
   loadedOverheadBytes: number;
-  /** TX_V1_HEAP_BYTES: heap request in v1 (0 = none, which matches the legacy keeper tx). */
+  /**
+   * TX_V1_HEAP_BYTES: heap request in v1. Default 131072, the wrapper's heap by contract (#176;
+   * the v1 config bit, since ComputeBudget instructions do not exist in v1). 0 = none, explicitly.
+   */
   heapBytes: number;
+  /**
+   * TX_V1_PRIORITY_FEE_LAMPORTS (K-5): TOTAL priority fee per v1 push tx, in lamports (v1 has no
+   * per-CU price). Default 0. Capped by {@link KEEPER_MAX_PRIORITY_FEE_LAMPORTS} at boot and by the
+   * SDK's MAX_PRIORITY_FEE_LAMPORTS in the encoder.
+   */
+  priorityFeeLamports: number;
   /** TX_V1_RETRY_AFTER_REJECT_MS: how long v1 stays suspended after a fallback. */
   retryAfterRejectMs: number;
   /**
@@ -102,7 +113,10 @@ export interface TxV1Settings {
 /**
  * Measured on devnet 2026-10-05 against the live ETDLAdi wrapper (simulateTransaction of the
  * keeper's real batch, 48 markets): 248,480 CU = ~5,177 CU per push (13 markets: 67,416 = ~5,186).
- * 8,000 per push + 10,000 base is >= 1.5x the measurement at every batch size.
+ * Re-measured with the 128 KiB heap bit (the default since K-5): 48 markets 249,733 CU vs 248,555
+ * without (+~24.5 CU per push; ~5,203 per push); the real default path (3 txs of 16) 82,945 /
+ * 83,774 / 82,994 CU against a 138,000 limit (1.65x); 48 in one tx (TX_V1_PUSH_MAX_MARKETS=0)
+ * 249,701 against 394,000 (1.58x). 8,000 per push + 10,000 base stays >= 1.5x at every size.
  */
 export const DEFAULT_PUSH_CU_PER_MARKET = 8_000;
 export const DEFAULT_PUSH_CU_BASE = 10_000;
@@ -113,6 +127,15 @@ export const DEFAULT_PUSH_CU_BASE = 10_000;
  * and LOADED_HEADROOM (1.25) applies on top: 48 markets -> limit 4,537,840 vs measured 3,590,545.
  */
 export const DEFAULT_LOADED_OVERHEAD_BYTES = 2_000_000;
+/**
+ * Keeper-side ceiling for TX_V1_PRIORITY_FEE_LAMPORTS: 1,000,000 lamports (0.001 SOL) per push tx.
+ * At one tx per 1.5 s cycle that is already ~57.6 SOL/day, so anything above is a unit mistake
+ * (a micro-lamports/CU price passed as a total), not a setting. Below the SDK ceiling.
+ */
+export const KEEPER_MAX_PRIORITY_FEE_LAMPORTS = 1_000_000;
+if (BigInt(KEEPER_MAX_PRIORITY_FEE_LAMPORTS) > MAX_PRIORITY_FEE_LAMPORTS) {
+  throw new Error("KEEPER_MAX_PRIORITY_FEE_LAMPORTS must not exceed the SDK's MAX_PRIORITY_FEE_LAMPORTS");
+}
 export const LOADED_HEADROOM = 1.25;
 
 export const DEFAULT_TX_V1_SETTINGS: Readonly<TxV1Settings> = Object.freeze({
@@ -123,7 +146,8 @@ export const DEFAULT_TX_V1_SETTINGS: Readonly<TxV1Settings> = Object.freeze({
   pushCuBase: DEFAULT_PUSH_CU_BASE,
   loadedAccountsBytes: null,
   loadedOverheadBytes: DEFAULT_LOADED_OVERHEAD_BYTES,
-  heapBytes: 0,
+  heapBytes: V17_WRAPPER_HEAP_FRAME_BYTES,
+  priorityFeeLamports: 0,
   retryAfterRejectMs: 10 * 60_000,
   canaryCycles: 5,
   canaryTimeoutMs: 10_000,
@@ -166,6 +190,13 @@ export function parseTxV1Settings(env: Readonly<Record<string, string | undefine
     throw new Error(`TX_V1_HEAP_BYTES=${heapBytes} must be 0 or a multiple of 1024 in [${TX_V1_MIN_HEAP_BYTES}, ${TX_V1_MAX_HEAP_BYTES}]`);
   }
   const loadedRaw = env.TX_V1_LOADED_ACCOUNTS_BYTES?.trim();
+  // A fee is money: digits only (no "1e5", "0x..", "1.5", sign or unit), and capped.
+  const feeRaw = env.TX_V1_PRIORITY_FEE_LAMPORTS?.trim() ?? "";
+  if (feeRaw !== "" && (!/^\d+$/.test(feeRaw) || Number(feeRaw) > KEEPER_MAX_PRIORITY_FEE_LAMPORTS)) {
+    throw new Error(
+      `TX_V1_PRIORITY_FEE_LAMPORTS="${feeRaw}" must be a whole number of lamports (TOTAL per tx) in [0, ${KEEPER_MAX_PRIORITY_FEE_LAMPORTS}]`,
+    );
+  }
   return {
     mode,
     pushMaxMarkets: intEnv(env, "TX_V1_PUSH_MAX_MARKETS", DEFAULT_TX_V1_SETTINGS.pushMaxMarkets, 0, 64),
@@ -178,6 +209,7 @@ export function parseTxV1Settings(env: Readonly<Record<string, string | undefine
         : intEnv(env, "TX_V1_LOADED_ACCOUNTS_BYTES", 0, 1, TX_MAX_LOADED_ACCOUNTS_DATA_BYTES),
     loadedOverheadBytes: intEnv(env, "TX_V1_LOADED_OVERHEAD_BYTES", DEFAULT_LOADED_OVERHEAD_BYTES, 0, TX_MAX_LOADED_ACCOUNTS_DATA_BYTES),
     heapBytes,
+    priorityFeeLamports: feeRaw === "" ? DEFAULT_TX_V1_SETTINGS.priorityFeeLamports : Number(feeRaw),
     retryAfterRejectMs: intEnv(env, "TX_V1_RETRY_AFTER_REJECT_MS", DEFAULT_TX_V1_SETTINGS.retryAfterRejectMs, 0, 24 * 3_600_000),
     canaryCycles: intEnv(env, "TX_V1_CANARY_CYCLES", DEFAULT_TX_V1_SETTINGS.canaryCycles, 0, 1_000),
     canaryTimeoutMs: intEnv(env, "TX_V1_CANARY_TIMEOUT_MS", DEFAULT_TX_V1_SETTINGS.canaryTimeoutMs, 1, 60_000),
@@ -428,6 +460,14 @@ export function loadedAccountsFit(accountDataBytes: readonly number[]): boolean 
  */
 export const V1_BUDGET_MARKETS_PER_CYCLE = 2;
 
+/** Heap and priority-fee part of every keeper v1 config (the size check and the real build share it). */
+function v1ConfigExtras(): { heapSizeBytes?: number; priorityFeeLamports?: bigint } {
+  return {
+    ...(settings.heapBytes === 0 ? {} : { heapSizeBytes: settings.heapBytes }),
+    ...(settings.priorityFeeLamports === 0 ? {} : { priorityFeeLamports: BigInt(settings.priorityFeeLamports) }),
+  };
+}
+
 /** Compile + sign a v1 tx. Throws if a v1 limit is exceeded (4096 B, 64 accounts, 64 ix). */
 export function buildV1Wire(p: {
   payer: PublicKey;
@@ -444,7 +484,7 @@ export function buildV1Wire(p: {
     config: {
       computeUnitLimit: p.computeUnitLimit,
       loadedAccountsDataSizeLimit: p.loadedAccountsDataSizeLimit,
-      heapSizeBytes: settings.heapBytes === 0 ? undefined : settings.heapBytes,
+      ...v1ConfigExtras(),
     },
   });
   return signV1Message(compiled, p.signers);
@@ -460,7 +500,7 @@ export function v1Size(p: Omit<Parameters<typeof buildV1Wire>[0], "signers">): n
       config: {
         computeUnitLimit: p.computeUnitLimit,
         loadedAccountsDataSizeLimit: p.loadedAccountsDataSizeLimit,
-        heapSizeBytes: settings.heapBytes === 0 ? undefined : settings.heapBytes,
+        ...v1ConfigExtras(),
       },
     }).txBytes;
   } catch {
