@@ -15,8 +15,8 @@
  */
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { MessageV1, VersionedTransaction } from "@solana/web3.js";
-import { TX_V1_FEATURE_ID } from "@percolatorct/sdk";
+import { Connection, MessageV1, SendTransactionError, VersionedTransaction } from "@solana/web3.js";
+import { TX_V1_FEATURE_ID, V1RpcError } from "@percolatorct/sdk";
 import {
   pushAuthMarkBatch,
   parseFailingPush,
@@ -27,8 +27,11 @@ import {
   WRAPPER_PROGRAM_ID,
 } from "./auth-mark-pusher.ts";
 import {
+  isFormatRejection,
   parseTxV1Settings,
   resetTxV1ForTests,
+  sendWire,
+  simulateWire,
   txV1Stats,
   DEFAULT_PUSH_CU_BASE,
   DEFAULT_PUSH_CU_PER_MARKET,
@@ -92,6 +95,8 @@ const GOLDEN = {
 };
 
 const FORMAT_REJECTION = "failed to deserialize transaction: unsupported transaction version";
+/** JSON-RPC "invalid params": what a node answers for bytes it cannot decode/sanitize. */
+const FORMAT_REJECTION_CODE = -32602;
 
 interface MockOpts {
   markets: string[];
@@ -101,7 +106,7 @@ interface MockOpts {
   locked?: Set<string>;
   /** v1 simulate returns a JSON-RPC decode error. */
   v1SimReject?: boolean;
-  /** v1 send throws a format rejection. */
+  /** v1 send: the node answers a JSON-RPC format rejection (code -32602); web3.js throws SendTransactionError. */
   v1SendReject?: boolean;
   /** v1 simulate returns this tx error (e.g. a budget error). */
   v1SimErr?: unknown;
@@ -143,10 +148,16 @@ function mockConn(o: MockOpts) {
       return { value: { err: evalPushes(ms, 1), logs: [] } };
     },
     async _rpcRequest(method: string, args: unknown[]) {
-      assert.equal(method, "simulateTransaction");
       const wire = Buffer.from(args[0] as string, "base64");
+      if (method === "sendTransaction") {
+        // Reached only through the web3.js-shaped sendRawTransaction below.
+        return o.v1SendReject && wire[0] === 0x81
+          ? { error: { code: FORMAT_REJECTION_CODE, message: FORMAT_REJECTION } }
+          : { result: "unused" };
+      }
+      assert.equal(method, "simulateTransaction");
       assert.equal(wire[0], 0x81, "the raw simulate path is only used for v1");
-      if (o.v1SimReject) return { error: { code: -32602, message: FORMAT_REJECTION } };
+      if (o.v1SimReject) return { error: { code: FORMAT_REJECTION_CODE, message: FORMAT_REJECTION } };
       const ms = marketsInWire(wire, WRAPPER);
       sims.push({ format: "v1", markets: ms });
       return { result: { value: { err: o.v1SimErr ?? evalPushes(ms, 0), logs: [] } } };
@@ -156,7 +167,14 @@ function mockConn(o: MockOpts) {
       const format = wire[0] === 0x81 ? "v1" : "legacy";
       const a: Attempt = { format, wire, accepted: false, markets: marketsInWire(wire, WRAPPER) };
       attempts.push(a);
-      if (format === "v1" && o.v1SendReject) throw new Error(`failed to send transaction: ${FORMAT_REJECTION}`);
+      if (format === "v1" && o.v1SendReject) {
+        // Exactly what web3.js 1.99 sendEncodedTransaction does with a JSON-RPC error reply:
+        // ask the transport, then throw a SendTransactionError carrying only the MESSAGE.
+        const r = (await this._rpcRequest("sendTransaction", [Buffer.from(wire).toString("base64"), {}])) as {
+          error?: { message: string };
+        };
+        if (r.error) throw new SendTransactionError({ action: "send", signature: "", transactionMessage: r.error.message });
+      }
       if (o.sendError) throw new Error(o.sendError);
       a.accepted = true;
       return `sig${attempts.length}`;
@@ -355,6 +373,73 @@ describe("an on-chain error never falls back or resends", () => {
     await cycle(m.conn, ms);
     assert.equal(m.attempts.length, 1);
     assert.equal(txV1Stats.fallbacks, 0);
+  });
+});
+
+describe("format rejection is classified by JSON-RPC CODE only (SDK-3)", () => {
+  /** A real web3.js 1.99 Connection whose transport is stubbed (nothing leaves the process). */
+  const realConn = (reply: (method: string) => unknown, calls: string[] = []) => {
+    const c = new Connection("http://127.0.0.1:9", "confirmed");
+    (c as unknown as { _rpcRequest: unknown })._rpcRequest = async (method: string) => {
+      calls.push(method);
+      return reply(method);
+    };
+    return c;
+  };
+  const someWire = Uint8Array.from([0x81, 1, 2, 3]);
+
+  it("real web3.js sendRawTransaction drops the code; sendWire recovers it from the same reply", async () => {
+    const conn = realConn(() => ({ jsonrpc: "2.0", id: "1", error: { code: FORMAT_REJECTION_CODE, message: FORMAT_REJECTION } }));
+    // Baseline: what web3.js itself throws carries no code (so a code-only classifier sees nothing).
+    const plain = await conn.sendRawTransaction(someWire, { skipPreflight: true, maxRetries: 0 }).catch((e: unknown) => e);
+    assert.ok(plain instanceof SendTransactionError);
+    assert.equal(isFormatRejection(plain), false);
+    const typed = await sendWire(conn, someWire, { skipPreflight: true, maxRetries: 0 }).catch((e: unknown) => e);
+    assert.ok(typed instanceof V1RpcError);
+    assert.equal((typed as V1RpcError).code, FORMAT_REJECTION_CODE);
+    assert.equal(isFormatRejection(typed), true);
+  });
+
+  it("other JSON-RPC codes (e.g. -32002 preflight failure, -32005 node behind) are NOT format rejections", async () => {
+    for (const code of [-32002, -32005, -32603]) {
+      const conn = realConn(() => ({ jsonrpc: "2.0", id: "1", error: { code, message: "unsupported transaction version / too large" } }));
+      const e = await sendWire(conn, someWire, { skipPreflight: true, maxRetries: 0 }).catch((x: unknown) => x);
+      assert.equal((e as V1RpcError).code, code);
+      assert.equal(isFormatRejection(e), false, `code ${code}`);
+    }
+  });
+
+  it("simulateWire turns a JSON-RPC error reply into a coded V1RpcError", async () => {
+    const conn = realConn(() => ({ jsonrpc: "2.0", id: "1", error: { code: FORMAT_REJECTION_CODE, message: FORMAT_REJECTION } }));
+    const e = await simulateWire(conn, someWire).catch((x: unknown) => x);
+    assert.ok(e instanceof V1RpcError && e.code === FORMAT_REJECTION_CODE && isFormatRejection(e));
+  });
+
+  it("sendWire honours the dry-run hard stop (connection.sendRawTransaction replaced): the transport is never reached", async () => {
+    const calls: string[] = [];
+    const conn = realConn(() => ({ result: "sig" }), calls);
+    conn.sendRawTransaction = () => {
+      throw new Error("DRY-RUN: transaction send blocked at the connection");
+    };
+    await assert.rejects(sendWire(conn, someWire, { skipPreflight: true }), /DRY-RUN/);
+    assert.deepEqual(calls, []);
+  });
+
+  it("plain Error TEXT that looks like a format rejection is never one: recorded, NOT resent in legacy", async () => {
+    const ms = seededMarkets(33, 10);
+    settings({ TX_V1: "auto" });
+    for (const text of [
+      `failed to send transaction: ${FORMAT_REJECTION}`,
+      "fetch failed: request entity too large (-32602)",
+      "transaction version (1) is not supported",
+    ]) {
+      const m = mockConn({ markets: ms, v1Active: true, sendError: text });
+      const res = await cycle(m.conn, ms);
+      assert.equal(m.attempts.length, 1, `one attempt, no resend: ${text}`);
+      assert.equal(m.attempts[0]!.format, "v1");
+      assert.equal(res.pushedMarkets.length, 0);
+      assert.equal(txV1Stats.fallbacks, 0);
+    }
   });
 });
 

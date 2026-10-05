@@ -20,15 +20,24 @@
  * keeper's configured headers (DEVNET_RPC_ORIGIN) apply, exactly like the legacy
  * `simulateTransaction`. Sending uses the unchanged `connection.sendRawTransaction`
  * (it only base64-encodes the bytes), so the dry-run hard stop in cross-cluster.ts still
- * blocks v1 sends at the connection.
+ * blocks v1 sends at the connection (see {@link sendWire}).
+ *
+ * Format rejections are classified by JSON-RPC error CODE only (SDK `isTxV1FormatRejection`:
+ * -32602 / -32015), never by message text: a transport error whose text merely mentions
+ * "too large" after the node may already have accepted the tx must not cause a legacy resend.
+ * web3.js 1.x drops the code when `sendRawTransaction` fails (it throws a SendTransactionError
+ * with only the message), so {@link sendWire} recovers the node's `{error:{code}}` from the
+ * same call and rethrows it as an SDK `V1RpcError`; {@link simulateWire} does the same for the
+ * raw simulate reply.
  *
  * v1 differences the callers must respect:
  *   - No ComputeBudget instructions: the budget is in the config mask, so instruction index i in
  *     a v1 error is the caller's instruction i (legacy: i - 1). See `ixOffsetFor`.
  *   - Unset CU or loaded-accounts-data-size = 0 = the tx fails; both are always set here.
  */
-import type { Connection, Keypair, PublicKey, TransactionInstruction } from "@solana/web3.js";
+import type { Connection, Keypair, PublicKey, SendOptions, TransactionInstruction } from "@solana/web3.js";
 import {
+  V1RpcError,
   compileV1Message,
   signV1Message,
   detectTxV1Support,
@@ -315,8 +324,9 @@ export interface WireSimulation {
  * (`connection.simulateTransaction(tx)`: base64, the connection's commitment, no sigVerify,
  * no blockhash replacement), plus any `extra` config.
  *
- * @throws Error carrying the JSON-RPC error message (decode/sanitize failures land here, and
- *   {@link isTxV1FormatRejection} classifies them).
+ * @throws V1RpcError carrying the node's JSON-RPC error code when the reply is a JSON-RPC
+ *   error (decode/sanitize failures land here, and {@link isFormatRejection} classifies them by
+ *   code); a plain Error (no code: never a format rejection) for anything else.
  */
 export async function simulateWire(
   conn: Connection | RpcTransport,
@@ -330,7 +340,10 @@ export async function simulateWire(
     error?: { code?: number; message?: string };
   };
   if (res.error) {
-    throw new Error(`failed to simulate transaction: ${res.error.code ?? ""} ${res.error.message ?? JSON.stringify(res.error)}`);
+    if (typeof res.error.code === "number") {
+      throw new V1RpcError("simulateTransaction", res.error.code, res.error.message ?? JSON.stringify(res.error));
+    }
+    throw new Error(`failed to simulate transaction: ${JSON.stringify(res.error)}`);
   }
   const v = res.result?.value;
   if (!v) throw new Error("failed to simulate transaction: malformed response");
@@ -349,7 +362,49 @@ export function isV1BudgetError(err: unknown, logs: readonly string[] | null = n
   return false;
 }
 
-/** True when a send/simulate failure means the node or cluster could not take v1 bytes at all. */
+/**
+ * Send serialized v1 bytes through `conn.sendRawTransaction` (so the dry-run hard stop, which
+ * replaces that method on the connection, still applies) and keep the node's JSON-RPC error
+ * CODE when the send is refused.
+ *
+ * web3.js 1.x `sendRawTransaction` -> `sendEncodedTransaction` -> `this._rpcRequest(...)`, and on
+ * a JSON-RPC error throws a SendTransactionError that carries only the message. This calls the
+ * same method on a per-call view of the connection (`Object.create(conn)`) whose `_rpcRequest`
+ * forwards to the real transport and records a `sendTransaction` error reply, so concurrent
+ * sends never share state and nothing on the connection is patched. A recorded reply is
+ * rethrown as a `V1RpcError` (cause = the original error); anything else (network failure,
+ * the dry-run refusal, a web3.js SolanaJSONRPCError that already has `.code`) is rethrown as is.
+ */
+export async function sendWire(conn: Connection, wire: Uint8Array, opts: SendOptions): Promise<string> {
+  const transport = (conn as unknown as Partial<RpcTransport>)._rpcRequest;
+  const seen: { error?: { code: number; message: string } } = {};
+  const view = Object.create(conn) as Connection;
+  if (typeof transport === "function") {
+    (view as unknown as RpcTransport)._rpcRequest = async (method: string, args: unknown[]): Promise<unknown> => {
+      const res = await transport.call(conn, method, args);
+      const e = (res as { error?: { code?: unknown; message?: unknown } } | null)?.error;
+      if (method === "sendTransaction" && e && typeof e.code === "number") {
+        seen.error = { code: e.code, message: typeof e.message === "string" ? e.message : JSON.stringify(e) };
+      }
+      return res;
+    };
+  }
+  try {
+    return await view.sendRawTransaction(wire, opts);
+  } catch (err) {
+    if (seen.error) {
+      const typed = new V1RpcError("sendTransaction", seen.error.code, seen.error.message);
+      Object.defineProperty(typed, "cause", { value: err, enumerable: false });
+      throw typed;
+    }
+    throw err;
+  }
+}
+
+/**
+ * True when a send/simulate failure means the node or cluster could not take v1 bytes at all.
+ * By JSON-RPC error code only (SDK classifier): plain Error text is never a format rejection.
+ */
 export function isFormatRejection(err: unknown): boolean {
   return isTxV1FormatRejection(err);
 }

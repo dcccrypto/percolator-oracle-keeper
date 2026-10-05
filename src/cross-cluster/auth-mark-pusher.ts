@@ -60,6 +60,7 @@ import {
   noteV1Fallback,
   pushComputeUnits,
   resolveSendFormat,
+  sendWire,
   simulateWire,
   txV1Stats,
   v1Size,
@@ -1207,7 +1208,11 @@ export async function pushAuthMarkBatch(
       // recorded as this chunk's error instead of escaping the cycle.
       const wire = legacyTx ? legacyTx.serialize() : buildPushTxV1(keeper, chunk, nowSlot, blockhash);
       attempted = true;
-      const signature = await devnetConn.sendRawTransaction(wire, PUSH_SEND_OPTIONS);
+      // v1: same sendRawTransaction (dry-run stop intact), but a refusal keeps the node's
+      // JSON-RPC code so a FORMAT rejection is told apart from everything else by code.
+      const signature = legacyTx
+        ? await devnetConn.sendRawTransaction(wire, PUSH_SEND_OPTIONS)
+        : await sendWire(devnetConn, wire, PUSH_SEND_OPTIONS);
       txsSent++;
       if (format === "v1") txV1Stats.v1TxsSent++;
       else txV1Stats.legacyTxsSent++;
