@@ -163,6 +163,15 @@ preflight) affects every market in the tx. Blast-radius controls (security revie
   one cycle, suspend v1 as before. v1 chunks also split when the summed loaded-accounts size would pass
   `TX_V1_LOADED_ACCOUNTS_BYTES` (or, derived, 64 MiB including the 1.25 headroom).
 
+Landing proof (security review K-2): for the first `TX_V1_CANARY_CYCLES` (default 5) v1 cycles, and again after
+every landing suspension, the cycle waits up to `TX_V1_CANARY_TIMEOUT_MS` (default 10000) for
+`getSignatureStatuses` to show each v1 tx confirmed. A v1 tx the last status read still reports absent suspends v1
+(landing) and exactly its markets are re-pushed in legacy with the same observation sequence; a tx seen processed
+but unconfirmed, or a status read that fails, is never re-pushed. `/health.txV1.canary` shows
+`{required, active, passed, failures, lastResult}` and `/health.txV1.landing` shows
+`{v1TxsSent, v1LandedOk, sentSinceLastLandedOk, stalled}`; `stalled` (and one error log) when 20 v1 txs have been
+sent since the last v1 tx was seen landed OK.
+
 Other knobs: `TX_V1_PUSH_CU_PER_MARKET` (8000), `TX_V1_PUSH_CU_BASE`
 (10000), `TX_V1_LOADED_ACCOUNTS_BYTES` (unset = 1.25 x (2,000,000 + sum of slab bytes + 64 each)),
 `TX_V1_LOADED_OVERHEAD_BYTES` (2000000), `TX_V1_HEAP_BYTES` (0, like legacy). `/health` gains a `txV1` block

@@ -116,6 +116,8 @@ interface MockOpts {
   v1BudgetMarkets?: Set<string>;
   /** Slab tail bytes (default SLAB_EXTRA). */
   slabExtra?: number;
+  /** Status every accepted send of this format reports (getSignatureStatuses); unset = not found. */
+  autoStatus?: { v1?: unknown; legacy?: unknown };
 }
 
 interface Attempt {
@@ -191,7 +193,10 @@ function mockConn(o: MockOpts) {
       }
       if (o.sendError) throw new Error(o.sendError);
       a.accepted = true;
-      return `sig${attempts.length}`;
+      const sig = `sig${attempts.length}`;
+      const st = o.autoStatus?.[format];
+      if (st !== undefined) statuses.set(sig, st);
+      return sig;
     },
     async getSignatureStatuses(sigs: string[]) {
       return { value: sigs.map((s) => statuses.get(s) ?? null) };
@@ -211,7 +216,8 @@ function mockConn(o: MockOpts) {
 const asPushes = (ms: string[]) => ms.map((m, i) => ({ marketAddress: m, assetIndex: 0, priceE6: 2_000_000n + BigInt(i) }));
 const cycle = (conn: unknown, ms: string[], slot = GOLDEN_NOW_SLOT) =>
   pushAuthMarkBatch(conn as never, keeper, asPushes(ms), slot, GOLDEN_BLOCKHASH, false);
-const settings = (env: Record<string, string>) => resetTxV1ForTests(parseTxV1Settings(env));
+/** The K-2 canary is opt-in per test (it waits on signature statuses); every other test runs with it off. */
+const settings = (env: Record<string, string>) => resetTxV1ForTests(parseTxV1Settings({ TX_V1_CANARY_CYCLES: "0", ...env }));
 
 /** Every market of `ms` appears in exactly one accepted send. */
 function assertEachPushedOnce(accepted: Attempt[], ms: string[]): void {
@@ -612,6 +618,121 @@ describe("TX_V1=on: fails closed only on detection; a runtime rejection never sk
       assertEachPushedOnce(m.accepted(), ms);
       assert.equal(res.pushedMarkets.length, 20, JSON.stringify(o));
     }
+  });
+});
+
+describe("K-2: landing canary and the sent-vs-landed alert", () => {
+  const CONFIRMED = { err: null, confirmationStatus: "confirmed", slot: 1, confirmations: 1 };
+  const canaryEnv = { TX_V1: "auto", TX_V1_CANARY_CYCLES: "2", TX_V1_CANARY_TIMEOUT_MS: "30" };
+  const health = async () =>
+    ((await import("./tx-v1.ts")).txV1HealthFields() as {
+      txV1: {
+        canary: { required: number; active: boolean; passed: number; failures: number; lastResult: string | null };
+        landing: { v1TxsSent: number; v1LandedOk: number; sentSinceLastLandedOk: number; stalled: boolean };
+        suspendedKind: string | null;
+      };
+    }).txV1;
+
+  it("defaults: 5 canary cycles, 10 s", () => {
+    const d = parseTxV1Settings({});
+    assert.deepEqual({ c: d.canaryCycles, t: d.canaryTimeoutMs }, { c: 5, t: 10_000 });
+    assert.throws(() => parseTxV1Settings({ TX_V1_CANARY_TIMEOUT_MS: "0" }), /TX_V1_CANARY_TIMEOUT_MS/);
+  });
+
+  it("confirmed v1 txs pass the canary; after N cycles it stops reading statuses inline", async () => {
+    resetPushLandingState();
+    const ms = seededMarkets(60, 20);
+    settings(canaryEnv);
+    const m = mockConn({ markets: ms, v1Active: true, autoStatus: { v1: CONFIRMED } });
+    let reads = 0;
+    const gss = m.conn.getSignatureStatuses.bind(m.conn);
+    m.conn.getSignatureStatuses = async (sigs: string[]) => {
+      reads++;
+      return gss(sigs);
+    };
+    for (let c = 0; c < 3; c++) await cycle(m.conn, ms, GOLDEN_NOW_SLOT + BigInt(c));
+    const h = await health();
+    assert.deepEqual({ passed: h.canary.passed, active: h.canary.active, last: h.canary.lastResult }, { passed: 2, active: false, last: "confirmed" });
+    assert.equal(reads, 2, "one inline status read per canary cycle, none after");
+    assert.equal(h.landing.v1LandedOk, 4, "2 canary cycles x 2 v1 txs (16 + 4)");
+    assert.ok(m.accepted().every((a) => a.format === "v1"));
+  });
+
+  it("an UNLANDED canary v1 tx: re-pushed in legacy (same markets, once), v1 suspended; landed ones are not re-sent", async () => {
+    resetPushLandingState();
+    const ms = seededMarkets(61, 20);
+    settings(canaryEnv);
+    const m = mockConn({ markets: ms, v1Active: true });
+    // First v1 tx (16 markets) lands; the second (4 markets) never shows up.
+    const send = m.conn.sendRawTransaction.bind(m.conn);
+    m.conn.sendRawTransaction = async (raw: Uint8Array) => {
+      const sig = await send(raw);
+      if (sig === "sig1") m.statuses.set(sig, CONFIRMED);
+      return sig;
+    };
+    const res = await cycle(m.conn, ms);
+    assert.deepEqual(
+      m.accepted().map((a) => [a.format, a.markets.length]),
+      [
+        ["v1", 16],
+        ["v1", 4],
+        ["legacy", 4],
+      ],
+    );
+    assert.deepEqual(m.accepted()[2]!.markets, ms.slice(16), "exactly the unlanded tx's markets");
+    // Same observation sequence as the unlanded v1 push (at most one of them can land).
+    const seqOf = (w: Uint8Array) =>
+      VersionedTransaction.deserialize(w).message.compiledInstructions
+        .filter((ix) => ix.data.length === 35)
+        .map((ix) => new DataView(ix.data.buffer, ix.data.byteOffset).getBigUint64(27, true));
+    assert.deepEqual(seqOf(m.accepted()[2]!.wire), seqOf(m.accepted()[1]!.wire));
+    assert.equal(res.pushedMarkets.length, 20);
+    assert.equal(new Set(res.pushedMarkets).size, 20);
+    const h = await health();
+    assert.deepEqual({ f: h.canary.failures, last: h.canary.lastResult, kind: h.suspendedKind }, { f: 1, last: "unlanded", kind: "landing" });
+    assert.equal(txV1Stats.landingSuspensions, 1);
+    const before = m.attempts.length;
+    await cycle(m.conn, ms, GOLDEN_NOW_SLOT + 1n);
+    assert.ok(m.attempts.slice(before).every((a) => a.format === "legacy"), "suspended");
+  });
+
+  it("a canary v1 tx seen PROCESSED (landed, unconfirmed) is never re-pushed and suspends nothing", async () => {
+    resetPushLandingState();
+    const ms = seededMarkets(62, 10);
+    settings(canaryEnv);
+    const m = mockConn({ markets: ms, v1Active: true, autoStatus: { v1: { err: null, confirmationStatus: "processed", slot: 1, confirmations: 0 } } });
+    await cycle(m.conn, ms);
+    assert.deepEqual(m.accepted().map((a) => a.format), ["v1"]);
+    const h = await health();
+    assert.deepEqual({ last: h.canary.lastResult, passed: h.canary.passed, f: h.canary.failures }, { last: "inconclusive", passed: 0, f: 0 });
+    assert.equal(txV1Stats.landingSuspensions, 0);
+  });
+
+  it("an unreadable status (RPC error) never triggers a re-push", async () => {
+    resetPushLandingState();
+    const ms = seededMarkets(63, 10);
+    settings(canaryEnv);
+    const m = mockConn({ markets: ms, v1Active: true });
+    m.conn.getSignatureStatuses = async () => {
+      throw new Error("429");
+    };
+    await cycle(m.conn, ms);
+    assert.deepEqual(m.accepted().map((a) => a.format), ["v1"]);
+    assert.equal(txV1Stats.landingSuspensions, 0);
+  });
+
+  it("/health flags v1TxsSent growing while no v1 tx is seen landed OK", async () => {
+    resetPushLandingState();
+    const ms = seededMarkets(64, 16);
+    settings({ TX_V1: "auto" });
+    const m = mockConn({ markets: ms, v1Active: true });
+    for (let c = 0; c < 20; c++) await cycle(m.conn, ms, GOLDEN_NOW_SLOT + BigInt(c));
+    let h = await health();
+    assert.deepEqual({ sent: h.landing.v1TxsSent, ok: h.landing.v1LandedOk, stalled: h.landing.stalled }, { sent: 20, ok: 0, stalled: true });
+    m.statuses.set("sig20", CONFIRMED);
+    await reconcilePushOutcomes(m.conn as never, Date.now() + 10_000);
+    h = await health();
+    assert.deepEqual({ ok: h.landing.v1LandedOk, since: h.landing.sentSinceLastLandedOk, stalled: h.landing.stalled }, { ok: 1, since: 0, stalled: false });
   });
 });
 

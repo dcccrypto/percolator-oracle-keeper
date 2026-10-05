@@ -62,7 +62,7 @@
  *                           config error; a runtime rejection still falls back for that cycle). See cross-cluster/tx-v1.ts, plus:
  *   TX_V1_PUSH_MAX_MARKETS (16; 0 = all that fit) / TX_V1_ISOLATION_MAX_SIMS (8) / TX_V1_PUSH_CU_PER_MARKET (8000) / TX_V1_PUSH_CU_BASE (10000) /
  *   TX_V1_LOADED_ACCOUNTS_BYTES (unset = derived per tx) / TX_V1_LOADED_OVERHEAD_BYTES (2000000) / TX_V1_HEAP_BYTES (0) /
- *   TX_V1_RETRY_AFTER_REJECT_MS (600000)
+ *   TX_V1_RETRY_AFTER_REJECT_MS (600000) / TX_V1_CANARY_CYCLES (5) / TX_V1_CANARY_TIMEOUT_MS (10000)
  *
  * CLI flags:
  *   --dry-run             same as DRY_RUN=true

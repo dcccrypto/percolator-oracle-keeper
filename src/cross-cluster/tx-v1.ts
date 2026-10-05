@@ -88,6 +88,15 @@ export interface TxV1Settings {
   heapBytes: number;
   /** TX_V1_RETRY_AFTER_REJECT_MS: how long v1 stays suspended after a fallback. */
   retryAfterRejectMs: number;
+  /**
+   * TX_V1_CANARY_CYCLES (K-2): the first N v1 push cycles (and the first N after every landing
+   * suspension) wait for `getSignatureStatuses` to show each v1 tx confirmed before the cycle
+   * counts as OK. A v1 tx not seen within TX_V1_CANARY_TIMEOUT_MS suspends v1 and its markets are
+   * re-pushed in legacy (after the status check proved it did not land). 0 = no canary.
+   */
+  canaryCycles: number;
+  /** TX_V1_CANARY_TIMEOUT_MS: how long a canary cycle waits for its v1 txs to confirm. */
+  canaryTimeoutMs: number;
 }
 
 /**
@@ -116,7 +125,15 @@ export const DEFAULT_TX_V1_SETTINGS: Readonly<TxV1Settings> = Object.freeze({
   loadedOverheadBytes: DEFAULT_LOADED_OVERHEAD_BYTES,
   heapBytes: 0,
   retryAfterRejectMs: 10 * 60_000,
+  canaryCycles: 5,
+  canaryTimeoutMs: 10_000,
 });
+
+/**
+ * /health `txV1.landing.stalled` (K-2): this many v1 txs sent since the last v1 tx was seen
+ * landed OK. Steady state is a few in flight (status is read once a tx is >= 4 s old).
+ */
+export const V1_STALL_ALERT_TXS = 20;
 
 function intEnv(
   env: Readonly<Record<string, string | undefined>>,
@@ -162,6 +179,8 @@ export function parseTxV1Settings(env: Readonly<Record<string, string | undefine
     loadedOverheadBytes: intEnv(env, "TX_V1_LOADED_OVERHEAD_BYTES", DEFAULT_LOADED_OVERHEAD_BYTES, 0, TX_MAX_LOADED_ACCOUNTS_DATA_BYTES),
     heapBytes,
     retryAfterRejectMs: intEnv(env, "TX_V1_RETRY_AFTER_REJECT_MS", DEFAULT_TX_V1_SETTINGS.retryAfterRejectMs, 0, 24 * 3_600_000),
+    canaryCycles: intEnv(env, "TX_V1_CANARY_CYCLES", DEFAULT_TX_V1_SETTINGS.canaryCycles, 0, 1_000),
+    canaryTimeoutMs: intEnv(env, "TX_V1_CANARY_TIMEOUT_MS", DEFAULT_TX_V1_SETTINGS.canaryTimeoutMs, 1, 60_000),
   };
 }
 
@@ -174,6 +193,18 @@ let suspendedUntilMs = 0;
  */
 let landingSuspendedUntilMs = 0;
 let lastSuspendReason: string | null = null;
+
+/** K-2 landing canary state (/health `txV1.canary`). */
+const canary = {
+  /** Canary cycles whose v1 txs all confirmed without error. */
+  passed: 0,
+  /** Canary cycles with a v1 tx that never showed up (each suspends v1). */
+  failures: 0,
+  lastResult: null as null | "confirmed" | "unlanded" | "reverted" | "inconclusive",
+};
+/** K-2 stall detector: v1TxsSent when a v1 tx was last seen landed OK. */
+let v1SentAtLastLandedOk = 0;
+let stallLogged = false;
 
 /** Observability: /health `txV1` and the per-cycle log. */
 export const txV1Stats = {
@@ -195,6 +226,10 @@ export const txV1Stats = {
   lastCycleIsolationSims: 0,
   /** Cycles in which the isolation cap was hit (some markets waited for the next cycle). */
   isolationCapHits: 0,
+  /** v1 txs read back from chain: landed OK / landed and reverted / never landed. */
+  v1LandedOk: 0,
+  v1LandedReverts: 0,
+  v1Unlanded: 0,
 };
 
 export function configureTxV1(s: TxV1Settings): void {
@@ -210,6 +245,11 @@ export function resetTxV1ForTests(s: TxV1Settings = { ...DEFAULT_TX_V1_SETTINGS 
   suspendedUntilMs = 0;
   landingSuspendedUntilMs = 0;
   lastSuspendReason = null;
+  canary.passed = 0;
+  canary.failures = 0;
+  canary.lastResult = null;
+  v1SentAtLastLandedOk = 0;
+  stallLogged = false;
   txV1Stats.lastFormat = null;
   txV1Stats.lastCycleTxs = 0;
   txV1Stats.lastCycleBaselineTxs = 0;
@@ -220,6 +260,9 @@ export function resetTxV1ForTests(s: TxV1Settings = { ...DEFAULT_TX_V1_SETTINGS 
   txV1Stats.landingSuspensions = 0;
   txV1Stats.lastCycleIsolationSims = 0;
   txV1Stats.isolationCapHits = 0;
+  txV1Stats.v1LandedOk = 0;
+  txV1Stats.v1LandedReverts = 0;
+  txV1Stats.v1Unlanded = 0;
 }
 
 /** /health fields: `{ txV1: {...} }` when TX_V1 is auto/on, `{}` when off (default /health unchanged). */
@@ -232,8 +275,60 @@ export function txV1HealthFields(nowMs: number = Date.now()): Record<string, unk
       suspendedKind: nowMs < landingSuspendedUntilMs ? "landing" : nowMs < suspendedUntilMs ? "rejection" : null,
       suspendedReason: nowMs < Math.max(suspendedUntilMs, landingSuspendedUntilMs) ? lastSuspendReason : null,
       ...txV1Stats,
+      canary: { required: settings.canaryCycles, active: canaryActive(), ...canary },
+      landing: v1LandingHealth(),
     },
   };
+}
+
+/** Whether this v1 cycle is a canary cycle (K-2). */
+export function canaryActive(): boolean {
+  return settings.canaryCycles > 0 && canary.passed < settings.canaryCycles;
+}
+
+/** Record a canary cycle's outcome. `unlanded` suspends v1 (landing) and re-arms the canary. */
+export function noteCanaryResult(result: "confirmed" | "unlanded" | "reverted" | "inconclusive", detail: string, nowMs: number = Date.now()): void {
+  canary.lastResult = result;
+  if (result === "confirmed") {
+    canary.passed++;
+    if (canary.passed === settings.canaryCycles) console.log(`[push][TX_V1] landing canary passed (${canary.passed} v1 cycles confirmed on chain)`);
+  } else if (result === "unlanded") {
+    canary.failures++;
+    suspendV1ForLanding(`canary: ${detail}`, nowMs);
+  }
+}
+
+/** Record a v1 tx's on-chain outcome (reconcile or canary). */
+export function noteV1Landing(outcome: "ok" | "revert" | "unlanded"): void {
+  if (outcome === "ok") {
+    txV1Stats.v1LandedOk++;
+    v1SentAtLastLandedOk = txV1Stats.v1TxsSent;
+    stallLogged = false;
+  } else if (outcome === "revert") txV1Stats.v1LandedReverts++;
+  else txV1Stats.v1Unlanded++;
+}
+
+/** /health `txV1.landing`: v1 sends vs v1 txs seen landed OK (K-2 alert). */
+export function v1LandingHealth(): { v1TxsSent: number; v1LandedOk: number; sentSinceLastLandedOk: number; stalled: boolean } {
+  const sentSinceLastLandedOk = txV1Stats.v1TxsSent - v1SentAtLastLandedOk;
+  return {
+    v1TxsSent: txV1Stats.v1TxsSent,
+    v1LandedOk: txV1Stats.v1LandedOk,
+    sentSinceLastLandedOk,
+    stalled: sentSinceLastLandedOk >= V1_STALL_ALERT_TXS,
+  };
+}
+
+/** Log once (per stall) when v1 sends keep growing while none is seen landed OK. */
+export function checkV1Stall(): void {
+  const h = v1LandingHealth();
+  if (h.stalled && !stallLogged) {
+    stallLogged = true;
+    console.error(
+      `[push][TX_V1] ALERT: ${h.sentSinceLastLandedOk} v1 txs sent since the last v1 tx seen landed OK ` +
+        `(sent ${h.v1TxsSent}, landed ok ${h.v1LandedOk}) — v1 pushes may not be landing`,
+    );
+  }
 }
 
 /** Result of {@link resolveSendFormat}. `null` = fail closed (TX_V1=on, cluster has no v1). */
@@ -279,6 +374,8 @@ export function noteV1Fallback(reason: string, nowMs: number = Date.now()): void
  */
 export function suspendV1ForLanding(reason: string, nowMs: number = Date.now()): void {
   txV1Stats.landingSuspensions++;
+  // Re-prove landing with a fresh canary when v1 resumes.
+  canary.passed = 0;
   landingSuspendedUntilMs = nowMs + settings.retryAfterRejectMs;
   lastSuspendReason = reason.slice(0, 200);
   console.error(

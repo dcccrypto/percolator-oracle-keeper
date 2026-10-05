@@ -64,6 +64,10 @@ import {
   sendWire,
   simulateWire,
   suspendV1ForLanding,
+  canaryActive,
+  checkV1Stall,
+  noteCanaryResult,
+  noteV1Landing,
   txV1Stats,
   v1Size,
   type KeeperTxFormat,
@@ -909,6 +913,61 @@ export function resetPushLandingState(): void {
 }
 
 /**
+ * Classify one read-back push tx (`st` null = not seen) into the landing stats; a landed v1
+ * revert that is not the benign late duplicate suspends v1 (K-1(d)). Shared by
+ * {@link reconcilePushOutcomes} and the v1 landing canary.
+ */
+function recordPushOutcome(
+  f: InFlightPush,
+  st: { err: unknown } | null,
+  nowMs: number,
+): "ok" | "lateDuplicate" | "revert" | "unlanded" {
+  if (!st) {
+    pushLandingStats.unlanded++;
+    if (f.format === "v1") noteV1Landing("unlanded");
+    return "unlanded";
+  }
+  if (!st.err) {
+    pushLandingStats.landedOk++;
+    if (f.format === "v1") noteV1Landing("ok");
+    return "ok";
+  }
+  if (f.format === "v1") noteV1Landing("revert");
+  const failing = parseFailingPush(st.err, f.items.length, f.ixOffset);
+  const superseded =
+    failing !== null &&
+    failing.custom === ENGINE_STALE_CUSTOM &&
+    f.items.every((it) => (lastSentObservationSequence.get(it.key) ?? 0n) > it.seq);
+  if (superseded) {
+    pushLandingStats.lateDuplicateReverts++;
+    lateDuplicatesSinceLog++;
+    return "lateDuplicate";
+  }
+  pushLandingStats.otherReverts++;
+  console.error(
+    `[push] LANDED REVERT ${f.signature.slice(0, 16)}… ${JSON.stringify(st.err).slice(0, 100)} — ` +
+      `markets: ${f.items.map((it) => it.market.slice(0, 8) + "…").join(", ")}; not a superseded late duplicate`,
+  );
+  // K-1(d): a v1 tx is atomic over up to TX_V1_PUSH_MAX_MARKETS markets, and a revert that
+  // only shows at landing (after a clean preflight) took ALL of them down. Go back to
+  // legacy's 13-market blast radius for the suspension window. The benign late duplicate
+  // above never gets here.
+  if (f.format === "v1") {
+    suspendV1ForLanding(
+      `landed v1 revert ${f.signature.slice(0, 16)}… ${JSON.stringify(st.err).slice(0, 80)} over ${f.items.length} market(s)`,
+      nowMs,
+    );
+  }
+  return "revert";
+}
+
+/** Stop tracking a push tx (resolved by reconcile or the canary). */
+function dropInFlight(f: InFlightPush): void {
+  const at = inFlightPushes.indexOf(f);
+  if (at >= 0) inFlightPushes.splice(at, 1);
+}
+
+/**
  * Read back what happened to the push txs we sent: one batched
  * `getSignatureStatuses` over the ones old enough to have landed (no RPC at all
  * when there are none). A landed push revert is classified rather than ignored:
@@ -923,40 +982,9 @@ export async function reconcilePushOutcomes(devnetConn: Connection, nowMs: numbe
     const { value } = await devnetConn.getSignatureStatuses(due.map((f) => f.signature));
     due.forEach((f, i) => {
       const st = value[i];
-      if (!st) {
-        if (nowMs - f.sentAtMs < PUSH_STATUS_GIVE_UP_MS) return; // may still land
-        pushLandingStats.unlanded++;
-      } else if (!st.err) {
-        pushLandingStats.landedOk++;
-      } else {
-        const failing = parseFailingPush(st.err, f.items.length, f.ixOffset);
-        const superseded =
-          failing !== null &&
-          failing.custom === ENGINE_STALE_CUSTOM &&
-          f.items.every((it) => (lastSentObservationSequence.get(it.key) ?? 0n) > it.seq);
-        if (superseded) {
-          pushLandingStats.lateDuplicateReverts++;
-          lateDuplicatesSinceLog++;
-        } else {
-          pushLandingStats.otherReverts++;
-          console.error(
-            `[push] LANDED REVERT ${f.signature.slice(0, 16)}… ${JSON.stringify(st.err).slice(0, 100)} — ` +
-              `markets: ${f.items.map((it) => it.market.slice(0, 8) + "…").join(", ")}; not a superseded late duplicate`,
-          );
-          // K-1(d): a v1 tx is atomic over up to TX_V1_PUSH_MAX_MARKETS markets, and a revert that
-          // only shows at landing (after a clean preflight) took ALL of them down. Go back to
-          // legacy's 13-market blast radius for the suspension window. The benign late duplicate
-          // above never gets here.
-          if (f.format === "v1") {
-            suspendV1ForLanding(
-              `landed v1 revert ${f.signature.slice(0, 16)}… ${JSON.stringify(st.err).slice(0, 80)} over ${f.items.length} market(s)`,
-              nowMs,
-            );
-          }
-        }
-      }
-      const at = inFlightPushes.indexOf(f);
-      if (at >= 0) inFlightPushes.splice(at, 1);
+      if (!st && nowMs - f.sentAtMs < PUSH_STATUS_GIVE_UP_MS) return; // may still land
+      recordPushOutcome(f, st ?? null, nowMs);
+      dropInFlight(f);
     });
     if (lateDuplicatesSinceLog > 0 && nowMs - lastLateDuplicateLogMs >= LATE_DUPLICATE_LOG_EVERY_MS) {
       console.log(
@@ -1133,6 +1161,8 @@ export async function pushAuthMarkBatch(
   const pushedMarkets: string[] = [];
   const errors: string[] = [];
   let txsSent = 0;
+  /** v1 txs sent this cycle, for the K-2 landing canary. */
+  const v1SentThisCycle: Array<{ flight: InFlightPush; chunk: AuthMarkPushItem[] }> = [];
   // K-1(c): v1 isolation re-simulations left this cycle.
   let isolationSimsLeft = getTxV1Settings().isolationMaxSims;
   // K-3: markets moved out of v1 this cycle by an attributed budget error; pushed in legacy
@@ -1299,13 +1329,15 @@ export async function pushAuthMarkBatch(
       if (format === "v1") txV1Stats.v1TxsSent++;
       else txV1Stats.legacyTxsSent++;
       firstSig ??= signature;
-      inFlightPushes.push({
+      const flight: InFlightPush = {
         signature,
         sentAtMs: Date.now(),
         items: chunk.map((p) => ({ key: pushGenerationKey(p), market: p.marketAddress, seq: p.observationSequence })),
         ixOffset: ixOffsetFor(format),
         format,
-      });
+      };
+      inFlightPushes.push(flight);
+      if (format === "v1") v1SentThisCycle.push({ flight, chunk });
       if (inFlightPushes.length > MAX_IN_FLIGHT_PUSHES) inFlightPushes.splice(0, inFlightPushes.length - MAX_IN_FLIGHT_PUSHES);
       for (const p of chunk) {
         pushedMarkets.push(p.marketAddress);
@@ -1468,6 +1500,66 @@ export async function pushAuthMarkBatch(
   if (legacyOnly.length > 0) {
     for (const c of chunkFor("legacy", legacyOnly)) await pushChunk(c, "legacy");
   }
+
+  // ── K-2 landing canary: the first TX_V1_CANARY_CYCLES v1 cycles must SEE their v1 txs land ──
+  if (v1SentThisCycle.length > 0 && canaryActive()) {
+    const { canaryTimeoutMs } = getTxV1Settings();
+    const pollMs = Math.min(1_000, Math.max(5, Math.floor(canaryTimeoutMs / 10)));
+    const deadline = Date.now() + canaryTimeoutMs;
+    const waiting = new Map(v1SentThisCycle.map((e) => [e.flight.signature, e]));
+    const lastSeen = new Map<string, "unread" | "absent" | "processed">([...waiting.keys()].map((sig) => [sig, "unread"]));
+    const outcomes: string[] = [];
+    for (;;) {
+      // Read FIRST, then decide: the last thing before giving up is always a status read.
+      try {
+        const entries = [...waiting.values()];
+        const { value } = await devnetConn.getSignatureStatuses(entries.map((e) => e.flight.signature));
+        entries.forEach((e, i) => {
+          const st = value[i];
+          const sig = e.flight.signature;
+          if (!st) {
+            lastSeen.set(sig, "absent");
+          } else if (st.err || st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized") {
+            outcomes.push(recordPushOutcome(e.flight, st, Date.now()));
+            dropInFlight(e.flight);
+            waiting.delete(sig);
+          } else {
+            lastSeen.set(sig, "processed"); // landed, not yet confirmed
+          }
+        });
+      } catch {
+        // An unreadable status proves nothing either way: never re-push on it.
+      }
+      if (waiting.size === 0 || Date.now() >= deadline) break;
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
+    // Only a tx the LAST read reported absent is unlanded; processed/unreadable ones may have
+    // landed, so they are left to reconcile and never re-pushed.
+    const unlanded = [...waiting.values()].filter((e) => lastSeen.get(e.flight.signature) === "absent");
+    for (const e of unlanded) {
+      recordPushOutcome(e.flight, null, Date.now());
+      dropInFlight(e.flight);
+    }
+    if (unlanded.length > 0) {
+      const items = unlanded.flatMap((e) => e.chunk);
+      noteCanaryResult(
+        "unlanded",
+        `${unlanded.length} v1 tx(s) (${items.length} market(s)) not seen within ${canaryTimeoutMs}ms`,
+      );
+      // Re-push exactly those markets in legacy, same observation sequence: the status read just
+      // showed the v1 tx did not land, and the nonce rule makes at most one of the two land anyway.
+      const again = new Set(items.map((p) => p.marketAddress));
+      for (let i = pushedMarkets.length - 1; i >= 0; i--) if (again.has(pushedMarkets[i]!)) pushedMarkets.splice(i, 1);
+      for (const c of chunkFor("legacy", items)) await pushChunk(c, "legacy");
+    } else if (outcomes.some((o) => o === "revert")) {
+      noteCanaryResult("reverted", "landed v1 revert");
+    } else if (waiting.size > 0) {
+      noteCanaryResult("inconclusive", `${waiting.size} v1 tx(s) not confirmed within ${canaryTimeoutMs}ms`);
+    } else {
+      noteCanaryResult("confirmed", "");
+    }
+  }
+  if (startFormat === "v1") checkV1Stall();
 
   txV1Stats.lastFormat = startFormat;
   txV1Stats.lastCycleIsolationSims = isolationSims;
