@@ -10,7 +10,7 @@
  * the price-reading pipeline is healthy before registering any markets.
  *
  * Usage:
- *   MAINNET_RPC_URL=https://mainnet.helius-rpc.com/?api-key=... \
+ *   HELIUS_MAINNET_RPC_URL=https://mainnet.helius-rpc.com/?api-key=<your key> \
  *     npx tsx src/dry-run.ts
  *
  * Optional env:
@@ -29,9 +29,16 @@ import type { DexType } from "./cross-cluster/registry.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const MAINNET_RPC =
-  process.env.MAINNET_RPC_URL ??
-  "https://mainnet.helius-rpc.com/?api-key=2a089bfd-18ae-48b5-abbe-36b0383ecad3";
+// Fail closed: there is deliberately NO default. A hardcoded Helius key here was committed to a
+// public repo; the key must come from the environment (HELIUS_MAINNET_RPC_URL, or MAINNET_RPC_URL).
+const MAINNET_RPC = (process.env.HELIUS_MAINNET_RPC_URL ?? process.env.MAINNET_RPC_URL ?? "").trim();
+if (!MAINNET_RPC) {
+  console.error(
+    "dry-run: set HELIUS_MAINNET_RPC_URL (or MAINNET_RPC_URL) to a mainnet RPC URL. " +
+      "There is no built-in default on purpose.",
+  );
+  process.exit(1);
+}
 
 const REGISTRY_PATH =
   process.env.REGISTRY_PATH ??
