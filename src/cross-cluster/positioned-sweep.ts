@@ -30,70 +30,31 @@
  * returns Custom(22) and reverts the whole transaction, so the cranker
  * simulate-prunes as before. Sweep transactions never carry a user order.
  *
- * Layout detection: the drift state is appended to every engine asset slot
- * (2 x 80 bytes), so the per-asset stride is 2485 bytes instead of 2325. A
- * market account is `1350 + max_market_slots * stride` bytes. Anything that is
- * not exactly the new length is NOT decoded here and the cranker keeps its
- * previous behaviour (accrue + refresh everything each cycle).
+ * Layouts: every offset read here comes from the table in market-layout.ts
+ * (v2.1-legacy, v2.1-drift, v2.2-drift). The sweep applies to the rows that
+ * carry the drift tail. Only the recognised v2.1-legacy row keeps the previous
+ * refresh-everything cycle; an account that matches no row is reported
+ * unhealthy by the cranker, never silently treated as legacy.
  */
 import { PublicKey } from "@solana/web3.js";
 
 import { ACCRUE_CRANK_CU, CATCHUP_CRANK_CU, LIQUIDATE_CRANK_CU, MAX_TX_CU, REPAIR_CU, buildObservationCrankIx, buildRefreshCrankIx, catchupAllowsRefresh } from "./positioned-refresh.ts";
 import type { CrankPlan, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
+import { KF_DRIFT_FIELDS, assetSlotsOff, detectLayout, engineSlotBase, layoutById } from "./market-layout.ts";
+import type { MarketLayout, MarketLayoutId } from "./market-layout.ts";
 import { buildLivenessRepairIx } from "./liveness-repair.ts";
 import type { LivenessRepair } from "./liveness-repair.ts";
 
-// ── Market account layout (absolute byte offsets, little-endian) ─────────────
+// ── Market account decode (every offset comes from market-layout.ts) ─────────
 
-/** HEADER_LEN (16) + WRAPPER_CONFIG_LEN (576). */
-export const MARKET_GROUP_OFF = 592;
-/** MarketGroupV16HeaderAccount is 758 bytes: asset slots start at 592 + 758. */
-export const ASSET_SLOTS_OFF = 1350;
-/** u32: V16ConfigAccount.max_market_slots (group +34). */
-export const HDR_MAX_MARKET_SLOTS = 626;
-/** u128: header.insurance. */
-export const HDR_INSURANCE = 893;
-/** u128: header.source_insurance_credit_reserved_total_atoms. */
-export const HDR_SOURCE_INSURANCE_RESERVED_TOTAL = 1037;
-/** u64: header.current_slot. */
-export const HDR_CURRENT_SLOT = 1205;
-/** Wrapper oracle block in front of every engine asset slot. */
-export const ASSET_WRAPPER_LEN = 1024;
-/** Per-asset stride before / after the drift state was appended. */
-export const LEGACY_SLOT_STRIDE = 2325;
-export const DRIFT_SLOT_STRIDE = 2485;
+const V21_DRIFT = layoutById("v2.1-drift");
+const V21_LEGACY = layoutById("v2.1-legacy");
 
-// EngineAssetSlotV16Account field offsets (relative to the engine slot base E).
-const E_LIFECYCLE = 16;
-const E_EFFECTIVE_PRICE = 25;
-const E_SLOT_LAST = 41;
-const E_KF_EPOCH_LONG = 145;
-const E_KF_EPOCH_SHORT = 153;
-const E_STALE_LONG = 337;
-const E_STALE_SHORT = 345;
-const E_PENDING_OBL_LONG = 353;
-const E_PENDING_OBL_SHORT = 361;
-const E_MODE_LONG = 513;
-const E_MODE_SHORT = 514;
-const E_INS_BUDGET_LONG = 515;
-const E_INS_BUDGET_SHORT = 531;
-const E_INS_SPENT_LONG = 547;
-const E_INS_SPENT_SHORT = 563;
-const E_BARRIER_LONG = 579;
-const E_BARRIER_SHORT = 587;
-/** InsuranceCreditReservationV16Account; first field insurance_credit_reserved_num u128. */
-const E_INS_RESERVATION_LONG = 1157;
-const E_INS_RESERVATION_SHORT = 1229;
-const E_KF_DRIFT_LONG = 1301;
-const E_KF_DRIFT_SHORT = 1381;
-/** KfDriftSideV16Account: gen_epoch u64, laggard_count u64, drift_gen, drift_prior, stale_weight, laggard_weight (u128). */
-export const KF_DRIFT_LEN = 80;
-const D_GEN_EPOCH = 0;
-const D_LAGGARD_COUNT = 8;
-const D_DRIFT_GEN = 16;
-const D_DRIFT_PRIOR = 32;
-const D_STALE_WEIGHT = 48;
-const D_LAGGARD_WEIGHT = 64;
+/** v2.1 constants kept for tests / callers; derived from the layout table. */
+export const ASSET_SLOTS_OFF = assetSlotsOff(V21_DRIFT);
+export const LEGACY_SLOT_STRIDE = V21_LEGACY.slotStride;
+export const DRIFT_SLOT_STRIDE = V21_DRIFT.slotStride;
+export const KF_DRIFT_LEN = KF_DRIFT_FIELDS.len;
 
 export const LIFECYCLE_ACTIVE = 2;
 export const SIDE_MODE_NORMAL = 0;
@@ -102,11 +63,6 @@ export const SOCIAL_WEIGHT_SCALE = 1_000_000_000_000_000n;
 export const POS_SCALE = 1_000_000n;
 export const BOUND_SCALE = 1_000_000_000_000n;
 
-export type MarketLayout = "drift" | "legacy" | "unknown";
-
-function u32(d: Uint8Array, off: number): number {
-  return new DataView(d.buffer, d.byteOffset, d.byteLength).getUint32(off, true);
-}
 function u64(d: Uint8Array, off: number): bigint {
   return new DataView(d.buffer, d.byteOffset, d.byteLength).getBigUint64(off, true);
 }
@@ -115,22 +71,19 @@ function u128(d: Uint8Array, off: number): bigint {
 }
 
 /**
- * Which slot layout a market account uses, from its length and
- * `max_market_slots`: `1350 + n * 2485` = drift (new program), `1350 + n * 2325`
- * = legacy. Anything else is "unknown" and is never decoded as drift.
+ * Coarse layout class kept for callers that only ask "does the sweep apply":
+ * "drift" = a known layout WITH the drift tail (v2.1-drift, v2.2-drift),
+ * "legacy" = the recognised v2.1 layout without it, "unknown" = no table row.
  */
-export function detectMarketLayout(data: Uint8Array): MarketLayout {
-  if (data.length < HDR_MAX_MARKET_SLOTS + 4) return "unknown";
-  const n = u32(data, HDR_MAX_MARKET_SLOTS);
-  if (n === 0) return "unknown";
-  if (data.length === ASSET_SLOTS_OFF + n * DRIFT_SLOT_STRIDE) return "drift";
-  if (data.length === ASSET_SLOTS_OFF + n * LEGACY_SLOT_STRIDE) return "legacy";
-  return "unknown";
+export function detectMarketLayout(data: Uint8Array): "drift" | "legacy" | "unknown" {
+  const d = detectLayout(data);
+  if (!d.known) return "unknown";
+  return d.layout.slot.driftLong !== null ? "drift" : "legacy";
 }
 
-/** Engine slot base E of `assetIndex` in a drift-layout market. */
-export function driftEngineSlotBase(assetIndex = 0): number {
-  return ASSET_SLOTS_OFF + assetIndex * DRIFT_SLOT_STRIDE + ASSET_WRAPPER_LEN;
+/** Engine slot base E of `assetIndex` (v2.1-drift unless a layout is given). */
+export function driftEngineSlotBase(assetIndex = 0, layout: MarketLayout = V21_DRIFT): number {
+  return engineSlotBase(layout, assetIndex);
 }
 
 export interface KfDriftSide {
@@ -143,6 +96,8 @@ export interface KfDriftSide {
 }
 
 export interface SweepMarketState {
+  /** The table row the account was decoded with. */
+  layoutId: MarketLayoutId;
   maxMarketSlots: number;
   currentSlot: bigint;
   insurance: bigint;
@@ -171,81 +126,95 @@ export interface SweepMarketState {
   driftShort: KfDriftSide;
 }
 
+
 function decodeDrift(d: Uint8Array, off: number): KfDriftSide {
   return {
-    genEpoch: u64(d, off + D_GEN_EPOCH),
-    laggardCount: u64(d, off + D_LAGGARD_COUNT),
-    driftGen: u128(d, off + D_DRIFT_GEN),
-    driftPrior: u128(d, off + D_DRIFT_PRIOR),
-    staleWeight: u128(d, off + D_STALE_WEIGHT),
-    laggardWeight: u128(d, off + D_LAGGARD_WEIGHT),
+    genEpoch: u64(d, off + KF_DRIFT_FIELDS.genEpoch),
+    laggardCount: u64(d, off + KF_DRIFT_FIELDS.laggardCount),
+    driftGen: u128(d, off + KF_DRIFT_FIELDS.driftGen),
+    driftPrior: u128(d, off + KF_DRIFT_FIELDS.driftPrior),
+    staleWeight: u128(d, off + KF_DRIFT_FIELDS.staleWeight),
+    laggardWeight: u128(d, off + KF_DRIFT_FIELDS.laggardWeight),
   };
 }
 
-/** Decode the sweep/coverage inputs. null when the account is not drift layout (old program: fall back). */
+/**
+ * Absolute offsets of every field the sweep reads, for `layout` (default
+ * v2.1-drift). Throws on a layout without the drift tail.
+ */
+export function sweepFieldOffsets(assetIndex = 0, layout: MarketLayout = V21_DRIFT) {
+  const g = layout.groupOff;
+  const e = engineSlotBase(layout, assetIndex);
+  const { header: h, asset: a, slot: s } = layout;
+  if (s.driftLong === null || s.driftShort === null) {
+    throw new Error(`layout ${layout.id} has no drift tail`);
+  }
+  return {
+    maxMarketSlots: g + h.maxMarketSlots,
+    currentSlot: g + h.currentSlot,
+    insurance: g + h.insurance,
+    sourceInsuranceReservedTotal: g + h.sourceInsuranceReservedTotal,
+    lifecycle: e + a.lifecycle,
+    effectivePrice: e + a.effectivePrice,
+    slotLast: e + a.slotLast,
+    kfEpochLong: e + a.kfEpochLong,
+    kfEpochShort: e + a.kfEpochShort,
+    staleLong: e + a.staleLong,
+    staleShort: e + a.staleShort,
+    pendingObligationLong: e + a.pendingOblLong,
+    pendingObligationShort: e + a.pendingOblShort,
+    modeLong: e + a.modeLong,
+    modeShort: e + a.modeShort,
+    insuranceBudgetLong: e + s.insBudgetLong,
+    insuranceBudgetShort: e + s.insBudgetShort,
+    insuranceSpentLong: e + s.insSpentLong,
+    insuranceSpentShort: e + s.insSpentShort,
+    pendingBarrierLong: e + s.barrierLong,
+    pendingBarrierShort: e + s.barrierShort,
+    insuranceReservedNumLong: e + s.insReservationLong,
+    insuranceReservedNumShort: e + s.insReservationShort,
+    driftLong: e + s.driftLong,
+    driftShort: e + s.driftShort,
+  };
+}
+
+/**
+ * Decode the sweep/coverage inputs. null when the account's layout is unknown
+ * or has no drift tail (v2.1-legacy): the caller decides what that means, this
+ * function never guesses offsets.
+ */
 export function decodeSweepMarketState(data: Uint8Array, assetIndex = 0): SweepMarketState | null {
-  if (detectMarketLayout(data) !== "drift") return null;
-  const maxMarketSlots = u32(data, HDR_MAX_MARKET_SLOTS);
-  if (assetIndex < 0 || assetIndex >= maxMarketSlots) return null;
-  const e = driftEngineSlotBase(assetIndex);
+  const det = detectLayout(data);
+  if (!det.known || det.layout.slot.driftLong === null) return null;
+  if (assetIndex < 0 || assetIndex >= det.slots) return null;
+  const o = sweepFieldOffsets(assetIndex, det.layout);
   return {
-    maxMarketSlots,
-    currentSlot: u64(data, HDR_CURRENT_SLOT),
-    insurance: u128(data, HDR_INSURANCE),
-    sourceInsuranceReservedTotal: u128(data, HDR_SOURCE_INSURANCE_RESERVED_TOTAL),
-    lifecycle: data[e + E_LIFECYCLE],
-    effectivePrice: u64(data, e + E_EFFECTIVE_PRICE),
-    slotLast: u64(data, e + E_SLOT_LAST),
-    kfEpochLong: u64(data, e + E_KF_EPOCH_LONG),
-    kfEpochShort: u64(data, e + E_KF_EPOCH_SHORT),
-    staleLong: u64(data, e + E_STALE_LONG),
-    staleShort: u64(data, e + E_STALE_SHORT),
-    pendingObligationLong: u64(data, e + E_PENDING_OBL_LONG),
-    pendingObligationShort: u64(data, e + E_PENDING_OBL_SHORT),
-    modeLong: data[e + E_MODE_LONG],
-    modeShort: data[e + E_MODE_SHORT],
-    insuranceBudgetLong: u128(data, e + E_INS_BUDGET_LONG),
-    insuranceBudgetShort: u128(data, e + E_INS_BUDGET_SHORT),
-    insuranceSpentLong: u128(data, e + E_INS_SPENT_LONG),
-    insuranceSpentShort: u128(data, e + E_INS_SPENT_SHORT),
-    pendingBarrierLong: u64(data, e + E_BARRIER_LONG),
-    pendingBarrierShort: u64(data, e + E_BARRIER_SHORT),
-    insuranceReservedNumLong: u128(data, e + E_INS_RESERVATION_LONG),
-    insuranceReservedNumShort: u128(data, e + E_INS_RESERVATION_SHORT),
-    driftLong: decodeDrift(data, e + E_KF_DRIFT_LONG),
-    driftShort: decodeDrift(data, e + E_KF_DRIFT_SHORT),
-  };
-}
-
-/** Absolute offsets tests patch (asset 0 unless given). */
-export function sweepFieldOffsets(assetIndex = 0) {
-  const e = driftEngineSlotBase(assetIndex);
-  return {
-    maxMarketSlots: HDR_MAX_MARKET_SLOTS,
-    currentSlot: HDR_CURRENT_SLOT,
-    insurance: HDR_INSURANCE,
-    sourceInsuranceReservedTotal: HDR_SOURCE_INSURANCE_RESERVED_TOTAL,
-    lifecycle: e + E_LIFECYCLE,
-    effectivePrice: e + E_EFFECTIVE_PRICE,
-    slotLast: e + E_SLOT_LAST,
-    kfEpochLong: e + E_KF_EPOCH_LONG,
-    kfEpochShort: e + E_KF_EPOCH_SHORT,
-    staleLong: e + E_STALE_LONG,
-    staleShort: e + E_STALE_SHORT,
-    pendingObligationLong: e + E_PENDING_OBL_LONG,
-    pendingObligationShort: e + E_PENDING_OBL_SHORT,
-    modeLong: e + E_MODE_LONG,
-    modeShort: e + E_MODE_SHORT,
-    insuranceBudgetLong: e + E_INS_BUDGET_LONG,
-    insuranceBudgetShort: e + E_INS_BUDGET_SHORT,
-    insuranceSpentLong: e + E_INS_SPENT_LONG,
-    insuranceSpentShort: e + E_INS_SPENT_SHORT,
-    pendingBarrierLong: e + E_BARRIER_LONG,
-    pendingBarrierShort: e + E_BARRIER_SHORT,
-    insuranceReservedNumLong: e + E_INS_RESERVATION_LONG,
-    insuranceReservedNumShort: e + E_INS_RESERVATION_SHORT,
-    driftLong: e + E_KF_DRIFT_LONG,
-    driftShort: e + E_KF_DRIFT_SHORT,
+    layoutId: det.layout.id,
+    maxMarketSlots: det.slots,
+    currentSlot: u64(data, o.currentSlot),
+    insurance: u128(data, o.insurance),
+    sourceInsuranceReservedTotal: u128(data, o.sourceInsuranceReservedTotal),
+    lifecycle: data[o.lifecycle],
+    effectivePrice: u64(data, o.effectivePrice),
+    slotLast: u64(data, o.slotLast),
+    kfEpochLong: u64(data, o.kfEpochLong),
+    kfEpochShort: u64(data, o.kfEpochShort),
+    staleLong: u64(data, o.staleLong),
+    staleShort: u64(data, o.staleShort),
+    pendingObligationLong: u64(data, o.pendingObligationLong),
+    pendingObligationShort: u64(data, o.pendingObligationShort),
+    modeLong: data[o.modeLong],
+    modeShort: data[o.modeShort],
+    insuranceBudgetLong: u128(data, o.insuranceBudgetLong),
+    insuranceBudgetShort: u128(data, o.insuranceBudgetShort),
+    insuranceSpentLong: u128(data, o.insuranceSpentLong),
+    insuranceSpentShort: u128(data, o.insuranceSpentShort),
+    pendingBarrierLong: u64(data, o.pendingBarrierLong),
+    pendingBarrierShort: u64(data, o.pendingBarrierShort),
+    insuranceReservedNumLong: u128(data, o.insuranceReservedNumLong),
+    insuranceReservedNumShort: u128(data, o.insuranceReservedNumShort),
+    driftLong: decodeDrift(data, o.driftLong),
+    driftShort: decodeDrift(data, o.driftShort),
   };
 }
 

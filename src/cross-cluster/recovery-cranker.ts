@@ -129,7 +129,10 @@ import {
   positionedSetMatchesMarket,
   selectPositionedPortfolios,
 } from "./positioned-refresh.ts";
-import { holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coordination.ts";
+import { countLayoutProblem, holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coordination.ts";
+import type { MarketLayoutHealth } from "./refresh-coordination.ts";
+import { describeUnknownLayout, detectLayout } from "./market-layout.ts";
+import type { LayoutDetection } from "./market-layout.ts";
 import {
   decodeSweepMarketState,
   evaluateCoverage,
@@ -226,6 +229,9 @@ interface CrankMarketState {
   sweepCursor: SweepCursor;
   /** Last sweep summary logged, so steady-state cycles stay quiet. */
   lastSweepSummary: string | null;
+  /** Last layout problem logged at error level, and how many reads have hit it since. */
+  lastLayoutProblem: string | null;
+  layoutProblemReads: number;
 }
 
 /** What one crank attempt saw — feeds alerting.ts. */
@@ -251,6 +257,8 @@ export interface CrankObservation {
   lossStaleCycles: number;
   /** Sweep health (drift-layout markets only; absent on legacy markets). */
   sweep?: SweepHealth;
+  /** Layout verdict of the market account for this read. */
+  layout?: MarketLayoutHealth;
 }
 
 export function freshCrankMarketState(): CrankMarketState {
@@ -280,6 +288,8 @@ export function freshCrankMarketState(): CrankMarketState {
     lastOverflowSummary: null,
     sweepCursor: freshSweepCursor(),
     lastSweepSummary: null,
+    lastLayoutProblem: null,
+    layoutProblemReads: 0,
   };
 }
 
@@ -526,39 +536,53 @@ export async function crankOneMarket(
     // boot crank, then the loop's first cycle in the same slot. A second crank can
     // only return Custom(22) EngineNonProgress; skip it instead of counting a revert.
     if (state.lastCrankSlot !== null && BigInt(acct.context.slot) <= state.lastCrankSlot) return;
+    // Which layout is this account? An unknown stride, or a layout whose portfolios the SDK
+    // parser cannot read, is NEVER treated as a legacy market: no portfolio is refreshed (the
+    // offsets would be guesses), the accrual crank alone keeps the engine clock moving, and the
+    // market is reported unhealthy (error log, /health, [health] line, alert).
+    const detection = detectLayout(acct.value.data);
     let pre: MarketRefreshState | null = null;
-    try {
-      pre = decodeMarketRefreshState(acct.value.data);
-    } catch (err) {
-      // Unknown layout: fall back to the single accrual crank this loop always sent.
-      if (!state.decodeWarned) {
-        state.decodeWarned = true;
-        console.warn(`[cranker] ${label}: market header decode failed (${err instanceof Error ? err.message : String(err)}) — sending accrual crank only`);
+    if (detection.known) {
+      try {
+        pre = decodeMarketRefreshState(acct.value.data);
+      } catch (err) {
+        if (!state.decodeWarned) {
+          state.decodeWarned = true;
+          console.warn(`[cranker] ${label}: market header decode failed (${err instanceof Error ? err.message : String(err)}) — sending accrual crank only`);
+        }
       }
     }
+    const layoutHealth = layoutHealthFor(detection, pre);
+    if (layoutHealth.problem) noteLayoutProblem(label, marketAddress, state, layoutHealth);
+    else state.lastLayoutProblem = null;
+    /** The keeper's other v2.1 decoders (liveness repairs, ADL) only read v2.1-compatible headers. */
+    const v21Decoders = detection.known && detection.layout.v21Decoders;
     const catchup = pre ? catchupCrankCount(BigInt(acct.context.slot) - pre.slotLast, pre.maxAccrualDtSlots) : 0;
-    const positionedAll = pre && marketHasPositions(pre) && catchupAllowsRefresh(catchup)
+    const positionedAll = pre && !layoutHealth.problem && marketHasPositions(pre) && catchupAllowsRefresh(catchup)
       ? await positionedPortfoliosFor(devnetConn, market, label, pre, state)
       : [];
     // Drift-layout market (v21-funding-scale program): continuous round-robin sweep of
     // k portfolios per transaction instead of refreshing every positioned portfolio
     // in the accrual's slot. Legacy / unknown layout: sweepCtx stays null and the
     // cycle below is byte-for-byte the previous behaviour.
-    const sweepCtx = pre ? sweepContextFor(acct.value.data, positionedAll, state, sweepCfg) : null;
+    const sweepCtx = pre && !layoutHealth.problem ? sweepContextFor(acct.value.data, positionedAll, state, sweepCfg) : null;
     const targets = sweepCtx ? sweepCtx.firstBatch : positionedAll;
 
     // Liveness repairs (lapsed Fresh backing bucket, side stuck in ResetPending):
     // states no crank can leave, which revert every crank Custom(19) or every
     // open Custom(21). Prepended to this cycle's transaction; see liveness-repair.ts.
     let repairs: LivenessRepair[] = [];
-    try {
-      repairs = planLivenessRepairs(decodeLivenessState(acct.value.data), BigInt(acct.context.slot));
-    } catch {
-      repairs = [];
+    if (v21Decoders) {
+      try {
+        repairs = planLivenessRepairs(decodeLivenessState(acct.value.data), BigInt(acct.context.slot));
+      } catch {
+        repairs = [];
+      }
     }
-    const obs = observeMarket(acct.value.data, BigInt(acct.context.slot), pre, repairs);
+    const obs = observeMarket(acct.value.data, BigInt(acct.context.slot), pre, repairs, { skipAdl: !v21Decoders });
+    obs.layout = layoutHealth;
     state.obs = obs;
-    if (pre) observed = obs;
+    if (pre || layoutHealth.problem) observed = obs;
     if (sweepCtx) {
       // Until this cycle's cranks prove otherwise, the market is as the pre-crank read says.
       sweepBlocked = sweepCtx.coverage.blocksRiskIncrease;
@@ -940,6 +964,65 @@ function decodePostState(data: Uint8Array | null): MarketRefreshState | null {
   } catch {
     return null;
   }
+}
+
+// ── Market layout verdict (market-layout.ts) ─────────────────────────────────
+
+/** Log the layout problem again every this many reads (it is also in /health and alerts). */
+export const LAYOUT_PROBLEM_LOG_EVERY = 30;
+
+/**
+ * The layout verdict for one read. A problem is either an account that matches
+ * no row of the layout table, or a known layout whose portfolio accounts the
+ * SDK parser (`parsePortfolioV17`, fixed at V17_PORTFOLIO_ACCOUNT_LEN) cannot
+ * read: without the parser the keeper cannot tell which portfolios are
+ * positioned, and it does not hand-roll leg offsets.
+ */
+export function layoutHealthFor(
+  detection: LayoutDetection,
+  pre: Pick<MarketRefreshState, "storedPosLong" | "storedPosShort"> | null,
+  sdkPortfolioLen: number = V17_PORTFOLIO_ACCOUNT_LEN,
+): MarketLayoutHealth {
+  const hasPositions = pre ? pre.storedPosLong !== 0n || pre.storedPosShort !== 0n : null;
+  if (!detection.known) {
+    return {
+      id: "unknown",
+      problem: describeUnknownLayout(detection),
+      kind: "unknown",
+      accountLen: detection.accountLen,
+      provisional: false,
+      hasPositions: null,
+    };
+  }
+  const L = detection.layout;
+  const accountLen = L.groupOff + L.headerLen + detection.slots * L.slotStride;
+  if (L.portfolioAccountLen !== sdkPortfolioLen) {
+    return {
+      id: L.id,
+      problem:
+        `layout ${L.id} uses ${L.portfolioAccountLen}-byte portfolios (leg ${L.portfolioLegLen} B) but the SDK ` +
+        `portfolio parser (parsePortfolioV17) only reads ${sdkPortfolioLen}-byte portfolios`,
+      kind: "unsupported",
+      accountLen,
+      provisional: L.provisional,
+      hasPositions,
+    };
+  }
+  return { id: L.id, problem: null, kind: "ok", accountLen, provisional: L.provisional, hasPositions };
+}
+
+/** Error-level log (first read, on change, then every LAYOUT_PROBLEM_LOG_EVERY reads) + the counter. */
+function noteLayoutProblem(label: string, marketAddress: string, state: CrankMarketState, h: MarketLayoutHealth): void {
+  if (h.kind !== "ok") countLayoutProblem(h.kind);
+  state.layoutProblemReads = state.lastLayoutProblem === h.problem ? state.layoutProblemReads + 1 : 0;
+  if (state.layoutProblemReads % LAYOUT_PROBLEM_LOG_EVERY === 0) {
+    console.error(
+      `[cranker][LAYOUT] ${label} (${marketAddress}): ${h.problem}; account length ${h.accountLen} — ` +
+        "NOT refreshing positioned portfolios (accrual crank only), market reported unhealthy. " +
+        "No legacy fallback: fix the layout table in market-layout.ts / the SDK parser.",
+    );
+  }
+  state.lastLayoutProblem = h.problem;
 }
 
 // ── Continuous sweep (drift-layout markets, positioned-sweep.ts) ─────────────
@@ -1444,8 +1527,16 @@ function publishRefreshHealth(
     overflowRefreshed: obs.overflowRefreshed,
     overflowError,
     lossStaleCycles: state.lossStaleCycles,
-    status: state.lossStaleCycles >= LOSS_STALE_ALERT_CYCLES ? "loss-stale" : "ok",
+    status:
+      obs.layout?.kind === "unknown"
+        ? "layout-unknown"
+        : obs.layout?.kind === "unsupported"
+          ? "layout-unsupported"
+          : state.lossStaleCycles >= LOSS_STALE_ALERT_CYCLES
+            ? "loss-stale"
+            : "ok",
     updatedAt: Date.now(),
+    ...(obs.layout ? { layout: obs.layout } : {}),
     ...(obs.sweep ? { sweep: obs.sweep } : {}),
   });
 }
@@ -1527,12 +1618,16 @@ export function observeMarket(
   chainSlot: bigint,
   pre: (Pick<MarketRefreshState, "currentSlot"> & Partial<Pick<MarketRefreshState, "staleLong" | "staleShort">>) | null,
   repairs: ReadonlyArray<LivenessRepair>,
+  /** skipAdl: the account is not a v2.1-compatible header, so the ADL decoder would read the wrong bytes. */
+  opts: { skipAdl?: boolean } = {},
 ): CrankObservation {
   let adl: AdlState | null = null;
-  try {
-    adl = decodeAdlState(data);
-  } catch {
-    adl = null;
+  if (!opts.skipAdl) {
+    try {
+      adl = decodeAdlState(data);
+    } catch {
+      adl = null;
+    }
   }
   return {
     chainSlot,

@@ -62,6 +62,7 @@ export type AlertKind =
   | "adl-reduce-only"
   | "loss-stale"
   | "loss-stale-prolonged"
+  | "market-layout"
   | "terminal-budget-unbooked"
   | "terminal-recovery-blocked-portfolios"
   | "terminal-pda-portfolio-closed"
@@ -209,6 +210,8 @@ export interface CrankHealthSample {
   overflowRefreshed?: number;
   /** Consecutive cycles the market ENDED loss-stale (Custom(21) for every open while it lasts). */
   lossStaleCycles?: number;
+  /** Layout verdict of the market account (market-layout.ts); `problem` non-null = the keeper cannot read it. */
+  layout?: { id: string; problem: string | null; kind: string; accountLen: number; provisional: boolean; hasPositions: boolean | null };
   /** Drift-layout markets: continuous-sweep coverage (positioned-sweep.ts). */
   sweep?: {
     coverageRatio: number | null;
@@ -323,6 +326,20 @@ export function evaluateCrankHealth(
       data: { consecutive: s.consecutiveReverts, lastCode: s.lastRevertCode, ok: s.totalOk, rev: s.totalReverts, market: s.market },
     });
   }
+  if (s.layout?.problem) {
+    // Never silent: the keeper is sending the accrual crank only and refreshing NO portfolio on this
+    // market. Critical unless the read proves the market holds no position (then nothing can go stale).
+    active.push({
+      kind: "market-layout",
+      severity: s.layout.hasPositions === false ? "warn" : "critical",
+      subject: s.label,
+      message:
+        `market account layout ${s.layout.kind === "unknown" ? "UNKNOWN" : "unsupported"} (${s.layout.problem}) — ` +
+        "positioned portfolios are NOT being refreshed; opens will revert loss-stale once funding accrues. " +
+        "Update the layout table (market-layout.ts) / the SDK portfolio parser.",
+      data: { market: s.market, layout: s.layout.id, kind: s.layout.kind, accountLen: s.layout.accountLen, hasPositions: s.layout.hasPositions },
+    });
+  }
   const lsc = s.lossStaleCycles ?? 0;
   if (lsc >= t.lossStaleCycles) {
     active.push({
@@ -408,6 +425,7 @@ export function crankHealthRecord(s: CrankHealthSample): Record<string, string |
     ...(s.positioned ? { pos: s.positioned } : {}),
     ...(s.overflow ? { ovf: s.overflow, ovfOk: s.overflowRefreshed ?? 0 } : {}),
     lsc: s.lossStaleCycles ?? 0,
+    ...(s.layout ? { lay: s.layout.id, ...(s.layout.problem ? { layErr: 1 } : {}) } : {}),
     ...(s.sweep
       ? {
           cov: s.sweep.coverageRatio,

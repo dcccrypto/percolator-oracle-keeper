@@ -108,6 +108,7 @@ function putDrift(b: Buffer, off: number, d: Partial<KfDriftSide>): void {
 function driftMarket(s: MarketSpec = {}): Buffer {
   const slots = s.slots ?? 1;
   const b = Buffer.alloc(ASSET_SLOTS_OFF + slots * DRIFT_SLOT_STRIDE);
+  b.writeUInt16LE(18, 8); // wrapper header VERSION (v2.1)
   const o = sweepFieldOffsets(0);
   b.writeUInt32LE(slots, o.maxMarketSlots);
   putU64(b, o.currentSlot, s.currentSlot ?? 1_000n);
@@ -175,6 +176,7 @@ describe("drift-layout decoder", () => {
     assert.equal(detectMarketLayout(driftMarket({ slots: 3 })), "drift");
     const legacy = Buffer.alloc(ASSET_SLOTS_OFF + 2 * LEGACY_SLOT_STRIDE);
     legacy.writeUInt32LE(2, 626);
+    legacy.writeUInt16LE(18, 8);
     assert.equal(detectMarketLayout(legacy), "legacy");
     const odd = Buffer.alloc(ASSET_SLOTS_OFF + DRIFT_SLOT_STRIDE + 8);
     odd.writeUInt32LE(1, 626);

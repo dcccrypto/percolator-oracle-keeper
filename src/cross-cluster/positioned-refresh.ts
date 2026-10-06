@@ -49,12 +49,12 @@ import {
   encodePermissionlessCrank,
   ACCOUNTS_PERMISSIONLESS_CRANK_BASE,
   buildAccountMetas,
-  V17_MARKET_GROUP_OFF,
-  V17_MARKET_GROUP_LEN,
   V17_PORTFOLIO_ACCOUNT_LEN,
   parsePortfolioV17,
 } from "@percolatorct/sdk";
 
+import { describeUnknownLayout, detectLayout, engineSlotBase, layoutById } from "./market-layout.ts";
+import type { MarketLayout } from "./market-layout.ts";
 import { buildLivenessRepairIx } from "./liveness-repair.ts";
 import type { LivenessRepair } from "./liveness-repair.ts";
 
@@ -64,40 +64,12 @@ import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 export const REFRESH_ASSET_INDEX = 0;
 
 // ── Market account offsets ────────────────────────────────────────────────
-// Group header (MarketGroupV16HeaderAccount) starts at V17_MARKET_GROUP_OFF:
-//   +0   market_group_id [32]
-//   +32  V16ConfigAccount: max_portfolio_assets u16, max_market_slots u32,
-//        min_nonzero_mm_req u128, min_nonzero_im_req u128, h_min, h_max,
-//        maintenance_margin_bps, initial_margin_bps, max_trading_fee_bps,
-//        liquidation_fee_bps (u64 x6), liquidation_fee_cap u128,
-//        min_liquidation_abs u128, max_accrual_dt_slots u64  => +150
-// current_slot (+613) and loss_stale_active (+623) were cross-checked against
-// live devnet reads: current_slot equals asset.slot_last right after a crank,
-// and loss_stale_active tracks the predicate above.
-const G = V17_MARKET_GROUP_OFF;
-const HDR_MAX_ACCRUAL_DT_SLOTS = G + 150;
-const HDR_CURRENT_SLOT = G + 613;
-const HDR_LOSS_STALE_ACTIVE = G + 623;
-
-// Asset slot i = [wrapper oracle block 1024][AssetStateV16Account ...].
-const ASSET_SLOT_BASE = G + V17_MARKET_GROUP_LEN;
-const ASSET_SLOT_LEN = 2325;
-const ASSET_WRAPPER_LEN = 1024;
-// AssetStateV16Account field offsets (repr(C), all Pod byte arrays, no padding).
-const AS_LIFECYCLE = 16;
-const AS_SLOT_LAST = 41;
-const AS_KF_EPOCH_LONG = 145;
-const AS_KF_EPOCH_SHORT = 153;
-const AS_OI_EFF_LONG = 289;
-const AS_OI_EFF_SHORT = 305;
-const AS_STORED_POS_LONG = 321;
-const AS_STORED_POS_SHORT = 329;
-const AS_STALE_LONG = 337;
-const AS_STALE_SHORT = 345;
-const AS_PENDING_OBL_LONG = 353;
-const AS_PENDING_OBL_SHORT = 361;
-const AS_LOSS_WEIGHT_LONG = 369;
-const AS_LOSS_WEIGHT_SHORT = 385;
+// Every offset comes from the layout table in market-layout.ts (group header
+// fields relative to the group offset, AssetStateV16Account fields relative to
+// the engine slot base). The v2.1 numbers were cross-checked against live
+// devnet reads: current_slot equals asset.slot_last right after a crank, and
+// loss_stale_active tracks the predicate above.
+const LEGACY_LAYOUT = layoutById("v2.1-legacy");
 
 const LIFECYCLE_ACTIVE = 2;
 const LIFECYCLE_DRAIN_ONLY = 3;
@@ -125,39 +97,49 @@ function u128(d: Uint8Array, off: number): bigint {
   return u64(d, off) | (u64(d, off + 8) << 64n);
 }
 
+/**
+ * Decode the refresh inputs with the layout the account length identifies.
+ * Throws on an unknown layout (the message names the length and the known
+ * strides): the caller must report it, never decode with another layout's offsets.
+ */
 export function decodeMarketRefreshState(
   data: Uint8Array,
   assetIndex = REFRESH_ASSET_INDEX,
 ): MarketRefreshState {
-  const a = ASSET_SLOT_BASE + assetIndex * ASSET_SLOT_LEN + ASSET_WRAPPER_LEN;
-  if (data.length < a + AS_LOSS_WEIGHT_SHORT + 16) {
-    throw new Error(`decodeMarketRefreshState: market account too short (${data.length} bytes)`);
+  const det = detectLayout(data);
+  if (!det.known) throw new Error(`decodeMarketRefreshState: ${describeUnknownLayout(det)}`);
+  const L = det.layout;
+  if (assetIndex < 0 || assetIndex >= det.slots) {
+    throw new Error(`decodeMarketRefreshState: asset ${assetIndex} out of range (${det.slots} slots)`);
   }
-  const lifecycle = data[a + AS_LIFECYCLE];
-  const storedPosLong = u64(data, a + AS_STORED_POS_LONG);
-  const storedPosShort = u64(data, a + AS_STORED_POS_SHORT);
-  const staleLong = u64(data, a + AS_STALE_LONG);
-  const staleShort = u64(data, a + AS_STALE_SHORT);
+  const g = L.groupOff;
+  const a = engineSlotBase(L, assetIndex);
+  const A = L.asset;
+  const lifecycle = data[a + A.lifecycle];
+  const storedPosLong = u64(data, a + A.storedPosLong);
+  const storedPosShort = u64(data, a + A.storedPosShort);
+  const staleLong = u64(data, a + A.staleLong);
+  const staleShort = u64(data, a + A.staleShort);
   const contributesToLossStale =
     (lifecycle === LIFECYCLE_ACTIVE || lifecycle === LIFECYCLE_DRAIN_ONLY) &&
-    (u128(data, a + AS_OI_EFF_LONG) !== 0n ||
-      u128(data, a + AS_OI_EFF_SHORT) !== 0n ||
+    (u128(data, a + A.oiEffLong) !== 0n ||
+      u128(data, a + A.oiEffShort) !== 0n ||
       storedPosLong !== 0n ||
       storedPosShort !== 0n ||
       staleLong !== 0n ||
       staleShort !== 0n ||
-      u64(data, a + AS_PENDING_OBL_LONG) !== 0n ||
-      u64(data, a + AS_PENDING_OBL_SHORT) !== 0n ||
-      u128(data, a + AS_LOSS_WEIGHT_LONG) !== 0n ||
-      u128(data, a + AS_LOSS_WEIGHT_SHORT) !== 0n);
+      u64(data, a + A.pendingOblLong) !== 0n ||
+      u64(data, a + A.pendingOblShort) !== 0n ||
+      u128(data, a + A.lossWeightSumLong) !== 0n ||
+      u128(data, a + A.lossWeightSumShort) !== 0n);
   return {
-    maxAccrualDtSlots: u64(data, HDR_MAX_ACCRUAL_DT_SLOTS),
-    currentSlot: u64(data, HDR_CURRENT_SLOT),
-    lossStaleActive: data[HDR_LOSS_STALE_ACTIVE] !== 0,
+    maxAccrualDtSlots: u64(data, g + L.header.maxAccrualDtSlots),
+    currentSlot: u64(data, g + L.header.currentSlot),
+    lossStaleActive: data[g + L.header.lossStaleActive] !== 0,
     lifecycle,
-    slotLast: u64(data, a + AS_SLOT_LAST),
-    kfEpochLong: u64(data, a + AS_KF_EPOCH_LONG),
-    kfEpochShort: u64(data, a + AS_KF_EPOCH_SHORT),
+    slotLast: u64(data, a + A.slotLast),
+    kfEpochLong: u64(data, a + A.kfEpochLong),
+    kfEpochShort: u64(data, a + A.kfEpochShort),
     storedPosLong,
     storedPosShort,
     staleLong,
@@ -167,9 +149,12 @@ export function decodeMarketRefreshState(
 }
 
 /** Absolute byte offsets of stale_account_count_long/short for `assetIndex` (tests patch these). */
-export function staleCountOffsets(assetIndex = REFRESH_ASSET_INDEX): { long: number; short: number } {
-  const a = ASSET_SLOT_BASE + assetIndex * ASSET_SLOT_LEN + ASSET_WRAPPER_LEN;
-  return { long: a + AS_STALE_LONG, short: a + AS_STALE_SHORT };
+export function staleCountOffsets(
+  assetIndex = REFRESH_ASSET_INDEX,
+  layout: MarketLayout = LEGACY_LAYOUT,
+): { long: number; short: number } {
+  const a = engineSlotBase(layout, assetIndex);
+  return { long: a + layout.asset.staleLong, short: a + layout.asset.staleShort };
 }
 
 /** Mirror of `asset_is_loss_stale_at_slot(asset, header.current_slot)`. */
