@@ -21,10 +21,22 @@ interface PotFx {
 const FX = fxJson<PotFx>("p2b-pot-records.json");
 const unhex = (h: string): Uint8Array => new Uint8Array(Buffer.from(h, "hex"));
 
+/**
+ * The SDK pot reader runs the VERSION guard (magic, VERSION 18, kind 1) before it reads a byte, so a synthetic
+ * market must carry the 16-byte wrapper header like a real one.
+ */
+function stampV21MarketHeader(m: Uint8Array): Uint8Array {
+  const v = new DataView(m.buffer, m.byteOffset, m.byteLength);
+  v.setBigUint64(0, 0x5045_5243_5631_3600n, true);
+  v.setUint16(8, 18, true);
+  m[10] = 1;
+  return m;
+}
+
 /** A market account with the planted pot records of asset 1 (domain 2 = long). */
 function plantedMarket(): Uint8Array {
   const m = new Uint8Array(FX.marketGroupOff + FX.marketGroupHeaderLen + 2 * FX.assetSlotLen);
-  m[10] = 1;
+  stampV21MarketHeader(m);
   m.set(unhex(FX.sourceCreditHex), FX.asset1.sourceCreditLong);
   m.set(unhex(FX.bucketHex), FX.asset1.backingLong);
   return m;
@@ -92,7 +104,7 @@ describe("earnVaults /health record on the hand-built pot", () => {
   });
 
   it("a vault with no ledgers yet reports 0 / 0 / 0, not an error", async () => {
-    const s = snapshot({ marketData: new Uint8Array(plantedMarket().length).map((_, i) => (i === 10 ? 1 : 0)), registryData: registryBytes({ bound: false, domain: 2, feeShareBps: 5000 }) });
+    const s = snapshot({ marketData: stampV21MarketHeader(new Uint8Array(plantedMarket().length)), registryData: registryBytes({ bound: false, domain: 2, feeShareBps: 5000 }) });
     const c = fakeConn({ accounts: new Map(), slot: 7 });
     const m = mon();
     const alerts = await m.run(c.conn as never, [s]);
