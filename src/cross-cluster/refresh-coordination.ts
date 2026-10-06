@@ -43,6 +43,8 @@ export function isPushHeld(market: string, nowMs: number = Date.now()): boolean 
   return true;
 }
 
+import type { SweepHealth } from "./positioned-sweep.ts";
+
 export interface CrankRefreshHealth {
   /** stale_account_count_long/short at this cycle's pre-crank read. */
   staleLong: number;
@@ -60,9 +62,46 @@ export interface CrankRefreshHealth {
   overflowError: string | null;
   /** Consecutive cycles the market ended loss-stale (stale count > 0 after our cranks). */
   lossStaleCycles: number;
-  /** "loss-stale" once lossStaleCycles reaches the alert threshold. */
-  status: "ok" | "loss-stale";
+  /**
+   * "loss-stale" once lossStaleCycles reaches the alert threshold. "layout-unknown": the market
+   * account matches no row of the layout table (market-layout.ts); "layout-unsupported": the layout
+   * is known but the SDK portfolio parser cannot read its portfolios. Both mean the keeper is NOT
+   * refreshing this market's portfolios (accrual crank only) and the market is unhealthy.
+   */
+  status: "ok" | "loss-stale" | "layout-unknown" | "layout-unsupported";
+  /** Layout the account was read with (absent on samples from before the layout table). */
+  layout?: MarketLayoutHealth;
   updatedAt: number;
+  /**
+   * Drift-layout markets (continuous sweep): bound-vs-insurance coverage, stale and
+   * laggard counts, pace. Absent on legacy markets, so their /health is unchanged.
+   */
+  sweep?: SweepHealth;
+}
+
+/** Layout verdict for one market read. */
+export interface MarketLayoutHealth {
+  /** Table row id, or "unknown". */
+  id: string;
+  /** null = the keeper can fully read this market. */
+  problem: string | null;
+  kind: "ok" | "unknown" | "unsupported";
+  accountLen: number;
+  /** The table row is marked provisional (numbers may still move). */
+  provisional: boolean;
+  /** Positions on the asset at the read (null: not decodable). */
+  hasPositions: boolean | null;
+}
+
+/** Process-lifetime counters: cranker market reads that hit a layout problem. */
+const layoutProblemCounts = { unknown: 0, unsupported: 0 };
+
+export function countLayoutProblem(kind: "unknown" | "unsupported"): void {
+  layoutProblemCounts[kind]++;
+}
+
+export function getLayoutProblemCounts(): { unknown: number; unsupported: number } {
+  return { ...layoutProblemCounts };
 }
 
 const refreshHealth = new Map<string, CrankRefreshHealth>();
@@ -99,4 +138,6 @@ export function pruneCrankRefreshHealth(keep: ReadonlySet<string>): string[] {
 export function resetRefreshCoordination(): void {
   holds.clear();
   refreshHealth.clear();
+  layoutProblemCounts.unknown = 0;
+  layoutProblemCounts.unsupported = 0;
 }

@@ -28,9 +28,10 @@ import type { CircuitBreakerState } from "../circuit-breaker.ts";
 import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets, pruneAuthMarkPusherState } from "./auth-mark-pusher.ts";
 import { evaluateMarketPush, evaluatePushCycle, getAlertSink } from "./alerting.ts";
 import type { Alert, MarketPushSample } from "./alerting.ts";
-import { getCrankRefreshHealth, isPushHeld, pruneCrankRefreshHealth } from "./refresh-coordination.ts";
+import { getCrankRefreshHealth, getLayoutProblemCounts, isPushHeld, pruneCrankRefreshHealth } from "./refresh-coordination.ts";
 import { p2bHealthFields } from "./p2b-health.ts";
 import type { CrankRefreshHealth } from "./refresh-coordination.ts";
+import type { SweepHealth } from "./positioned-sweep.ts";
 import {
   type WalletBalanceState,
   createWalletBalanceState,
@@ -273,11 +274,24 @@ export function publishLandedTicks(
  * has ended loss-stale (stale count > 0 after the keeper's refreshes) for
  * ALERT_LOSS_STALE_CYCLES cycles: every risk-increasing trade reverts Custom(21).
  */
-export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<string, string | number | null> {
+export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<string, string | number | boolean | null> {
   if (!h) return { crankStatus: null };
   return {
+    ...(h.layout
+      ? {
+          marketLayout: h.layout.id,
+          marketLayoutUnknown: h.layout.kind === "unknown",
+          marketLayoutProblem: h.layout.problem,
+          marketLayoutProvisional: h.layout.provisional,
+        }
+      : {}),
+    ...(h.sweep ? sweepHealthFields(h.sweep) : {}),
     crankStatus: h.status,
-    lossStale: h.postStaleLong !== null ? Number(h.postStaleLong + (h.postStaleShort ?? 0) > 0) : Number(h.staleLong + h.staleShort > 0),
+    // Sweep markets carry stale portfolios by design (every accrual re-stales them); there
+    // `lossStale` means what users feel: a risk-increasing order would be refused now.
+    lossStale: h.sweep
+      ? Number(h.sweep.blocksRiskIncrease)
+      : h.postStaleLong !== null ? Number(h.postStaleLong + (h.postStaleShort ?? 0) > 0) : Number(h.staleLong + h.staleShort > 0),
     lossStaleCycles: h.lossStaleCycles,
     staleLong: h.staleLong,
     staleShort: h.staleShort,
@@ -289,6 +303,51 @@ export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<str
     overflowError: h.overflowError,
     crankHealthAgo: `${Math.floor((Date.now() - h.updatedAt) / 1000)}s`,
   };
+}
+
+/**
+ * Sweep (drift-layout market) fields for /health: `sweepCoverageRatio` is
+ * max(bound/available) over both sides (null = infinite: a bound faces zero
+ * insurance), `sweepCovered` the engine's coverage verdict, and
+ * `sweepBlocksRiskIncrease` whether an open would be refused right now.
+ */
+export function sweepHealthFields(s: SweepHealth): Record<string, string | number | boolean | null> {
+  return {
+    sweepPace: s.pace,
+    sweepCoverageRatio: s.coverageRatio,
+    sweepCovered: s.covered,
+    sweepBlocksRiskIncrease: s.blocksRiskIncrease,
+    sweepRelaxedEligible: s.relaxedEligible,
+    sweepTrackerMalformed: s.trackerMalformed,
+    sweepIneligibleReason: s.ineligibleReason,
+    sweepBoundLong: s.boundLong,
+    sweepBoundShort: s.boundShort,
+    sweepAvailableLongDomain: s.availableLongDomain,
+    sweepAvailableShortDomain: s.availableShortDomain,
+    sweepStaleLong: s.staleLong,
+    sweepStaleShort: s.staleShort,
+    sweepLaggardLong: s.laggardLong,
+    sweepLaggardShort: s.laggardShort,
+    sweepK: s.k,
+    sweepTxsPlanned: s.txsPlanned,
+    sweepTxsSent: s.txsSent,
+    sweepRefreshed: s.refreshed,
+    sweepPruned: s.pruned,
+    sweepPositioned: s.positioned,
+    sweepUnvisited: s.neverVisited,
+  };
+}
+
+/**
+ * Top-level /health fields for market-layout problems. Present ONLY once a problem has been seen
+ * (so a keeper on fully recognised layouts serves the exact same top-level keys as before):
+ * `layoutProblemMarkets` = markets currently unreadable, `sweepLayoutUnknown` /
+ * `sweepLayoutUnsupported` = process-lifetime counts of cranker reads that hit each problem.
+ */
+export function layoutProblemFields(layoutProblemMarkets: string[]): Record<string, string[] | number> {
+  const c = getLayoutProblemCounts();
+  if (layoutProblemMarkets.length === 0 && c.unknown === 0 && c.unsupported === 0) return {};
+  return { layoutProblemMarkets, sweepLayoutUnknown: c.unknown, sweepLayoutUnsupported: c.unsupported };
 }
 
 export function withheldFromPush(market: string, withholdPush: ((m: string) => boolean) | undefined): boolean {
@@ -380,6 +439,11 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
     const lossStaleMarkets = [...state.stats.entries()]
       .filter(([addr]) => getCrankRefreshHealth(addr)?.status === "loss-stale")
       .map(([addr, stat]) => stat.label || addr);
+    // Markets whose account the keeper cannot read (unknown stride / unsupported portfolio layout):
+    // their portfolios are not being refreshed. Reported, never silently treated as a legacy market.
+    const layoutProblemMarkets = [...state.stats.entries()]
+      .filter(([addr]) => getCrankRefreshHealth(addr)?.status.startsWith("layout-"))
+      .map(([addr, stat]) => stat.label || addr);
     // A quarantined market reverted its push 3 cycles running, so the pusher
     // stopped batching it to keep it from freezing everyone else's price.
     //
@@ -404,6 +468,7 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
           ? pricingStatus
           : quarantinedMarkets.length > 0 ||
               lossStaleMarkets.length > 0 ||
+              layoutProblemMarkets.length > 0 ||
               noPushMarkets.length > 0 ||
               markLaggingMarkets.length > 0
             ? "degraded-markets"
@@ -418,6 +483,7 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       lossStaleMarkets,
       noPushMarkets,
       markLaggingMarkets,
+      ...layoutProblemFields(layoutProblemMarkets),
       uptimeSec,
       cycleCount: state.cycleCount,
       timeoutCount: state.timeoutCount,

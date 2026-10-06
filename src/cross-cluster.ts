@@ -25,6 +25,11 @@
  *   DRY_RUN               "true" for dry-run (no on-chain writes, default: false)
  *   CRANK_ENABLED          "false" disables the recovery crank loop + crank-on-boot (default: true)
  *   CRANK_INTERVAL_MS       recovery crank cycle interval ms (default: 20000)
+ *   KEEPER_SWEEP_ENABLED    "false" keeps the refresh-everything cycle on drift-layout (v21-funding-scale) markets
+ *                           too (default: true; legacy-layout markets never sweep). See positioned-sweep.ts.
+ *   KEEPER_SWEEP_K          base refreshes per sweep tx (default 10; capped by the CU budget)
+ *   KEEPER_SWEEP_REFRESH_CU / KEEPER_SWEEP_ACCRUE_CU / KEEPER_SWEEP_HEADROOM_CU  sweep tx CU estimates (114000 / 200000 / 60000)
+ *   KEEPER_SWEEP_MAX_TXS_PER_CYCLE  most sweep txs per market per crank cycle (default 8)
  *   CRANK_LIVENESS_INTERVALS      exit 1 if the crank loop is silent for more than this many intervals (default 2; 0 disables)
  *   CRANK_LIVENESS_MIN_SILENCE_MS floor on that limit in ms (default 120000)
  *   ALERT_LOSS_STALE_PROLONGED_MS loud critical alert once a market is loss-stale this long (default 300000 = 5 min)
