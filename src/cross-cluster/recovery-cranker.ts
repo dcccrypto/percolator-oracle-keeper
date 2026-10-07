@@ -109,6 +109,7 @@ import {
   ACCOUNTS_PERMISSIONLESS_CRANK_BASE,
   buildAccountMetas,
   V17_PORTFOLIO_ACCOUNT_LEN,
+  LAYOUTS_BY_VERSION,
   parsePortfolioV17,
 } from "@percolatorct/sdk";
 import type { CrankObservationHint } from "@percolatorct/sdk";
@@ -130,8 +131,10 @@ import {
   selectPositionedPortfolios,
 } from "./positioned-refresh.ts";
 import { countLayoutProblem, holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coordination.ts";
+import { getSweepDelegate } from "./v22/delegation.ts";
+import { formatProgramError } from "./v22/errors.ts";
 import type { MarketLayoutHealth } from "./refresh-coordination.ts";
-import { describeUnknownLayout, detectLayout } from "./market-layout.ts";
+import { SDK_PORTFOLIO_LENS, describeUnknownLayout, detectLayout } from "./market-layout.ts";
 import type { LayoutDetection } from "./market-layout.ts";
 import {
   decodeSweepMarketState,
@@ -209,6 +212,8 @@ interface CrankMarketState {
   positionedFetchedAt: number;
   /** Set when a simulation still ended loss-stale: re-read the positioned set. */
   positionedDirty: boolean;
+  /** Portfolio account length of this market's layout (9,563 B on v2.1; 10,603 B on v2.2 variant B). */
+  portfolioLen: number;
   /** Last refresh summary logged, so steady-state cycles stay quiet. */
   lastRefreshSummary: string | null;
   decodeWarned: boolean;
@@ -277,6 +282,7 @@ export function freshCrankMarketState(): CrankMarketState {
     positioned: null,
     positionedFetchedAt: 0,
     positionedDirty: false,
+    portfolioLen: V17_PORTFOLIO_ACCOUNT_LEN,
     lastRefreshSummary: null,
     decodeWarned: false,
     obs: null,
@@ -385,7 +391,7 @@ async function withRpcRetry<T>(label: string, fn: () => Promise<T>, maxAttempts 
  * require the exact portfolio length.
  */
 export function isLpVaultPortfolio(data: Uint8Array): boolean {
-  if (data.length !== V17_PORTFOLIO_ACCOUNT_LEN) return false;
+  if (!SDK_PORTFOLIO_LENS.has(data.length)) return false;
   try {
     return parsePortfolioV17(data).matcherEnabled === true;
   } catch {
@@ -398,10 +404,10 @@ export function isLpVaultPortfolio(data: Uint8Array): boolean {
  * null if none exists yet (e.g. a brand-new market with no LP vault) — the
  * caller should skip cranking that market until discovery succeeds.
  */
-export function fetchMarketPortfolios(conn: Connection, market: PublicKey) {
+export function fetchMarketPortfolios(conn: Connection, market: PublicKey, portfolioLen: number = V17_PORTFOLIO_ACCOUNT_LEN) {
   return conn.getProgramAccounts(WRAPPER_PROGRAM_ID, {
     filters: [
-      { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
+      { dataSize: portfolioLen },
       { memcmp: { offset: 0, bytes: V17_PORTFOLIO_MAGIC.toString("base64"), encoding: "base64" } },
       { memcmp: { offset: V17_PF_MARKET_OFF, bytes: market.toBase58() } },
     ],
@@ -541,6 +547,14 @@ export async function crankOneMarket(
     // offsets would be guesses), the accrual crank alone keeps the engine clock moving, and the
     // market is reported unhealthy (error log, /health, [health] line, alert).
     const detection = detectLayout(acct.value.data);
+    if (detection.known && SDK_PORTFOLIO_LENS.has(detection.layout.portfolioAccountLen)) state.portfolioLen = detection.layout.portfolioAccountLen;
+    // v2.2 (KEEPER_V22_SWEEP): the v2.2 layer owns the positioned-refresh sweep of a variant-B market. No delegate is
+    // installed unless the flags are on, so every other market (and every market with the flags off) skips this.
+    const sweepDelegate = getSweepDelegate();
+    if (sweepDelegate && detection.known && detection.layout.id === "v2.2-b") {
+      const handled = await sweepDelegate({ conn: devnetConn, keeper, entry, marketData: acct.value.data, slot: acct.context.slot, dryRun });
+      if (handled) return;
+    }
     let pre: MarketRefreshState | null = null;
     if (detection.known) {
       try {
@@ -706,7 +720,8 @@ export async function crankOneMarket(
       state.totalReverts++;
       state.consecutiveReverts++;
       state.lastRevertCode = code;
-      state.lastErrorMsg = `revert ${code != null ? `Custom(${code})` : JSON.stringify(resolved.sim.err)}`;
+      // v2.2: a wrapper error 104-124 is logged by NAME (PriceBandPinned(104), EngineLossStale(121), ...), same text otherwise.
+      state.lastErrorMsg = `revert ${code != null ? `Custom(${code})${code >= 104 && code <= 124 ? ` ${formatProgramError("wrapper", code)}` : ""}` : JSON.stringify(resolved.sim.err)}`;
       const computeExhausted = isComputeExhaustion(resolved.sim.err, resolved.sim.logs);
       if (computeExhausted) {
         state.lastErrorMsg += ` — compute exhausted at ${resolved.plan.computeUnits} CU (${resolved.plan.cranks.length} cranks)`;
@@ -930,7 +945,7 @@ async function positionedPortfoliosFor(
   }
   state.positionedFetchedAt = now;
   try {
-    const accounts = await withRpcRetry(label, () => fetchMarketPortfolios(conn, market));
+    const accounts = await withRpcRetry(label, () => fetchMarketPortfolios(conn, market, state.portfolioLen));
     const set = selectPositionedPortfolios(accounts.map((a) => ({ pubkey: a.pubkey, data: a.account.data })));
     const changed =
       cached === null ||
@@ -981,7 +996,7 @@ export const LAYOUT_PROBLEM_LOG_EVERY = 30;
 export function layoutHealthFor(
   detection: LayoutDetection,
   pre: Pick<MarketRefreshState, "storedPosLong" | "storedPosShort"> | null,
-  sdkPortfolioLen: number = V17_PORTFOLIO_ACCOUNT_LEN,
+  sdkPortfolioLen?: number,
 ): MarketLayoutHealth {
   const hasPositions = pre ? pre.storedPosLong !== 0n || pre.storedPosShort !== 0n : null;
   if (!detection.known) {
@@ -996,6 +1011,9 @@ export function layoutHealthFor(
   }
   const L = detection.layout;
   const accountLen = L.groupOff + L.headerLen + detection.slots * L.slotStride;
+  // The portfolio length the SDK parser reads for THIS layout's VERSION (VERSION-keyed since the v2.2 SDK:
+  // 9,563 B for VERSION 18, 10,603 B for VERSION 19). An explicit argument overrides it (tests).
+  sdkPortfolioLen ??= LAYOUTS_BY_VERSION.get(L.wrapperVersion)?.portfolio.accountLen ?? V17_PORTFOLIO_ACCOUNT_LEN;
   if (L.portfolioAccountLen !== sdkPortfolioLen) {
     return {
       id: L.id,

@@ -30,6 +30,9 @@ import { evaluateMarketPush, evaluatePushCycle, getAlertSink } from "./alerting.
 import type { Alert, MarketPushSample } from "./alerting.ts";
 import { getCrankRefreshHealth, getLayoutProblemCounts, isPushHeld, pruneCrankRefreshHealth } from "./refresh-coordination.ts";
 import { p2bHealthFields } from "./p2b-health.ts";
+import { v22HealthFields } from "./v22/health.ts";
+import { layoutGuardSnapshot } from "./layout-guard-metrics.ts";
+import type { LayoutGuardSnapshot } from "./layout-guard-metrics.ts";
 import type { CrankRefreshHealth } from "./refresh-coordination.ts";
 import type { SweepHealth } from "./positioned-sweep.ts";
 import {
@@ -344,10 +347,17 @@ export function sweepHealthFields(s: SweepHealth): Record<string, string | numbe
  * `layoutProblemMarkets` = markets currently unreadable, `sweepLayoutUnknown` /
  * `sweepLayoutUnsupported` = process-lifetime counts of cranker reads that hit each problem.
  */
-export function layoutProblemFields(layoutProblemMarkets: string[]): Record<string, string[] | number> {
+export function layoutProblemFields(layoutProblemMarkets: string[]): Record<string, string[] | number | LayoutGuardSnapshot> {
   const c = getLayoutProblemCounts();
-  if (layoutProblemMarkets.length === 0 && c.unknown === 0 && c.unsupported === 0) return {};
-  return { layoutProblemMarkets, sweepLayoutUnknown: c.unknown, sweepLayoutUnsupported: c.unsupported };
+  const guard = layoutGuardSnapshot();
+  if (layoutProblemMarkets.length === 0 && c.unknown === 0 && c.unsupported === 0 && guard.refusals === 0) return {};
+  return {
+    layoutProblemMarkets,
+    sweepLayoutUnknown: c.unknown,
+    sweepLayoutUnsupported: c.unsupported,
+    // v2.2: the VERSION-keyed guard's refusal counters (by reason / on-chain VERSION); present only once one fired.
+    ...(guard.refusals > 0 ? { layoutGuard: guard } : {}),
+  };
 }
 
 export function withheldFromPush(market: string, withholdPush: ((m: string) => boolean) | undefined): boolean {
@@ -497,6 +507,8 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       markets,
       // v2.1 (P2b), additive: `earnVaults` + `p2b`. `{}` (nothing added) unless the wrapper supports P2b.
       ...p2bHealthFields(),
+      // v2.2 layer, additive: `v22`. `{}` unless KEEPER_V22=on.
+      ...v22HealthFields(),
     });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(payload);

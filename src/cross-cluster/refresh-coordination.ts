@@ -44,6 +44,7 @@ export function isPushHeld(market: string, nowMs: number = Date.now()): boolean 
 }
 
 import type { SweepHealth } from "./positioned-sweep.ts";
+import { resetLayoutGuardMetrics } from "./layout-guard-metrics.ts";
 
 export interface CrankRefreshHealth {
   /** stale_account_count_long/short at this cycle's pre-crank read. */
@@ -140,4 +141,5 @@ export function resetRefreshCoordination(): void {
   refreshHealth.clear();
   layoutProblemCounts.unknown = 0;
   layoutProblemCounts.unsupported = 0;
+  resetLayoutGuardMetrics();
 }

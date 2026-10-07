@@ -53,7 +53,7 @@ import {
   parsePortfolioV17,
 } from "@percolatorct/sdk";
 
-import { describeUnknownLayout, detectLayout, engineSlotBase, layoutById } from "./market-layout.ts";
+import { SDK_PORTFOLIO_LENS, describeUnknownLayout, detectLayout, engineSlotBase, layoutById } from "./market-layout.ts";
 import type { MarketLayout } from "./market-layout.ts";
 import { buildLivenessRepairIx } from "./liveness-repair.ts";
 import type { LivenessRepair } from "./liveness-repair.ts";
@@ -195,7 +195,7 @@ export function selectPositionedPortfolios(
 ): PositionedPortfolio[] {
   const out: PositionedPortfolio[] = [];
   for (const { pubkey, data } of accounts) {
-    if (data.length !== V17_PORTFOLIO_ACCOUNT_LEN) continue;
+    if (!SDK_PORTFOLIO_LENS.has(data.length)) continue;
     let parsed;
     try {
       parsed = parsePortfolioV17(data);

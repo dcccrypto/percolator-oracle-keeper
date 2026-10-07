@@ -61,6 +61,7 @@
  *   P2B_ALLOCATE_INTERVAL_MS (60000) / P2B_ALLOCATE_JITTER_PCT (25) / P2B_ALLOCATE_CU (600000)   tag 103 pacing
  *   P2B_WIND_DOWN_MAX_PER_MARKET (3) / _MAX_PER_CYCLE (8) / _MAX_SIMS (6) / _MAX_MARK_AGE_SLOTS (140) / _CU (600000) / _COOLDOWN_MS (60000)   tag 104
  *   HEDGED_LOCKOUT_UTIL_BPS (9000) / HEDGED_LOCKOUT_FLAT_BPS (300) / HEDGED_LOCKOUT_INTERVAL_MS (30000)
+ *   KEEPER_V22 (off) + KEEPER_V22_* / VAULT_LP_LONE_CRANK   v2.2 layer, every flag default OFF: see cross-cluster/v22/flags.ts and the README
  *   EARN_GAP_INTERVAL_MS (60000) / EARN_GAP_ALERT_BPS (100) / EARN_GAP_ALERT_CYCLES (3)   R3-M1 par-E3 gap
  *
  * CLI flags:
@@ -114,6 +115,9 @@ import { P2bLoop, p2bLoopConfigFromEnv, startP2bLoop } from "./cross-cluster/p2b
 import type { P2bLoopConfig } from "./cross-cluster/p2b-loop.ts";
 import { setP2bHealthProvider } from "./cross-cluster/p2b-health.ts";
 import { fetchMarketPortfolios } from "./cross-cluster/recovery-cranker.ts";
+import { v22FlagsFromEnv, describeV22Flags } from "./cross-cluster/v22/flags.ts";
+import { V22Loop, startV22Loop } from "./cross-cluster/v22/loop.ts";
+import { setLoneLpCrankSuppressor } from "./cross-cluster/v22/delegation.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -438,6 +442,31 @@ if (!REGISTER_SOURCE_URL && !DRY_RUN) {
 // exactly why this closes the SOL/JUP/TRUMP boot-gap.
 // B7: the boot states go to the loop, so its first cycle does not re-crank a
 // market in the slot the boot crank already covered (a benign Custom(22)).
+// v2.2 layer (KEEPER_V22=on; default OFF, then nothing below is created and every legacy path is unchanged).
+// Installed BEFORE the boot crank so the first crank of a variant-B market already goes through the v2.2 sweep
+// delegate. See cross-cluster/v22/loop.ts and the README "v2.2 keeper" section for every flag.
+const V22_FLAGS = v22FlagsFromEnv();
+if (V22_FLAGS.enabled) {
+  const v22Loop = new V22Loop({
+    conn: devnetConn,
+    keeper,
+    programId: CFG_WRAPPER_PROGRAM_ID,
+    markets: () => registry.markets,
+    flags: V22_FLAGS,
+    dryRun: DRY_RUN,
+    mainnetBuild: process.env.KEEPER_V22_MAINNET_BUILD === "on",
+  });
+  v22Loop.install();
+  console.log(`[v22] layer ON ${JSON.stringify(describeV22Flags(V22_FLAGS))}${DRY_RUN || V22_FLAGS.dryRun ? " (DRY-RUN: simulate and log, send nothing)" : ""}`);
+  void startV22Loop(v22Loop, V22_FLAGS.tickMs).catch((err: unknown) => {
+    console.error(`[v22] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`);
+  });
+} else if (process.env.VAULT_LP_LONE_CRANK !== undefined && process.env.VAULT_LP_LONE_CRANK.trim().toLowerCase() === "off") {
+  // The lone-LP-crank switch is meaningful on its own (it is the settle-pairing hazard), so it works without KEEPER_V22.
+  setLoneLpCrankSuppressor(() => true);
+  console.log("[v22] VAULT_LP_LONE_CRANK=off: the lone vault-LP crank after a landed push is suppressed on every market");
+}
+
 const bootCrankStates = CRANK_ENABLED ? await crankAllOnce(devnetConn, keeper, registry, DRY_RUN) : undefined;
 
 // Recovery crank loop runs concurrently on its own interval — deliberately

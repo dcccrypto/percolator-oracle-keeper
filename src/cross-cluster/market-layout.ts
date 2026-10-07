@@ -28,10 +28,24 @@
  *                provisional: the wrapper release branch had not merged Wave B at probe time
  *                and the engine header has already grown twice (790 -> 798 -> 806).
  *
+ *   v2.2-b       VARIANT B, the v2.2 LAUNCH CANDIDATE (wrapper release/v22-wrapper-rem c8501d15 on engine
+ *                release/v22-engine-rem 5ef44c83: per-leg K/F remainders + the second 32 B slot tail).
+ *                Every geometry number is READ FROM the SDK's VERSION-keyed LAYOUT_V22 (percolator-sdk#406),
+ *                not typed here; only the in-slot drift-tail offsets (which the SDK table does not carry) are
+ *                keeper-side, and `rowAgreesWithSdk` fails the row closed if the two ever disagree.
+ *   v2.2-drift   (stage A) the earlier v2.2 numbers, kept so a stage-A account is still READ loudly rather than
+ *                mis-decoded; its portfolios are 10,091 B which the SDK parser (VERSION 19 = variant B) refuses,
+ *                so the cranker reports it "unsupported" (see layoutHealthFor).
+ *
  * Detection never guesses: a length that matches no row is "unknown", and the
  * caller must report the market unhealthy (see recovery-cranker.ts), not fall
- * back to another layout's behaviour.
+ * back to another layout's behaviour. Before any row is tried the header VERSION must be one the pinned SDK has a
+ * table for (LAYOUTS_BY_VERSION); a refusal is counted in layout-guard-metrics.ts and surfaces
+ * in /health as `layoutGuard`, never as a silent fallback.
  */
+import { LAYOUTS_BY_VERSION, LAYOUT_V22 } from "@percolatorct/sdk";
+import type { LayoutTable } from "@percolatorct/sdk";
+import { noteLayoutGuardRefusal } from "./layout-guard-metrics.ts";
 
 /** KfDriftSideV16Account field offsets (identical wherever the tail exists). */
 export const KF_DRIFT_FIELDS = {
@@ -44,7 +58,7 @@ export const KF_DRIFT_FIELDS = {
   laggardWeight: 64,
 } as const;
 
-export type MarketLayoutId = "v2.1-legacy" | "v2.1-drift" | "v2.2-drift";
+export type MarketLayoutId = "v2.1-legacy" | "v2.1-drift" | "v2.2-drift" | "v2.2-b";
 
 export interface MarketLayout {
   id: MarketLayoutId;
@@ -235,7 +249,83 @@ export const MARKET_LAYOUTS: ReadonlyArray<MarketLayout> = [
       driftShort: 1493,
     },
   },
+  v22VariantBRow(LAYOUT_V22),
 ];
+
+
+/**
+ * The variant-B row, derived from the SDK's LAYOUT_V22 table so the geometry has ONE source. Only the drift-tail
+ * offsets (the #277 funding tail sits at the END of the engine slot, before #282's 32 B tail, so they equal
+ * stage A's) and the header words the SDK table does not carry (`max_accrual_dt_slots`, `loss_stale_active`)
+ * are keeper-side; they are unchanged from stage A (a header +48 B config growth moves neither relative to
+ * the group base, because the config sits BEFORE them and the SDK `group.insurance` already includes it).
+ */
+export function v22VariantBRow(t: LayoutTable): MarketLayout {
+  return {
+    id: "v2.2-b",
+    provisional: t.status === "PROVISIONAL",
+    source: `SDK LAYOUT_V22 "${t.name}": ${t.source}`,
+    wrapperVersion: t.version,
+    groupOff: t.marketGroupOff,
+    headerLen: t.marketGroupLen,
+    wrapperLen: t.wrapperSlotLen,
+    engineSlotLen: t.engineSlotLen,
+    slotStride: t.assetSlotStride,
+    portfolioAccountLen: t.portfolio.accountLen,
+    portfolioLegLen: t.portfolio.legStride,
+    v21Decoders: false,
+    header: {
+      maxMarketSlots: 34,
+      maxAccrualDtSlots: 150,
+      insurance: t.group.insurance,
+      sourceInsuranceReservedTotal: t.group.sourceInsuranceCreditReservedTotalAtoms,
+      currentSlot: t.group.currentSlot,
+      lossStaleActive: 671,
+    },
+    asset: ASSET_V21,
+    slot: {
+      insBudgetLong: t.engineSlot.insuranceDomainBudgetLong,
+      insBudgetShort: t.engineSlot.insuranceDomainBudgetShort,
+      insSpentLong: t.engineSlot.insuranceDomainSpentLong,
+      insSpentShort: t.engineSlot.insuranceDomainSpentShort,
+      barrierLong: 691,
+      barrierShort: 699,
+      insReservationLong: t.engineSlot.insuranceReservationLong,
+      insReservationShort: t.engineSlot.insuranceReservationShort,
+      driftLong: 1413,
+      driftShort: 1493,
+    },
+  };
+}
+
+/**
+ * True when the keeper row and the SDK table of the row's VERSION agree on the geometry both carry
+ * (group offset, header length, wrapper-slot length; the whole stride / portfolio / leg for the variant-B row).
+ * A disagreement means the SDK pin moved under the keeper: the row is refused, loudly.
+ */
+export function rowAgreesWithSdk(l: MarketLayout, sdk: ReadonlyMap<number, LayoutTable> = LAYOUTS_BY_VERSION): string | null {
+  const t = sdk.get(l.wrapperVersion);
+  if (!t) return `SDK has no layout for VERSION ${l.wrapperVersion}`;
+  const diffs: string[] = [];
+  const cmp = (name: string, a: number, b: number) => {
+    if (a !== b) diffs.push(`${name} keeper ${a} != SDK ${b}`);
+  };
+  cmp("groupOff", l.groupOff, t.marketGroupOff);
+  cmp("headerLen", l.headerLen, t.marketGroupLen);
+  cmp("wrapperLen", l.wrapperLen, t.wrapperSlotLen);
+  if (l.id === "v2.2-b") {
+    cmp("slotStride", l.slotStride, t.assetSlotStride);
+    cmp("portfolioAccountLen", l.portfolioAccountLen, t.portfolio.accountLen);
+    cmp("portfolioLegLen", l.portfolioLegLen, t.portfolio.legStride);
+  }
+  return diffs.length === 0 ? null : diffs.join("; ");
+}
+
+/**
+ * Portfolio account lengths the pinned SDK parser decodes (VERSION 18 = 9,563 B, VERSION 19 = 10,603 B).
+ * A portfolio of any other length is not read: the keeper never hand-rolls leg offsets.
+ */
+export const SDK_PORTFOLIO_LENS: ReadonlySet<number> = new Set([...LAYOUTS_BY_VERSION.values()].map((t) => t.portfolio.accountLen));
 
 export function layoutById(id: MarketLayoutId): MarketLayout {
   const l = MARKET_LAYOUTS.find((x) => x.id === id);
@@ -288,8 +378,26 @@ export function detectLayout(data: Uint8Array): LayoutDetection {
   if (n === 0) {
     return { known: false, accountLen: data.length, slots: 0, version, reason: `length ${data.length}: max_market_slots is 0` };
   }
+  // The SDK's VERSION registry (LAYOUTS_BY_VERSION) decides BEFORE any row is tried: a VERSION the pinned SDK has no
+  // table for is refused (UNKNOWN_VERSION). The magic / kind check is NOT applied here (this function has always
+  // read synthetic and real accounts by header VERSION alone); the v2.2 loader (v22/market.ts) runs the SDK's full
+  // guard, `resolveLayout` with kind = Market, on every account it decodes.
+  const guardCode: string | null = LAYOUTS_BY_VERSION.has(version) ? null : "UNKNOWN_VERSION";
   const matches = MARKET_LAYOUTS.filter((l) => l.wrapperVersion === version && data.length === marketAccountLen(l, n));
-  if (matches.length === 1) return { known: true, layout: matches[0], slots: n };
+  if (guardCode === null && matches.length === 1) {
+    const disagree = rowAgreesWithSdk(matches[0]);
+    if (disagree === null) return { known: true, layout: matches[0], slots: n };
+    noteLayoutGuardRefusal("ROW_DISAGREES_WITH_SDK", version);
+    return {
+      known: false,
+      accountLen: data.length,
+      slots: n,
+      version,
+      reason: `layout row ${matches[0].id} disagrees with the pinned SDK table for VERSION ${version} (${disagree}); refusing to decode`,
+    };
+  }
+  if (guardCode !== null) noteLayoutGuardRefusal(guardCode, version);
+  else noteLayoutGuardRefusal(matches.length === 0 ? "NO_ROW_FOR_LENGTH" : "AMBIGUOUS_ROW", version);
   return {
     known: false,
     accountLen: data.length,
@@ -297,7 +405,7 @@ export function detectLayout(data: Uint8Array): LayoutDetection {
     version,
     reason:
       matches.length === 0
-        ? `length ${data.length} with VERSION ${version}, max_market_slots=${n} matches no known layout (${knownStrides()})`
+        ? `length ${data.length} with VERSION ${version}, max_market_slots=${n} matches no known layout (${knownStrides()})${guardCode ? ` [sdk-guard: ${guardCode}]` : ""}`
         : `length ${data.length} with VERSION ${version} is ambiguous between ${matches.map((m) => m.id).join(" / ")}`,
   };
 }

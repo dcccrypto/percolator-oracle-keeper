@@ -27,6 +27,7 @@ import { staleResolveWindow } from "./market-state.ts";
 import type { StaleResolveWindow } from "./market-state.ts";
 import { exhaustedAlert, getExhaustedRegistry } from "./p3-exhausted-resolve.ts";
 import type { ExhaustedRegistry } from "./p3-exhausted-resolve.ts";
+import { loneLpCrankSuppressedFor } from "./v22/delegation.ts";
 
 export type SeniorDrawEvent =
   | { kind: "draw"; deficit: bigint; moved: bigint; unfunded: bigint }
@@ -114,7 +115,7 @@ export class VaultLpCranker {
   private readonly lookup = new Map<string, { vaultLp: PublicKey | null; at: number }>();
   private readonly lastMark = new Map<string, bigint>();
   private readonly inflight = new Set<string>();
-  readonly stats = { cranked: 0, benign: 0, failed: 0 };
+  readonly stats = { cranked: 0, benign: 0, failed: 0, suppressed: 0 };
 
   constructor(
     private readonly conn: VaultLpCrankConnection,
@@ -152,7 +153,14 @@ export class VaultLpCranker {
   }
 
   /** Call after a push LANDED for `marketAddress` at `priceE6`. Returns what happened (for tests/logs). */
-  async onPushLanded(marketAddress: string, priceE6: bigint, label = marketAddress): Promise<"no-move" | "busy" | "not-bound" | "cranked" | "benign" | "failed"> {
+  async onPushLanded(marketAddress: string, priceE6: bigint, label = marketAddress): Promise<"no-move" | "busy" | "not-bound" | "cranked" | "benign" | "failed" | "suppressed"> {
+    // v2.2 SETTLE_PAIRING / VAULT_LP_LONE_CRANK=off: a LONE LP crank settles the LP without its counterparties, which
+    // can strand value at a price peak (settle-pairing.ts). The suppressor is installed only when a v2.2 flag asks for
+    // it; with nothing installed this is a no-op and the method is unchanged.
+    if (loneLpCrankSuppressedFor(marketAddress)) {
+      this.stats.suppressed++;
+      return "suppressed";
+    }
     const prev = this.lastMark.get(marketAddress);
     if (prev === priceE6) return "no-move";
     this.lastMark.set(marketAddress, priceE6);

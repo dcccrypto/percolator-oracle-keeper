@@ -1,0 +1,79 @@
+/**
+ * cross-cluster/v22/rent.ts   (KEEPER_V22_HOLDING_RENT)
+ *
+ * Tag 106 SettleHoldingRent on rent markets (rent_max_e9_per_slot != 0), at a configurable cadence per portfolio.
+ * Rent is exact regardless of timing (a carry keeps the total identical: ten one-slot settles charged the same as
+ * one over the same index delta, Wave B review), so the cadence only bounds how much rent sits un-routed.
+ *
+ * Tag 106 is crank-equivalent (accrues, then refreshes the portfolio). Settling the vault LP through it is an LP-alone
+ * settle, so under SETTLE_PAIRING the LP is NOT rent-settled here (the sweep settles it with its counterparties).
+ * Band expected states (104/111/112/113) are counted, not failures.
+ */
+import { buildSettleHoldingRentIxV22 } from "@percolatorct/sdk";
+import { simulateAndSend } from "./exec.ts";
+import type { ExecContext, ExecOutcome } from "./exec.ts";
+import type { V22MarketCtx } from "./market.ts";
+import type { V22Positioned } from "./positioned.ts";
+import { portfolioWeight } from "./settle-pairing.ts";
+
+export interface RentState {
+  /** `market|portfolio` -> slot of the last settle (landed or dry-run). */
+  last: Map<string, bigint>;
+}
+export const freshRentState = (): RentState => ({ last: new Map() });
+
+export const RENT_TX_UNITS = 600_000;
+
+export interface RentPlan {
+  due: Array<{ portfolio: string; weight: number; ageSlots: bigint | null }>;
+  skippedLp: boolean;
+}
+
+/** Portfolios due for a rent settle: never settled, or older than the cadence; heaviest first. Pure. */
+export function planRentSettles(ctx: V22MarketCtx, positioned: V22Positioned, st: RentState, cadenceSlots: number, pairingActive: boolean, maxPerTick: number): RentPlan {
+  const now = BigInt(ctx.readSlot);
+  const rows: RentPlan["due"] = [];
+  let skippedLp = false;
+  for (const p of positioned.all) {
+    if (p.isLp && pairingActive) {
+      skippedLp = true;
+      continue;
+    }
+    const key = `${ctx.marketAddress}|${p.pubkey.toBase58()}`;
+    const last = st.last.get(key);
+    const age = last === undefined ? null : now - last;
+    if (age === null || age >= BigInt(cadenceSlots)) rows.push({ portfolio: p.pubkey.toBase58(), weight: portfolioWeight(p), ageSlots: age });
+  }
+  rows.sort((a, b) => {
+    // never settled first, then oldest, then heaviest
+    if ((a.ageSlots === null) !== (b.ageSlots === null)) return a.ageSlots === null ? -1 : 1;
+    if (a.ageSlots !== null && b.ageSlots !== null && a.ageSlots !== b.ageSlots) return a.ageSlots > b.ageSlots ? -1 : 1;
+    return b.weight - a.weight || (a.portfolio < b.portfolio ? -1 : 1);
+  });
+  return { due: rows.slice(0, maxPerTick), skippedLp };
+}
+
+export async function settleRentOnce(
+  exec: ExecContext,
+  ctx: V22MarketCtx,
+  positioned: V22Positioned,
+  st: RentState,
+  p: { cadenceSlots: number; pairingActive: boolean; maxPerTick?: number },
+): Promise<{ plan: RentPlan; outcomes: Array<{ portfolio: string; outcome: ExecOutcome }> }> {
+  if (!ctx.isRent || !ctx.lpPortfolio) return { plan: { due: [], skippedLp: false }, outcomes: [] };
+  const plan = planRentSettles(ctx, positioned, st, p.cadenceSlots, p.pairingActive, p.maxPerTick ?? 4);
+  const outcomes: Array<{ portfolio: string; outcome: ExecOutcome }> = [];
+  const oracleAccounts = ctx.oracleMode === 1 ? ctx.oracleLegFeeds : [];
+  for (const d of plan.due) {
+    const portfolio = positioned.all.find((x) => x.pubkey.toBase58() === d.portfolio);
+    if (!portfolio) continue;
+    const ix = buildSettleHoldingRentIxV22(ctx.sdk, exec.keeper.publicKey, portfolio.pubkey, 0, BigInt(ctx.readSlot), oracleAccounts);
+    const outcome = await simulateAndSend(exec, [ix], { job: "rent-106", label: `${ctx.label} ${d.portfolio.slice(0, 6)}`, units: RENT_TX_UNITS });
+    outcomes.push({ portfolio: d.portfolio, outcome });
+    if ((outcome.kind === "sent" && outcome.landed === "landed") || outcome.kind === "dry-run" || (outcome.kind === "refused" && outcome.expected)) {
+      // an expected band state still counts as "visited": retry at the cadence, not every tick
+      st.last.set(`${ctx.marketAddress}|${d.portfolio}`, BigInt(ctx.readSlot));
+    }
+  }
+  return { plan, outcomes };
+}
