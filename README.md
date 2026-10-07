@@ -132,3 +132,48 @@ When supported (tick every `P2B_TICK_MS`, one batched snapshot read per tick):
 
 Independent of the gate: tag 78 on a bound vault appends `[7]` ext and `[8]` vault LP once the registry ext
 flag (byte 161) is set (it is 0 on every pre-P2b program). See `.env.example` for every knob.
+
+## v2.2 keeper (KEEPER_V22, default OFF)
+
+Entry point is `src/cross-cluster.ts` (the Railway / launchd launcher runs `tsx src/cross-cluster.ts`; `src/index.ts` is not the live entry).
+Everything below is flag-gated and default OFF: with no `KEEPER_V22*` variable set the v2.2 layer is never created,
+the legacy cranker / fee job / vault-LP cranker take their old paths, and `/health` gains no key.
+
+**SDK pin.** `@percolatorct/sdk` = `github:dcccrypto/percolator-sdk#ecb6215ec634e2a284bcc0f409c4ca5df6cb43a1`
+(percolator-sdk#406, branch `feat/v22-sdk`: `LAYOUT_V22` variant B, VERSION-keyed layout guard, v2.2 builders, compute presets).
+`@solana/web3.js` is 1.99.0 (the SDK's peer). To move the pin: change the ref in `package.json`, `pnpm install`, `npm install --package-lock-only`.
+
+**Layout.** `market-layout.ts` keeps one table; the variant-B row (`v2.2-b`: group 806, slot 2,629, leg 217, portfolio 10,603, VERSION 19)
+is derived from the SDK's `LAYOUT_V22` and refused if the two ever disagree. A VERSION the SDK has no table for, a length that matches no row,
+a bad magic or a wrong kind is a loud error: counted (`layout-guard-metrics.ts`), logged once, `/health` `layoutGuard` + `status: degraded-markets`. No silent fallback.
+
+| flag | default | what |
+|---|---|---|
+| `KEEPER_V22` | off | master switch |
+| `KEEPER_V22_DRY_RUN` | off | simulate and log "would send", send nothing (also implied by `DRY_RUN`) |
+| `KEEPER_V22_TICK_MS` | 20000 | loop tick |
+| `KEEPER_V22_FEE_CRANK_BOND` | off | tag 78 on bond markets: LP crank (tag 5) first, then 78 with ext + writable LP + tranche |
+| `KEEPER_V22_SWEEP` | off | positioned-refresh sweep for variant-B markets, leg-weight budget (3 + legs), heaviest first |
+| `KEEPER_V22_SETTLE_PAIRING` | prefer | `off` / `prefer` / `strict`; acts only with the sweep on. See `v22/settle-pairing.ts` |
+| `KEEPER_V22_ACCRUE_ANCHORS` | none | `market:flatPortfolio,...` accrue-only crank targets (else discovered) |
+| `KEEPER_V22_HOLDING_RENT` / `_RENT_CADENCE_SLOTS` | off / 9000 | tag 106 on rent markets |
+| `KEEPER_V22_DUST_SWEEP` | off | tag 118 (own flag; keep off on a wrapper without the bilateral fix) |
+| `KEEPER_V22_G9` | off | tag 111 propose -> 9,000 slots -> draw, restore |
+| `KEEPER_V22_G9_DRY_RUN` | **on** | G9 logs only until set to `off` |
+| `KEEPER_V22_G9_ALLOW_ANY_ORACLE_MODE` | off | skip the Hybrid-only gate (devnet testing) |
+| `KEEPER_V22_G9_DRAW_CAP_ATOMS` | u64 max | cap passed to draw / restore |
+| `KEEPER_V22_MAINNET_BUILD` | off | G9 modes 0/2 pass the allowlist PDA + leg accounts |
+| `KEEPER_V22_STAKE_SYNC` / `_INTERVAL_MS` | off / 60000 | stake v5 tag 31 |
+| `KEEPER_V22_EARN_EXIT` | off | tag 77 on `keeper_ok` requests, only on a loss-current book |
+| `VAULT_LP_LONE_CRANK` | on | `off` suppresses the lone vault-LP crank after every landed push (works without `KEEPER_V22`) |
+
+**SETTLE_PAIRING.** Engine tag 5 on a portfolio settles only that portfolio, then accrues; a loss is booked at once, counterparties' gains
+only when they are settled. The LP settled alone at a peak strands value. Policy: the LP is never settled in a tx that does not also settle every counterparty
+that fits; a round that does not fit one tx sends the counterparty txs first (in parallel, pushes held) and the LP tx LAST, only inside `maxGapSlots` (8).
+Accrue-only: the no-observation crank does NOT accrue (Custom(22) unless already accrued); an observation crank accrues through whichever portfolio it targets, so the
+accrue uses a flat anchor if known, else the tx's first counterparty. Not verified without a live v2.2 market: that an observation crank on a flat portfolio succeeds.
+What it cannot guarantee: multi-tx rounds are not atomic (expected gap 1-4 slots, cap 8; funding/rent keep accruing, other writers' pushes can move K); only a single-tx
+round is exactly atomic; anyone can still crank the LP alone (tag 5 is permissionless); the positioned set is a read; beyond `maxTxsPerRound` (16) `prefer` settles the LP
+with counterparties unvisited (counted `unpairedLpSettles`) and `strict` skips the LP that round. Defence in depth: the engine fix is separate.
+
+Every v2.2 send is simulated first (`v22/exec.ts`); refusals are logged by name (`PriceBandPinned(104)`, `InsuranceReadingsDiverged(44)`); band states 104/111/112/113 are expected, counted, never alerted.

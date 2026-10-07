@@ -158,12 +158,16 @@ export function buildV22MarketCtx(p: {
   if (p.registryData) {
     try {
       registryDomain = Number(parseLpVaultRegistry(p.registryData).domain);
-      bound = lpVaultRegistryBound(p.registryData);
-      ext = lpVaultRegistryExtFlag(p.registryData);
-      bond = lpVaultRegistryBondFlag(p.registryData);
     } catch {
-      // an unreadable registry reads as "no vault": the jobs that need it skip
+      // domain stays 0; the flags below are read from their own bytes
     }
+    try {
+      bound = lpVaultRegistryBound(p.registryData);
+    } catch {
+      bound = false; // an invalid bound byte reads as unbound: the jobs that need the vault skip
+    }
+    ext = lpVaultRegistryExtFlag(p.registryData);
+    bond = lpVaultRegistryBondFlag(p.registryData);
   }
   const vaultLpState = deriveVaultLpState(p.programId, market);
   const st = p.vaultLpStateData ? decodeVaultLpState(p.vaultLpStateData) : null;
