@@ -29,7 +29,10 @@ import { allJobCounters } from "./exec.ts";
 import type { ExecContext } from "./exec.ts";
 import { crankOracleAccounts, loadV22Market } from "./market.ts";
 import type { V22MarketCtx, V22MarketLoad } from "./market.ts";
-import { loadV22Positioned, lpNearLiquidation, parseAccrueAnchors } from "./positioned.ts";
+import { loadV22Positioned, parseAccrueAnchors } from "./positioned.ts";
+import { simulateOnly } from "./exec.ts";
+import { buildObservationCrankIx } from "../positioned-refresh.ts";
+import { parseSeniorDrawLogs } from "../vault-lp-crank.ts";
 import type { V22Positioned } from "./positioned.ts";
 import { DEFAULT_SWEEP_ROUND_CONFIG, freshGapBackoff, pairingStats, runSettleRound } from "./sweep.ts";
 import type { GapBackoff, RentPlanInput as RoundInputRent, RoundResult, SweepDeps, SweepRoundConfig } from "./sweep.ts";
@@ -74,6 +77,14 @@ interface MarketRuntime {
   gapBackoff: GapBackoff;
   earn: ReturnType<typeof freshEarnExitState>;
   lastProtectiveAtMs: number;
+  /** Consecutive protective rounds that did not settle the LP (backoff 5 s x 2^n, cap 120 s). */
+  protectiveFailures: number;
+  nextProtectiveAtMs: number;
+  /** Last time a protective round ran on the 'senior draw outstanding' signal alone (at most every 30 s). */
+  lastOutstandingRoundAtMs: number;
+  quarantineHistory: Map<string, { code: number; level: number }>;
+  /** Rounds left in which the operator / discovered anchor is not used (the program refused an anchor accrue). */
+  anchorBadRounds: number;
   lossStaleCycles: number;
   lastFeeAtMs: number;
   lastEarnAtMs: number;
@@ -115,6 +126,11 @@ export class V22Loop {
         gapBackoff: freshGapBackoff(),
         earn: freshEarnExitState(),
         lastProtectiveAtMs: 0,
+        protectiveFailures: 0,
+        nextProtectiveAtMs: 0,
+        lastOutstandingRoundAtMs: 0,
+        quarantineHistory: new Map(),
+        anchorBadRounds: 0,
         lossStaleCycles: 0,
         lastFeeAtMs: 0,
         lastEarnAtMs: 0,
@@ -206,15 +222,17 @@ export class V22Loop {
         return false;
       }
       const f = this.d.flags;
-      // Rent settles ride the round (tag 106 in place of that portfolio's refresh), only when pairing is acting.
+      // Rent (tag 106) runs AFTER the LP tx of a round, sequentially, for portfolios the plain refresh already settled.
       let rent: RoundInputRent | undefined;
       if (f.holdingRent && ctx.isRent && pairingActive(f)) {
         const plan = planRentSettles(ctx, positioned, r.rent, f.rentCadenceSlots, true, 4);
         if (plan.due.length > 0) {
           const oracle = crankOracleAccounts(ctx);
-          rent = { due: new Set(plan.due.map((x) => x.portfolio)), build: (p) => buildSettleHoldingRentIxV22(ctx.sdk, this.d.keeper.publicKey, p.pubkey, 0, BigInt(ctx.readSlot), ctx.oracleMode === 1 ? oracle : []) };
+          rent = { due: new Set(plan.due.map((x) => x.portfolio)), max: 4, build: (p) => buildSettleHoldingRentIxV22(ctx.sdk, this.d.keeper.publicKey, p.pubkey, 0, BigInt(ctx.readSlot), ctx.oracleMode === 1 ? oracle : []) };
         }
       }
+      const useAnchor = r.anchorBadRounds > 0 ? null : positioned.flatAnchor;
+      if (r.anchorBadRounds > 0) r.anchorBadRounds--;
       const res = await runSettleRound(
         this.sweepDeps(),
         { market: ctx.market, label: ctx.label },
@@ -222,9 +240,10 @@ export class V22Loop {
           lp: positioned.lp.pubkey,
           lpWeight: portfolioWeight(positioned.lp),
           counterparties: positioned.counterparties,
-          anchor: positioned.flatAnchor,
+          anchor: useAnchor,
           oracleAccounts: crankOracleAccounts(ctx),
           quarantine: r.quarantine,
+          quarantineHistory: r.quarantineHistory,
           nowSlot: ctx.readSlot,
           gapBackoff: r.gapBackoff,
           rent,
@@ -232,6 +251,11 @@ export class V22Loop {
         },
         this.roundConfig(),
       );
+      if (res.backedOff) return false; // nothing ran: let the legacy accrual crank run this cycle (N-4)
+      if (res.anchorRefused) {
+        r.anchorBadRounds = 5;
+        this.log(`[v22][sweep] ${ctx.label}: the program refused the flat-anchor accrue; using the counterparty accrue form for 5 rounds`);
+      }
       if (rent) {
         markRentSettled(r.rent, ctx, res.rentSettled);
         pairingStats.rentSettlesInRound += res.rentSettled.length;
@@ -255,29 +279,48 @@ export class V22Loop {
   }
 
   /**
-   * Protective trigger (installed into the suppressed lone-LP-crank path): when the LP itself is near liquidation or a
-   * senior draw is pending, run a full PAIRED round NOW instead of waiting for the next crank cycle. Never a lone LP
-   * crank. Latency without it: up to one crank cycle (CRANK_INTERVAL_MS, default 20 s) plus the round; with it: the
-   * time of one round (about 1-5 s) after the landed push. Debounced per market.
+   * Protective trigger (installed into the suppressed lone-LP-crank path). When the LP itself needs protection the v2.2
+   * layer runs a full PAIRED round NOW instead of waiting for the next crank cycle. Never a lone LP crank.
+   *
+   * Signal (the PROGRAM's own, not a capital ratio): (a) a SIMULATION of the LP observation crank (no send) whose logs carry
+   * the wrapper's `p3_senior_draw` lines = the LP is liquidatable / a senior draw is due at this mark, or (b)
+   * `senior_draw_outstanding > 0` on vault_lp_state.
+   *
+   * CADENCE (bounded fee spend): signal (a): at most one round per market every 5 s; signal (b) alone: at most one every
+   * 30 s; after a protective round that did not settle the LP, the next one waits 5 s x 2^n (10, 20, 40, 80 s, cap 120 s),
+   * reset on success. Latency without it: up to one crank cycle (default 20 s) plus a round; with it: about one round (1-5 s).
    */
   private async protectiveRound(marketAddress: string): Promise<void> {
     const entry = this.d.markets().find((m) => m.marketAddress === marketAddress);
     if (!entry || !this.isV22(marketAddress)) return;
     const r = this.rtFor(marketAddress);
-    if (r.sweepInflight || this.now() - r.lastProtectiveAtMs < 5_000) return;
-    r.lastProtectiveAtMs = this.now();
+    const t = this.now();
+    if (r.sweepInflight || t < r.nextProtectiveAtMs || t - r.lastProtectiveAtMs < 5_000) return;
+    r.lastProtectiveAtMs = t;
     const load = await loadV22Market(this.d.conn, entry, this.d.programId);
     if (!load.ok) return;
     const ctx = load.ctx;
-    let lpData: Uint8Array | null = null;
+    let signal = false;
     if (ctx.lpPortfolio) {
-      const info = await this.d.conn.getAccountInfo(ctx.lpPortfolio, "processed");
-      lpData = info ? new Uint8Array(info.data) : null;
+      try {
+        const sim = await simulateOnly(this.execCtx(), [buildObservationCrankIx(this.d.keeper.publicKey, ctx.market, ctx.lpPortfolio, crankOracleAccounts(ctx))], { units: 400_000 });
+        if (!sim.err) signal = parseSeniorDrawLogs(sim.logs).some((e) => e.kind === "draw" || e.kind === "booked");
+      } catch {
+        signal = false;
+      }
     }
-    if (ctx.seniorDrawOutstandingAtoms > 0n || lpNearLiquidation(lpData)) {
-      this.log(`[v22][protect] ${ctx.label}: LP needs protection (${ctx.seniorDrawOutstandingAtoms > 0n ? "senior draw pending" : "near liquidation"}): running a full paired round now`);
-      r.positionedCache = null;
-      await this.runRoundFor(this.d.conn, entry, true);
+    const outstandingDue = ctx.seniorDrawOutstandingAtoms > 0n && t - r.lastOutstandingRoundAtMs >= 30_000;
+    if (!signal && !outstandingDue) return;
+    if (!signal) r.lastOutstandingRoundAtMs = t;
+    this.log(`[v22][protect] ${ctx.label}: LP needs protection (${signal ? "the program's senior-draw signal" : "senior draw outstanding"}): running a full paired round now`);
+    r.positionedCache = null;
+    await this.runRoundFor(this.d.conn, entry, true);
+    if (r.lastRound?.protective && r.lastRound.lpSettled && r.lastRound.at >= t) {
+      r.protectiveFailures = 0;
+      r.nextProtectiveAtMs = 0;
+    } else {
+      r.protectiveFailures++;
+      r.nextProtectiveAtMs = t + Math.min(5_000 * 2 ** r.protectiveFailures, 120_000);
     }
   }
 

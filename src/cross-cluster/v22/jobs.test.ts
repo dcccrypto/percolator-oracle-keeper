@@ -19,7 +19,7 @@ beforeEach(() => resetJobCounters());
 const sd = (conn: Parameters<typeof execCtx>[0], dry = false) => ({ exec: execCtx(conn, dry), getSlot: async () => 1000 });
 
 function positioned(cps: ReturnType<typeof pf>[], lp = pf(901, 2, { lp: true }), minAbs: Record<number, bigint> = {}): V22Positioned {
-  return { all: [lp, ...cps], counterparties: cps, lp, minLegAbs: new Map(Object.entries(minAbs).map(([k, v]) => [key(Number(k)).toBase58(), v])), flatAnchor: null, lpData: null, undecodable: 0 };
+  return { all: [lp, ...cps], counterparties: cps, lp, minLegAbs: new Map(Object.entries(minAbs).map(([k, v]) => [key(Number(k)).toBase58(), v])), flatAnchor: null, lpData: null, anchorOverrideRejected: null, undecodable: 0 };
 }
 
 describe("error tables", () => {

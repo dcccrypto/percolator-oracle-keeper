@@ -28,8 +28,10 @@
  * `SETTLE_PAIRING` and the lone LP crank: see settle-pairing.ts. With pairing on and the sweep on, the lone crank
  * is suppressed on v2.2 markets whatever VAULT_LP_LONE_CRANK says.
  *
- * PARSING IS STRICT: an unrecognised value of any of these variables is a startup error (V22FlagError), never a
- * silent default. Booleans accept on/1/true/yes and off/0/false/no; empty means unset.
+ * PARSING IS STRICT: an unrecognised value is a startup error (V22FlagError), never a silent default. Booleans accept
+ * on/1/true/yes and off/0/false/no; empty means unset. SCOPE: KEEPER_V22 and VAULT_LP_LONE_CRANK are always validated;
+ * every other KEEPER_V22_* variable is validated (and read) only when KEEPER_V22 is on, so a flags-off keeper cannot be
+ * stopped at boot by a stray value (audit the live env before deploy: README).
  */
 
 export type PairingMode = "off" | "prefer" | "strict";
@@ -88,7 +90,20 @@ function posInt(env: Env, key: string, def: number): number {
 
 const U64_MAX = (1n << 64n) - 1n;
 
+/** Every v2.2 flag at its default (OFF; G9 dry-run ON; the lone LP crank ON = today). */
+export const V22_FLAG_DEFAULTS: V22Flags = {
+  enabled: false, dryRun: false, tickMs: 20_000, feeCrankBond: false, sweep: false, pairing: "prefer", holdingRent: false,
+  rentCadenceSlots: 9_000, dustSweep: false, g9: false, g9DryRun: true, g9AllowAnyOracleMode: false, g9DrawCapAtoms: U64_MAX,
+  stakeSync: false, stakeSyncIntervalMs: 60_000, earnExit: false, loneLpCrank: true, mainnetBuild: false,
+};
+
 export function v22FlagsFromEnv(env: Env = process.env): V22Flags {
+  // ALWAYS validated: the master switch and the one flag that is meaningful without it. With KEEPER_V22 off every other
+  // KEEPER_V22_* variable is NOT read, so a stray value in a flags-off live environment cannot stop the keeper at boot
+  // (security re-review N-6). With KEEPER_V22=on every variable is validated strictly.
+  const enabled = parseFlag(env, "KEEPER_V22", false);
+  const loneLpCrank = parseFlag(env, "VAULT_LP_LONE_CRANK", true);
+  if (!enabled) return { ...V22_FLAG_DEFAULTS, loneLpCrank };
   const pairingRaw = env.KEEPER_V22_SETTLE_PAIRING;
   let pairing: PairingMode = "prefer";
   if (pairingRaw !== undefined && pairingRaw.trim() !== "") {
@@ -105,7 +120,7 @@ export function v22FlagsFromEnv(env: Env = process.env): V22Flags {
     cap = c;
   }
   return {
-    enabled: parseFlag(env, "KEEPER_V22", false),
+    enabled,
     dryRun: parseFlag(env, "KEEPER_V22_DRY_RUN", false),
     tickMs: posInt(env, "KEEPER_V22_TICK_MS", 20_000),
     feeCrankBond: parseFlag(env, "KEEPER_V22_FEE_CRANK_BOND", false),
@@ -123,7 +138,7 @@ export function v22FlagsFromEnv(env: Env = process.env): V22Flags {
     stakeSyncIntervalMs: posInt(env, "KEEPER_V22_STAKE_SYNC_INTERVAL_MS", 60_000),
     earnExit: parseFlag(env, "KEEPER_V22_EARN_EXIT", false),
     // today's behaviour unless explicitly turned off
-    loneLpCrank: parseFlag(env, "VAULT_LP_LONE_CRANK", true),
+    loneLpCrank,
     mainnetBuild: parseFlag(env, "KEEPER_V22_MAINNET_BUILD", false),
   };
 }

@@ -8,10 +8,9 @@ import { readFileSync } from "node:fs";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import { ACCOUNTS_PERMISSIONLESS_CRANK_BASE, buildSettleHoldingRentIxV22, deriveLpVaultRegistry, parsePortfolioV17 } from "@percolatorct/sdk";
 import { allJobCounters, resetJobCounters } from "./exec.ts";
-import { DEFAULT_SWEEP_ROUND_CONFIG, QUARANTINE_HARD_SLOTS, buildSweepTxIxs, freshGapBackoff, pairingStats, resetPairingStats, runSettleRound } from "./sweep.ts";
-import { RENT_EXTRA_WEIGHT, planSettleRound, portfolioWeight } from "./settle-pairing.ts";
+import { DEFAULT_SWEEP_ROUND_CONFIG, QUARANTINE_FIRST_SLOTS, buildSweepTxIxs, freshGapBackoff, pairingStats, resetPairingStats, runSettleRound } from "./sweep.ts";
 import { crankBondFee, planBondFee } from "./fee-bond.ts";
-import { analysePortfolios, lpNearLiquidation } from "./positioned.ts";
+import { analysePortfolios } from "./positioned.ts";
 import type { V22Positioned } from "./positioned.ts";
 import { crankOracleAccounts } from "./market.ts";
 import { V22Loop } from "./loop.ts";
@@ -24,7 +23,7 @@ import { setV22HealthProvider } from "./health.ts";
 import { VaultLpCranker } from "../vault-lp-crank.ts";
 import { buildObservationCrankIx } from "../positioned-refresh.ts";
 import { WRAPPER_PROGRAM_ID } from "../../program-ids.ts";
-import { customAt, execCtx, fakeExecConn, fakeLoopConn, key, pf, portfolioBytes, refusePortfolio, registryBytes, v22Ctx, v22MarketBytes, vaultLpStateBytes } from "./test-helpers.ts";
+import { computeAt, customAt, execCtx, fakeExecConn, fakeLoopConn, key, pf, portfolioBytes, refusePortfolio, registryBytes, v22Ctx, v22MarketBytes, vaultLpStateBytes } from "./test-helpers.ts";
 
 const LP = key(500);
 const MARKET = key(900);
@@ -106,7 +105,7 @@ describe("item 2: one refused portfolio does not block its whole tx; it is quara
     assert.equal(f.sent.length, r.plan.txs.length, "every planned tx was still sent");
     assert.ok(f.sent.every((s) => !hasKey(s, bad.pubkey)), "the poisoned portfolio is in no sent tx");
     assert.equal(r.settled.length, 29, "the other 29 settled");
-    assert.equal(quarantine.get(bad.pubkey.toBase58()), BigInt(100 + QUARANTINE_HARD_SLOTS));
+    assert.equal(quarantine.get(bad.pubkey.toBase58()), BigInt(100 + QUARANTINE_FIRST_SLOTS), "first cool-down is the SHORT one (150)");
     // next round inside the cool-down: the portfolio is not even planned (its key never appears in a simulation)
     const g = fakeExecConn();
     const r2 = await runSettleRound(deps(g.conn), { market: MARKET, label: "T" }, { lp: LP, counterparties: list, nowSlot: 110, quarantine }, DEFAULT_SWEEP_ROUND_CONFIG);
@@ -114,12 +113,8 @@ describe("item 2: one refused portfolio does not block its whole tx; it is quara
     assert.ok(r2.missing.some((m) => m.key === bad.pubkey.toBase58() && m.why === "quarantined"));
     // after the cool-down it is retried
     const h = fakeExecConn();
-    await runSettleRound(deps(h.conn), { market: MARKET, label: "T" }, { lp: LP, counterparties: list, nowSlot: 100 + QUARANTINE_HARD_SLOTS + 1, quarantine }, DEFAULT_SWEEP_ROUND_CONFIG);
+    await runSettleRound(deps(h.conn), { market: MARKET, label: "T" }, { lp: LP, counterparties: list, nowSlot: 100 + QUARANTINE_FIRST_SLOTS + 1, quarantine }, DEFAULT_SWEEP_ROUND_CONFIG);
     assert.ok(h.sims.some((s) => hasKey(s, bad.pubkey)));
-    // NEGATIVE CONTROL: a refusal with NO instruction index (compute exhaustion) shrinks the tx rather than blocking it
-    const c = fakeExecConn({ simErr: (_d, n) => (n === 0 ? { InstructionError: [0, "ComputationalBudgetExceeded"] } : null) });
-    const rc = await runSettleRound(deps(c.conn), { market: MARKET, label: "T" }, { lp: LP, counterparties: cps(6), nowSlot: 100 }, DEFAULT_SWEEP_ROUND_CONFIG);
-    assert.ok(rc.missing.some((m) => m.why === "deferred") || c.sent.length >= 0);
   });
 });
 
@@ -169,7 +164,7 @@ describe("item 4: a gap-exceeded round backs off and is counted", () => {
 });
 
 describe("item 5: tag 78 is counted, pruned, and rides the end of a round", () => {
-  const positioned = (cs: ReturnType<typeof pf>[]): V22Positioned => ({ all: cs, counterparties: cs, lp: pf(901, 2, { lp: true }), minLegAbs: new Map(), flatAnchor: null, lpData: null, undecodable: 0 });
+  const positioned = (cs: ReturnType<typeof pf>[]): V22Positioned => ({ all: cs, counterparties: cs, lp: pf(901, 2, { lp: true }), minLegAbs: new Map(), flatAnchor: null, lpData: null, anchorOverrideRejected: null, undecodable: 0 });
   const sd = (conn: ReturnType<typeof fakeExecConn>["conn"]) => ({ exec: execCtx(conn), getSlot: async () => 1000 });
   it("prefer + overflow: the LP-alone shape is COUNTED (it was uncounted)", async () => {
     const f = fakeExecConn();
@@ -229,21 +224,6 @@ describe("item 6: lone LP crank stays suppressed; protection runs a PAIRED round
     assert.equal(await c.onPushLanded(Keypair.generate().publicKey.toBase58(), 100n), "not-bound");
     assert.deepEqual(seen, []);
   });
-  it("LP near liquidation heuristic (equity <= 20% of capital, or <= 0) and the senior-draw reading", () => {
-    const owner = key(7);
-    assert.equal(lpNearLiquidation(portfolioBytes({ owner, capital: 1000n, pnl: -850n, legs: [{ side: 0, basis: 5n }] })), true);
-    assert.equal(lpNearLiquidation(portfolioBytes({ owner, capital: 1000n, pnl: -1200n, legs: [{ side: 0, basis: 5n }] })), true);
-    assert.equal(lpNearLiquidation(portfolioBytes({ owner, capital: 1000n, pnl: -100n, legs: [{ side: 0, basis: 5n }] })), false, "healthy");
-    assert.equal(lpNearLiquidation(portfolioBytes({ owner, capital: 1000n, pnl: -990n })), false, "flat: nothing to liquidate");
-    assert.equal(lpNearLiquidation(null), false);
-    const lp = key(901);
-    const withDraw = (outstanding: bigint) => {
-      const m = v22Ctx({ lp: null });
-      void m;
-      return outstanding;
-    };
-    void withDraw;
-  });
   it("V22Loop: a landed push on a market whose LP has a senior draw pending runs ONE paired round; a healthy LP runs none", async () => {
     const lp = key(901);
     const mk = (outstanding: bigint) => {
@@ -256,50 +236,68 @@ describe("item 6: lone LP crank stays suppressed; protection runs a PAIRED round
     assert.equal(await hot.loop.sweepDelegate({ conn: hot.f.conn as never, keeper: Keypair.generate(), entry: { marketAddress: MARKET.toBase58(), label: "T/V22" }, marketData: v22MarketBytes(), slot: 5000, dryRun: false }), true);
     const before = hot.f.sims.length;
     await (hot.loop as unknown as { protectiveRound(m: string): Promise<void> }).protectiveRound(MARKET.toBase58());
-    assert.ok(hot.lines.some((l) => l.includes("[v22][protect]") && l.includes("senior draw pending")));
+    assert.ok(hot.lines.some((l) => l.includes("[v22][protect]") && l.includes("senior draw outstanding")));
     assert.ok(hot.f.sims.length > before, "a round ran");
     const calm = mk(0n);
     await calm.loop.sweepDelegate({ conn: calm.f.conn as never, keeper: Keypair.generate(), entry: { marketAddress: MARKET.toBase58(), label: "T/V22" }, marketData: v22MarketBytes(), slot: 5000, dryRun: false });
     const b2 = calm.f.sims.length;
     await (calm.loop as unknown as { protectiveRound(m: string): Promise<void> }).protectiveRound(MARKET.toBase58());
-    assert.equal(calm.f.sims.length, b2, "no protection needed: nothing sent");
+    assert.equal(calm.f.sims.length, b2 + 1, "only the read-only signal simulation ran");
+    assert.equal(calm.f.sent.length, 1, "no protective round: only the delegate's own round above was sent");
+    assert.ok(!calm.lines.some((l) => l.includes("[v22][protect]")));
   });
 });
 
-describe("item 7: rent settles ride the round, in place of the refresh", () => {
+describe("item 7 / N-3: rent (tag 106) runs AFTER the LP tx, sequentially, never in place of a refresh", () => {
   const rentFor = (ctx: ReturnType<typeof v22Ctx>, keeper: PublicKey) => (p: { pubkey: PublicKey }) => buildSettleHoldingRentIxV22(ctx.sdk, keeper, p.pubkey, 0, 5000n, []);
-  it("a due portfolio gets tag 106 INSTEAD of tag 5, in the same tx; no lone 106 tx; counted as settled", async () => {
+  it("a due portfolio keeps its PLAIN refresh in phase 1; its 106 goes in a later tx, after the LP tx", async () => {
     const ctx = v22Ctx({ rent: true });
     const f = fakeExecConn();
     const d = deps(f.conn);
     const target = pf(2, 1);
     const r = await runSettleRound(d, { market: MARKET, label: "T" }, { lp: LP, counterparties: [pf(1), target, pf(3)], nowSlot: 100, rent: { due: new Set([target.pubkey.toBase58()]), build: rentFor(ctx, d.exec.keeper.publicKey) } }, DEFAULT_SWEEP_ROUND_CONFIG);
-    assert.equal(f.sent.length, 1);
-    assert.deepEqual(f.sent[0].tags, [5, 106, 5, 5], "LP crank, then 106 for the due (heaviest) portfolio in place of its refresh, then the other refreshes");
+    assert.equal(f.sent.length, 2);
+    assert.deepEqual(f.sent[0].tags, [5, 5, 5, 5], "the round tx has ONLY plain cranks: the refresh (so a liquidation still happens) stays");
+    assert.ok(hasKey(f.sent[0], target.pubkey), "the due portfolio is refreshed in the round");
+    assert.deepEqual(f.sent[1].tags, [106], "then ONE separate tx with the 106");
+    assert.ok(f.sent[1].order > f.sent[0].order, "after the LP tx");
     assert.deepEqual(r.rentSettled, [target.pubkey.toBase58()]);
-    assert.ok(r.lpSettled && r.plan.paired);
-    // NEGATIVE CONTROL: nothing due -> plain refreshes only
-    const g = fakeExecConn();
-    await runSettleRound(deps(g.conn), { market: MARKET, label: "T" }, { lp: LP, counterparties: [pf(1), target] , nowSlot: 100 }, DEFAULT_SWEEP_ROUND_CONFIG);
-    assert.ok(!g.sent[0].tags.includes(106));
+    assert.equal(pairingStats.rentSettlesInRound, 1);
   });
-  it("a refused 106 falls back to the plain refresh (the counterparty still settles; rent is not marked)", async () => {
+  it("multi-tx rounds: no phase-1 tx carries a 106 (phase 1 stays parallel: no LP write lock from rent)", async () => {
+    const ctx = v22Ctx({ rent: true });
+    const list = cps(30);
+    const f = fakeExecConn();
+    const d = deps(f.conn);
+    await runSettleRound(d, { market: MARKET, label: "T" }, { lp: LP, counterparties: list, nowSlot: 100, rent: { due: new Set(list.slice(0, 3).map((x) => x.pubkey.toBase58())), build: rentFor(ctx, d.exec.keeper.publicKey) } }, DEFAULT_SWEEP_ROUND_CONFIG);
+    const idx106 = f.sent.map((s, i) => (s.tags.includes(106) ? i : -1)).filter((i) => i >= 0);
+    assert.equal(idx106.length, 3);
+    const lpIdx = f.sent.findIndex((s) => hasKey(s, LP));
+    assert.ok(idx106.every((i) => i > lpIdx), "every 106 comes after the LP tx");
+    assert.ok(f.sent.filter((s) => s.tags.includes(106)).every((s) => s.tags.length === 1), "one 106 per tx");
+  });
+  it("NEGATIVE CONTROLS: no rent when the LP did not settle, none for a portfolio the round did not settle, 106 refusal changes nothing else", async () => {
     const ctx = v22Ctx({ rent: true });
     const target = pf(2, 1);
-    const f = fakeExecConn({ simErr: (d) => (d.tags.includes(106) ? customAt(d.tags.indexOf(106), 999) : null) });
-    const d = deps(f.conn);
-    const r = await runSettleRound(d, { market: MARKET, label: "T" }, { lp: LP, counterparties: [pf(1), target], nowSlot: 100, rent: { due: new Set([target.pubkey.toBase58()]), build: rentFor(ctx, d.exec.keeper.publicKey) } }, DEFAULT_SWEEP_ROUND_CONFIG);
-    assert.deepEqual(f.sent[0].tags, [5, 5, 5]);
+    const build = (d: ReturnType<typeof deps>) => ({ due: new Set([target.pubkey.toBase58()]), build: rentFor(ctx, d.exec.keeper.publicKey) });
+    // LP held (counterparty tx did not land): no rent tx at all
+    const a = fakeExecConn({ confirmFail: () => 7 });
+    const da = deps(a.conn);
+    await runSettleRound(da, { market: MARKET, label: "T" }, { lp: LP, counterparties: cps(30).concat([target]), nowSlot: 100, rent: build(da) }, DEFAULT_SWEEP_ROUND_CONFIG);
+    assert.ok(a.sent.every((s) => !s.tags.includes(106)));
+    // the target was refused (band) in the round: not settled -> no rent for it
+    const b = fakeExecConn({ simErr: refusePortfolio(target.pubkey, 104, true) });
+    const db = deps(b.conn);
+    await runSettleRound(db, { market: MARKET, label: "T" }, { lp: LP, counterparties: [pf(1), target], nowSlot: 100, rent: build(db) }, DEFAULT_SWEEP_ROUND_CONFIG);
+    assert.ok(b.sent.every((s) => !s.tags.includes(106)));
+    // a refused 106 is not recorded and does not affect the round
+    const c = fakeExecConn({ simErr: (d) => (d.tags.includes(106) ? customAt(0, 999) : null) });
+    const dc = deps(c.conn);
+    const r = await runSettleRound(dc, { market: MARKET, label: "T" }, { lp: LP, counterparties: [pf(1), target], nowSlot: 100, rent: build(dc) }, DEFAULT_SWEEP_ROUND_CONFIG);
     assert.deepEqual(r.rentSettled, []);
-    assert.ok(r.settled.includes(target.pubkey.toBase58()));
+    assert.equal(r.lpSettled, true);
   });
-  it("a rent settle weighs more than a refresh in the budget", () => {
-    const a = pf(1, 1);
-    assert.equal(portfolioWeight({ ...a, extraWeight: RENT_EXTRA_WEIGHT }), portfolioWeight(a) + RENT_EXTRA_WEIGHT);
-    const heavy = Array.from({ length: 8 }, (_, i) => ({ ...pf(i + 1, 1), extraWeight: RENT_EXTRA_WEIGHT }));
-    assert.ok(planSettleRound({ mode: "prefer", lp: LP, counterparties: heavy }).txs.length > 1, "8 rent settles no longer fit one tx");
-  });
-  it("the tick's lone rent timer is OFF while the sweep + pairing own rent (no lone counterparty settle); ON when the sweep is off", async () => {
+  it("the tick's lone rent timer is OFF while the sweep + pairing own rent; ON when the sweep is off", async () => {
     const owner = key(7);
     const mk = (env: Record<string, string>) => {
       const f = fakeLoopConn({ market: v22MarketBytes({ rent: true }), registry: registryBytes({ bound: true, ext: true }), vaultLpState: vaultLpStateBytes(key(901)), portfolios: [{ pubkey: key(11), data: portfolioBytes({ owner, capital: 10n, legs: [{ side: 0, basis: 5n }] }) }] });

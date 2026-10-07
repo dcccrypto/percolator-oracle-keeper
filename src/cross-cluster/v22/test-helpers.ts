@@ -28,6 +28,8 @@ export interface SentTx {
 export interface FakeConnOptions {
   /** Return an `err` for a simulation given the decoded instructions (tags/keys), or null for success. */
   simErr?: (ixs: SentTx, callIndex: number) => unknown;
+  /** Program logs a simulation returns (by decoded tx and call index). */
+  simLogs?: (ixs: SentTx, callIndex: number) => string[];
   slot?: () => number;
   landedSlot?: () => number;
   confirmStatus?: "ok" | "err";
@@ -52,8 +54,9 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
     async simulateTransaction(tx: { message: Parameters<typeof decode>[0] }) {
       const d = decode(tx.message);
       sims.push(d);
-      const err = o.simErr ? o.simErr(d, sim++) : null;
-      return { context: { slot: 1 }, value: { err: err ?? null, logs: [], unitsConsumed: 123_456 } };
+      const callIndex = sim++;
+      const err = o.simErr ? o.simErr(d, callIndex) : null;
+      return { context: { slot: 1 }, value: { err: err ?? null, logs: o.simLogs ? o.simLogs(d, callIndex) : [], unitsConsumed: 123_456 } };
     },
     async sendRawTransaction(raw: Uint8Array) {
       // decode the transaction actually being sent (phase-1 txs are simulated and sent concurrently)
@@ -74,6 +77,9 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
     async getSlot() {
       return (o.slot ?? (() => slot))();
     },
+    async getMinimumBalanceForRentExemption(len: number) {
+      return len * 7_000;
+    },
   };
   return { conn: conn as unknown as ExecConnection & { getSlot(): Promise<number> }, sims, sent };
 }
@@ -84,6 +90,9 @@ export function execCtx(conn: ExecConnection, dryRun = false): ExecContext {
 
 /** A Custom(code) error at instruction index `i` of the tx as the test sees it (compute-budget ixs are added back). */
 export const customAt = (i: number, code: number) => ({ InstructionError: [i + COMPUTE_IX_COUNT, { Custom: code }] });
+
+/** A runtime error WITH an instruction index but NO program Custom code (what a compute-budget overrun looks like). */
+export const computeAt = (i: number) => ({ InstructionError: [i + COMPUTE_IX_COUNT, "ComputationalBudgetExceeded"] });
 
 const L = layoutById("v2.2-b");
 

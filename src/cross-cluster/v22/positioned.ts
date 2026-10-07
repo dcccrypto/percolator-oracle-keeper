@@ -25,6 +25,8 @@ export interface V22Positioned {
    * null. NEVER a user's portfolio: a user can fill or close it and grief the round (security review F-4).
    */
   flatAnchor: PublicKey | null;
+  /** An operator override that failed the keeper-ownership / flatness check (and was therefore ignored), with the reason. */
+  anchorOverrideRejected: string | null;
   /** Raw bytes of the vault LP portfolio when it was in the scan (protection checks). */
   lpData: Uint8Array | null;
   /** Accounts that did not decode (counted, never guessed). */
@@ -33,12 +35,15 @@ export interface V22Positioned {
 
 export function analysePortfolios(
   accounts: ReadonlyArray<{ pubkey: PublicKey; data: Uint8Array }>,
-  p: { assetIndex?: number; lpPortfolio: PublicKey | null; portfolioLen: number; keeperOwner?: PublicKey | null },
+  p: { assetIndex?: number; lpPortfolio: PublicKey | null; portfolioLen: number; keeperOwner?: PublicKey | null; anchorOverride?: PublicKey | null },
 ): V22Positioned {
   const assetIndex = p.assetIndex ?? 0;
   const all: PositionedPortfolio[] = [];
   const minLegAbs = new Map<string, bigint>();
   let flatAnchor: PublicKey | null = null;
+  let overrideAnchor: PublicKey | null = null;
+  let overrideSeen = false;
+  let overrideWhy: string | null = null;
   let lpData: Uint8Array | null = null;
   let undecodable = 0;
   for (const { pubkey, data } of accounts) {
@@ -76,7 +81,14 @@ export function analysePortfolios(
         kfShort = kfShort === null || leg.kfEpochSnap < kfShort ? leg.kfEpochSnap : kfShort;
       }
     }
-    if (!anyActive && !isLp && !parsed.matcherEnabled && flatAnchor === null && p.keeperOwner && parsed.owner.equals(p.keeperOwner)) flatAnchor = pubkey;
+    const keeperFlat = !anyActive && !isLp && !parsed.matcherEnabled && !!p.keeperOwner && parsed.owner.equals(p.keeperOwner);
+    if (keeperFlat && flatAnchor === null) flatAnchor = pubkey;
+    // An operator override passes the SAME check as a discovered anchor: owned by the keeper, flat, not the LP, not a matcher.
+    if (p.anchorOverride && pubkey.equals(p.anchorOverride)) {
+      overrideSeen = true;
+      if (keeperFlat) overrideAnchor = pubkey;
+      else overrideWhy = `override ${pubkey.toBase58()} is ${isLp ? "the vault LP" : anyActive ? "not flat" : parsed.matcherEnabled ? "a matcher portfolio" : "not owned by the keeper"}`;
+    }
     if (longLegs + shortLegs === 0) continue;
     all.push({ pubkey, longLegs, shortLegs, isLp, lossWeight, kfEpochSnapLong: kfLong, kfEpochSnapShort: kfShort });
     if (minAbs !== null) minLegAbs.set(pubkey.toBase58(), minAbs);
@@ -84,7 +96,9 @@ export function analysePortfolios(
   let lp: PositionedPortfolio | null = all.find((x) => x.isLp) ?? null;
   // A flat LP (no legs on the asset) is still the LP: it settles at the end of every round.
   if (!lp && p.lpPortfolio) lp = { pubkey: p.lpPortfolio, longLegs: 0, shortLegs: 0, isLp: true, lossWeight: 0n };
-  return { all, counterparties: all.filter((x) => !x.isLp), lp, minLegAbs, flatAnchor, lpData, undecodable };
+  if (p.anchorOverride && !overrideSeen) overrideWhy = `override ${p.anchorOverride.toBase58()} is not a decodable portfolio of this market`;
+  // a passing override wins; a failing one is IGNORED (discovery of the keeper's own flat portfolio stays)
+  return { all, counterparties: all.filter((x) => !x.isLp), lp, minLegAbs, flatAnchor: overrideAnchor ?? flatAnchor, lpData, anchorOverrideRejected: overrideWhy, undecodable };
 }
 
 /** One read: every portfolio of the market at the layout's length. Never throws (returns null). */
@@ -98,9 +112,9 @@ export async function loadV22Positioned(
     const accts = await fetchMarketPortfolios(conn, ctx.market, ctx.layout.portfolioAccountLen);
     const r = analysePortfolios(
       accts.map((a) => ({ pubkey: a.pubkey, data: a.account.data })),
-      { lpPortfolio: ctx.lpPortfolio, portfolioLen: ctx.layout.portfolioAccountLen, keeperOwner },
+      { lpPortfolio: ctx.lpPortfolio, portfolioLen: ctx.layout.portfolioAccountLen, keeperOwner, anchorOverride },
     );
-    if (anchorOverride) r.flatAnchor = anchorOverride;
+    if (r.anchorOverrideRejected) console.warn(`[v22] ${ctx.label}: KEEPER_V22_ACCRUE_ANCHORS ignored: ${r.anchorOverrideRejected}`);
     return r;
   } catch (err) {
     console.warn(`[v22] ${ctx.label}: positioned-portfolio discovery failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`);
@@ -121,22 +135,4 @@ export function parseAccrueAnchors(raw: string | undefined): Map<string, PublicK
     }
   }
   return out;
-}
-
-/**
- * Heuristic "the vault LP is near liquidation": it holds legs and its equity (`capital + pnl` at its last settle) is
- * at or below `thresholdPct` percent of its capital. The keeper does not know the engine's margin ratios, so this is a
- * coarse trigger for a PROTECTIVE round (a full paired round, never a lone LP crank); the program decides everything.
- */
-export function lpNearLiquidation(lpData: Uint8Array | null, thresholdPct = 20): boolean {
-  if (!lpData) return false;
-  try {
-    const p = parsePortfolioV17(lpData);
-    if (p.activeBitmap === 0n) return false;
-    const equity = p.capital + p.pnl;
-    if (equity <= 0n) return true;
-    return p.capital > 0n && equity * 100n <= p.capital * BigInt(thresholdPct);
-  } catch {
-    return false;
-  }
 }

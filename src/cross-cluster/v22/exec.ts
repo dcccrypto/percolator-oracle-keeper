@@ -30,6 +30,8 @@ export interface ExecContext {
   /** Global dry run (DRY_RUN / --dry-run or KEEPER_V22_DRY_RUN). */
   dryRun: boolean;
   confirm?: ConfirmOptions;
+  /** Extra signers (a new account being created); the keeper always signs. */
+  extraSigners?: ReadonlyArray<Keypair>;
   log?: (line: string) => void;
 }
 
@@ -139,7 +141,7 @@ export async function simulateAndSend(
       const { blockhash, lastValidBlockHeight } = await ctx.conn.getLatestBlockhash("confirmed");
       const tx = buildTx(ctx.keeper, ixs, o, blockhash);
       const dry = ctx.dryRun || o.dryRun === true;
-      if (!dry) tx.sign(ctx.keeper);
+      if (!dry) tx.sign(ctx.keeper, ...(ctx.extraSigners ?? []));
       const sim = await ctx.conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), { sigVerify: false, commitment: "processed" });
       const logs = sim.value.logs ?? [];
       const units = sim.value.unitsConsumed ?? null;

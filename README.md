@@ -193,6 +193,14 @@ any keeper action (`prefer` counts it, `strict` freezes the LP until it clears, 
 (counted) and `strict` skips the LP that round; the accrue-through-a-counterparty fallback settles that counterparty alone at the new K for the round's duration; the LP's rent is not settled under pairing
 (rent is index-based and timing-invariant). Defence in depth: the engine fix is separate.
 
-Env parsing is STRICT: an unrecognised value of any `KEEPER_V22*` variable or `VAULT_LP_LONE_CRANK` stops the keeper at startup (on/1/true/yes, off/0/false/no).
+Env parsing is STRICT (on/1/true/yes, off/0/false/no). Scope: `KEEPER_V22` and `VAULT_LP_LONE_CRANK` are validated on EVERY start; the other `KEEPER_V22_*` variables are read and validated only when `KEEPER_V22` is on. **Operator: audit the live (Railway) env for stray `KEEPER_V22*` / `VAULT_LP_LONE_CRANK` values before deploying this build**: a malformed `VAULT_LP_LONE_CRANK` stops even a flags-off keeper at boot (fail closed).
+
+Rent (tag 106) is NOT substituted for a refresh (106 forces the Refresh action, so a liquidatable counterparty would not be liquidated, and every 106 write-locks the LP, serialising phase 1). It runs after the LP tx of a round, one tx per portfolio, sequentially, only for portfolios the round already refreshed with the plain crank and only when the LP settled; the counterparty it touches is settled alone at the newer K for that tx (a one-portfolio mirror-image window, after the LP's own settle).
+
+Refusal classification: only an error with a program Custom code is a refusal of that portfolio (22 = current, 104/111/112/113 = band state, anything else = hard). An error with no code (compute exhaustion, account in use, blockhash, RPC) shrinks the tx, blames and quarantines nobody, and the cut counterparties HOLD the LP in both modes. Cool-downs start at 150 slots and lengthen (450, 1,500) only when the same portfolio repeats the same code; at most 2 quarantines per round unless each carries a distinct code.
+
+Protective rounds: triggered by the wrapper's own senior-draw signal (a read-only simulation of the LP crank whose logs carry `p3_senior_draw`) or `senior_draw_outstanding > 0`. Cadence: signal at most every 5 s per market; outstanding-only at most every 30 s; after a protective round that did not settle the LP the next waits 10, 20, 40, 80, 120 s (reset on success).
+
+Anchor: `node --import tsx/esm src/v22-create-anchor.ts <market>` (operator tool, never run by the keeper) creates the keeper's own flat portfolio at the layout's exact length; it needs `KEEPER_V22_CREATE_ANCHOR=on` and is dry-run unless `KEEPER_V22_CREATE_ANCHOR_DRY_RUN=off`. The `KEEPER_V22_ACCRUE_ANCHORS` override must pass the same keeper-owned / flat check as discovery.
 
 Every v2.2 send is simulated first (`v22/exec.ts`); refusals are logged by name (`PriceBandPinned(104)`, `InsuranceReadingsDiverged(44)`); band states 104/111/112/113 are expected, counted, never alerted.

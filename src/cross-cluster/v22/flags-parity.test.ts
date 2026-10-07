@@ -61,10 +61,17 @@ describe("flags OFF: no behaviour change", () => {
       { KEEPER_V22_RENT_CADENCE_SLOTS: "-5" },
       { KEEPER_V22_STAKE_SYNC_INTERVAL_MS: "1.5" },
     ];
-    for (const env of bad) assert.throws(() => v22FlagsFromEnv(env), (e: unknown) => e instanceof V22FlagError && /Refusing to start/.test((e as Error).message), JSON.stringify(env));
+    // KEEPER_V22_* values are validated when the layer is ON; the two always-validated variables throw either way
+    for (const env of bad) assert.throws(() => v22FlagsFromEnv({ KEEPER_V22: "on", ...env }), (e: unknown) => e instanceof V22FlagError && /Refusing to start/.test((e as Error).message), JSON.stringify(env));
+    // N-6: with KEEPER_V22 unset a malformed KEEPER_V22_* value is NOT read (a flags-off live keeper must still boot) ...
+    for (const env of bad.filter((e) => !("KEEPER_V22" in e) && !("VAULT_LP_LONE_CRANK" in e))) assert.doesNotThrow(() => v22FlagsFromEnv(env), JSON.stringify(env));
+    assert.deepEqual(v22FlagsFromEnv({ KEEPER_V22_SWEEP: "maybe", KEEPER_V22_DRY_RUN: "enabled" }), v22FlagsFromEnv({}), "and they change nothing");
+    // ... while the master switch and VAULT_LP_LONE_CRANK are validated regardless
+    assert.throws(() => v22FlagsFromEnv({ VAULT_LP_LONE_CRANK: "of" }), V22FlagError);
+    assert.throws(() => v22FlagsFromEnv({ KEEPER_V22: "yess" }), V22FlagError);
     // valid values still parse
-    assert.doesNotThrow(() => v22FlagsFromEnv({ KEEPER_V22_G9_DRAW_CAP_ATOMS: "18446744073709551615", KEEPER_V22_SETTLE_PAIRING: " Strict " }));
-    assert.equal(v22FlagsFromEnv({ KEEPER_V22_SETTLE_PAIRING: " Strict " }).pairing, "strict");
+    assert.doesNotThrow(() => v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_G9_DRAW_CAP_ATOMS: "18446744073709551615", KEEPER_V22_SETTLE_PAIRING: " Strict " }));
+    assert.equal(v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_SETTLE_PAIRING: " Strict " }).pairing, "strict");
   });
 
   it("nothing is installed into the legacy paths unless a v2.2 flag installs it", () => {
