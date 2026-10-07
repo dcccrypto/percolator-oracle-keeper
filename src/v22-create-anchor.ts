@@ -30,4 +30,8 @@ const secret = process.env.KEEPER_KEYPAIR ? JSON.parse(process.env.KEEPER_KEYPAI
 const keeper = Keypair.fromSecretKey(Uint8Array.from(secret));
 const conn = new Connection(rpc, "confirmed");
 const r = await createKeeperAnchor({ conn, keeper, dryRun }, conn, { market: new PublicKey(marketArg), programId: WRAPPER_PROGRAM_ID, dryRun });
+if (r.outcome.kind === "failed") {
+  console.error(`[v22-create-anchor] ${r.outcome.error}`);
+  process.exit(1);
+}
 console.log(`[v22-create-anchor] ${dryRun ? "DRY-RUN " : ""}anchor ${r.anchor.toBase58()} rent ${r.lamports} lamports: ${r.outcome.kind}`);

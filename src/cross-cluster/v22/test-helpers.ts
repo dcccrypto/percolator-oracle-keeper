@@ -34,7 +34,7 @@ export interface FakeConnOptions {
   landedSlot?: () => number;
   confirmStatus?: "ok" | "err";
   /** Program error code a LANDED tx fails with (by send index), or null for success. */
-  confirmFail?: (sendIndex: number) => number | null;
+  confirmFail?: (sendIndex: number, tx: SentTx) => number | null;
 }
 
 export function fakeExecConn(o: FakeConnOptions = {}) {
@@ -68,7 +68,7 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
     },
     async confirmTransaction(arg: { signature: string }) {
       const idx = Number(arg.signature.slice(3)) - 1; // sendRawTransaction returned `sig<N>`
-      const code = o.confirmFail ? o.confirmFail(idx) : o.confirmStatus === "err" ? 1 : null;
+      const code = o.confirmFail ? o.confirmFail(idx, sent[idx]) : o.confirmStatus === "err" ? 1 : null;
       return { context: { slot: 1 }, value: { err: code !== null ? { InstructionError: [2, { Custom: code }] } : null } };
     },
     async getSignatureStatuses() {

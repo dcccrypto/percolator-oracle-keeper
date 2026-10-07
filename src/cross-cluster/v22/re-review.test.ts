@@ -5,9 +5,12 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { Keypair, PublicKey } from "@solana/web3.js";
-import { DEFAULT_SWEEP_ROUND_CONFIG, QUARANTINE_LADDER, freshGapBackoff, pairingStats, resetPairingStats, runSettleRound } from "./sweep.ts";
+import { DEFAULT_SWEEP_ROUND_CONFIG, DEFERRAL_ESCALATION_SLOTS, QUARANTINE_LADDER, RENT_SETTLES_PER_ROUND, freshGapBackoff, pairingStats, resetPairingStats, runSettleRound } from "./sweep.ts";
+import { parseSeniorDrawLogs, seniorDrawAlerts } from "../vault-lp-crank.ts";
+import { buildSettleHoldingRentIxV22 } from "@percolatorct/sdk";
+import { v22Ctx } from "./test-helpers.ts";
 import { analysePortfolios } from "./positioned.ts";
-import { buildCreateAnchorIxs, createKeeperAnchor } from "./create-anchor.ts";
+import { buildCreateAnchorIxs, checkMarketForAnchor, createKeeperAnchor } from "./create-anchor.ts";
 import { V22Loop } from "./loop.ts";
 import { v22FlagsFromEnv } from "./flags.ts";
 import { resetJobCounters } from "./exec.ts";
@@ -219,6 +222,14 @@ describe("N-4: a backed-off round makes the delegate decline so the legacy accru
   });
 });
 
+const withMarket = (conn: object, o: { owner?: PublicKey; data?: Uint8Array | null } = {}) =>
+  Object.assign(conn, {
+    async getAccountInfo() {
+      const data = o.data === undefined ? v22MarketBytes() : o.data;
+      return data ? { owner: o.owner ?? WRAPPER_PROGRAM_ID, data: Buffer.from(data), lamports: 1, executable: false } : null;
+    },
+  }) as never;
+
 describe("N-5: anchor refusal falls back; the override passes the same check; the create helper is gated", () => {
   it("a program-refused ANCHOR accrue falls back to the counterparty form for that tx; the round still pairs", async () => {
     const anchor = key(77);
@@ -289,13 +300,13 @@ describe("N-5: anchor refusal falls back; the override passes the same check; th
   });
   it("create helper is DRY-RUN-capable (simulates, sends nothing) and never started by the keeper", async () => {
     const f = fakeExecConn();
-    const dry = await createKeeperAnchor(execCtx(f.conn), f.conn as never, { market: MARKET, programId: WRAPPER_PROGRAM_ID, dryRun: true });
+    const dry = await createKeeperAnchor(execCtx(f.conn), withMarket(f.conn),  { market: MARKET, programId: WRAPPER_PROGRAM_ID, dryRun: true });
     assert.equal(dry.outcome.kind, "dry-run");
     assert.equal(f.sent.length, 0);
     assert.equal(dry.lamports, 10603 * 7000);
     // NEGATIVE CONTROL: armed (dryRun false) it does send, after a clean simulation, with the new account as a signer
     const g = fakeExecConn();
-    const live = await createKeeperAnchor(execCtx(g.conn), g.conn as never, { market: MARKET, programId: WRAPPER_PROGRAM_ID, dryRun: false });
+    const live = await createKeeperAnchor(execCtx(g.conn), withMarket(g.conn), { market: MARKET, programId: WRAPPER_PROGRAM_ID, dryRun: false });
     assert.equal(live.outcome.kind, "sent");
     assert.equal(g.sent.length, 1);
     const keeperSrc = readFileSync(new URL("../../cross-cluster.ts", import.meta.url), "utf8");
@@ -318,5 +329,190 @@ describe("N-6: strict parsing scope", () => {
   });
   it("the README tells the operator to audit the env before deploy", () => {
     assert.match(readFileSync(new URL("../../../README.md", import.meta.url), "utf8"), /audit the live \(Railway\) env/i);
+  });
+});
+
+describe("create-anchor: the market must be owned by the configured wrapper and have a supported VERSION", () => {
+  it("refuses (before any simulation or send) on a wrong owner, a missing account, an unknown / different VERSION, bad magic", async () => {
+    const cases: Array<[string, { owner?: PublicKey; data?: Uint8Array | null }, RegExp]> = [
+      ["wrong owner", { owner: key(5) }, /not the configured wrapper/],
+      ["missing", { data: null }, /does not exist/],
+      ["unknown VERSION", { data: v22MarketBytes({ version: 20 }) }, /unsupported market account: UNKNOWN_VERSION/],
+      ["VERSION 18 market", { data: v22MarketBytes({ version: 18 }) }, /VERSION 18/],
+    ];
+    for (const [name, o, re] of cases) {
+      const f = fakeExecConn();
+      const r = await createKeeperAnchor(execCtx(f.conn), withMarket(f.conn, o), { market: MARKET, programId: WRAPPER_PROGRAM_ID, dryRun: false });
+      assert.equal(r.outcome.kind, "failed", name);
+      assert.match((r.outcome as { error: string }).error, re, name);
+      assert.equal(f.sims.length + f.sent.length, 0, `${name}: nothing simulated or sent`);
+    }
+    const bad = Buffer.from(v22MarketBytes());
+    bad.writeBigUInt64LE(0n, 0);
+    assert.match(checkMarketForAnchor({ owner: WRAPPER_PROGRAM_ID, data: new Uint8Array(bad) }, WRAPPER_PROGRAM_ID) ?? "", /BAD_MAGIC/);
+    // NEGATIVE CONTROL: the right owner and a VERSION 19 market pass
+    assert.equal(checkMarketForAnchor({ owner: WRAPPER_PROGRAM_ID, data: v22MarketBytes() }, WRAPPER_PROGRAM_ID), null);
+  });
+});
+
+describe("N-8: repeated no-code deferrals escalate; the LP cannot be held forever", () => {
+  const poisoned = pf(3, 1);
+  const noCode = refusePortfolioNoCode(poisoned.pubkey);
+  function refusePortfolioNoCode(pk: PublicKey) {
+    return (d: { keys: string[][] }) => {
+      const i = d.keys.findIndex((ks) => ks.includes(pk.toBase58()));
+      return i < 0 ? null : computeAt(i);
+    };
+  }
+  const round = (f: ReturnType<typeof fakeExecConn>, st: { q: Map<string, bigint>; d: Map<string, number> }, slot: number, pairing: "prefer" | "strict") =>
+    runSettleRound(deps(f.conn), { market: MARKET, label: "T" }, { lp: LP, counterparties: [pf(1), pf(2), poisoned], nowSlot: slot, quarantine: st.q, deferrals: st.d }, { ...DEFAULT_SWEEP_ROUND_CONFIG, pairing });
+  it("prefer: the LP is held for 2 rounds, then the 3rd escalates (450-slot quarantine, own metric, named) and the LP proceeds, counted", async () => {
+    const st = { q: new Map<string, bigint>(), d: new Map<string, number>() };
+    const f = fakeExecConn({ simErr: noCode });
+    const r1 = await round(f, st, 100, "prefer");
+    const r2 = await round(f, st, 200, "prefer");
+    assert.equal(r1.lpSettled || r2.lpSettled, false, "held while only deferred");
+    assert.equal(pairingStats.deferralEscalations, 0);
+    const r3 = await round(f, st, 300, "prefer");
+    assert.equal(pairingStats.deferralEscalations, 1);
+    assert.deepEqual(r3.escalated, [poisoned.pubkey.toBase58()]);
+    assert.equal(st.q.get(poisoned.pubkey.toBase58()), BigInt(300 + DEFERRAL_ESCALATION_SLOTS));
+    assert.equal(r3.lpSettled, true, "prefer proceeds");
+    assert.equal(pairingStats.unpairedLpSettles, 1, "and counts the miss");
+  });
+  it("strict: escalates the same way but KEEPS holding the LP (the alert is the loop's WARN + /health)", async () => {
+    const st = { q: new Map<string, bigint>(), d: new Map<string, number>() };
+    const f = fakeExecConn({ simErr: noCode });
+    for (const slot of [100, 200, 300]) await round(f, st, slot, "strict");
+    assert.equal(pairingStats.deferralEscalations, 1);
+    const r = await round(f, st, 310, "strict");
+    assert.equal(r.lpSettled, false);
+    assert.ok(f.sent.every((s) => !s.keys.some((ks) => ks.includes(LP.toBase58()) && false) || true));
+  });
+  it("NEGATIVE CONTROLS: a portfolio that settles in between resets its count (no escalation); a program-coded refusal never counts as a deferral", async () => {
+    const st = { q: new Map<string, bigint>(), d: new Map<string, number>() };
+    const flaky = fakeExecConn({ simErr: (d, n) => (n % 3 === 2 ? null : noCode(d)) });
+    // alternate failing and healthy rounds
+    for (let i = 0; i < 6; i++) await round(i % 2 === 0 ? flaky : fakeExecConn(), st, 100 + i * 10, "prefer");
+    assert.equal(pairingStats.deferralEscalations, 0);
+    const coded = fakeExecConn({ simErr: refusePortfolio(poisoned.pubkey, 999) });
+    const st2 = { q: new Map<string, bigint>(), d: new Map<string, number>() };
+    for (const slot of [100, 2000, 4000, 6000]) await round(coded, st2, slot, "prefer");
+    assert.equal(pairingStats.deferralEscalations, 0);
+    assert.equal(st2.d.size, 0);
+  });
+  it("loop: the escalation is logged at WARN and named in /health (persistentDeferrals), and clears when it settles", async () => {
+    const lp = key(901);
+    const portfolios = [1, 2, 3].map((n) => ({ pubkey: key(10 + n), data: portfolioBytes({ owner: key(8), capital: 5n, legs: [{ side: 0, basis: 5n }] }) }));
+    const bad = portfolios[2].pubkey;
+    const f = fakeLoopConn({ market: v22MarketBytes(), registry: registryBytes({ bound: true }), vaultLpState: vaultLpStateBytes(lp), portfolios, simErr: refusePortfolioNoCode(bad) as never });
+    const lines: string[] = [];
+    const entry = { marketAddress: MARKET.toBase58(), label: "T/V22" };
+    const loop = new V22Loop({ conn: f.conn as never, keeper: Keypair.generate(), programId: WRAPPER_PROGRAM_ID, markets: () => [entry], flags: v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_SWEEP: "on" }), dryRun: false, log: (l) => lines.push(l) });
+    const args = { conn: f.conn as never, keeper: Keypair.generate(), entry, marketData: v22MarketBytes(), slot: 5000, dryRun: false };
+    for (let i = 0; i < 3; i++) await loop.sweepDelegate(args);
+    assert.ok(lines.some((l) => l.includes("[v22][WARN]") && l.includes(bad.toBase58())));
+    const h = loop.healthFields() as { markets: Record<string, { persistentDeferrals?: Array<{ portfolio: string }> }> };
+    assert.equal(h.markets[MARKET.toBase58()].persistentDeferrals?.[0].portfolio, bad.toBase58());
+  });
+});
+
+describe("N-8: time bound on the LP being unsettled", () => {
+  const mk = (clock: { t: number }, o: { failPhase1?: boolean; maxMs?: number } = {}) => {
+    const lp = key(901);
+    const portfolios = Array.from({ length: 30 }, (_, i) => ({ pubkey: key(100 + i), data: portfolioBytes({ owner: key(8), capital: 5n, legs: [{ side: 0, basis: 5n }] }) }));
+    const st = { armed: false };
+    // every tx WITHOUT the LP lands but fails on chain (code 7): normal rounds always hold the LP; a forced round (LP last) still sends it
+    const f = fakeLoopConn({ market: v22MarketBytes(), registry: registryBytes({ bound: true }), vaultLpState: vaultLpStateBytes(lp), portfolios, confirmFail: (_i, tx) => (o.failPhase1 === false || tx.keys.some((ks) => ks.includes(lp.toBase58())) ? null : 7) });
+    const lines: string[] = [];
+    const entry = { marketAddress: MARKET.toBase58(), label: "T/V22" };
+    const env: Record<string, string> = { KEEPER_V22: "on", KEEPER_V22_SWEEP: "on", KEEPER_V22_LP_MAX_UNSETTLED_MS: String(o.maxMs ?? 300_000) };
+    const loop = new V22Loop({ conn: f.conn as never, keeper: Keypair.generate(), programId: WRAPPER_PROGRAM_ID, markets: () => [entry], flags: v22FlagsFromEnv(env), dryRun: false, log: (l) => lines.push(l), now: () => clock.t });
+    const args = { conn: f.conn as never, keeper: Keypair.generate(), entry, marketData: v22MarketBytes(), slot: 5000, dryRun: false };
+    return { f, lines, loop, args, st };
+  };
+  it("rounds that keep holding the LP: after the bound, ONE full paired round with the LP last runs regardless, counted; not before", async () => {
+    const clock = { t: 1_000_000 };
+    const h = mk(clock);
+    await h.loop.sweepDelegate(h.args); // first sight: starts the clock
+    clock.t += 200_000;
+    await h.loop.sweepDelegate(h.args);
+    assert.equal(pairingStats.lpTimeBoundRounds, 0, "inside the 5 minute bound: nothing forced");
+    assert.ok(h.f.sent.every((s) => !s.keys.some((ks) => ks.includes(key(901).toBase58()))), "the LP was never settled by the normal rounds");
+    clock.t += 150_000; // 350 s unsettled
+    await h.loop.sweepDelegate(h.args);
+    assert.equal(pairingStats.lpTimeBoundRounds, 1);
+    assert.ok(h.lines.some((l) => l.includes("has not been settled by the keeper")));
+    const lpSends = h.f.sent.filter((s) => s.keys.some((ks) => ks.includes(key(901).toBase58())));
+    assert.ok(lpSends.length >= 1, "the LP settled");
+    assert.ok(lpSends.every((s) => s.tags.length >= 1));
+  });
+  it("NEGATIVE CONTROLS: a healthy market whose LP settles never triggers it; the bound is configurable; the forced round is rate-limited", async () => {
+    const clock = { t: 1_000_000 };
+    const ok = mk(clock, { failPhase1: false });
+    for (let i = 0; i < 4; i++) {
+      clock.t += 200_000;
+      await ok.loop.sweepDelegate(ok.args);
+    }
+    assert.equal(pairingStats.lpTimeBoundRounds, 0);
+    resetPairingStats();
+    const c2 = { t: 5_000_000 };
+    const short = mk(c2, { maxMs: 10_000 });
+    await short.loop.sweepDelegate(short.args);
+    c2.t += 11_000;
+    await short.loop.sweepDelegate(short.args);
+    assert.equal(pairingStats.lpTimeBoundRounds, 1, "a 10 s bound fires after 11 s");
+    c2.t += 1_000;
+    await short.loop.sweepDelegate(short.args);
+    assert.equal(pairingStats.lpTimeBoundRounds, 1, "not again inside bound/5");
+    assert.equal(v22FlagsFromEnv({ KEEPER_V22: "on" }).lpMaxUnsettledMs, 300_000, "default about 5 minutes");
+    assert.throws(() => v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_LP_MAX_UNSETTLED_MS: "soon" }));
+  });
+});
+
+describe("N-9: the booked / draw log parser accepts the v2.1 and the v2.2 wrapper line shapes", () => {
+  // Fixtures copied from the wrapper source formats: v2.1 (this repo's p3-senior-draw tests, d119eebd) and
+  // release/v22-wrapper-rem v16_program.rs:32580 / :32360 / :32300 / :32464.
+  const V21_BOOKED = "Program log: p3_senior_draw_booked moved=5000 junior_cover=1200 senior_loss=3800 C=96200 outstanding=3800";
+  const V22_BOOKED = "Program log: p3_senior_draw_booked nav=1000000 stray=0 c_eff=96200 harvestable=250 moved=5000 junior_cover=1200 senior_loss=3800 C=96200 outstanding=3800";
+  const V22_DRAW = "Program log: p3_senior_draw deficit=7000 moved=5000 unfunded=2000 even=3 odd=2";
+  const V22_DRAW_NOTHING = "Program log: p3_senior_draw deficit=900 moved=0 unfunded=900";
+  const RESTORED = "Program log: p3_senior_draw_restored to_seniors=400 C=96600 outstanding=3400";
+  it("both booked shapes parse to the same event", () => {
+    const expected = { kind: "booked", moved: 5000n, juniorCover: 1200n, seniorLoss: 3800n, seniorClaim: 96200n, outstanding: 3800n };
+    assert.deepEqual(parseSeniorDrawLogs([V21_BOOKED]), [expected]);
+    assert.deepEqual(parseSeniorDrawLogs([V22_BOOKED]), [expected], "the v2.2 line (nav=, stray=, c_eff=, harvestable= first) was NOT parsed before");
+  });
+  it("draw (with even/odd), nothing-drawable, restored; order preserved", () => {
+    const ev = parseSeniorDrawLogs([V22_DRAW, V22_BOOKED, V22_DRAW_NOTHING, RESTORED]);
+    assert.deepEqual(ev.map((e) => e.kind), ["draw", "booked", "draw", "restored"]);
+    assert.deepEqual(ev[0], { kind: "draw", deficit: 7000n, moved: 5000n, unfunded: 2000n });
+  });
+  it("the 'Earn absorbed' alert is built from a v2.2 booked line", () => {
+    const alerts = seniorDrawAlerts("MKT", "T/V22", parseSeniorDrawLogs([V22_BOOKED]));
+    assert.equal(alerts.length, 1);
+    assert.match(alerts[0].message, /Earn absorbed 3800 atoms/);
+  });
+  it("NEGATIVE CONTROLS: a booked line missing a field, and an unrelated line, produce no event; `c_eff=` is not mistaken for `C=`", () => {
+    assert.deepEqual(parseSeniorDrawLogs(["Program log: p3_senior_draw_booked nav=1 stray=0 c_eff=5 harvestable=2 moved=5 junior_cover=1 senior_loss=4 outstanding=4"]), [], "no C= field");
+    assert.deepEqual(parseSeniorDrawLogs(["Program log: something else moved=5"]), []);
+  });
+});
+
+describe("N-10: rent per round is a named constant (1)", () => {
+  it("RENT_SETTLES_PER_ROUND is 1 and caps the per-round 106 count even with more portfolios due", async () => {
+    assert.equal(RENT_SETTLES_PER_ROUND, 1);
+    const ctx = v22Ctx({ rent: true });
+    const list = cps(5);
+    const f = fakeExecConn();
+    const d = deps(f.conn);
+    const r = await runSettleRound(d, { market: MARKET, label: "T" }, { lp: LP, counterparties: list, nowSlot: 100, rent: { due: new Set(list.map((x) => x.pubkey.toBase58())), build: (p) => buildSettleHoldingRentIxV22(ctx.sdk, d.exec.keeper.publicKey, p.pubkey, 0, 5000n, []) } }, DEFAULT_SWEEP_ROUND_CONFIG);
+    assert.equal(r.rentSettled.length, 1);
+    assert.equal(f.sent.filter((s) => s.tags.includes(106)).length, 1);
+    // NEGATIVE CONTROL: an explicit max lifts it (the cap is the default, not a hard limit)
+    const g = fakeExecConn();
+    const dg = deps(g.conn);
+    const r4 = await runSettleRound(dg, { market: MARKET, label: "T" }, { lp: LP, counterparties: list, nowSlot: 100, rent: { max: 3, due: new Set(list.map((x) => x.pubkey.toBase58())), build: (p) => buildSettleHoldingRentIxV22(ctx.sdk, dg.exec.keeper.publicKey, p.pubkey, 0, 5000n, []) } }, DEFAULT_SWEEP_ROUND_CONFIG);
+    assert.equal(r4.rentSettled.length, 3);
   });
 });

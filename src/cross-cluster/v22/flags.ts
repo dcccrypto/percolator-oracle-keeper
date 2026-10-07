@@ -11,6 +11,8 @@
  *   KEEPER_V22_FEE_CRANK_BOND     tag 78 on bond markets (LP crank first, ext + writable LP + tranche tail)
  *   KEEPER_V22_SWEEP              positioned-refresh sweep for v2.2 markets ([LP crank, refresh xN], weight-budgeted)
  *   KEEPER_V22_SETTLE_PAIRING     off | prefer | strict   (default prefer; only acts when KEEPER_V22_SWEEP is on)
+ *   KEEPER_V22_LP_MAX_UNSETTLED_MS  longest the vault LP may go unsettled by the keeper while the market is otherwise healthy (default 300000 = 5 min);
+ *                                 then ONE full paired round with the LP last runs regardless (same shape as the protective round)
  *   KEEPER_V22_HOLDING_RENT       tag 106 settle on rent markets
  *   KEEPER_V22_RENT_CADENCE_SLOTS slots between rent settles of one portfolio (default 9000, about one hour)
  *   KEEPER_V22_DUST_SWEEP         tag 118 (OFF by default, own flag; band markets only)
@@ -55,6 +57,8 @@ export interface V22Flags {
   earnExit: boolean;
   loneLpCrank: boolean;
   mainnetBuild: boolean;
+  /** Longest the keeper leaves the vault LP unsettled while the market is otherwise healthy before a forced paired round (ms). */
+  lpMaxUnsettledMs: number;
 }
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -94,7 +98,7 @@ const U64_MAX = (1n << 64n) - 1n;
 export const V22_FLAG_DEFAULTS: V22Flags = {
   enabled: false, dryRun: false, tickMs: 20_000, feeCrankBond: false, sweep: false, pairing: "prefer", holdingRent: false,
   rentCadenceSlots: 9_000, dustSweep: false, g9: false, g9DryRun: true, g9AllowAnyOracleMode: false, g9DrawCapAtoms: U64_MAX,
-  stakeSync: false, stakeSyncIntervalMs: 60_000, earnExit: false, loneLpCrank: true, mainnetBuild: false,
+  stakeSync: false, stakeSyncIntervalMs: 60_000, earnExit: false, loneLpCrank: true, mainnetBuild: false, lpMaxUnsettledMs: 300_000,
 };
 
 export function v22FlagsFromEnv(env: Env = process.env): V22Flags {
@@ -140,6 +144,7 @@ export function v22FlagsFromEnv(env: Env = process.env): V22Flags {
     // today's behaviour unless explicitly turned off
     loneLpCrank,
     mainnetBuild: parseFlag(env, "KEEPER_V22_MAINNET_BUILD", false),
+    lpMaxUnsettledMs: posInt(env, "KEEPER_V22_LP_MAX_UNSETTLED_MS", 300_000),
   };
 }
 
@@ -159,6 +164,7 @@ export function describeV22Flags(f: V22Flags): Record<string, string | number | 
     stakeSync: f.stakeSync,
     earnExit: f.earnExit,
     loneLpCrank: f.loneLpCrank,
+    lpMaxUnsettledMs: f.lpMaxUnsettledMs,
   };
 }
 

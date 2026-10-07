@@ -38,11 +38,24 @@ export type SeniorDrawEvent =
 export function parseSeniorDrawLogs(logs: ReadonlyArray<string> | null | undefined): SeniorDrawEvent[] {
   const out: SeniorDrawEvent[] = [];
   for (const l of logs ?? []) {
-    let m = l.match(/p3_senior_draw_booked moved=(\d+) junior_cover=(\d+) senior_loss=(\d+) C=(\d+) outstanding=(\d+)/);
-    if (m) {
-      out.push({ kind: "booked", moved: BigInt(m[1]), juniorCover: BigInt(m[2]), seniorLoss: BigInt(m[3]), seniorClaim: BigInt(m[4]), outstanding: BigInt(m[5]) });
-      continue;
+    // `booked`: parsed BY FIELD NAME so both wrapper shapes work. v2.1: `... moved= junior_cover= senior_loss= C= outstanding=`;
+    // v2.2 puts `nav= stray= c_eff= harvestable=` first (v16_program.rs:32580). Every field the alert needs must be present.
+    if (/p3_senior_draw_booked\b/.test(l)) {
+      const f = (name: string): bigint | null => {
+        const mm = l.match(new RegExp(`(?:^|\\s)${name}=(\\d+)`));
+        return mm ? BigInt(mm[1]) : null;
+      };
+      const moved = f("moved");
+      const juniorCover = f("junior_cover");
+      const seniorLoss = f("senior_loss");
+      const seniorClaim = f("C");
+      const outstanding = f("outstanding");
+      if (moved !== null && juniorCover !== null && seniorLoss !== null && seniorClaim !== null && outstanding !== null) {
+        out.push({ kind: "booked", moved, juniorCover, seniorLoss, seniorClaim, outstanding });
+        continue;
+      }
     }
+    let m: RegExpMatchArray | null;
     m = l.match(/p3_senior_draw_restored to_seniors=(\d+) C=(\d+) outstanding=(\d+)/);
     if (m) {
       out.push({ kind: "restored", toSeniors: BigInt(m[1]), seniorClaim: BigInt(m[2]), outstanding: BigInt(m[3]) });

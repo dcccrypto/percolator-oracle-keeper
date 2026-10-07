@@ -16,7 +16,7 @@
  */
 import { Keypair, PublicKey, TransactionInstruction } from "@solana/web3.js";
 import type { Connection } from "@solana/web3.js";
-import { ACCOUNTS_INIT_USER, buildAccountMetas, buildCreatePortfolioAccountIxV22, encodeInitUser, LAYOUT_V22 } from "@percolatorct/sdk";
+import { ACCOUNTS_INIT_USER, ACCOUNT_KIND, UnknownLayoutError, buildAccountMetas, buildCreatePortfolioAccountIxV22, encodeInitUser, LAYOUT_V22, resolveLayout } from "@percolatorct/sdk";
 import type { LayoutTable } from "@percolatorct/sdk";
 import { simulateAndSend } from "./exec.ts";
 import type { ExecContext, ExecOutcome } from "./exec.ts";
@@ -31,14 +31,37 @@ export function buildCreateAnchorIxs(p: { keeper: PublicKey; anchor: PublicKey; 
   return [create, init];
 }
 
+/**
+ * Refuse (return the reason) unless the market account exists, is owned by the CONFIGURED wrapper program and carries a VERSION
+ * the SDK knows (and the layout we create portfolios for). Runs before anything is simulated or sent.
+ */
+export function checkMarketForAnchor(
+  info: { owner: PublicKey; data: Uint8Array } | null,
+  programId: PublicKey,
+  layout: LayoutTable = LAYOUT_V22,
+): string | null {
+  if (!info) return "the market account does not exist";
+  if (!info.owner.equals(programId)) return `the market is owned by ${info.owner.toBase58()}, not the configured wrapper ${programId.toBase58()} (check WRAPPER_PROGRAM_ID)`;
+  try {
+    const t = resolveLayout(new Uint8Array(info.data), { parser: "v22-create-anchor", kind: ACCOUNT_KIND.Market });
+    if (t.version !== layout.version) return `the market is wrapper VERSION ${t.version}; this helper creates VERSION ${layout.version} (${layout.portfolio.accountLen} B) portfolios`;
+  } catch (e) {
+    return e instanceof UnknownLayoutError ? `unsupported market account: ${e.code}` : `unreadable market account: ${(e as Error).message}`;
+  }
+  return null;
+}
+
 export async function createKeeperAnchor(
   exec: ExecContext,
-  conn: Pick<Connection, "getMinimumBalanceForRentExemption">,
+  conn: Pick<Connection, "getMinimumBalanceForRentExemption" | "getAccountInfo">,
   p: { market: PublicKey; programId: PublicKey; dryRun: boolean; layout?: LayoutTable; anchorKeypair?: Keypair },
 ): Promise<{ anchor: PublicKey; lamports: number; outcome: ExecOutcome }> {
   const layout = p.layout ?? LAYOUT_V22;
-  const lamports = await conn.getMinimumBalanceForRentExemption(layout.portfolio.accountLen);
   const kp = p.anchorKeypair ?? Keypair.generate();
+  const info = await conn.getAccountInfo(p.market, "confirmed");
+  const refusal = checkMarketForAnchor(info ? { owner: info.owner, data: info.data } : null, p.programId, layout);
+  if (refusal) return { anchor: kp.publicKey, lamports: 0, outcome: { kind: "failed", error: `refused: ${refusal}` } };
+  const lamports = await conn.getMinimumBalanceForRentExemption(layout.portfolio.accountLen);
   const ixs = buildCreateAnchorIxs({ keeper: exec.keeper.publicKey, anchor: kp.publicKey, market: p.market, programId: p.programId, lamports, layout });
   const outcome = await simulateAndSend({ ...exec, extraSigners: [kp] }, ixs, { job: "create-anchor", label: p.market.toBase58().slice(0, 8), units: 400_000, dryRun: p.dryRun, expected: new Set() });
   return { anchor: kp.publicKey, lamports, outcome };

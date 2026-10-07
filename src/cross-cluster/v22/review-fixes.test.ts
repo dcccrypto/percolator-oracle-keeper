@@ -269,7 +269,7 @@ describe("item 7 / N-3: rent (tag 106) runs AFTER the LP tx, sequentially, never
     const list = cps(30);
     const f = fakeExecConn();
     const d = deps(f.conn);
-    await runSettleRound(d, { market: MARKET, label: "T" }, { lp: LP, counterparties: list, nowSlot: 100, rent: { due: new Set(list.slice(0, 3).map((x) => x.pubkey.toBase58())), build: rentFor(ctx, d.exec.keeper.publicKey) } }, DEFAULT_SWEEP_ROUND_CONFIG);
+    await runSettleRound(d, { market: MARKET, label: "T" }, { lp: LP, counterparties: list, nowSlot: 100, rent: { max: 3, due: new Set(list.slice(0, 3).map((x) => x.pubkey.toBase58())), build: rentFor(ctx, d.exec.keeper.publicKey) } }, DEFAULT_SWEEP_ROUND_CONFIG);
     const idx106 = f.sent.map((s, i) => (s.tags.includes(106) ? i : -1)).filter((i) => i >= 0);
     assert.equal(idx106.length, 3);
     const lpIdx = f.sent.findIndex((s) => hasKey(s, LP));

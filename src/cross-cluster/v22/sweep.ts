@@ -30,7 +30,7 @@ import { buildObservationCrankIx, buildRefreshCrankIx } from "../positioned-refr
 import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import { holdPushes as realHold, releasePushes as realRelease } from "../refresh-coordination.ts";
 import { BAND_EXPECTED_CODES } from "./errors.ts";
-import { simulateAndSend } from "./exec.ts";
+import { simulateAndSend, simulateOnly } from "./exec.ts";
 import type { ExecContext, ExecOutcome } from "./exec.ts";
 import { DEFAULT_MAX_GAP_SLOTS, DEFAULT_MAX_TXS_PER_ROUND, DEFAULT_WEIGHT_BUDGET, planSettleRound } from "./settle-pairing.ts";
 import type { PlannedTx, RoundPlan } from "./settle-pairing.ts";
@@ -47,6 +47,23 @@ export const SWEEP_MAX_PRUNES = 8;
 export const QUARANTINE_LADDER: readonly number[] = [150, 450, 1_500];
 export const MAX_QUARANTINES_PER_ROUND = 2;
 export const QUARANTINE_FIRST_SLOTS = QUARANTINE_LADDER[0];
+/**
+ * A portfolio whose refresh fails WITHOUT a program code this many rounds in a row is treated as program-refused for pairing
+ * (quarantined DEFERRAL_ESCALATION_SLOTS, counted, WARN, named in /health), so `prefer` can proceed; `strict` keeps holding
+ * and surfaces the same alert. Without this a portfolio that always overruns / fails by itself would hold the LP forever.
+ */
+export const DEFERRAL_ESCALATION_AFTER = 3;
+export const DEFERRAL_ESCALATION_SLOTS = 450;
+/** Most single-refresh probe simulations per tx when looking for a portfolio that fails by itself without a code. */
+export const MAX_PROBES = 12;
+/**
+ * Rent (tag 106) settles per round: 1. Each 106 accrues and settles ONE counterparty to a K newer than the LP's (the LP tx came
+ * first), and the LP stays behind until the NEXT round's LP tx. With N per round the mirror window is N sequential txs; with 1 it is
+ * one portfolio for one cycle. Rent is index-based and timing-invariant, so a slower rent cadence costs nothing: 1 per round
+ * (a 20 s cycle) still settles 180 portfolios per default cadence (9,000 slots = 1 h), and a larger book simply settles each
+ * portfolio less often than the cadence, which the program does not care about.
+ */
+export const RENT_SETTLES_PER_ROUND = 1;
 /** Rounds skipped after a gap-exceeded round: 1, then 2 (capped: the engine clock must not go unaccrued for long). */
 export const MAX_GAP_BACKOFF_ROUNDS = 2;
 
@@ -101,6 +118,10 @@ export interface PairingStats {
   anchorFallbacks: number;
   /** Quarantines skipped because the per-round cap was reached. */
   quarantineCapped: number;
+  /** Portfolios escalated after repeated no-code deferrals (their own metric). */
+  deferralEscalations: number;
+  /** Rounds forced because the LP had not been settled by the keeper for lpMaxUnsettledMs. */
+  lpTimeBoundRounds: number;
   /** Accrue went through a counterparty because the market had no keeper-owned flat anchor. */
   counterpartyAccrues: number;
   accrueAlreadyDone: number;
@@ -116,7 +137,7 @@ const zeroStats = (): PairingStats => ({
   rounds: 0, singleTxRounds: 0, multiTxRounds: 0, pairedLpSettles: 0, unpairedLpSettles: 0, lpDeferredStrict: 0,
   lpHeldPhase1Unlanded: 0, lpHeldCounterpartyMiss: 0, gapExceeded: 0, gapBackoffRounds: 0, consecutiveGapExceeded: 0,
   lastGapSlots: null, maxGapSlots: 0, bandExpected: 0, prunedCurrent: 0, hardRefusals: 0, quarantinedNow: 0,
-  anchorAccrues: 0, anchorFallbacks: 0, quarantineCapped: 0, counterpartyAccrues: 0, accrueAlreadyDone: 0, protectiveRounds: 0, rentSettlesInRound: 0, shrinkDeferrals: 0,
+  anchorAccrues: 0, anchorFallbacks: 0, quarantineCapped: 0, deferralEscalations: 0, lpTimeBoundRounds: 0, counterpartyAccrues: 0, accrueAlreadyDone: 0, protectiveRounds: 0, rentSettlesInRound: 0, shrinkDeferrals: 0,
   feeAfterRound: 0, feeUnpairedLpSettles: 0,
 });
 
@@ -143,7 +164,7 @@ export interface RentPlanInput {
   /** base58 portfolio keys whose rent is due this round. */
   due: ReadonlySet<string>;
   build: (p: PositionedPortfolio) => TransactionInstruction;
-  /** Most rent settles per round (default 4). */
+  /** Most rent settles per round (default RENT_SETTLES_PER_ROUND = 1). */
   max?: number;
 }
 
@@ -159,6 +180,8 @@ export interface RoundInput {
   quarantine?: Map<string, bigint>;
   /** base58 -> last program code + ladder level (a longer cool-down only on a repeat of the same code). */
   quarantineHistory?: Map<string, { code: number; level: number }>;
+  /** base58 -> consecutive rounds the portfolio's refresh failed WITHOUT a program code (reset when it settles). */
+  deferrals?: Map<string, number>;
   nowSlot?: number;
   gapBackoff?: GapBackoff;
   rent?: RentPlanInput;
@@ -181,6 +204,8 @@ export interface RoundResult {
   backedOff: boolean;
   /** The program refused an anchor accrue this round (the caller drops the anchor for a while). */
   anchorRefused: boolean;
+  /** Portfolios escalated this round after DEFERRAL_ESCALATION_AFTER consecutive no-code failures. */
+  escalated: string[];
   pruned: number;
   lpSettled: boolean;
   gapSlots: number | null;
@@ -209,9 +234,11 @@ interface TxRun {
   outcome: ExecOutcome;
   /** counterparties settled by this tx (empty unless it landed / dry-ran). */
   settled: string[];
-  pruned: Array<{ key: string; reason: PruneReason; code: number | null }>;
+  pruned: Array<{ key: string; reason: PruneReason; code: number | null; culprit?: boolean }>;
   /** refreshes of this tx that did not settle because the tx did not land. */
   unlanded: string[];
+  /** Portfolios whose refresh failed WITHOUT a program code in this tx (cut tail + a tx that failed with no code). */
+  noCodeKeys: string[];
   droppedAccrue: boolean;
   anchorRefused: boolean;
 }
@@ -225,7 +252,7 @@ export interface RunTxOptions {
   /** Extra expected codes for this tx (the tail's, e.g. 38 for tag 78). */
   expected?: ReadonlySet<number>;
   /** LP tx gate: given the keys pruned for a reason other than "current" so far, a reason to hold the send. */
-  lpGate?: (prunedNotSettled: Array<{ key: string; reason: PruneReason }>) => string | null;
+  lpGate?: (prunedNotSettled: Array<{ key: string; reason: PruneReason; culprit?: boolean }>) => string | null;
 }
 
 /** Run one planned tx with simulate-prune-isolate. Exported for the tag-78 job. */
@@ -238,6 +265,9 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
   let droppedAccrue = false;
   let anchorRefused = false;
   let shrinks = 0;
+  let probed = false;
+  /** Portfolios proven (by single-refresh probe simulation) to fail BY THEMSELVES without a program code. */
+  const culprits = new Set<string>();
   const budget = SWEEP_MAX_PRUNES + 3;
   const settledKeys = (): string[] => {
     // the first counterparty is settled by its own accrue crank when the accrue went through it
@@ -245,11 +275,19 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
     if (accrue === "counterparty" && target) ks.unshift(target.toBase58());
     return ks;
   };
-  const fail = (outcome: ExecOutcome): TxRun => ({ outcome, settled: [], pruned, unlanded: settledKeys(), droppedAccrue, anchorRefused });
+  const fail = (outcome: ExecOutcome): TxRun => ({
+    outcome,
+    settled: [],
+    pruned,
+    unlanded: settledKeys(),
+    noCodeKeys: [...culprits],
+    droppedAccrue,
+    anchorRefused,
+  });
   for (let attempt = 0; attempt <= budget; attempt++) {
     const hasAccrue = accrue !== "none" && target !== null;
     const ixs = buildSweepTxIxs(owner, ctx.market, { accrue, accrueTarget: target, refresh, oracleAccounts: o.oracleAccounts, tail: o.tail });
-    if (ixs.length === 0) return { outcome: { kind: "dry-run", unitsConsumed: null, logs: [], ixCount: 0 }, settled: [], pruned, unlanded: [], droppedAccrue, anchorRefused };
+    if (ixs.length === 0) return { outcome: { kind: "dry-run", unitsConsumed: null, logs: [], ixCount: 0 }, settled: [], pruned, unlanded: [], noCodeKeys: [...culprits], droppedAccrue, anchorRefused };
     const outcome = await simulateAndSend(deps.exec, ixs, {
       job: o.job ?? "sweep",
       label: ctx.label,
@@ -258,7 +296,7 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
       beforeSend: () => (t.settlesLp && o.lpGate ? o.lpGate(pruned.filter((p) => p.reason !== "current")) : null),
     });
     const landed = outcome.kind === "sent" && outcome.landed === "landed";
-    if (landed || outcome.kind === "dry-run") return { outcome, settled: settledKeys(), pruned, unlanded: [], droppedAccrue, anchorRefused };
+    if (landed || outcome.kind === "dry-run") return { outcome, settled: settledKeys(), pruned, unlanded: [], noCodeKeys: [...culprits], droppedAccrue, anchorRefused };
     // A landed tx that failed on its accrue crank with Custom(22): another tx accrued this slot. Continue refresh-only.
     if (outcome.kind === "sent" && outcome.landed === "failed" && outcome.failCode === NON_PROGRESS && hasAccrue && !droppedAccrue) {
       pairingStats.accrueAlreadyDone++;
@@ -272,6 +310,31 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
     // NOT a program refusal (no Custom code): compute exhaustion, account in use, blockhash, RPC. Nobody is blamed and nothing
     // is quarantined: shrink the tx (cut the TAIL), the cut refreshes are "deferred" = unsettled, which holds the LP in both modes.
     if (refused.code === null) {
+      // Which portfolio (if any) fails BY ITSELF? Probe each refresh alone with the same accrue (read-only simulations, capped).
+      // A refresh that fails alone with no code is a CULPRIT: dropped, counted toward the deferral escalation. If the accrue
+      // crank alone already fails, nobody is blamed. If nothing fails alone the tx is simply too heavy (the weight model):
+      // cut the tail, count nobody.
+      if (!probed && hasAccrue && refresh.length > 0) {
+        probed = true;
+        const accrueOnly = buildSweepTxIxs(owner, ctx.market, { accrue, accrueTarget: target, refresh: [], oracleAccounts: o.oracleAccounts });
+        const base = await simulateOnly(deps.exec, accrueOnly, { units: SWEEP_TX_UNITS });
+        if (base.err !== null && base.code === null) return fail(outcome); // the accrue itself fails: no blame
+        const bad: PositionedPortfolio[] = [];
+        for (const p of refresh.slice(0, MAX_PROBES)) {
+          const probe = await simulateOnly(deps.exec, buildSweepTxIxs(owner, ctx.market, { accrue, accrueTarget: target, refresh: [p], oracleAccounts: o.oracleAccounts }), { units: SWEEP_TX_UNITS });
+          if (probe.err !== null && probe.code === null) bad.push(p);
+        }
+        if (bad.length > 0) {
+          const badKeys = new Set(bad.map((p) => p.pubkey.toBase58()));
+          for (const k of badKeys) {
+            culprits.add(k);
+            pruned.push({ key: k, reason: "deferred", code: null, culprit: true });
+          }
+          pairingStats.shrinkDeferrals++;
+          refresh = refresh.filter((p) => !badKeys.has(p.pubkey.toBase58()));
+          continue;
+        }
+      }
       if (refresh.length > 1 && shrinks < 3) {
         shrinks++;
         pairingStats.shrinkDeferrals++;
@@ -349,7 +412,7 @@ export async function runSettleRound(
   const history = input.quarantineHistory ?? new Map<string, { code: number; level: number }>();
   const backoff = input.gapBackoff;
   const protective = input.protective === true;
-  const emptyRes = (plan: RoundPlan, abandoned: string | null, backedOff: boolean): RoundResult => ({ plan, txsSent: 0, settled: [], missing: [], rentSettled: [], backedOff, anchorRefused: false, pruned: 0, lpSettled: false, gapSlots: null, abandoned, outcomes: [] });
+  const emptyRes = (plan: RoundPlan, abandoned: string | null, backedOff: boolean): RoundResult => ({ plan, txsSent: 0, settled: [], missing: [], rentSettled: [], backedOff, anchorRefused: false, escalated: [], pruned: 0, lpSettled: false, gapSlots: null, abandoned, outcomes: [] });
 
   // Gap backoff: after a round abandoned for a gap > maxGapSlots, skip a few rounds instead of re-sending phase 1 every tick.
   if (backoff && backoff.skipRounds > 0 && !protective) {
@@ -373,7 +436,7 @@ export async function runSettleRound(
   pairingStats.quarantinedNow = [...quarantine.values()].filter((u) => u > nowSlot).length;
 
   const plan = planSettleRound({ mode: cfg.pairing, lp: input.lp, lpWeight: input.lpWeight, counterparties: planned, anchor: input.anchor ?? null, weightBudget: cfg.weightBudget, maxTxsPerRound: cfg.maxTxsPerRound });
-  const res: RoundResult = { plan, txsSent: 0, settled: [], missing, rentSettled: [], backedOff: false, anchorRefused: false, pruned: 0, lpSettled: false, gapSlots: null, abandoned: null, outcomes: [] };
+  const res: RoundResult = { plan, txsSent: 0, settled: [], missing, rentSettled: [], backedOff: false, anchorRefused: false, escalated: [], pruned: 0, lpSettled: false, gapSlots: null, abandoned: null, outcomes: [] };
   pairingStats.rounds++;
   if (protective) pairingStats.protectiveRounds++;
   if (plan.txs.length <= 1) pairingStats.singleTxRounds++;
@@ -389,6 +452,7 @@ export async function runSettleRound(
   const holding = plan.needsPushHold && cfg.pairing !== "off";
   if (holding) hold(marketKey, cfg.holdMs);
   // Quarantine a program-refused portfolio: ladder by REPEAT of the same code; capped per round unless each code is distinct.
+  const deferrals = input.deferrals ?? new Map<string, number>();
   const quarantinedThisRound = new Set<number>();
   let quarantinedCount = 0;
   const q = (key: string, code: number | null) => {
@@ -408,7 +472,12 @@ export async function runSettleRound(
     const [phase1, phase2] = plan.phases.length > 1 ? [plan.phases[0], plan.phases[1]] : [plan.phases[0] ?? [], [] as number[]];
     const runOpts = (isLp: boolean): RunTxOptions => ({
       oracleAccounts: input.oracleAccounts,
-      lpGate: isLp ? (prunedNotSettled) => lpHold(prunedNotSettled.map((p) => p.reason === "deferred" ? "deferred" : p.key)) : undefined,
+      lpGate: isLp
+        ? (prunedNotSettled) =>
+            // a culprit about to be escalated (this would be its DEFERRAL_ESCALATION_AFTER-th no-code failure in a row) is a
+            // program-refused miss for pairing, not a deferral: the gate must agree with what record() will do next
+            lpHold(prunedNotSettled.map((p) => (p.reason === "deferred" && !(p.culprit && (deferrals.get(p.key) ?? 0) + 1 >= DEFERRAL_ESCALATION_AFTER) ? "deferred" : p.key)))
+        : undefined,
     });
     /**
      * Reason to hold the LP tx now, or null. A counterparty that did NOT land or was DEFERRED (no program code: compute /
@@ -428,14 +497,34 @@ export async function runSettleRound(
       if (r.outcome.kind === "sent") res.txsSent++;
       if (r.anchorRefused) res.anchorRefused = true;
       res.settled.push(...r.settled);
+      for (const k of r.settled) deferrals.delete(k);
+      // Memory for no-code failures: after DEFERRAL_ESCALATION_AFTER in a row the portfolio is treated as program-refused
+      // for pairing (so `prefer` proceeds; `strict` still holds on it), quarantined, counted, and named for the alert.
+      const escalatedNow = new Set<string>();
+      for (const k of new Set(r.noCodeKeys)) {
+        const n = (deferrals.get(k) ?? 0) + 1;
+        deferrals.set(k, n);
+        if (n >= DEFERRAL_ESCALATION_AFTER) escalatedNow.add(k);
+      }
+      const escalate = (k: string) => {
+        if (res.escalated.includes(k)) return;
+        res.escalated.push(k);
+        pairingStats.deferralEscalations++;
+        quarantine.set(k, nowSlot + BigInt(DEFERRAL_ESCALATION_SLOTS));
+        res.missing.push({ key: k, why: "hard" });
+      };
       for (const p of r.pruned) {
         if (p.reason === "current") res.settled.push(p.key);
+        else if (p.reason === "deferred" && escalatedNow.has(p.key)) escalate(p.key);
         else {
           res.missing.push({ key: p.key, why: p.reason });
           if (p.reason === "band" || p.reason === "hard") q(p.key, p.code);
         }
       }
-      for (const k of r.unlanded) res.missing.push({ key: k, why: "unlanded" });
+      for (const k of r.unlanded) {
+        if (escalatedNow.has(k)) escalate(k);
+        else res.missing.push({ key: k, why: "unlanded" });
+      }
     };
     const lpIsInPhase1 = plan.lpTxIndex !== null && phase1.includes(plan.lpTxIndex);
     const run = (i: number) => runPlannedTx(deps, ctx, plan.txs[i], runOpts(plan.txs[i].settlesLp));
@@ -516,7 +605,7 @@ export async function runSettleRound(
       let n = 0;
       for (const c of input.counterparties) {
         const k = c.pubkey.toBase58();
-        if (n >= (input.rent.max ?? 4)) break;
+        if (n >= (input.rent.max ?? RENT_SETTLES_PER_ROUND)) break;
         if (!input.rent.due.has(k) || !settled.has(k)) continue;
         n++;
         const out = await simulateAndSend(deps.exec, [input.rent.build(c)], { job: "rent-106", label: ctx.label, units: 600_000, expected: BAND_EXPECTED_CODES });

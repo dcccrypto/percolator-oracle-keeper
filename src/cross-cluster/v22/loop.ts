@@ -34,7 +34,7 @@ import { simulateOnly } from "./exec.ts";
 import { buildObservationCrankIx } from "../positioned-refresh.ts";
 import { parseSeniorDrawLogs } from "../vault-lp-crank.ts";
 import type { V22Positioned } from "./positioned.ts";
-import { DEFAULT_SWEEP_ROUND_CONFIG, freshGapBackoff, pairingStats, runSettleRound } from "./sweep.ts";
+import { RENT_SETTLES_PER_ROUND, DEFERRAL_ESCALATION_AFTER, DEFERRAL_ESCALATION_SLOTS, DEFAULT_SWEEP_ROUND_CONFIG, freshGapBackoff, pairingStats, runSettleRound } from "./sweep.ts";
 import type { GapBackoff, RentPlanInput as RoundInputRent, RoundResult, SweepDeps, SweepRoundConfig } from "./sweep.ts";
 import { redactErrorText } from "./redact.ts";
 import { loneLpCrankSuppressed, markV22Market, portfolioWeight, weightBudgetFor } from "./settle-pairing.ts";
@@ -85,6 +85,12 @@ interface MarketRuntime {
   quarantineHistory: Map<string, { code: number; level: number }>;
   /** Rounds left in which the operator / discovered anchor is not used (the program refused an anchor accrue). */
   anchorBadRounds: number;
+  deferrals: Map<string, number>;
+  /** base58 -> {at, rounds}: portfolios escalated for repeated no-code refresh failures (named in /health). */
+  escalated: Map<string, { atMs: number; count: number }>;
+  /** Last time a round of ours settled the vault LP (0 = not yet seen). */
+  lastLpSettledAtMs: number;
+  nextTimeBoundAtMs: number;
   lossStaleCycles: number;
   lastFeeAtMs: number;
   lastEarnAtMs: number;
@@ -131,6 +137,10 @@ export class V22Loop {
         lastOutstandingRoundAtMs: 0,
         quarantineHistory: new Map(),
         anchorBadRounds: 0,
+        deferrals: new Map(),
+        escalated: new Map(),
+        lastLpSettledAtMs: 0,
+        nextTimeBoundAtMs: 0,
         lossStaleCycles: 0,
         lastFeeAtMs: 0,
         lastEarnAtMs: 0,
@@ -225,10 +235,10 @@ export class V22Loop {
       // Rent (tag 106) runs AFTER the LP tx of a round, sequentially, for portfolios the plain refresh already settled.
       let rent: RoundInputRent | undefined;
       if (f.holdingRent && ctx.isRent && pairingActive(f)) {
-        const plan = planRentSettles(ctx, positioned, r.rent, f.rentCadenceSlots, true, 4);
+        const plan = planRentSettles(ctx, positioned, r.rent, f.rentCadenceSlots, true, RENT_SETTLES_PER_ROUND);
         if (plan.due.length > 0) {
           const oracle = crankOracleAccounts(ctx);
-          rent = { due: new Set(plan.due.map((x) => x.portfolio)), max: 4, build: (p) => buildSettleHoldingRentIxV22(ctx.sdk, this.d.keeper.publicKey, p.pubkey, 0, BigInt(ctx.readSlot), ctx.oracleMode === 1 ? oracle : []) };
+          rent = { due: new Set(plan.due.map((x) => x.portfolio)), max: RENT_SETTLES_PER_ROUND, build: (p) => buildSettleHoldingRentIxV22(ctx.sdk, this.d.keeper.publicKey, p.pubkey, 0, BigInt(ctx.readSlot), ctx.oracleMode === 1 ? oracle : []) };
         }
       }
       const useAnchor = r.anchorBadRounds > 0 ? null : positioned.flatAnchor;
@@ -244,6 +254,7 @@ export class V22Loop {
           oracleAccounts: crankOracleAccounts(ctx),
           quarantine: r.quarantine,
           quarantineHistory: r.quarantineHistory,
+          deferrals: r.deferrals,
           nowSlot: ctx.readSlot,
           gapBackoff: r.gapBackoff,
           rent,
@@ -262,7 +273,29 @@ export class V22Loop {
       }
       r.positionedCache = null; // positions changed
       this.recordRound(ctx, r, res, positioned, protective);
+      for (const k of res.escalated) {
+        const prev = r.escalated.get(k);
+        r.escalated.set(k, { atMs: this.now(), count: (prev?.count ?? 0) + 1 });
+        this.log(`[v22][WARN] ${ctx.label}: portfolio ${k} failed its refresh without a program error ${DEFERRAL_ESCALATION_AFTER} rounds in a row; treated as program-refused for pairing (quarantined ${DEFERRAL_ESCALATION_SLOTS} slots). ${this.d.flags.pairing === "strict" ? "strict: the LP keeps waiting on it" : "prefer: the LP proceeds with it counted"}`);
+      }
+      // a portfolio that settled again is no longer escalated
+      for (const k of [...r.escalated.keys()]) if (res.settled.includes(k)) r.escalated.delete(k);
+      if (res.lpSettled) r.lastLpSettledAtMs = this.now();
+      else if (r.lastLpSettledAtMs === 0) r.lastLpSettledAtMs = this.now();
       await this.publishHealth(ctx, r, positioned, res);
+      // TIME BOUND: the keeper never settles the LP alone and the lone crank is suppressed, so if rounds keep holding the LP
+      // (a persistent miss, repeated landing failures) it could stay unsettled for good. After lpMaxUnsettledMs, with the market
+      // otherwise healthy (we are here: Active, readable, LP known), run ONE full paired round with the LP last regardless
+      // (the protective shape). Counted; retried at most every lpMaxUnsettledMs / 5.
+      if (!protective && !res.lpSettled && !res.backedOff && this.now() - r.lastLpSettledAtMs >= f.lpMaxUnsettledMs && this.now() >= r.nextTimeBoundAtMs) {
+        r.nextTimeBoundAtMs = this.now() + Math.max(1, Math.floor(f.lpMaxUnsettledMs / 5));
+        pairingStats.lpTimeBoundRounds++;
+        this.log(`[v22][sweep] ${ctx.label}: the vault LP has not been settled by the keeper for ${Math.round((this.now() - r.lastLpSettledAtMs) / 1000)} s: running one full paired round with the LP last`);
+        r.positionedCache = null;
+        r.sweepInflight = false;
+        await this.runRoundFor(conn, entry, true);
+        return true;
+      }
       // 78 at the END of a paired round (the LP was just settled with its counterparties), not on its own timer.
       if (f.feeCrankBond && ctx.bond && res.lpSettled && this.now() - r.lastFeeAtMs >= (this.d.feeIntervalMs ?? 200_000)) {
         r.lastFeeAtMs = this.now();
@@ -424,6 +457,7 @@ export class V22Loop {
         ...(r.lastG9 ? { g9: r.lastG9 } : {}),
         ...(r.lastStake ? { stakeSync: r.lastStake } : {}),
         ...(r.lastEarn ? { earnExit: r.lastEarn } : {}),
+        ...(r.escalated.size > 0 ? { persistentDeferrals: [...r.escalated].map(([k, v]) => ({ portfolio: k, rounds: v.count, sinceMsAgo: this.now() - v.atMs })) } : {}),
         ...(this.layoutProblems.has(addr) ? { layoutProblem: redactErrorText(this.layoutProblems.get(addr) as string, 200) } : {}),
       };
     }
