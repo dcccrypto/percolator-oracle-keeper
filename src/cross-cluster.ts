@@ -454,15 +454,16 @@ if (V22_FLAGS.enabled) {
     markets: () => registry.markets,
     flags: V22_FLAGS,
     dryRun: DRY_RUN,
-    mainnetBuild: process.env.KEEPER_V22_MAINNET_BUILD === "on",
+    mainnetBuild: V22_FLAGS.mainnetBuild,
   });
   v22Loop.install();
   console.log(`[v22] layer ON ${JSON.stringify(describeV22Flags(V22_FLAGS))}${DRY_RUN || V22_FLAGS.dryRun ? " (DRY-RUN: simulate and log, send nothing)" : ""}`);
   void startV22Loop(v22Loop, V22_FLAGS.tickMs).catch((err: unknown) => {
     console.error(`[v22] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`);
   });
-} else if (process.env.VAULT_LP_LONE_CRANK !== undefined && process.env.VAULT_LP_LONE_CRANK.trim().toLowerCase() === "off") {
+} else if (!V22_FLAGS.loneLpCrank) {
   // The lone-LP-crank switch is meaningful on its own (it is the settle-pairing hazard), so it works without KEEPER_V22.
+  // Parsed by the same strict parser as every other v2.2 flag (off/0/false/no).
   setLoneLpCrankSuppressor(() => true);
   console.log("[v22] VAULT_LP_LONE_CRANK=off: the lone vault-LP crank after a landed push is suppressed on every market");
 }

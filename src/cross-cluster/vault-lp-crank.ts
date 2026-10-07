@@ -27,7 +27,7 @@ import { staleResolveWindow } from "./market-state.ts";
 import type { StaleResolveWindow } from "./market-state.ts";
 import { exhaustedAlert, getExhaustedRegistry } from "./p3-exhausted-resolve.ts";
 import type { ExhaustedRegistry } from "./p3-exhausted-resolve.ts";
-import { loneLpCrankSuppressedFor } from "./v22/delegation.ts";
+import { loneLpCrankSuppressedFor, triggerProtectiveRound } from "./v22/delegation.ts";
 
 export type SeniorDrawEvent =
   | { kind: "draw"; deficit: bigint; moved: bigint; unfunded: bigint }
@@ -159,6 +159,11 @@ export class VaultLpCranker {
     // it; with nothing installed this is a no-op and the method is unchanged.
     if (loneLpCrankSuppressedFor(marketAddress)) {
       this.stats.suppressed++;
+      // Not a lone LP crank: if the LP itself needs protection the v2.2 layer runs a full PAIRED round instead.
+      if (this.lastMark.get(marketAddress) !== priceE6) {
+        this.lastMark.set(marketAddress, priceE6);
+        triggerProtectiveRound(marketAddress);
+      }
       return "suppressed";
     }
     const prev = this.lastMark.get(marketAddress);

@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair } from "@solana/web3.js";
-import { describeV22Flags, pairingActive, v22FlagsFromEnv } from "./flags.ts";
+import { V22FlagError, describeV22Flags, pairingActive, v22FlagsFromEnv } from "./flags.ts";
 import { bondFeeDelegated, getSweepDelegate, loneLpCrankSuppressedFor, setBondFeeDelegated, setLoneLpCrankSuppressor, setSweepDelegate } from "./delegation.ts";
 import { setV22HealthProvider, v22HealthFields } from "./health.ts";
 import { V22Loop } from "./loop.ts";
@@ -32,16 +32,39 @@ describe("flags OFF: no behaviour change", () => {
     assert.equal(describeV22Flags(f).enabled, false);
   });
 
-  it("flag parsing: on/off words, junk falls back to the default, G9 real sends need an explicit off", () => {
-    const f = v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_SWEEP: "1", KEEPER_V22_SETTLE_PAIRING: "strict", KEEPER_V22_G9: "true", KEEPER_V22_G9_DRY_RUN: "off", VAULT_LP_LONE_CRANK: "off", KEEPER_V22_RENT_CADENCE_SLOTS: "abc" });
+  it("flag parsing: on/off words; G9 real sends need an explicit off", () => {
+    const f = v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_SWEEP: "1", KEEPER_V22_SETTLE_PAIRING: "strict", KEEPER_V22_G9: "true", KEEPER_V22_G9_DRY_RUN: "off", VAULT_LP_LONE_CRANK: "0", KEEPER_V22_RENT_CADENCE_SLOTS: "123" });
     assert.equal(f.enabled && f.sweep && f.g9, true);
     assert.equal(f.pairing, "strict");
     assert.equal(f.g9DryRun, false);
-    assert.equal(f.loneLpCrank, false);
-    assert.equal(f.rentCadenceSlots, 9000);
+    assert.equal(f.loneLpCrank, false, "VAULT_LP_LONE_CRANK=0 suppresses (same parser with or without KEEPER_V22)");
+    assert.equal(f.rentCadenceSlots, 123);
     assert.equal(pairingActive(f), true);
-    assert.equal(v22FlagsFromEnv({ KEEPER_V22_SETTLE_PAIRING: "nonsense" }).pairing, "prefer");
-    assert.equal(v22FlagsFromEnv({ KEEPER_V22_G9_DRY_RUN: "maybe" }).g9DryRun, true);
+    for (const w of ["off", "OFF", "0", "false", "no"]) assert.equal(v22FlagsFromEnv({ VAULT_LP_LONE_CRANK: w }).loneLpCrank, false, w);
+    for (const w of ["on", "1", "true", "yes", ""]) assert.equal(v22FlagsFromEnv({ VAULT_LP_LONE_CRANK: w }).loneLpCrank, true, w);
+  });
+
+  it("STRICT parsing: every unrecognised v2.2 value is a STARTUP ERROR, never a silent default (negative control: the old parser fell back)", () => {
+    const bad: Array<Record<string, string>> = [
+      { KEEPER_V22_DRY_RUN: "enabled" },
+      { KEEPER_V22_DRY_RUN: "dry" },
+      { VAULT_LP_LONE_CRANK: "of" },
+      { VAULT_LP_LONE_CRANK: "disable" },
+      { KEEPER_V22_SETTLE_PAIRING: "strct" },
+      { KEEPER_V22_G9_DRAW_CAP_ATOMS: "12x" },
+      { KEEPER_V22_G9_DRAW_CAP_ATOMS: "0" },
+      { KEEPER_V22_G9_DRAW_CAP_ATOMS: "18446744073709551616" },
+      { KEEPER_V22: "yess" },
+      { KEEPER_V22_SWEEP: "maybe" },
+      { KEEPER_V22_G9_DRY_RUN: "maybe" },
+      { KEEPER_V22_TICK_MS: "abc" },
+      { KEEPER_V22_RENT_CADENCE_SLOTS: "-5" },
+      { KEEPER_V22_STAKE_SYNC_INTERVAL_MS: "1.5" },
+    ];
+    for (const env of bad) assert.throws(() => v22FlagsFromEnv(env), (e: unknown) => e instanceof V22FlagError && /Refusing to start/.test((e as Error).message), JSON.stringify(env));
+    // valid values still parse
+    assert.doesNotThrow(() => v22FlagsFromEnv({ KEEPER_V22_G9_DRAW_CAP_ATOMS: "18446744073709551615", KEEPER_V22_SETTLE_PAIRING: " Strict " }));
+    assert.equal(v22FlagsFromEnv({ KEEPER_V22_SETTLE_PAIRING: " Strict " }).pairing, "strict");
   });
 
   it("nothing is installed into the legacy paths unless a v2.2 flag installs it", () => {

@@ -28,8 +28,8 @@
  *                provisional: the wrapper release branch had not merged Wave B at probe time
  *                and the engine header has already grown twice (790 -> 798 -> 806).
  *
- *   v2.2-b       VARIANT B, the v2.2 LAUNCH CANDIDATE (wrapper release/v22-wrapper-rem c8501d15 on engine
- *                release/v22-engine-rem 5ef44c83: per-leg K/F remainders + the second 32 B slot tail).
+ *   v2.2-b       VARIANT B, the v2.2 LAUNCH CANDIDATE (wrapper release/v22-wrapper-rem f199054a on engine
+ *                release/v22-engine-rem 36282ecb; struct layout unchanged since c8501d15 / 5ef44c83: per-leg K/F remainders + the second 32 B slot tail).
  *                Every geometry number is READ FROM the SDK's VERSION-keyed LAYOUT_V22 (percolator-sdk#406),
  *                not typed here; only the in-slot drift-tail offsets (which the SDK table does not carry) are
  *                keeper-side, and `rowAgreesWithSdk` fails the row closed if the two ever disagree.
@@ -368,7 +368,7 @@ export function knownStrides(): string {
  * header VERSION and `len == groupOff + headerLen + max_market_slots * slotStride`;
  * otherwise the result is `known: false` with the reason. Never a guess.
  */
-export function detectLayout(data: Uint8Array): LayoutDetection {
+export function detectLayout(data: Uint8Array, sdkRegistry: ReadonlyMap<number, LayoutTable> = LAYOUTS_BY_VERSION): LayoutDetection {
   if (data.length < ABS_MAX_MARKET_SLOTS + 4) {
     return { known: false, accountLen: data.length, slots: null, version: null, reason: `length ${data.length}: account too short for a market group header` };
   }
@@ -382,10 +382,10 @@ export function detectLayout(data: Uint8Array): LayoutDetection {
   // table for is refused (UNKNOWN_VERSION). The magic / kind check is NOT applied here (this function has always
   // read synthetic and real accounts by header VERSION alone); the v2.2 loader (v22/market.ts) runs the SDK's full
   // guard, `resolveLayout` with kind = Market, on every account it decodes.
-  const guardCode: string | null = LAYOUTS_BY_VERSION.has(version) ? null : "UNKNOWN_VERSION";
+  const guardCode: string | null = sdkRegistry.has(version) ? null : "UNKNOWN_VERSION";
   const matches = MARKET_LAYOUTS.filter((l) => l.wrapperVersion === version && data.length === marketAccountLen(l, n));
   if (guardCode === null && matches.length === 1) {
-    const disagree = rowAgreesWithSdk(matches[0]);
+    const disagree = rowAgreesWithSdk(matches[0], sdkRegistry);
     if (disagree === null) return { known: true, layout: matches[0], slots: n };
     noteLayoutGuardRefusal("ROW_DISAGREES_WITH_SDK", version);
     return {

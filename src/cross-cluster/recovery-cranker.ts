@@ -1013,6 +1013,22 @@ export function layoutHealthFor(
   const accountLen = L.groupOff + L.headerLen + detection.slots * L.slotStride;
   // The portfolio length the SDK parser reads for THIS layout's VERSION (VERSION-keyed since the v2.2 SDK:
   // 9,563 B for VERSION 18, 10,603 B for VERSION 19). An explicit argument overrides it (tests).
+  // v2.2 variant B is NEVER driven by this legacy path (its [LP crank, refresh xN] sweep settles the LP in every tx, the
+  // shape SETTLE_PAIRING exists to avoid). The v2.2 layer takes the market through the sweep delegate BEFORE this
+  // verdict is reached; anything that gets here (no KEEPER_V22 / KEEPER_V22_SWEEP, or the delegate declined) gets the
+  // accrual-only crank and a loud "unsupported" status (security review F-1 / F-5).
+  if (L.id === "v2.2-b") {
+    return {
+      id: L.id,
+      problem:
+        "variant-B (VERSION 19) market on the legacy cranker: the legacy sweep is refused for v2.2. " +
+        "Set KEEPER_V22=on and KEEPER_V22_SWEEP=on (accrual crank only until then)",
+      kind: "unsupported",
+      accountLen,
+      provisional: L.provisional,
+      hasPositions,
+    };
+  }
   sdkPortfolioLen ??= LAYOUTS_BY_VERSION.get(L.wrapperVersion)?.portfolio.accountLen ?? V17_PORTFOLIO_ACCOUNT_LEN;
   if (L.portfolioAccountLen !== sdkPortfolioLen) {
     return {

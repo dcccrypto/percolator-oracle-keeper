@@ -20,20 +20,26 @@ export interface V22Positioned {
   lp: PositionedPortfolio | null;
   /** Smallest |basis_pos_q| among a portfolio's active legs on the asset, by base58 key. */
   minLegAbs: Map<string, bigint>;
-  /** A zero-leg, non-LP portfolio of the market (accrue-only target), or null. */
+  /**
+   * The keeper's OWN zero-leg portfolio of this market (accrue-only target), or an operator-supplied override, or
+   * null. NEVER a user's portfolio: a user can fill or close it and grief the round (security review F-4).
+   */
   flatAnchor: PublicKey | null;
+  /** Raw bytes of the vault LP portfolio when it was in the scan (protection checks). */
+  lpData: Uint8Array | null;
   /** Accounts that did not decode (counted, never guessed). */
   undecodable: number;
 }
 
 export function analysePortfolios(
   accounts: ReadonlyArray<{ pubkey: PublicKey; data: Uint8Array }>,
-  p: { assetIndex?: number; lpPortfolio: PublicKey | null; portfolioLen: number },
+  p: { assetIndex?: number; lpPortfolio: PublicKey | null; portfolioLen: number; keeperOwner?: PublicKey | null },
 ): V22Positioned {
   const assetIndex = p.assetIndex ?? 0;
   const all: PositionedPortfolio[] = [];
   const minLegAbs = new Map<string, bigint>();
   let flatAnchor: PublicKey | null = null;
+  let lpData: Uint8Array | null = null;
   let undecodable = 0;
   for (const { pubkey, data } of accounts) {
     if (data.length !== p.portfolioLen) continue;
@@ -44,7 +50,10 @@ export function analysePortfolios(
       undecodable++;
       continue;
     }
-    const isLp = (p.lpPortfolio !== null && pubkey.equals(p.lpPortfolio)) || parsed.matcherEnabled === true;
+    // The LP is EXACTLY the registry's vault LP key. A matcher-enabled portfolio of any other owner is a counterparty:
+    // anyone can enable a matcher on their own portfolio, so `matcherEnabled` is not an identity (review F-4).
+    const isLp = p.lpPortfolio !== null && pubkey.equals(p.lpPortfolio);
+    if (isLp) lpData = data;
     let longLegs = 0;
     let shortLegs = 0;
     let lossWeight = 0n;
@@ -67,13 +76,15 @@ export function analysePortfolios(
         kfShort = kfShort === null || leg.kfEpochSnap < kfShort ? leg.kfEpochSnap : kfShort;
       }
     }
-    if (!anyActive && !isLp && flatAnchor === null) flatAnchor = pubkey;
+    if (!anyActive && !isLp && !parsed.matcherEnabled && flatAnchor === null && p.keeperOwner && parsed.owner.equals(p.keeperOwner)) flatAnchor = pubkey;
     if (longLegs + shortLegs === 0) continue;
     all.push({ pubkey, longLegs, shortLegs, isLp, lossWeight, kfEpochSnapLong: kfLong, kfEpochSnapShort: kfShort });
     if (minAbs !== null) minLegAbs.set(pubkey.toBase58(), minAbs);
   }
-  const lp = all.find((x) => x.isLp) ?? null;
-  return { all, counterparties: all.filter((x) => !x.isLp), lp, minLegAbs, flatAnchor, undecodable };
+  let lp: PositionedPortfolio | null = all.find((x) => x.isLp) ?? null;
+  // A flat LP (no legs on the asset) is still the LP: it settles at the end of every round.
+  if (!lp && p.lpPortfolio) lp = { pubkey: p.lpPortfolio, longLegs: 0, shortLegs: 0, isLp: true, lossWeight: 0n };
+  return { all, counterparties: all.filter((x) => !x.isLp), lp, minLegAbs, flatAnchor, lpData, undecodable };
 }
 
 /** One read: every portfolio of the market at the layout's length. Never throws (returns null). */
@@ -81,12 +92,13 @@ export async function loadV22Positioned(
   conn: Connection,
   ctx: V22MarketCtx,
   anchorOverride: PublicKey | null = null,
+  keeperOwner: PublicKey | null = null,
 ): Promise<V22Positioned | null> {
   try {
     const accts = await fetchMarketPortfolios(conn, ctx.market, ctx.layout.portfolioAccountLen);
     const r = analysePortfolios(
       accts.map((a) => ({ pubkey: a.pubkey, data: a.account.data })),
-      { lpPortfolio: ctx.lpPortfolio, portfolioLen: ctx.layout.portfolioAccountLen },
+      { lpPortfolio: ctx.lpPortfolio, portfolioLen: ctx.layout.portfolioAccountLen, keeperOwner },
     );
     if (anchorOverride) r.flatAnchor = anchorOverride;
     return r;
@@ -109,4 +121,22 @@ export function parseAccrueAnchors(raw: string | undefined): Map<string, PublicK
     }
   }
   return out;
+}
+
+/**
+ * Heuristic "the vault LP is near liquidation": it holds legs and its equity (`capital + pnl` at its last settle) is
+ * at or below `thresholdPct` percent of its capital. The keeper does not know the engine's margin ratios, so this is a
+ * coarse trigger for a PROTECTIVE round (a full paired round, never a lone LP crank); the program decides everything.
+ */
+export function lpNearLiquidation(lpData: Uint8Array | null, thresholdPct = 20): boolean {
+  if (!lpData) return false;
+  try {
+    const p = parsePortfolioV17(lpData);
+    if (p.activeBitmap === 0n) return false;
+    const equity = p.capital + p.pnl;
+    if (equity <= 0n) return true;
+    return p.capital > 0n && equity * 100n <= p.capital * BigInt(thresholdPct);
+  } catch {
+    return false;
+  }
 }

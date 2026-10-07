@@ -70,9 +70,12 @@ export const DEFAULT_MAX_GAP_SLOTS = 8;
 export const FLAT_ANCHOR_WEIGHT = 3;
 
 /** Weight of one refreshed / settled portfolio: 3 + its active legs on the asset (Wave A "A6"). */
-export function portfolioWeight(p: Pick<PositionedPortfolio, "longLegs" | "shortLegs">): number {
-  return 3 + p.longLegs + p.shortLegs;
+export function portfolioWeight(p: Pick<PositionedPortfolio, "longLegs" | "shortLegs"> & { extraWeight?: number }): number {
+  return 3 + p.longLegs + p.shortLegs + (p.extraWeight ?? 0);
 }
+
+/** Extra weight of a tag-106 rent settle in place of a plain refresh (about 600k CU vs about 130k at 35k per unit). */
+export const RENT_EXTRA_WEIGHT = 13;
 
 /** The weight budget a tx of `maxCu` compute units supports once the accrue crank and headroom are paid. */
 export function weightBudgetFor(maxCu = MAX_TX_CU_V22, accrueCu = 200_000, headroomCu = 60_000, cuPerWeight = CU_PER_WEIGHT): number {

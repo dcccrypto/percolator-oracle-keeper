@@ -23,6 +23,7 @@ const state = {
   sweep: null as SweepDelegate | null,
   bondFeeDelegated: false,
   suppressLoneLpCrank: null as ((marketAddress: string) => boolean) | null,
+  protectiveTrigger: null as ((marketAddress: string) => void) | null,
 };
 
 export function setSweepDelegate(d: SweepDelegate | null): void {
@@ -43,4 +44,20 @@ export function setLoneLpCrankSuppressor(f: ((marketAddress: string) => boolean)
 }
 export function loneLpCrankSuppressedFor(marketAddress: string): boolean {
   return state.suppressLoneLpCrank ? state.suppressLoneLpCrank(marketAddress) : false;
+}
+
+/**
+ * Called by the vault-LP cranker INSTEAD of a lone LP crank when it is suppressed: the v2.2 layer checks whether the LP
+ * itself needs protection (senior draw pending / near liquidation) and, if so, runs a full PAIRED round at once.
+ * Never a lone LP crank. Fire-and-forget.
+ */
+export function setProtectiveTrigger(f: ((marketAddress: string) => void) | null): void {
+  state.protectiveTrigger = f;
+}
+export function triggerProtectiveRound(marketAddress: string): void {
+  try {
+    state.protectiveTrigger?.(marketAddress);
+  } catch {
+    // never breaks the push path
+  }
 }

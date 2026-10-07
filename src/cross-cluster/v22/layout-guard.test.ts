@@ -68,10 +68,31 @@ describe("VERSION-keyed layout guard", () => {
     assert.ok(LAYOUTS_BY_VERSION.has(19));
   });
 
-  it("layout health: variant B is supported (SDK reads 10,603 B at VERSION 19); stage A (10,091 B) is unsupported and says why", () => {
-    const ok = layoutHealthFor(detectLayout(v22MarketBytes()), null);
-    assert.equal(ok.kind, "ok");
-    assert.equal(ok.id, "v2.2-b");
+  it("F-9: detectLayout ITSELF refuses a row that disagrees with the SDK registry (fails if the rowAgreesWithSdk call is removed)", () => {
+    const moved = new Map<number, LayoutTable>([[18, LAYOUT_V21], [19, { ...LAYOUT_V22, assetSlotStride: LAYOUT_V22.assetSlotStride + 8 }]]);
+    const d = detectLayout(v22MarketBytes(), moved);
+    assert.equal(d.known, false, "the account matches the keeper row but the registry disagrees: refused");
+    if (!d.known) assert.match(d.reason, /disagrees with the pinned SDK table/);
+    assert.equal(layoutGuardSnapshot().byCode.ROW_DISAGREES_WITH_SDK, 1);
+    // with the agreeing registry the same bytes decode
+    assert.equal(detectLayout(v22MarketBytes(), LAYOUTS_BY_VERSION).known, true);
+    // a registry without VERSION 19 refuses with UNKNOWN_VERSION
+    resetLayoutGuardMetrics();
+    assert.equal(detectLayout(v22MarketBytes(), new Map([[18, LAYOUT_V21]])).known, false);
+    assert.equal(layoutGuardSnapshot().byCode.UNKNOWN_VERSION, 1);
+  });
+
+  it("layout health: the LEGACY path never drives variant B (F-1), whatever the SDK can parse; stage A (10,091 B) is unsupported and says why", () => {
+    const vb = layoutHealthFor(detectLayout(v22MarketBytes()), null);
+    assert.equal(vb.kind, "unsupported");
+    assert.equal(vb.id, "v2.2-b");
+    assert.match(vb.problem ?? "", /KEEPER_V22=on and KEEPER_V22_SWEEP=on/);
+    // the v2.1 rows are untouched
+    const l = layoutById("v2.1-legacy");
+    const v21 = Buffer.alloc(marketAccountLen(l, 1));
+    v21.writeUInt16LE(18, 8);
+    v21.writeUInt32LE(1, l.groupOff + l.header.maxMarketSlots);
+    assert.equal(layoutHealthFor(detectLayout(new Uint8Array(v21)), null).kind, "ok", "negative control: v2.1 stays supported");
     const stageA = layoutById("v2.2-drift");
     const len = marketAccountLen(stageA, 1);
     const b = Buffer.alloc(len);

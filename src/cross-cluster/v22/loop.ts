@@ -27,22 +27,24 @@ import { describeV22Flags, pairingActive } from "./flags.ts";
 import type { V22Flags } from "./flags.ts";
 import { allJobCounters } from "./exec.ts";
 import type { ExecContext } from "./exec.ts";
-import { loadV22Market } from "./market.ts";
+import { crankOracleAccounts, loadV22Market } from "./market.ts";
 import type { V22MarketCtx, V22MarketLoad } from "./market.ts";
-import { loadV22Positioned, parseAccrueAnchors } from "./positioned.ts";
+import { loadV22Positioned, lpNearLiquidation, parseAccrueAnchors } from "./positioned.ts";
 import type { V22Positioned } from "./positioned.ts";
-import { DEFAULT_SWEEP_ROUND_CONFIG, pairingStats, runSettleRound } from "./sweep.ts";
-import type { RoundResult, SweepRoundConfig } from "./sweep.ts";
+import { DEFAULT_SWEEP_ROUND_CONFIG, freshGapBackoff, pairingStats, runSettleRound } from "./sweep.ts";
+import type { GapBackoff, RentPlanInput as RoundInputRent, RoundResult, SweepDeps, SweepRoundConfig } from "./sweep.ts";
+import { redactErrorText } from "./redact.ts";
 import { loneLpCrankSuppressed, markV22Market, portfolioWeight, weightBudgetFor } from "./settle-pairing.ts";
 import { crankBondFee } from "./fee-bond.ts";
-import { freshRentState, settleRentOnce } from "./rent.ts";
+import { freshRentState, markRentSettled, planRentSettles, settleRentOnce } from "./rent.ts";
+import { buildSettleHoldingRentIxV22 } from "@percolatorct/sdk";
 import { freshDustState, sweepDustOnce } from "./dust.ts";
 import { freshG9State, g9Once } from "./g9.ts";
 import { freshStakeSyncState, stakeSyncOnce } from "./stake-sync.ts";
-import { executeKeeperExits, fetchRedemptionRequests } from "./earn-exit.ts";
+import { executeKeeperExits, fetchRedemptionRequests, freshEarnExitState } from "./earn-exit.ts";
 import { bandHealthFor } from "./band.ts";
 import type { BandHealth } from "./band.ts";
-import { setBondFeeDelegated, setLoneLpCrankSuppressor, setSweepDelegate } from "./delegation.ts";
+import { setBondFeeDelegated, setLoneLpCrankSuppressor, setProtectiveTrigger, setSweepDelegate } from "./delegation.ts";
 import type { SweepDelegateArgs } from "./delegation.ts";
 import { setV22HealthProvider } from "./health.ts";
 
@@ -68,12 +70,15 @@ interface MarketRuntime {
   dust: ReturnType<typeof freshDustState>;
   g9: ReturnType<typeof freshG9State>;
   stake: ReturnType<typeof freshStakeSyncState>;
-  lpSkips: { count: number };
+  quarantine: Map<string, bigint>;
+  gapBackoff: GapBackoff;
+  earn: ReturnType<typeof freshEarnExitState>;
+  lastProtectiveAtMs: number;
   lossStaleCycles: number;
   lastFeeAtMs: number;
   lastEarnAtMs: number;
   lastBand: BandHealth | null;
-  lastRound: { paired: boolean; txs: number; lpSettled: boolean; gapSlots: number | null; abandoned: string | null; unvisited: number; at: number } | null;
+  lastRound: { paired: boolean; txs: number; lpSettled: boolean; gapSlots: number | null; abandoned: string | null; settled: number; missing: number; protective: boolean; at: number } | null;
   lastG9: string | null;
   lastFee: string | null;
   lastStake: string | null;
@@ -106,7 +111,10 @@ export class V22Loop {
         dust: freshDustState(),
         g9: freshG9State(),
         stake: freshStakeSyncState(),
-        lpSkips: { count: 0 },
+        quarantine: new Map(),
+        gapBackoff: freshGapBackoff(),
+        earn: freshEarnExitState(),
+        lastProtectiveAtMs: 0,
         lossStaleCycles: 0,
         lastFeeAtMs: 0,
         lastEarnAtMs: 0,
@@ -139,6 +147,7 @@ export class V22Loop {
     if (f.sweep) setSweepDelegate((a) => this.sweepDelegate(a));
     if (f.feeCrankBond) setBondFeeDelegated(true);
     setLoneLpCrankSuppressor((m) => loneLpCrankSuppressed({ loneLpCrankFlag: f.loneLpCrank, pairingActive: pairingActive(f), isV22Market: this.isV22(m) }));
+    if (pairingActive(f)) setProtectiveTrigger((m) => void this.protectiveRound(m).catch(() => {}));
     setV22HealthProvider(() => this.healthFields());
   }
 
@@ -149,7 +158,7 @@ export class V22Loop {
   private async positionedFor(ctx: V22MarketCtx, r: MarketRuntime): Promise<V22Positioned | null> {
     const t = this.now();
     if (r.positionedCache && t - r.positionedCache.at < POSITIONED_TTL_MS) return r.positionedCache.value;
-    const v = await loadV22Positioned(this.d.conn, ctx, (this.d.anchors ?? parseAccrueAnchors(process.env.KEEPER_V22_ACCRUE_ANCHORS)).get(ctx.market.toBase58()) ?? null);
+    const v = await loadV22Positioned(this.d.conn, ctx, (this.d.anchors ?? parseAccrueAnchors(process.env.KEEPER_V22_ACCRUE_ANCHORS)).get(ctx.market.toBase58()) ?? null, this.d.keeper.publicKey);
     if (v) r.positionedCache = { at: t, value: v };
     return v;
   }
@@ -168,43 +177,114 @@ export class V22Loop {
     return null;
   }
 
-  /** The recovery cranker's per-market hook for a variant-B market (KEEPER_V22_SWEEP). Returns true when handled. */
+  private sweepDeps(): SweepDeps {
+    return { exec: this.execCtx(), getSlot: () => this.d.conn.getSlot("confirmed") };
+  }
+
+  /**
+   * The recovery cranker's per-market hook for a variant-B market (KEEPER_V22_SWEEP). Returns true ONLY when this layer
+   * actually ran (or a round is already running); on every "could not run" path it returns FALSE so the legacy
+   * accrual-only crank still runs this cycle (review F-5: the engine clock must keep moving).
+   */
   async sweepDelegate(a: SweepDelegateArgs): Promise<boolean> {
-    const r = this.rtFor(a.entry.marketAddress);
-    if (r.sweepInflight) return true;
+    return this.runRoundFor(a.conn, a.entry, false);
+  }
+
+  private async runRoundFor(conn: Connection, entry: { marketAddress: string; label: string; lpPortfolio?: string }, protective: boolean): Promise<boolean> {
+    const r = this.rtFor(entry.marketAddress);
+    if (r.sweepInflight) return true; // a round is running and accrues the market
     r.sweepInflight = true;
     try {
-      const load = await loadV22Market(a.conn, a.entry, this.d.programId);
-      const ctx = this.noteLoad(a.entry, load);
+      const load = await loadV22Market(conn, entry, this.d.programId);
+      const ctx = this.noteLoad(entry, load);
       if (!ctx) return false;
       r.lastBand = bandHealthFor(ctx);
-      if (ctx.refresh.lifecycle !== 2 && ctx.refresh.lifecycle !== 3) return true; // not Active / DrainOnly: nothing to sweep
+      if (ctx.refresh.lifecycle !== 2 && ctx.refresh.lifecycle !== 3) return false; // not Active / DrainOnly
       const positioned = await this.positionedFor(ctx, r);
       if (!positioned || !positioned.lp) {
-        this.log(`[v22][sweep] ${ctx.label}: no LP portfolio or positioned set unreadable; skipping this cycle`);
-        return true;
+        this.log(`[v22][sweep] ${ctx.label}: no vault LP portfolio or the positioned set is unreadable; leaving this cycle to the legacy accrual crank`);
+        return false;
+      }
+      const f = this.d.flags;
+      // Rent settles ride the round (tag 106 in place of that portfolio's refresh), only when pairing is acting.
+      let rent: RoundInputRent | undefined;
+      if (f.holdingRent && ctx.isRent && pairingActive(f)) {
+        const plan = planRentSettles(ctx, positioned, r.rent, f.rentCadenceSlots, true, 4);
+        if (plan.due.length > 0) {
+          const oracle = crankOracleAccounts(ctx);
+          rent = { due: new Set(plan.due.map((x) => x.portfolio)), build: (p) => buildSettleHoldingRentIxV22(ctx.sdk, this.d.keeper.publicKey, p.pubkey, 0, BigInt(ctx.readSlot), ctx.oracleMode === 1 ? oracle : []) };
+        }
       }
       const res = await runSettleRound(
-        { exec: this.execCtx(), getSlot: () => this.d.conn.getSlot("confirmed") },
+        this.sweepDeps(),
         { market: ctx.market, label: ctx.label },
-        { lp: positioned.lp.pubkey, lpWeight: portfolioWeight(positioned.lp), counterparties: positioned.counterparties, anchor: positioned.flatAnchor, lpSkips: r.lpSkips },
+        {
+          lp: positioned.lp.pubkey,
+          lpWeight: portfolioWeight(positioned.lp),
+          counterparties: positioned.counterparties,
+          anchor: positioned.flatAnchor,
+          oracleAccounts: crankOracleAccounts(ctx),
+          quarantine: r.quarantine,
+          nowSlot: ctx.readSlot,
+          gapBackoff: r.gapBackoff,
+          rent,
+          protective,
+        },
         this.roundConfig(),
       );
+      if (rent) {
+        markRentSettled(r.rent, ctx, res.rentSettled);
+        pairingStats.rentSettlesInRound += res.rentSettled.length;
+      }
       r.positionedCache = null; // positions changed
-      this.recordRound(ctx, r, res, positioned);
+      this.recordRound(ctx, r, res, positioned, protective);
       await this.publishHealth(ctx, r, positioned, res);
+      // 78 at the END of a paired round (the LP was just settled with its counterparties), not on its own timer.
+      if (f.feeCrankBond && ctx.bond && res.lpSettled && this.now() - r.lastFeeAtMs >= (this.d.feeIntervalMs ?? 200_000)) {
+        r.lastFeeAtMs = this.now();
+        const fee = await crankBondFee(this.sweepDeps(), ctx, positioned, { mode: this.d.flags.pairing, weightBudget: weightBudgetFor(), afterRound: true });
+        r.lastFee = fee.kind === "skipped" ? `skipped: ${fee.reason}` : `after-round ${fee.kind}`;
+      }
       return true;
     } catch (err) {
-      this.log(`[v22][sweep] ${a.entry.label}: ${(err instanceof Error ? err.message : String(err)).slice(0, 140)}`);
-      return true;
+      this.log(`[v22][sweep] ${entry.label}: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+      return false;
     } finally {
       r.sweepInflight = false;
     }
   }
 
-  private recordRound(ctx: V22MarketCtx, r: MarketRuntime, res: RoundResult, positioned: V22Positioned): void {
-    r.lastRound = { paired: res.plan.paired, txs: res.plan.txs.length, lpSettled: res.lpSettled, gapSlots: res.gapSlots, abandoned: res.abandoned, unvisited: res.plan.unvisited.length, at: this.now() };
-    const summary = `${res.plan.paired ? "PAIRED" : "UNPAIRED"} ${res.plan.txs.length} tx(s), lp ${res.lpSettled ? "settled" : res.plan.lpDeferred ? "deferred (strict)" : "not settled"}, refreshed ${res.refreshed}, pruned ${res.pruned}${res.gapSlots !== null ? `, gap ${res.gapSlots} slots` : ""}${res.abandoned ? `, ${res.abandoned}` : ""} (positioned ${positioned.all.length})`;
+  /**
+   * Protective trigger (installed into the suppressed lone-LP-crank path): when the LP itself is near liquidation or a
+   * senior draw is pending, run a full PAIRED round NOW instead of waiting for the next crank cycle. Never a lone LP
+   * crank. Latency without it: up to one crank cycle (CRANK_INTERVAL_MS, default 20 s) plus the round; with it: the
+   * time of one round (about 1-5 s) after the landed push. Debounced per market.
+   */
+  private async protectiveRound(marketAddress: string): Promise<void> {
+    const entry = this.d.markets().find((m) => m.marketAddress === marketAddress);
+    if (!entry || !this.isV22(marketAddress)) return;
+    const r = this.rtFor(marketAddress);
+    if (r.sweepInflight || this.now() - r.lastProtectiveAtMs < 5_000) return;
+    r.lastProtectiveAtMs = this.now();
+    const load = await loadV22Market(this.d.conn, entry, this.d.programId);
+    if (!load.ok) return;
+    const ctx = load.ctx;
+    let lpData: Uint8Array | null = null;
+    if (ctx.lpPortfolio) {
+      const info = await this.d.conn.getAccountInfo(ctx.lpPortfolio, "processed");
+      lpData = info ? new Uint8Array(info.data) : null;
+    }
+    if (ctx.seniorDrawOutstandingAtoms > 0n || lpNearLiquidation(lpData)) {
+      this.log(`[v22][protect] ${ctx.label}: LP needs protection (${ctx.seniorDrawOutstandingAtoms > 0n ? "senior draw pending" : "near liquidation"}): running a full paired round now`);
+      r.positionedCache = null;
+      await this.runRoundFor(this.d.conn, entry, true);
+    }
+  }
+
+  private recordRound(ctx: V22MarketCtx, r: MarketRuntime, res: RoundResult, positioned: V22Positioned, protective: boolean): void {
+    const misses = res.missing.filter((m) => m.why !== "current");
+    r.lastRound = { paired: res.plan.paired && misses.length === 0, txs: res.plan.txs.length, lpSettled: res.lpSettled, gapSlots: res.gapSlots, abandoned: res.abandoned, settled: res.settled.length, missing: misses.length, protective, at: this.now() };
+    const summary = `${r.lastRound.paired ? "PAIRED" : "UNPAIRED"}${protective ? " (protective)" : ""} ${res.plan.txs.length} tx(s), lp ${res.lpSettled ? "settled" : res.plan.lpDeferred ? "deferred (strict)" : "not settled"}, settled ${res.settled.length}/${positioned.counterparties.length} counterparties, missing ${misses.length}, pruned ${res.pruned}${res.gapSlots !== null ? `, gap ${res.gapSlots} slots` : ""}${res.abandoned ? `, ${res.abandoned}` : ""}`;
     this.log(`[v22][sweep] ${ctx.label}: ${summary}`);
   }
 
@@ -224,7 +304,7 @@ export class V22Loop {
       postStaleLong: Number(post.staleLong),
       postStaleShort: Number(post.staleShort),
       positioned: positioned.all.length,
-      overflow: res.plan.unvisited.length,
+      overflow: res.missing.filter((m) => m.why !== "current").length,
       overflowRefreshed: 0,
       overflowError: res.abandoned,
       lossStaleCycles: r.lossStaleCycles,
@@ -252,12 +332,14 @@ export class V22Loop {
         const positioned = needsPositioned ? await this.positionedFor(ctx, r) : null;
         const pairing = pairingActive(f) ? f.pairing : "off";
 
-        if (f.feeCrankBond && ctx.bond && this.now() - r.lastFeeAtMs >= (this.d.feeIntervalMs ?? 200_000)) {
+        // With the sweep + pairing on, 78 runs at the end of a paired round (runRoundFor); this timer is the sweep-off path.
+        if (f.feeCrankBond && ctx.bond && !pairingActive(f) && this.now() - r.lastFeeAtMs >= (this.d.feeIntervalMs ?? 200_000)) {
           r.lastFeeAtMs = this.now();
-          const res = await crankBondFee(exec, ctx, positioned, { mode: pairing, weightBudget: weightBudgetFor(), unpairedCounter: undefined });
+          const res = await crankBondFee(this.sweepDeps(), ctx, positioned, { mode: pairing, weightBudget: weightBudgetFor() });
           r.lastFee = res.kind === "skipped" ? `skipped: ${res.reason}` : res.kind;
         }
-        if (f.holdingRent && ctx.isRent && positioned) {
+        // With the sweep + pairing on, rent settles ride the round (tag 106 in place of the refresh); this is the sweep-off path.
+        if (f.holdingRent && ctx.isRent && positioned && !pairingActive(f)) {
           const res = await settleRentOnce(exec, ctx, positioned, r.rent, { cadenceSlots: f.rentCadenceSlots, pairingActive: pairingActive(f) });
           if (res.outcomes.length > 0) this.log(`[v22][rent] ${ctx.label}: ${res.outcomes.length} settle(s) ${res.outcomes.map((o) => o.outcome.kind).join(",")}`);
         }
@@ -278,11 +360,11 @@ export class V22Loop {
         if (f.earnExit && this.now() - r.lastEarnAtMs >= 30_000) {
           r.lastEarnAtMs = this.now();
           const reqs = await fetchRedemptionRequests(this.d.conn, ctx);
-          const ex = await executeKeeperExits(exec, ctx, reqs);
+          const ex = await executeKeeperExits(exec, ctx, reqs, 2, r.earn);
           r.lastEarn = ex.gate.ok ? `executed ${ex.outcomes.length}` : `gated: ${ex.gate.reason}`;
         }
       } catch (err) {
-        this.log(`[v22] ${entry.label}: tick error: ${(err instanceof Error ? err.message : String(err)).slice(0, 140)}`);
+        this.log(`[v22] ${entry.label}: tick error: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
       }
     }
   }
@@ -299,7 +381,7 @@ export class V22Loop {
         ...(r.lastG9 ? { g9: r.lastG9 } : {}),
         ...(r.lastStake ? { stakeSync: r.lastStake } : {}),
         ...(r.lastEarn ? { earnExit: r.lastEarn } : {}),
-        ...(this.layoutProblems.has(addr) ? { layoutProblem: this.layoutProblems.get(addr) } : {}),
+        ...(this.layoutProblems.has(addr) ? { layoutProblem: redactErrorText(this.layoutProblems.get(addr) as string, 200) } : {}),
       };
     }
     return {
@@ -308,7 +390,7 @@ export class V22Loop {
       lastTickAgoMs: this.lastTickAt === null ? null : this.now() - this.lastTickAt,
       pairing: { ...pairingStats },
       jobs: allJobCounters(),
-      layoutProblems: Object.fromEntries(this.layoutProblems),
+      layoutProblems: Object.fromEntries([...this.layoutProblems].map(([k, v]) => [k, redactErrorText(v, 200)])),
       markets,
     };
   }

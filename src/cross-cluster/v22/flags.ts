@@ -27,6 +27,9 @@
  *
  * `SETTLE_PAIRING` and the lone LP crank: see settle-pairing.ts. With pairing on and the sweep on, the lone crank
  * is suppressed on v2.2 markets whatever VAULT_LP_LONE_CRANK says.
+ *
+ * PARSING IS STRICT: an unrecognised value of any of these variables is a startup error (V22FlagError), never a
+ * silent default. Booleans accept on/1/true/yes and off/0/false/no; empty means unset.
  */
 
 export type PairingMode = "off" | "prefer" | "strict";
@@ -49,51 +52,79 @@ export interface V22Flags {
   stakeSyncIntervalMs: number;
   earnExit: boolean;
   loneLpCrank: boolean;
+  mainnetBuild: boolean;
 }
 
 type Env = Readonly<Record<string, string | undefined>>;
 
-const on = (v: string | undefined): boolean => v !== undefined && ["on", "1", "true", "yes"].includes(v.trim().toLowerCase());
-const off = (v: string | undefined): boolean => v !== undefined && ["off", "0", "false", "no"].includes(v.trim().toLowerCase());
+/** Thrown at startup for a v2.2 variable with an unrecognised value (a typo must never silently pick a default). */
+export class V22FlagError extends Error {
+  constructor(key: string, value: string, expected: string) {
+    super(`${key}="${value}" is not recognised (expected ${expected}). Refusing to start: a v2.2 flag is never silently defaulted.`);
+    this.name = "V22FlagError";
+  }
+}
+
+const TRUE_WORDS = ["on", "1", "true", "yes"];
+const FALSE_WORDS = ["off", "0", "false", "no"];
+
+/** unset / empty -> `def`; on/1/true/yes -> true; off/0/false/no -> false; anything else THROWS. */
+export function parseFlag(env: Env, key: string, def: boolean): boolean {
+  const raw = env[key];
+  if (raw === undefined || raw.trim() === "") return def;
+  const v = raw.trim().toLowerCase();
+  if (TRUE_WORDS.includes(v)) return true;
+  if (FALSE_WORDS.includes(v)) return false;
+  throw new V22FlagError(key, raw, "on/1/true/yes or off/0/false/no");
+}
 
 function posInt(env: Env, key: string, def: number): number {
   const raw = env[key];
   if (raw === undefined || raw.trim() === "") return def;
-  const n = Number(raw);
-  return Number.isInteger(n) && n > 0 ? n : def;
+  const n = Number(raw.trim());
+  if (!Number.isInteger(n) || n <= 0) throw new V22FlagError(key, raw, "a positive integer");
+  return n;
 }
 
 const U64_MAX = (1n << 64n) - 1n;
 
 export function v22FlagsFromEnv(env: Env = process.env): V22Flags {
-  const pairingRaw = (env.KEEPER_V22_SETTLE_PAIRING ?? "prefer").trim().toLowerCase();
-  const pairing: PairingMode = pairingRaw === "off" || pairingRaw === "strict" ? pairingRaw : "prefer";
+  const pairingRaw = env.KEEPER_V22_SETTLE_PAIRING;
+  let pairing: PairingMode = "prefer";
+  if (pairingRaw !== undefined && pairingRaw.trim() !== "") {
+    const v = pairingRaw.trim().toLowerCase();
+    if (v !== "off" && v !== "prefer" && v !== "strict") throw new V22FlagError("KEEPER_V22_SETTLE_PAIRING", pairingRaw, "off | prefer | strict");
+    pairing = v;
+  }
   let cap = U64_MAX;
   const capRaw = env.KEEPER_V22_G9_DRAW_CAP_ATOMS;
-  if (capRaw !== undefined && /^\d+$/.test(capRaw.trim())) {
+  if (capRaw !== undefined && capRaw.trim() !== "") {
+    if (!/^\d+$/.test(capRaw.trim())) throw new V22FlagError("KEEPER_V22_G9_DRAW_CAP_ATOMS", capRaw, "a positive integer of atoms");
     const c = BigInt(capRaw.trim());
-    if (c > 0n && c <= U64_MAX) cap = c;
+    if (c <= 0n || c > U64_MAX) throw new V22FlagError("KEEPER_V22_G9_DRAW_CAP_ATOMS", capRaw, "1..=18446744073709551615");
+    cap = c;
   }
   return {
-    enabled: on(env.KEEPER_V22),
-    dryRun: on(env.KEEPER_V22_DRY_RUN),
+    enabled: parseFlag(env, "KEEPER_V22", false),
+    dryRun: parseFlag(env, "KEEPER_V22_DRY_RUN", false),
     tickMs: posInt(env, "KEEPER_V22_TICK_MS", 20_000),
-    feeCrankBond: on(env.KEEPER_V22_FEE_CRANK_BOND),
-    sweep: on(env.KEEPER_V22_SWEEP),
+    feeCrankBond: parseFlag(env, "KEEPER_V22_FEE_CRANK_BOND", false),
+    sweep: parseFlag(env, "KEEPER_V22_SWEEP", false),
     pairing,
-    holdingRent: on(env.KEEPER_V22_HOLDING_RENT),
+    holdingRent: parseFlag(env, "KEEPER_V22_HOLDING_RENT", false),
     rentCadenceSlots: posInt(env, "KEEPER_V22_RENT_CADENCE_SLOTS", 9_000),
-    dustSweep: on(env.KEEPER_V22_DUST_SWEEP),
-    g9: on(env.KEEPER_V22_G9),
-    // default ON: only an explicit "off" arms real G9 sends
-    g9DryRun: !off(env.KEEPER_V22_G9_DRY_RUN),
-    g9AllowAnyOracleMode: on(env.KEEPER_V22_G9_ALLOW_ANY_ORACLE_MODE),
+    dustSweep: parseFlag(env, "KEEPER_V22_DUST_SWEEP", false),
+    g9: parseFlag(env, "KEEPER_V22_G9", false),
+    // default ON: only an explicit off arms real G9 sends
+    g9DryRun: parseFlag(env, "KEEPER_V22_G9_DRY_RUN", true),
+    g9AllowAnyOracleMode: parseFlag(env, "KEEPER_V22_G9_ALLOW_ANY_ORACLE_MODE", false),
     g9DrawCapAtoms: cap,
-    stakeSync: on(env.KEEPER_V22_STAKE_SYNC),
+    stakeSync: parseFlag(env, "KEEPER_V22_STAKE_SYNC", false),
     stakeSyncIntervalMs: posInt(env, "KEEPER_V22_STAKE_SYNC_INTERVAL_MS", 60_000),
-    earnExit: on(env.KEEPER_V22_EARN_EXIT),
+    earnExit: parseFlag(env, "KEEPER_V22_EARN_EXIT", false),
     // today's behaviour unless explicitly turned off
-    loneLpCrank: !off(env.VAULT_LP_LONE_CRANK),
+    loneLpCrank: parseFlag(env, "VAULT_LP_LONE_CRANK", true),
+    mainnetBuild: parseFlag(env, "KEEPER_V22_MAINNET_BUILD", false),
   };
 }
 

@@ -2,7 +2,7 @@
  * Test helpers for the v2.2 layer: a recording fake Connection (simulate / send / confirm), a synthetic variant-B
  * market account, and hand-built positioned portfolios. Not a test file (the glob only runs *.test.ts).
  */
-import { Keypair, PublicKey } from "@solana/web3.js";
+import { Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import { LAYOUT_V22, WRAPPER_ACCOUNT_MAGIC } from "@percolatorct/sdk";
 import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import type { ExecConnection, ExecContext } from "./exec.ts";
@@ -31,6 +31,8 @@ export interface FakeConnOptions {
   slot?: () => number;
   landedSlot?: () => number;
   confirmStatus?: "ok" | "err";
+  /** Program error code a LANDED tx fails with (by send index), or null for success. */
+  confirmFail?: (sendIndex: number) => number | null;
 }
 
 export function fakeExecConn(o: FakeConnOptions = {}) {
@@ -54,13 +56,17 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
       return { context: { slot: 1 }, value: { err: err ?? null, logs: [], unitsConsumed: 123_456 } };
     },
     async sendRawTransaction(raw: Uint8Array) {
-      void raw;
-      const d = sims[sims.length - 1];
+      // decode the transaction actually being sent (phase-1 txs are simulated and sent concurrently)
+      const t = Transaction.from(Buffer.from(raw));
+      const ixs = t.instructions.slice(COMPUTE_IX_COUNT);
+      const d: SentTx = { tags: ixs.map((i) => i.data[0]), keys: ixs.map((i) => i.keys.map((k) => k.pubkey.toBase58())) };
       sent.push({ ...d, order: order++ });
       return `sig${sent.length}`;
     },
-    async confirmTransaction() {
-      return { context: { slot: 1 }, value: { err: o.confirmStatus === "err" ? { InstructionError: [0, { Custom: 1 }] } : null } };
+    async confirmTransaction(arg: { signature: string }) {
+      const idx = Number(arg.signature.slice(3)) - 1; // sendRawTransaction returned `sig<N>`
+      const code = o.confirmFail ? o.confirmFail(idx) : o.confirmStatus === "err" ? 1 : null;
+      return { context: { slot: 1 }, value: { err: code !== null ? { InstructionError: [2, { Custom: code }] } : null } };
     },
     async getSignatureStatuses() {
       return { context: { slot: 1 }, value: [{ slot: (o.landedSlot ?? (() => (slot += 1)))(), confirmations: 1, err: null, confirmationStatus: "confirmed" as const }] };
@@ -82,7 +88,7 @@ export const customAt = (i: number, code: number) => ({ InstructionError: [i + C
 const L = layoutById("v2.2-b");
 
 /** A synthetic variant-B market (1 slot) with the wrapper header stamped, optional band / rent / pin words. */
-export function v22MarketBytes(o: { slots?: number; version?: number; band?: boolean; rent?: boolean; pinSince?: bigint; currentSlot?: bigint; maxPin?: bigint; oracleMode?: number; legs?: number; lifecycle?: number; staleLong?: bigint } = {}): Uint8Array {
+export function v22MarketBytes(o: { slots?: number; version?: number; band?: boolean; rent?: boolean; pinSince?: bigint; currentSlot?: bigint; maxPin?: bigint; oracleMode?: number; legs?: number; lifecycle?: number; staleLong?: bigint; legFeeds?: PublicKey[] } = {}): Uint8Array {
   const slots = o.slots ?? 1;
   const len = L.groupOff + L.headerLen + slots * L.slotStride;
   const b = Buffer.alloc(len);
@@ -108,6 +114,7 @@ export function v22MarketBytes(o: { slots?: number; version?: number; band?: boo
   const w = L.groupOff + L.headerLen;
   b[w] = o.oracleMode ?? 1;
   b[w + 1] = o.legs ?? 1;
+  (o.legFeeds ?? []).forEach((f, i) => Buffer.from(f.toBytes()).copy(b, w + 224 + i * 32));
   return new Uint8Array(b);
 }
 
@@ -138,3 +145,81 @@ export function v22Ctx(o: Parameters<typeof v22MarketBytes>[0] & { bound?: boole
 }
 
 export { LAYOUT_V22 };
+
+/** A refusal at the instruction (any) whose accounts include `portfolio` -- targets one counterparty's refresh. */
+export function refusePortfolio(portfolio: PublicKey, code: number, firstOnly = false) {
+  let done = false;
+  return (d: SentTx): unknown => {
+    if (firstOnly && done) return null;
+    const i = d.keys.findIndex((ks, idx) => ks.includes(portfolio.toBase58()) && !(idx === 0 && false));
+    if (i < 0) return null;
+    done = true;
+    return customAt(i, code);
+  };
+}
+
+/** A parsable 10,603 B variant-B portfolio (SDK VERSION 19 guard): owner, capital, pnl, legs on asset 0. */
+export function portfolioBytes(o: { owner: PublicKey; capital?: bigint; pnl?: bigint; legs?: Array<{ side: 0 | 1; basis: bigint }>; matcher?: boolean }): Uint8Array {
+  const G = LAYOUT_V22.portfolio;
+  const b = Buffer.alloc(G.accountLen);
+  b.writeBigUInt64LE(WRAPPER_ACCOUNT_MAGIC, 0);
+  b.writeUInt16LE(19, 8);
+  b[10] = 2;
+  b.writeUInt16LE(1, 112);
+  b.writeUInt16LE(19, 114);
+  Buffer.from(o.owner.toBytes()).copy(b, 116);
+  const w128 = (off: number, v: bigint) => {
+    const u = BigInt.asUintN(128, v);
+    b.writeBigUInt64LE(u & 0xffff_ffff_ffff_ffffn, off);
+    b.writeBigUInt64LE(u >> 64n, off + 8);
+  };
+  w128(148, o.capital ?? 0n);
+  w128(164, o.pnl ?? 0n);
+  const legs = o.legs ?? [];
+  let bitmap = 0n;
+  legs.forEach((l, i) => {
+    bitmap |= 1n << BigInt(i);
+    const at = G.legsOff + i * G.legStride;
+    b[at + G.leg.active] = 1;
+    b.writeUInt32LE(0, at + G.leg.assetIndex);
+    b[at + G.leg.side] = l.side;
+    w128(at + G.leg.basisPosQ, l.basis);
+    w128(at + G.leg.lossWeight, 1n);
+  });
+  b.writeBigUInt64LE(bitmap, 348);
+  if (o.matcher) b.writeBigUInt64LE(1n, G.matcherConfigOff + 96);
+  return new Uint8Array(b);
+}
+
+/** A vault_lp_state account (kind 9, 272 B) with the bound LP and a senior draw outstanding. */
+export function vaultLpStateBytes(lp: PublicKey, outstanding = 0n): Uint8Array {
+  const b = Buffer.alloc(16 + 256);
+  b.writeBigUInt64LE(WRAPPER_ACCOUNT_MAGIC, 0);
+  b.writeUInt16LE(18, 8);
+  b[10] = 9;
+  Buffer.from(lp.toBytes()).copy(b, 16 + 64);
+  b[16 + 214] = 1;
+  b.writeBigUInt64LE(outstanding & 0xffff_ffff_ffff_ffffn, 16 + 240);
+  return new Uint8Array(b);
+}
+
+/** A fake Connection for the V22Loop: reads, getProgramAccounts, plus the exec surface. */
+export function fakeLoopConn(o: { market: Uint8Array; registry?: Uint8Array | null; vaultLpState?: Uint8Array | null; portfolios?: Array<{ pubkey: PublicKey; data: Uint8Array }>; lpAccount?: Uint8Array | null; throwOnRead?: boolean } & FakeConnOptions) {
+  const base = fakeExecConn(o);
+  const progCalls: Array<{ filters: unknown[] }> = [];
+  const acct = (d: Uint8Array | null | undefined) => (d ? { data: Buffer.from(d), owner: key(1), lamports: 1, executable: false } : null);
+  const conn = Object.assign(base.conn, {
+    async getMultipleAccountsInfoAndContext() {
+      if (o.throwOnRead) throw new Error("fetch failed https://x.helius-rpc.com/?api-key=SECRET123");
+      return { context: { slot: 5000 }, value: [acct(o.market), acct(o.registry ?? null), acct(o.vaultLpState ?? null)] };
+    },
+    async getAccountInfo() {
+      return acct(o.lpAccount ?? null);
+    },
+    async getProgramAccounts(_p: PublicKey, cfg: { filters: unknown[] }) {
+      progCalls.push(cfg);
+      return (o.portfolios ?? []).map((x) => ({ pubkey: x.pubkey, account: { data: Buffer.from(x.data) } }));
+    },
+  });
+  return { conn, sims: base.sims, sent: base.sent, progCalls };
+}

@@ -17,6 +17,7 @@ import type { ConfirmOptions } from "../tx-confirm.ts";
 import { BAND_EXPECTED_CODES, errorCodeOf, formatProgramError } from "./errors.ts";
 import type { ProgramKind } from "./errors.ts";
 import { parseInstructionError } from "../positioned-refresh.ts";
+import { redactErrorText } from "./redact.ts";
 
 /** Compute-budget instructions buildTx puts in front of the caller's list (heap frame + unit limit). */
 export const COMPUTE_IX_COUNT = 2;
@@ -46,12 +47,15 @@ export interface ExecOptions {
   expected?: ReadonlySet<number>;
   /** Send even when the simulation reports a compute-budget overrun? Never. Kept explicit for tests. */
   priorityMicroLamportsPerCu?: number;
+  /** Evaluated AFTER a clean simulation and BEFORE the send: return a reason to hold the tx (nothing is sent). */
+  beforeSend?: () => string | null;
 }
 
 export type ExecOutcome =
-  | { kind: "sent"; signature: string; landed: "landed" | "failed" | "not-landed"; landedSlot: number | null; unitsConsumed: number | null; logs: string[] }
+  | { kind: "sent"; signature: string; landed: "landed" | "failed" | "not-landed"; /** program error code of a landed-but-failed tx */ failCode: number | null; landedSlot: number | null; unitsConsumed: number | null; logs: string[] }
   | { kind: "dry-run"; unitsConsumed: number | null; logs: string[]; ixCount: number }
   | { kind: "refused"; code: number | null; /** instruction index inside the SENT list (compute-budget ixs excluded), or null */ index: number | null; name: string; expected: boolean; logs: string[] }
+  | { kind: "held"; reason: string }
   | { kind: "failed"; error: string };
 
 /** Per-job counters, exported through /health (health.ts). */
@@ -61,6 +65,7 @@ export interface JobCounters {
   refused: number;
   expected: number;
   failed: number;
+  held: number;
   byError: Record<string, number>;
   lastError: string | null;
   lastAt: number | null;
@@ -71,7 +76,7 @@ const counters = new Map<string, JobCounters>();
 export function jobCounters(job: string): JobCounters {
   let c = counters.get(job);
   if (!c) {
-    c = { sent: 0, dryRun: 0, refused: 0, expected: 0, failed: 0, byError: {}, lastError: null, lastAt: null };
+    c = { sent: 0, dryRun: 0, refused: 0, expected: 0, failed: 0, held: 0, byError: {}, lastError: null, lastAt: null };
     counters.set(job, c);
   }
   return c;
@@ -95,9 +100,11 @@ function bump(job: string, o: ExecOutcome, now: () => number): void {
     else c.refused++;
     c.byError[o.name] = (c.byError[o.name] ?? 0) + 1;
     if (!o.expected) c.lastError = o.name;
+  } else if (o.kind === "held") {
+    c.held++;
   } else {
     c.failed++;
-    c.lastError = o.error.slice(0, 160);
+    c.lastError = redactErrorText(o.error);
   }
 }
 
@@ -147,6 +154,8 @@ export async function simulateAndSend(
         log(`[v22][DRY-RUN] ${o.job} ${o.label}: would send ${ixs.length} instruction(s) [${ixs.map((i) => `tag ${i.data[0]}`).join(", ")}] units=${o.units} simulated=${units ?? "n/a"}`);
         return { kind: "dry-run", unitsConsumed: units, logs, ixCount: ixs.length };
       }
+      const hold = o.beforeSend?.() ?? null;
+      if (hold) return { kind: "held", reason: hold };
       const sig = await ctx.conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
       const c = await confirmBySignature(ctx.conn, sig, blockhash, lastValidBlockHeight, ctx.confirm);
       let landedSlot: number | null = null;
@@ -157,9 +166,10 @@ export async function simulateAndSend(
           landedSlot = null;
         }
       }
-      return { kind: "sent", signature: sig, landed: c.status, landedSlot, unitsConsumed: units, logs };
+      const failCode = c.status === "failed" ? c.code : null;
+      return { kind: "sent", signature: sig, landed: c.status, failCode, landedSlot, unitsConsumed: units, logs };
     } catch (err) {
-      return { kind: "failed", error: err instanceof Error ? err.message : String(err) };
+      return { kind: "failed", error: redactErrorText(err instanceof Error ? err.message : String(err)) };
     }
   }
 }

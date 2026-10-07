@@ -247,8 +247,14 @@ export function buildObservationCrankIx(
   owner: PublicKey,
   market: PublicKey,
   portfolio: PublicKey,
+  /**
+   * The asset's oracle leg accounts (read-only, after the base accounts) and the hint count. EMPTY by default, which
+   * is the AUTH_MARK form every v1 / v2.1 caller uses and is byte-identical to before. A Hybrid market needs its
+   * legs: without them the wrapper answers NotEnoughAccountKeys (security review F-3).
+   */
+  oracleAccounts: ReadonlyArray<PublicKey> = [],
 ): TransactionInstruction {
-  return buildPermissionlessCrankIx(owner, market, portfolio, true);
+  return buildPermissionlessCrankIx(owner, market, portfolio, true, oracleAccounts);
 }
 
 /** No-observation crank: refreshes a stale portfolio from committed state. */
@@ -265,11 +271,13 @@ function buildPermissionlessCrankIx(
   market: PublicKey,
   portfolio: PublicKey,
   withObservation: boolean,
+  oracleAccounts: ReadonlyArray<PublicKey> = [],
 ): TransactionInstruction {
   const keys = buildAccountMetas(ACCOUNTS_PERMISSIONLESS_CRANK_BASE, { owner, market, portfolio });
+  if (withObservation) for (const a of oracleAccounts) keys.push({ pubkey: a, isSigner: false, isWritable: false });
   const data = encodePermissionlessCrank({
     nowSlot: 0n, // wrapper authenticates against Clock::get()
-    observations: withObservation ? [{ assetIndex: REFRESH_ASSET_INDEX, oracleAccounts: 0 }] : [],
+    observations: withObservation ? [{ assetIndex: REFRESH_ASSET_INDEX, oracleAccounts: oracleAccounts.length }] : [],
   });
   return new TransactionInstruction({
     programId: WRAPPER_PROGRAM_ID,

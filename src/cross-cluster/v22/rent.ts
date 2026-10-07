@@ -5,8 +5,13 @@
  * Rent is exact regardless of timing (a carry keeps the total identical: ten one-slot settles charged the same as
  * one over the same index delta, Wave B review), so the cadence only bounds how much rent sits un-routed.
  *
- * Tag 106 is crank-equivalent (accrues, then refreshes the portfolio). Settling the vault LP through it is an LP-alone
- * settle, so under SETTLE_PAIRING the LP is NOT rent-settled here (the sweep settles it with its counterparties).
+ * Tag 106 is crank-equivalent (it ACCRUES the market, then refreshes ONE portfolio). A lone 106 on a counterparty is
+ * therefore a counterparty-alone settle plus an accrual outside any round, so:
+ *   - with the sweep + pairing ON, rent settles do NOT run from this module's timer: the sweep round sends the
+ *     tag 106 IN PLACE OF that portfolio's plain refresh, in the same tx (sweep.ts `RentPlanInput`);
+ *   - the LP is never rent-settled under pairing (its settle belongs to the LP tx; rent is index-based and
+ *     timing-invariant, so an LP rent settle that waits for pairing off loses nothing);
+ *   - with the sweep OFF (no pairing exists) this module's timer path is the only rent settler, as before.
  * Band expected states (104/111/112/113) are counted, not failures.
  */
 import { buildSettleHoldingRentIxV22 } from "@percolatorct/sdk";
@@ -23,6 +28,11 @@ export interface RentState {
 export const freshRentState = (): RentState => ({ last: new Map() });
 
 export const RENT_TX_UNITS = 600_000;
+
+/** Record rent settles that landed inside a round (the round, not this module, sent them). */
+export function markRentSettled(st: RentState, ctx: Pick<V22MarketCtx, "marketAddress" | "readSlot">, keys: ReadonlyArray<string>): void {
+  for (const k of keys) st.last.set(`${ctx.marketAddress}|${k}`, BigInt(ctx.readSlot));
+}
 
 export interface RentPlan {
   due: Array<{ portfolio: string; weight: number; ageSlots: bigint | null }>;

@@ -78,17 +78,18 @@ describe("runSettleRound", () => {
     assert.equal(pairingStats.lastGapSlots !== null, true);
   });
 
-  it("phase 1 failure: the LP is NOT settled alone (strict never; prefer only after lpSkipLimit rounds, counted)", async () => {
-    const failing = (d: { tags: number[] }) => (d.tags.length >= 1 ? customAt(0, 7) : null);
-    // every counterparty-tx simulation fails with an unrelated error: phase 1 does not land
-    const mk = () => fakeExecConn({ simErr: (d, n) => (n < 2 ? failing(d) : null) });
-    const strictConn = mk();
-    const skips = { count: 0 };
-    const r = await runSettleRound(deps(strictConn.conn), { market: MARKET, label: "T" }, { lp: LP, counterparties: cps(30), lpSkips: skips }, { ...DEFAULT_SWEEP_ROUND_CONFIG, pairing: "strict" });
-    assert.equal(r.lpSettled, false);
-    assert.equal(pairingStats.lpSkippedPhase1Failed, 1);
-    assert.ok(strictConn.sent.every((s) => !s.keys[0].includes(LP.toBase58())));
-    assert.equal(skips.count, 1);
+  it("phase 1 that does not LAND: the LP is NOT settled alone (strict and prefer), and nothing forces it later", async () => {
+    // every counterparty tx lands but FAILS on chain with an unrelated code: phase 1 did not settle anything
+    for (const pairing of ["strict", "prefer"] as const) {
+      resetPairingStats();
+      const conn = fakeExecConn({ confirmFail: () => 7 });
+      for (let i = 0; i < 4; i++) {
+        const r = await runSettleRound(deps(conn.conn), { market: MARKET, label: "T" }, { lp: LP, counterparties: cps(30) }, { ...DEFAULT_SWEEP_ROUND_CONFIG, pairing });
+        assert.equal(r.lpSettled, false, `${pairing} round ${i}`);
+      }
+      assert.equal(pairingStats.lpHeldPhase1Unlanded, 4, pairing);
+      assert.ok(conn.sent.every((s) => !s.keys[0].includes(LP.toBase58())), pairing);
+    }
   });
 
   it("a refresh the engine says is not stale (Custom(22)) is pruned and the tx re-simulated; the prune is counted", async () => {
@@ -96,7 +97,7 @@ describe("runSettleRound", () => {
     const r = await runSettleRound(deps(f.conn), { market: MARKET, label: "T" }, { lp: LP, counterparties: cps(5) }, DEFAULT_SWEEP_ROUND_CONFIG);
     assert.equal(r.pruned, 1);
     assert.equal(f.sent[0].tags.length, 5, "6 instructions minus the pruned refresh");
-    assert.equal(pairingStats.prunedRefreshes, 1);
+    assert.equal(pairingStats.prunedCurrent, 1);
   });
 
   it("an accrue crank that answers Custom(22) (an earlier tx accrued this slot) degrades to refresh-only; the LP still settles (as a refresh)", async () => {
@@ -121,8 +122,8 @@ describe("runSettleRound", () => {
     }
   });
 
-  it("an UNEXPECTED refusal is a refusal (not expected) and nothing is sent for that tx", async () => {
-    const f = fakeExecConn({ simErr: () => customAt(1, 999) });
+  it("an UNEXPECTED refusal on the ACCRUE crank is a refusal and nothing is sent for that tx", async () => {
+    const f = fakeExecConn({ simErr: () => customAt(0, 999) });
     const r = await runSettleRound(deps(f.conn), { market: MARKET, label: "T" }, { lp: LP, counterparties: cps(3) }, DEFAULT_SWEEP_ROUND_CONFIG);
     assert.equal(f.sent.length, 0);
     assert.equal(r.lpSettled, false);

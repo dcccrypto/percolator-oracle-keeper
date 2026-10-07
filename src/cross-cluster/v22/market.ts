@@ -80,6 +80,8 @@ export interface V22MarketCtx {
   bond: boolean;
   lpPortfolio: PublicKey | null;
   vaultLpState: PublicKey;
+  /** `senior_draw_outstanding_atoms` of the vault_lp_state (0 when unreadable): > 0 means a senior draw is pending. */
+  seniorDrawOutstandingAtoms: bigint;
   oracleMode: number;
   oracleLegCount: number;
   oracleLegFeeds: PublicKey[];
@@ -196,12 +198,18 @@ export function buildV22MarketCtx(p: {
     bond,
     lpPortfolio,
     vaultLpState,
+    seniorDrawOutstandingAtoms: st ? st.seniorDrawOutstandingAtoms : 0n,
     oracleMode: profile.oracleMode,
     oracleLegCount: profile.oracleLegCount,
     oracleLegFeeds: profile.oracleLegFeeds.slice(0, profile.oracleLegCount),
     sdk: { programId: p.programId, market, registryDomain, ...(lpPortfolio ? { lpPortfolio } : {}) },
   };
   return { ok: true, ctx };
+}
+
+/** The oracle leg accounts an observation crank must carry on this market ([] for AUTH_MARK; the legs for Hybrid). */
+export function crankOracleAccounts(ctx: Pick<V22MarketCtx, "oracleMode" | "oracleLegFeeds">): PublicKey[] {
+  return ctx.oracleMode === 1 ? [...ctx.oracleLegFeeds] : [];
 }
 
 /** One read of market + registry + vault_lp_state, then {@link buildV22MarketCtx}. Never throws. */

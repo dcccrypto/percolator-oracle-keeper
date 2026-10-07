@@ -168,12 +168,31 @@ a bad magic or a wrong kind is a loud error: counted (`layout-guard-metrics.ts`)
 | `VAULT_LP_LONE_CRANK` | on | `off` suppresses the lone vault-LP crank after every landed push (works without `KEEPER_V22`) |
 
 **SETTLE_PAIRING.** Engine tag 5 on a portfolio settles only that portfolio, then accrues; a loss is booked at once, counterparties' gains
-only when they are settled. The LP settled alone at a peak strands value. Policy: the LP is never settled in a tx that does not also settle every counterparty
-that fits; a round that does not fit one tx sends the counterparty txs first (in parallel, pushes held) and the LP tx LAST, only inside `maxGapSlots` (8).
-Accrue-only: the no-observation crank does NOT accrue (Custom(22) unless already accrued); an observation crank accrues through whichever portfolio it targets, so the
-accrue uses a flat anchor if known, else the tx's first counterparty. Not verified without a live v2.2 market: that an observation crank on a flat portfolio succeeds.
+only when they are settled. The LP settled alone at a peak strands value. Policy: the round tracks which counterparties ACTUALLY settled
+(landed refresh, or the program said "already current", Custom(22)). The LP tx is sent only if every positioned counterparty settled, or under
+`prefer` when the only misses are portfolios the program REFUSED (band 104/111/112/113, hard refusal; counted in `unpairedLpSettles`);
+`strict` holds the LP in that case. A counterparty tx that did not LAND holds the LP in both modes: there is no "force after N rounds".
+A multi-tx round sends the counterparty txs first (parallel, pushes held) and the LP tx LAST, only inside `maxGapSlots` (8); a round that
+exceeds it backs off 1 then 2 rounds (counted `gapBackoffRounds`) instead of re-sending phase 1 every tick.
+A refused refresh is isolated (pruned, the rest re-sent) and the portfolio is quarantined (150 slots for a band state, 1,500 for a hard refusal).
+Accrue-only: the no-observation crank does NOT accrue (Custom(22) unless already accrued); an observation crank accrues through whichever portfolio it
+targets. The accrue goes through the KEEPER'S OWN flat portfolio when one exists (never a user's; verified by the program: a NoAction crank succeeds iff it accrued),
+else through the tx's first counterparty (counted `counterpartyAccrues`). A landed Custom(22) on the accrue (a parallel tx accrued the same slot) means "already accrued": re-sent refresh-only.
+The observation crank carries the Hybrid oracle leg accounts (without them the wrapper answers NotEnoughAccountKeys).
+Tag 78 runs at the END of a paired round (alone, the LP was just settled), tag 106 rent settles ride the round in place of that portfolio's refresh
+(the sweep-off timer paths are the only lone ones, and exist only without pairing). Any LP-alone settle that remains (78 timer path without the sweep, `prefer` overflow) is counted.
+
+LP protection latency. The 1.5 s lone LP crank is suppressed on v2.2 markets while sweep + pairing are on, so the LP's own senior-draw / liquidation protection
+waits for the next round: up to one crank cycle (`CRANK_INTERVAL_MS`, default 20 s) plus the round (about 1-5 s). Exception: on every landed push the v2.2 layer checks
+the LP (senior draw pending, or equity <= 20% of capital: a coarse heuristic, the program decides) and, if so, runs a full PAIRED round immediately (about one round, 1-5 s). A protective
+round may go with phase-1 failures but still puts the LP last in a tx WITH counterparties, never alone. No lone LP crank is reintroduced.
+
 What it cannot guarantee: multi-tx rounds are not atomic (expected gap 1-4 slots, cap 8; funding/rent keep accruing, other writers' pushes can move K); only a single-tx
-round is exactly atomic; anyone can still crank the LP alone (tag 5 is permissionless); the positioned set is a read; beyond `maxTxsPerRound` (16) `prefer` settles the LP
-with counterparties unvisited (counted `unpairedLpSettles`) and `strict` skips the LP that round. Defence in depth: the engine fix is separate.
+round is exactly atomic; anyone can still crank the LP alone (tag 5 is permissionless); the positioned set is a read; a portfolio the program keeps refusing can never be settled by
+any keeper action (`prefer` counts it, `strict` freezes the LP until it clears, see `quarantinedNow`); beyond `maxTxsPerRound` (16) `prefer` settles the LP with counterparties unvisited
+(counted) and `strict` skips the LP that round; the accrue-through-a-counterparty fallback settles that counterparty alone at the new K for the round's duration; the LP's rent is not settled under pairing
+(rent is index-based and timing-invariant). Defence in depth: the engine fix is separate.
+
+Env parsing is STRICT: an unrecognised value of any `KEEPER_V22*` variable or `VAULT_LP_LONE_CRANK` stops the keeper at startup (on/1/true/yes, off/0/false/no).
 
 Every v2.2 send is simulated first (`v22/exec.ts`); refusals are logged by name (`PriceBandPinned(104)`, `InsuranceReadingsDiverged(44)`); band states 104/111/112/113 are expected, counted, never alerted.

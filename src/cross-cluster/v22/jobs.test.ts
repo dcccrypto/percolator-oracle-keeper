@@ -16,9 +16,10 @@ import { customAt, execCtx, fakeExecConn, key, pf, v22Ctx } from "./test-helpers
 import { STAKE_PROGRAM_ID } from "../../program-ids.ts";
 
 beforeEach(() => resetJobCounters());
+const sd = (conn: Parameters<typeof execCtx>[0], dry = false) => ({ exec: execCtx(conn, dry), getSlot: async () => 1000 });
 
 function positioned(cps: ReturnType<typeof pf>[], lp = pf(901, 2, { lp: true }), minAbs: Record<number, bigint> = {}): V22Positioned {
-  return { all: [lp, ...cps], counterparties: cps, lp, minLegAbs: new Map(Object.entries(minAbs).map(([k, v]) => [key(Number(k)).toBase58(), v])), flatAnchor: null, undecodable: 0 };
+  return { all: [lp, ...cps], counterparties: cps, lp, minLegAbs: new Map(Object.entries(minAbs).map(([k, v]) => [key(Number(k)).toBase58(), v])), flatAnchor: null, lpData: null, undecodable: 0 };
 }
 
 describe("error tables", () => {
@@ -80,22 +81,22 @@ describe("tag 78 on bond markets", () => {
     const ctx = v22Ctx();
     const big = positioned(Array.from({ length: 12 }, (_, i) => pf(i + 1)));
     const f = fakeExecConn({ simErr: () => customAt(0, 999) });
-    const r = await crankBondFee(execCtx(f.conn), ctx, big, { mode: "strict", weightBudget: 32 });
+    const r = await crankBondFee(sd(f.conn), ctx, big, { mode: "strict", weightBudget: 32 });
     assert.equal(r.kind, "deferred");
     assert.equal(f.sent.length, 0);
     const g = fakeExecConn({ simErr: () => customAt(1, 38) });
-    assert.equal((await crankBondFee(execCtx(g.conn), ctx, positioned([pf(1)]), { mode: "prefer", weightBudget: 32 })).kind, "nothing");
+    assert.equal((await crankBondFee(sd(g.conn), ctx, positioned([pf(1)]), { mode: "prefer", weightBudget: 32 })).kind, "nothing");
     assert.equal(g.sent.length, 0);
   });
   it("sends after a clean simulation; dry-run sends nothing", async () => {
     const ctx = v22Ctx();
     const f = fakeExecConn();
-    const r = await crankBondFee(execCtx(f.conn), ctx, positioned([pf(1)]), { mode: "prefer", weightBudget: 32 });
+    const r = await crankBondFee(sd(f.conn), ctx, positioned([pf(1)]), { mode: "prefer", weightBudget: 32 });
     assert.equal(r.kind, "sent");
     assert.equal(f.sims.length, 1);
     assert.equal(f.sent.length, 1);
     const d = fakeExecConn();
-    assert.equal((await crankBondFee(execCtx(d.conn, true), ctx, positioned([pf(1)]), { mode: "prefer", weightBudget: 32 })).kind, "dry-run");
+    assert.equal((await crankBondFee(sd(d.conn, true), ctx, positioned([pf(1)]), { mode: "prefer", weightBudget: 32 })).kind, "dry-run");
     assert.equal(d.sent.length, 0);
   });
 });
