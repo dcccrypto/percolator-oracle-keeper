@@ -361,7 +361,7 @@ console.log(`  registry:  ${REGISTRY_PATH} (${registry.markets.length} markets)`
 console.log(`  mode:      ${DRY_RUN ? "DRY-RUN (no on-chain writes)" : "LIVE"}`);
 console.log(`  interval:  ${CC_INTERVAL_MS}ms`);
 for (const line of describeProgramIds()) console.log(`  program:   ${line}`);
-console.log(`  alerts:    webhook ${process.env.KEEPER_ALERT_WEBHOOK_URL ? "ON" : "off"}; telegram ${process.env.KEEPER_ALERT_TELEGRAM_BOT_TOKEN ? "ON" : "off"}; thresholds ${JSON.stringify(ALERT_SINK.thresholds)}`);
+console.log(`  alerts:    webhook ${process.env.KEEPER_ALERT_WEBHOOK_URL ? "ON" : "off"}; telegram ${ALERT_SINK.telegramEnabled ? "ON" : "off"}; thresholds ${JSON.stringify(ALERT_SINK.thresholds)}`);
 console.log(
   `  cranker:   ${CRANK_ENABLED ? `every ${CRANK_INTERVAL_MS}ms` : "disabled (CRANK_ENABLED=false)"}`,
   `  lp-fee:    ${LP_FEE_CRANK_ENABLED ? `every ${LP_FEE_CRANK_INTERVAL_MS}ms` : "disabled (LP_FEE_CRANK_ENABLED=false)"}`,
