@@ -37,6 +37,10 @@
  *                      `{ text, alert }` — `text` works for Slack/Discord
  *                      incoming webhooks as-is. Delivery failures are logged
  *                      and never thrown: alerting must not take down a loop.
+ *   Optional Telegram: KEEPER_ALERT_TELEGRAM_BOT_TOKEN + KEEPER_ALERT_TELEGRAM_CHAT_ID
+ *                      (both or neither). Telegram's sendMessage needs `chat_id`,
+ *                      which the webhook body does not carry, so it is its own
+ *                      delivery. The token is part of the URL: never logged.
  *
  * Evaluation is a pure function of (sample, thresholds, previous state) so it
  * is unit-testable without RPC; the sink owns dedupe/cooldown and delivery.
@@ -506,9 +510,15 @@ export function evaluateMarketPush(
 
 export type WebhookPoster = (url: string, body: string) => Promise<void>;
 
+export interface TelegramTarget {
+  botToken: string;
+  chatId: string;
+}
+
 export interface AlertSinkOptions {
   thresholds: AlertThresholds;
   webhookUrl?: string;
+  telegram?: TelegramTarget;
   post?: WebhookPoster;
   now?: () => number;
   log?: (line: string) => void;
@@ -548,16 +558,36 @@ export function validateWebhookUrl(raw: string | undefined): string | undefined 
   return u.toString();
 }
 
+/** Telegram Bot API base; tests point it at a local stub. */
+export const TELEGRAM_API_BASE = "https://api.telegram.org";
+
+/**
+ * Telegram target from env. Both or neither: one without the other is a misconfiguration that must stop
+ * boot (it would otherwise silently deliver nothing). Errors never echo either value.
+ */
+export function telegramTargetFromEnv(env: Env): TelegramTarget | undefined {
+  const token = env.KEEPER_ALERT_TELEGRAM_BOT_TOKEN?.trim() ?? "";
+  const chat = env.KEEPER_ALERT_TELEGRAM_CHAT_ID?.trim() ?? "";
+  if (token === "" && chat === "") return undefined;
+  if (token === "" || chat === "") {
+    throw new Error("KEEPER_ALERT_TELEGRAM_BOT_TOKEN and KEEPER_ALERT_TELEGRAM_CHAT_ID must be set together");
+  }
+  if (!/^\d+:[A-Za-z0-9_-]+$/.test(token)) throw new Error("KEEPER_ALERT_TELEGRAM_BOT_TOKEN is not a bot token (<id>:<secret>)");
+  if (!/^-?\d+$/.test(chat) && !/^@[A-Za-z0-9_]+$/.test(chat)) throw new Error("KEEPER_ALERT_TELEGRAM_CHAT_ID must be a numeric chat id or @channel");
+  return { botToken: token, chatId: chat };
+}
+
 export class AlertSink {
   private readonly lastSent = new Map<string, number>();
   /** Active alert key -> the severity it last fired with (echoed on RESOLVED). */
   private readonly activeKeys = new Map<string, AlertSeverity>();
-  private readonly opts: Required<Omit<AlertSinkOptions, "webhookUrl">> & { webhookUrl?: string };
+  private readonly opts: Required<Omit<AlertSinkOptions, "webhookUrl" | "telegram">> & { webhookUrl?: string; telegram?: TelegramTarget };
 
   constructor(opts: AlertSinkOptions) {
     this.opts = {
       thresholds: opts.thresholds,
       webhookUrl: opts.webhookUrl,
+      telegram: opts.telegram,
       post: opts.post ?? defaultPost,
       now: opts.now ?? Date.now,
       log: opts.log ?? ((l) => console.log(l)),
@@ -624,13 +654,28 @@ export class AlertSink {
     const line = `[${tag}] ${JSON.stringify(a, bigintSafe)}`;
     if (tag === "ALERT") this.opts.logError(line);
     else this.opts.log(line);
-    if (!this.opts.webhookUrl) return;
+    if (!this.opts.webhookUrl && !this.opts.telegram) return;
     const text = `${tag === "ALERT" ? `[${a.severity.toUpperCase()}]` : "[RESOLVED]"} percolator-keeper ${a.kind} ${a.subject}: ${a.message}`;
-    try {
-      await this.opts.post(this.opts.webhookUrl, JSON.stringify({ text, alert: a }, bigintSafe));
-    } catch (err) {
-      // Never echo the URL — it is a credential.
-      this.opts.logError(`[alerting] webhook delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+    if (this.opts.webhookUrl) {
+      try {
+        await this.opts.post(this.opts.webhookUrl, JSON.stringify({ text, alert: a }, bigintSafe));
+      } catch (err) {
+        // Never echo the URL — it is a credential.
+        this.opts.logError(`[alerting] webhook delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (this.opts.telegram) {
+      const { botToken, chatId } = this.opts.telegram;
+      try {
+        await this.opts.post(
+          `${TELEGRAM_API_BASE}/bot${botToken}/sendMessage`,
+          JSON.stringify({ chat_id: chatId, text: text.slice(0, 4000), disable_web_page_preview: true }),
+        );
+      } catch (err) {
+        // The token is in the URL: report the failure without the URL and scrub the token from the message.
+        const msg = (err instanceof Error ? err.message : String(err)).split(botToken).join("<token>");
+        this.opts.logError(`[alerting] telegram delivery failed: ${msg}`);
+      }
     }
   }
 }
@@ -649,6 +694,7 @@ export function getAlertSink(): AlertSink {
     shared = new AlertSink({
       thresholds: thresholdsFromEnv(process.env),
       webhookUrl: validateWebhookUrl(process.env.KEEPER_ALERT_WEBHOOK_URL),
+      telegram: telegramTargetFromEnv(process.env),
     });
   }
   return shared;
