@@ -15,7 +15,7 @@ const B = layoutById("v2.2-b");
 
 describe("VERSION-keyed layout guard", () => {
   it("variant B: every geometry number comes from the SDK LAYOUT_V22 (slot 2,629, leg 217, portfolio 10,603, group 806, VERSION 19)", () => {
-    assert.deepEqual([B.wrapperVersion, B.slotStride, B.portfolioLegLen, B.portfolioAccountLen, B.headerLen, B.groupOff], [19, 2629, 217, 10603, 806, 592]);
+    assert.deepEqual([B.wrapperVersion, B.slotStride, B.portfolioLegLen, B.portfolioAccountLen, B.headerLen, B.groupOff], [19, 2661, 217, 10603, 806, 592]);
     assert.deepEqual([B.slotStride, B.portfolioAccountLen, B.portfolioLegLen, B.headerLen], [LAYOUT_V22.assetSlotStride, LAYOUT_V22.portfolio.accountLen, LAYOUT_V22.portfolio.legStride, LAYOUT_V22.marketGroupLen]);
     assert.equal(rowAgreesWithSdk(B), null);
     assert.equal(rowAgreesWithSdk(layoutById("v2.1-legacy")), null);
@@ -60,9 +60,9 @@ describe("VERSION-keyed layout guard", () => {
   it("a keeper row that disagrees with the pinned SDK table is refused (ROW_DISAGREES_WITH_SDK), via an SDK that moved", () => {
     const moved: LayoutTable = { ...LAYOUT_V22, assetSlotStride: LAYOUT_V22.assetSlotStride + 8 };
     const registry = new Map<number, LayoutTable>([[18, LAYOUT_V21], [19, moved]]);
-    assert.match(rowAgreesWithSdk(B, registry) ?? "", /slotStride keeper 2629 != SDK 2637/);
+    assert.match(rowAgreesWithSdk(B, registry) ?? "", /slotStride keeper 2661 != SDK 2669/);
     // a row rebuilt from the moved table carries the new stride, i.e. the table is the single source
-    assert.equal(v22VariantBRow(moved).slotStride, 2637);
+    assert.equal(v22VariantBRow(moved).slotStride, 2669);
     assert.match(rowAgreesWithSdk(layoutById("v2.1-legacy"), new Map([[18, { ...LAYOUT_V21, marketGroupLen: 760 }]])) ?? "", /headerLen/);
     assert.match(rowAgreesWithSdk(B, new Map()) ?? "", /no layout for VERSION 19/);
     assert.ok(LAYOUTS_BY_VERSION.has(19));

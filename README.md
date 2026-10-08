@@ -143,7 +143,7 @@ the legacy cranker / fee job / vault-LP cranker take their old paths, and `/heal
 (percolator-sdk#406, branch `feat/v22-sdk`: `LAYOUT_V22` variant B, VERSION-keyed layout guard, v2.2 builders, compute presets).
 `@solana/web3.js` is 1.99.0 (the SDK's peer). To move the pin: change the ref in `package.json`, `pnpm install`, `npm install --package-lock-only`.
 
-**Layout.** `market-layout.ts` keeps one table; the variant-B row (`v2.2-b`: group 806, slot 2,629, leg 217, portfolio 10,603, VERSION 19)
+**Layout.** `market-layout.ts` keeps one table; the variant-B row (`v2.2-b`: group 806, slot 2,661, leg 217, portfolio 10,603, VERSION 19)
 is derived from the SDK's `LAYOUT_V22` and refused if the two ever disagree. A VERSION the SDK has no table for, a length that matches no row,
 a bad magic or a wrong kind is a loud error: counted (`layout-guard-metrics.ts`), logged once, `/health` `layoutGuard` + `status: degraded-markets`. No silent fallback.
 

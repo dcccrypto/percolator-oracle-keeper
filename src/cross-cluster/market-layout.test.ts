@@ -74,7 +74,7 @@ describe("layout table", () => {
         assert.equal(l.slot.driftShort, l.slot.driftLong + KF_DRIFT_FIELDS.len, l.id);
         // the drift tail is the END of the engine slot
         // (variant B appends #282's 32 B slot tail AFTER the drift tail)
-        assert.equal(l.slot.driftShort + KF_DRIFT_FIELDS.len + (l.id === "v2.2-b" ? 32 : 0), l.engineSlotLen, l.id);
+        assert.equal(l.slot.driftShort + KF_DRIFT_FIELDS.len + (l.id === "v2.2-b" ? 64 : 0), l.engineSlotLen, l.id);
       } else {
         assert.equal(l.slot.driftLong, null);
         assert.equal(l.slot.driftShort, null);
