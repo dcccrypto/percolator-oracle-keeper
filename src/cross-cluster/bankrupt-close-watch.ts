@@ -75,10 +75,66 @@ export interface BankruptCloseWatchConfig {
 
 export type BankruptCloseConnection = Pick<Connection, "getProgramAccounts" | "getMultipleAccountsInfo" | "getSlot">;
 
+/** Where the market pubkey sits in a portfolio account (the per-market memcmp offset). */
+const PORTFOLIO_MARKET_OFF = 16;
+
+/**
+ * ONE getProgramAccounts for every market's "active bankrupt close" portfolios, shared by a sweep.
+ *
+ * The watch used to issue one getProgramAccounts PER MARKET per sweep (10 Helius credits each).
+ * The filter that matters, `active == 1`, matches only portfolios mid-close, so dropping the
+ * per-market memcmp returns a handful of accounts for the whole program; they are then split by the
+ * market pubkey, which the slice carries (offset 16..48 .. through the 184-byte close-progress block).
+ * The result is reused for `ttlMs`, far inside the 3,000-slot (~20 min) warning horizon.
+ */
+export function makeSharedCloseScan(ttlMs = 90_000, now: () => number = Date.now) {
+  type Snapshot = { at: number; byMarket: Map<string, Array<{ pubkey: PublicKey; data: Uint8Array }>> };
+  let cached: Snapshot | null = null as Snapshot | null;
+  let inflight: Promise<Snapshot> | null = null;
+  const sliceLen = CLOSE_PROGRESS_OFF + CLOSE_PROGRESS_LEN - PORTFOLIO_MARKET_OFF;
+  return {
+    async forMarket(
+      conn: Pick<Connection, "getProgramAccounts">,
+      programId: PublicKey,
+      market: PublicKey,
+    ): Promise<Array<{ pubkey: PublicKey; account: { data: Uint8Array } }>> {
+      if (!cached || now() - cached.at > ttlMs) {
+        inflight ??= (async () => {
+          try {
+            const accs = await conn.getProgramAccounts(programId, {
+              dataSlice: { offset: PORTFOLIO_MARKET_OFF, length: sliceLen },
+              filters: [
+                { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
+                { memcmp: { offset: CLOSE_PROGRESS_OFF, bytes: "2" } }, // base58 of [0x01]: active == 1
+              ],
+            });
+            const byMarket = new Map<string, Array<{ pubkey: PublicKey; data: Uint8Array }>>();
+            for (const a of accs) {
+              const d = new Uint8Array(a.account.data);
+              const key = new PublicKey(d.subarray(0, 32)).toBase58();
+              const list = byMarket.get(key) ?? [];
+              list.push({ pubkey: a.pubkey, data: d.subarray(CLOSE_PROGRESS_OFF - PORTFOLIO_MARKET_OFF) });
+              byMarket.set(key, list);
+            }
+            cached = { at: now(), byMarket };
+            return cached;
+          } finally {
+            inflight = null;
+          }
+        })();
+        await inflight;
+      }
+      return (cached?.byMarket.get(market.toBase58()) ?? []).map((x) => ({ pubkey: x.pubkey, account: { data: x.data } }));
+    },
+  };
+}
+export type SharedCloseScan = ReturnType<typeof makeSharedCloseScan>;
+
 export async function watchBankruptCloses(
   conn: BankruptCloseConnection,
   marketAddress: string,
   cfg: BankruptCloseWatchConfig,
+  shared?: SharedCloseScan,
 ): Promise<FeeJobOutcome> {
   let market: PublicKey;
   try {
@@ -90,14 +146,16 @@ export async function watchBankruptCloses(
     const [mi] = await conn.getMultipleAccountsInfo([market], "confirmed");
     // The valve only exists on LIVE markets (group.header.mode == 0).
     if (!mi || marketMode(new Uint8Array(mi.data)) !== 0) return { kind: "nothing" };
-    const accs = await conn.getProgramAccounts(cfg.wrapperProgramId, {
-      dataSlice: { offset: CLOSE_PROGRESS_OFF, length: CLOSE_PROGRESS_LEN },
-      filters: [
-        { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
-        { memcmp: { offset: 16, bytes: market.toBase58() } },
-        { memcmp: { offset: CLOSE_PROGRESS_OFF, bytes: "2" } }, // base58 of [0x01]: active == 1
-      ],
-    });
+    const accs = shared
+      ? await shared.forMarket(conn, cfg.wrapperProgramId, market)
+      : await conn.getProgramAccounts(cfg.wrapperProgramId, {
+          dataSlice: { offset: CLOSE_PROGRESS_OFF, length: CLOSE_PROGRESS_LEN },
+          filters: [
+            { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
+            { memcmp: { offset: 16, bytes: market.toBase58() } },
+            { memcmp: { offset: CLOSE_PROGRESS_OFF, bytes: "2" } }, // base58 of [0x01]: active == 1
+          ],
+        });
     const pending = accs
       .map((a) => ({ portfolio: a.pubkey.toBase58(), c: decodeCloseProgress(new Uint8Array(a.account.data), true) }))
       .filter((x): x is { portfolio: string; c: CloseProgress } => x.c !== null && hasPendingResidual(x.c));
@@ -142,5 +200,6 @@ export function bankruptCloseWatchConfigFromEnv(env: Readonly<Record<string, str
 }
 
 export function makeBankruptCloseWatchJob(cfg: BankruptCloseWatchConfig): FeeJob {
-  return { name: "bankrupt-close-watch", run: (ctx, m) => watchBankruptCloses(ctx.conn, m.marketAddress, cfg) };
+  const shared = makeSharedCloseScan();
+  return { name: "bankrupt-close-watch", run: (ctx, m) => watchBankruptCloses(ctx.conn, m.marketAddress, cfg, shared) };
 }

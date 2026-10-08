@@ -86,6 +86,7 @@ import { startRegisterPollLoop, pollOnce } from "./cross-cluster/register-poll.t
 import { startRegistrationStream, type RegistrationStream } from "./cross-cluster/registration-stream.ts";
 import { startRegistryReloadLoop } from "./cross-cluster/registry-reload.ts";
 import { WRAPPER_PROGRAM_ID } from "./cross-cluster/auth-mark-pusher.ts";
+import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -332,10 +333,10 @@ if (registry.markets.length === 0) {
   }
 }
 
-const mainnetConn = new Connection(MAINNET_RPC, "confirmed");
+const mainnetConn = new Connection(MAINNET_RPC, { commitment: "confirmed", fetch: countingFetch("mainnet") });
 // DEVNET_RPC_ORIGIN replaces the uncommitted `httpHeaders: { Origin }` edit the
 // live machine carried here (Origin-restricted Helius key; see rpc-headers.ts).
-const devnetConn = new Connection(DEVNET_RPC, DEVNET_CONN_CONFIG);
+const devnetConn = new Connection(DEVNET_RPC, { ...DEVNET_CONN_CONFIG, fetch: countingFetch("devnet") });
 
 // Dry-run hard stop. Every write path is meant to honour `dryRun` on its own,
 // but there are a dozen send sites; a standby keeper that signs even one tx
