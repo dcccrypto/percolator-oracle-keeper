@@ -37,6 +37,10 @@
  *                      `{ text, alert }` — `text` works for Slack/Discord
  *                      incoming webhooks as-is. Delivery failures are logged
  *                      and never thrown: alerting must not take down a loop.
+ *   Optional Telegram: KEEPER_ALERT_TELEGRAM_BOT_TOKEN + KEEPER_ALERT_TELEGRAM_CHAT_ID
+ *                      (both or neither). Telegram's sendMessage needs `chat_id`,
+ *                      which the webhook body does not carry, so it is its own
+ *                      delivery. The token is part of the URL: never logged.
  *
  * Evaluation is a pure function of (sample, thresholds, previous state) so it
  * is unit-testable without RPC; the sink owns dedupe/cooldown and delivery.
@@ -506,9 +510,15 @@ export function evaluateMarketPush(
 
 export type WebhookPoster = (url: string, body: string) => Promise<void>;
 
+export interface TelegramTarget {
+  botToken: string;
+  chatId: string;
+}
+
 export interface AlertSinkOptions {
   thresholds: AlertThresholds;
   webhookUrl?: string;
+  telegram?: TelegramTarget;
   post?: WebhookPoster;
   now?: () => number;
   log?: (line: string) => void;
@@ -548,16 +558,64 @@ export function validateWebhookUrl(raw: string | undefined): string | undefined 
   return u.toString();
 }
 
+/** Telegram Bot API base; tests point it at a local stub. */
+export const TELEGRAM_API_BASE = "https://api.telegram.org";
+
+/**
+ * Telegram target from env. Both or neither: one without the other is a misconfiguration that must stop
+ * boot (it would otherwise silently deliver nothing). Errors never echo either value.
+ */
+export function telegramTargetFromEnv(env: Env): TelegramTarget | undefined {
+  const token = env.KEEPER_ALERT_TELEGRAM_BOT_TOKEN?.trim() ?? "";
+  const chat = env.KEEPER_ALERT_TELEGRAM_CHAT_ID?.trim() ?? "";
+  if (token === "" && chat === "") return undefined;
+  if (token === "" || chat === "") {
+    throw new Error("KEEPER_ALERT_TELEGRAM_BOT_TOKEN and KEEPER_ALERT_TELEGRAM_CHAT_ID must be set together");
+  }
+  if (!/^\d+:[A-Za-z0-9_-]+$/.test(token)) throw new Error("KEEPER_ALERT_TELEGRAM_BOT_TOKEN is not a bot token (<id>:<secret>)");
+  if (!/^-?\d+$/.test(chat) && !/^@[A-Za-z0-9_]+$/.test(chat)) throw new Error("KEEPER_ALERT_TELEGRAM_CHAT_ID must be a numeric chat id or @channel");
+  return { botToken: token, chatId: chat };
+}
+
+/**
+ * Telegram is a pager, not a log: only `critical` alerts go there, an active alert re-fires there at most every
+ * TELEGRAM_REPEAT_MS (independent of the 15-min cooldown the log/webhook use), and sends never block the loop
+ * (one promise chain, at most TELEGRAM_QUEUE_CAP pending; beyond that messages are dropped with one log line).
+ */
+export const TELEGRAM_REPEAT_MS = 2 * 3_600_000;
+export const TELEGRAM_QUEUE_CAP = 20;
+
+/**
+ * Boot-safe variant: a typo'd or half-set Telegram config must not crash-loop the live keeper. Logs ONE error (no
+ * value echoed: telegramTargetFromEnv's messages never contain it) and starts with Telegram off.
+ */
+export function telegramTargetOrOff(env: Env, logError: (l: string) => void = (l) => console.error(l)): TelegramTarget | undefined {
+  try {
+    return telegramTargetFromEnv(env);
+  } catch (err) {
+    logError(`[alerting] Telegram alerts OFF: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+}
+
 export class AlertSink {
+  private tgChain: Promise<void> = Promise.resolve();
+  private tgPending = 0;
+  private tgDropped = 0;
+  /** Telegram-delivered alert key -> when it was last sent there (a RESOLVED goes to Telegram only for these). */
+  private readonly tgLastSent = new Map<string, number>();
+  /** True while reconcile() is delivering a set that itself contains zero-pushes. */
+  private zeroPushesInFlight = false;
   private readonly lastSent = new Map<string, number>();
   /** Active alert key -> the severity it last fired with (echoed on RESOLVED). */
   private readonly activeKeys = new Map<string, AlertSeverity>();
-  private readonly opts: Required<Omit<AlertSinkOptions, "webhookUrl">> & { webhookUrl?: string };
+  private readonly opts: Required<Omit<AlertSinkOptions, "webhookUrl" | "telegram">> & { webhookUrl?: string; telegram?: TelegramTarget };
 
   constructor(opts: AlertSinkOptions) {
     this.opts = {
       thresholds: opts.thresholds,
       webhookUrl: opts.webhookUrl,
+      telegram: opts.telegram,
       post: opts.post ?? defaultPost,
       now: opts.now ?? Date.now,
       log: opts.log ?? ((l) => console.log(l)),
@@ -583,6 +641,7 @@ export class AlertSink {
     const now = this.opts.now();
     const fired: Alert[] = [];
     const activeNow = new Set<string>();
+    this.zeroPushesInFlight = active.some((a) => a.kind === "zero-pushes");
     for (const a of active) {
       const key = `${scope}|${a.kind}|${a.subject}`;
       activeNow.add(key);
@@ -590,9 +649,10 @@ export class AlertSink {
       if (last === undefined || now - last >= this.opts.thresholds.cooldownMs) {
         this.lastSent.set(key, now);
         fired.push(a);
-        await this.deliver("ALERT", a);
+        await this.deliver("ALERT", a, key);
       }
     }
+    this.zeroPushesInFlight = false;
     for (const [key, sev] of [...this.activeKeys]) {
       if (!key.startsWith(`${scope}|`) || activeNow.has(key)) continue;
       this.activeKeys.delete(key);
@@ -603,7 +663,7 @@ export class AlertSink {
         severity: sev,
         subject,
         message: "condition cleared",
-      });
+      }, key);
     }
     for (const a of active) this.activeKeys.set(`${scope}|${a.kind}|${a.subject}`, a.severity);
     return fired;
@@ -616,22 +676,83 @@ export class AlertSink {
     const last = this.lastSent.get(key);
     if (last !== undefined && now - last < this.opts.thresholds.cooldownMs) return false;
     this.lastSent.set(key, now);
-    await this.deliver("ALERT", a);
+    await this.deliver("ALERT", a, key);
     return true;
   }
 
-  private async deliver(tag: "ALERT" | "ALERT-RESOLVED", a: Alert): Promise<void> {
+  /** Telegram delivery configured (and valid). */
+  get telegramEnabled(): boolean {
+    return this.opts.telegram !== undefined;
+  }
+
+  /** Resolves once every queued Telegram send has settled (tests; shutdown). */
+  flush(): Promise<void> {
+    return this.tgChain;
+  }
+
+  private zeroPushesActive(): boolean {
+    if (this.zeroPushesInFlight) return true;
+    for (const k of this.activeKeys.keys()) if (k.split("|")[1] === "zero-pushes") return true;
+    return false;
+  }
+
+  /** Queue one Telegram message without awaiting it. Never throws, never logs the token. */
+  private enqueueTelegram(tag: "ALERT" | "ALERT-RESOLVED", a: Alert, key: string, text: string): void {
+    const tg = this.opts.telegram;
+    if (!tg) return;
+    const now = this.opts.now();
+    if (tag === "ALERT") {
+      if (a.severity !== "critical") return;
+      // A whole-board outage is ONE page (zero-pushes), not one per market.
+      if (a.kind === "market-no-push" && this.zeroPushesActive()) return;
+      const last = this.tgLastSent.get(key);
+      if (last !== undefined && now - last < TELEGRAM_REPEAT_MS) return;
+    } else if (!this.tgLastSent.has(key)) {
+      return; // never paged: nothing to resolve there
+    }
+    if (this.tgPending >= TELEGRAM_QUEUE_CAP) {
+      if (this.tgDropped++ === 0) {
+        this.opts.logError(`[alerting] telegram queue full (${TELEGRAM_QUEUE_CAP} pending): dropping further messages until it drains`);
+      }
+      return;
+    }
+    if (tag === "ALERT") this.tgLastSent.set(key, now);
+    else this.tgLastSent.delete(key);
+    this.tgPending++;
+    const { botToken, chatId } = tg;
+    const url = `${TELEGRAM_API_BASE}/bot${botToken}/sendMessage`;
+    const body = JSON.stringify({ chat_id: chatId, text: text.slice(0, 4000), disable_web_page_preview: true });
+    this.tgChain = this.tgChain
+      .then(() => this.opts.post(url, body))
+      .catch((err: unknown) => {
+        // The token is in the URL: report the failure without the URL and scrub the token from the message.
+        const msg = (err instanceof Error ? err.message : String(err)).split(botToken).join("<token>");
+        this.opts.logError(`[alerting] telegram delivery failed: ${msg}`);
+      })
+      .finally(() => {
+        this.tgPending--;
+        if (this.tgPending === 0 && this.tgDropped > 0) {
+          this.opts.logError(`[alerting] telegram queue drained; ${this.tgDropped} message(s) were dropped while it was full`);
+          this.tgDropped = 0;
+        }
+      });
+  }
+
+  private async deliver(tag: "ALERT" | "ALERT-RESOLVED", a: Alert, key: string): Promise<void> {
     const line = `[${tag}] ${JSON.stringify(a, bigintSafe)}`;
     if (tag === "ALERT") this.opts.logError(line);
     else this.opts.log(line);
-    if (!this.opts.webhookUrl) return;
+    if (!this.opts.webhookUrl && !this.opts.telegram) return;
     const text = `${tag === "ALERT" ? `[${a.severity.toUpperCase()}]` : "[RESOLVED]"} percolator-keeper ${a.kind} ${a.subject}: ${a.message}`;
-    try {
-      await this.opts.post(this.opts.webhookUrl, JSON.stringify({ text, alert: a }, bigintSafe));
-    } catch (err) {
-      // Never echo the URL — it is a credential.
-      this.opts.logError(`[alerting] webhook delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+    if (this.opts.webhookUrl) {
+      try {
+        await this.opts.post(this.opts.webhookUrl, JSON.stringify({ text, alert: a }, bigintSafe));
+      } catch (err) {
+        // Never echo the URL — it is a credential.
+        this.opts.logError(`[alerting] webhook delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
+    this.enqueueTelegram(tag, a, key, text);
   }
 }
 
@@ -649,6 +770,7 @@ export function getAlertSink(): AlertSink {
     shared = new AlertSink({
       thresholds: thresholdsFromEnv(process.env),
       webhookUrl: validateWebhookUrl(process.env.KEEPER_ALERT_WEBHOOK_URL),
+      telegram: telegramTargetOrOff(process.env),
     });
   }
   return shared;
