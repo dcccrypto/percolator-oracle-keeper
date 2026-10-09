@@ -96,6 +96,7 @@
  *   auto-crank planner; measured on devnet, the sequence above lands clean.)
  */
 import {
+  type AccountInfo,
   Connection,
   Keypair,
   PublicKey,
@@ -104,6 +105,7 @@ import {
   ComputeBudgetProgram,
   VersionedTransaction,
 } from "@solana/web3.js";
+import { getCachedBlockhash, invalidateBlockhash } from "./blockhash-cache.ts";
 import {
   encodePermissionlessCrank,
   ACCOUNTS_PERMISSIONLESS_CRANK_BASE,
@@ -463,12 +465,52 @@ export function buildCrankIx(owner: PublicKey, market: PublicKey, portfolio: Pub
   });
 }
 
+/**
+ * One getMultipleAccounts (`processed`, 100 keys per call) for every market the cycle will crank, in
+ * place of one getAccountInfo per market. Returns market address -> {value, context}. A market whose
+ * chunk failed (or that came back null) is simply absent: crankOneMarket then reads it on its own,
+ * which is the pre-existing behaviour, so a failed batch costs calls, never correctness.
+ */
+export async function readMarketsForCycle(
+  devnetConn: Pick<Connection, "getMultipleAccountsInfoAndContext">,
+  markets: ReadonlyArray<{ marketAddress: string }>,
+  states: ReadonlyMap<string, CrankMarketState>,
+): Promise<Map<string, { value: AccountInfo<Buffer>; context: { slot: number } }>> {
+  const out = new Map<string, { value: AccountInfo<Buffer>; context: { slot: number } }>();
+  // Terminal markets cost no RPC (crankOneMarket returns first); nothing to prefetch for them.
+  const wanted = markets.filter((m) => !states.get(m.marketAddress)?.terminal);
+  for (let i = 0; i < wanted.length; i += 100) {
+    const slice = wanted.slice(i, i + 100);
+    try {
+      const res = await devnetConn.getMultipleAccountsInfoAndContext(
+        slice.map((m) => new PublicKey(m.marketAddress)),
+        { commitment: "processed" },
+      );
+      if (res.value.length !== slice.length) continue;
+      slice.forEach((m, j) => {
+        const v = res.value[j];
+        if (v) out.set(m.marketAddress, { value: v, context: { slot: res.context.slot } });
+      });
+    } catch {
+      /* this chunk's markets fall back to their own read */
+    }
+  }
+  return out;
+}
+
 export async function crankOneMarket(
   devnetConn: Connection,
   keeper: Keypair,
   entry: Pick<MarketEntry, "marketAddress" | "label" | "lpPortfolio">,
   state: CrankMarketState,
   dryRun: boolean,
+  /**
+   * This cycle's market read, taken for ALL markets in one getMultipleAccounts at the start of the
+   * cycle (see readMarketsForCycle). Same `processed` commitment and the same moment the per-market
+   * reads used to fire (every market starts at once), so the data is no staler. Absent or null = read
+   * this market on its own, exactly as before.
+   */
+  prefetched?: { value: AccountInfo<Buffer> | null; context: { slot: number } } | null,
 ): Promise<void> {
   // B13: a market seen Resolved/closed stays that way (resolution is one-way,
   // a tombstone is final), so it costs no RPC and no alert from here on.
@@ -523,7 +565,9 @@ export async function crankOneMarket(
 
   try {
     // One read gives both the market state and the slot it was read at.
-    const acct = await withRpcRetry(label, () => devnetConn.getAccountInfoAndContext(market, "processed"));
+    const acct = prefetched?.value
+      ? prefetched
+      : await withRpcRetry(label, () => devnetConn.getAccountInfoAndContext(market, "processed"));
     if (!acct.value) throw new Error(`market ${marketAddress} could not find account`);
     // B13 (E2E 2026-09-30): a Resolved market / CloseSlab tombstone is never
     // cranked again. The engine refuses it, and cranking only produced critical
@@ -638,7 +682,7 @@ export async function crankOneMarket(
       held = true;
     }
 
-    const bh = await withRpcRetry(label, () => devnetConn.getLatestBlockhash("processed"));
+    const bh = await withRpcRetry(label, () => getCachedBlockhash(devnetConn, "processed"));
     const toTx = (plan: CrankPlan): Transaction => {
       const tx = new Transaction();
       tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: plan.computeUnits }));
@@ -847,7 +891,7 @@ export async function crankOneMarket(
       if (accrual !== "landed") {
         ov = { attempted: plan.overflow.length, refreshed: 0, liquidated: 0, bankruptFound: 0, pruned: [], signatures: [], error: `accrual tx ${accrual}` };
       } else {
-        const ovBh = await withRpcRetry(label, () => devnetConn.getLatestBlockhash("processed"));
+        const ovBh = await withRpcRetry(label, () => getCachedBlockhash(devnetConn, "processed"));
         const toOvTx = (p: CrankPlan): Transaction => {
           const t = new Transaction();
           t.add(ComputeBudgetProgram.setComputeUnitLimit({ units: p.computeUnits }));
@@ -897,6 +941,7 @@ export async function crankOneMarket(
   } catch (err) {
     state.totalErrors++;
     state.lastErrorMsg = err instanceof Error ? err.message : String(err);
+    if (/blockhash/i.test(state.lastErrorMsg)) invalidateBlockhash(devnetConn);
     console.warn(`[cranker] ${label}: crank send failed — ${state.lastErrorMsg.slice(0, 160)}`);
     // A stale-account error (e.g. LP portfolio closed) is worth rediscovering next attempt.
     if (/AccountNotFound|could not find account/i.test(state.lastErrorMsg)) {
@@ -1810,8 +1855,10 @@ export async function startRecoveryCrankLoop(
     // market's errors are already fully isolated inside crankOneMarket / the
     // per-iteration try/catch below, so Promise.allSettled here is defense in
     // depth, not a correctness requirement — it just keeps cycle time flat.
+    const cycleMarkets = [...registry.markets];
+    const prefetched = await readMarketsForCycle(devnetConn, cycleMarkets, states).catch(() => new Map());
     await Promise.allSettled(
-      registry.markets.map(async (m) => {
+      cycleMarkets.map(async (m) => {
         // Lazily track markets registered AFTER boot (added live by the register-poll
         // loop, or hot-reloaded — see registry-reload.ts). The states Map was seeded
         // only from the markets present at startup, so without this a newly-registered
@@ -1824,7 +1871,7 @@ export async function startRecoveryCrankLoop(
           console.log(`[cranker] now tracking newly-registered market ${m.label} (${m.marketAddress.slice(0, 8)}…)`);
         }
         try {
-          await crankOneMarket(devnetConn, keeper, m, state, config.dryRun);
+          await crankOneMarket(devnetConn, keeper, m, state, config.dryRun, prefetched.get(m.marketAddress));
         } catch (err) {
           // Defense in depth: crankOneMarket already isolates errors per-market,
           // but never let an unexpected throw kill the whole loop.

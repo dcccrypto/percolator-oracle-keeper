@@ -85,6 +85,7 @@ import {
 } from "@percolatorct/sdk";
 import { parseInstructionError } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
+import { getMultipleAccountsInfoChunked } from "./rpc-chunk.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 
 export const WRAPPER_TAG_CLOSE_PORTFOLIO = 8;
@@ -570,8 +571,9 @@ export async function cleanupResolvedPortfolios(
   const atas = pfs.map((p) => ownerAta(p.owner, collateralMint));
   let ataExists: boolean[];
   try {
-    const infos = await conn.getMultipleAccountsInfo(atas, "confirmed");
-    ataExists = infos.map((i) => i !== null);
+    // Chunked at 100 (RPC cap): a resolved market can hold >100 portfolios. A failed chunk reads as "absent" (undefined -> false), as a whole-call failure did.
+    const { infos } = await getMultipleAccountsInfoChunked(conn, atas, "confirmed");
+    ataExists = infos.map((i) => i != null);
   } catch {
     ataExists = atas.map(() => false);
   }
@@ -769,7 +771,7 @@ export async function cleanupResolvedPortfolios(
     const cands = pfs.filter((q) => pdaOwnerKind(q.owner, market, cfg) !== "lp-registry");
     let infos: Array<{ data: Buffer | Uint8Array } | null> = [];
     try {
-      infos = cands.length ? await conn.getMultipleAccountsInfo(cands.map((q) => q.pubkey), "confirmed") : [];
+      infos = cands.length ? (await getMultipleAccountsInfoChunked(conn, cands.map((q) => q.pubkey), "confirmed")).infos.map((i) => i ?? null) : [];
     } catch {
       infos = [];
     }

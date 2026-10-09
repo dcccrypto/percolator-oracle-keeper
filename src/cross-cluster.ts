@@ -45,6 +45,7 @@
  *                           pinned set selected by KEEPER_DEVNET_V21; PROGRAM_ID is a legacy alias for the wrapper) — see program-ids.ts
  *   DEVNET_RPC_ORIGIN       Origin header for an Origin-restricted devnet RPC key (optional)
  *   KEEPER_ALERT_WEBHOOK_URL  https webhook for [ALERT] lines (optional; Slack/Discord-compatible `text`)
+ *   KEEPER_ALERT_TELEGRAM_BOT_TOKEN / KEEPER_ALERT_TELEGRAM_CHAT_ID  Telegram delivery for [ALERT] lines (optional; both or neither)
  *   ALERT_SLOT_LAG_WARN / ALERT_SLOT_LAG_CRITICAL / ALERT_CRANK_REVERTS / ALERT_ZERO_PUSH_CYCLES /
  *   ALERT_LAPSED_BUCKET_CYCLES / ALERT_BANKRUPT_CYCLES / ALERT_COOLDOWN_MS  alert thresholds (alerting.ts)
  *   ALERT_MARKET_NO_PUSH_CYCLES (default 40) / ALERT_MARK_LAG_MS (120000) / ALERT_MARK_LAG_PCT (10) /
@@ -118,6 +119,7 @@ import { fetchMarketPortfolios } from "./cross-cluster/recovery-cranker.ts";
 import { v22FlagsFromEnv, describeV22Flags } from "./cross-cluster/v22/flags.ts";
 import { V22Loop, startV22Loop } from "./cross-cluster/v22/loop.ts";
 import { setLoneLpCrankSuppressor } from "./cross-cluster/v22/delegation.ts";
+import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -379,10 +381,10 @@ if (registry.markets.length === 0) {
   }
 }
 
-const mainnetConn = new Connection(MAINNET_RPC, "confirmed");
+const mainnetConn = new Connection(MAINNET_RPC, { commitment: "confirmed", fetch: countingFetch("mainnet") });
 // DEVNET_RPC_ORIGIN replaces the uncommitted `httpHeaders: { Origin }` edit the
 // live machine carried here (Origin-restricted Helius key; see rpc-headers.ts).
-const devnetConn = new Connection(DEVNET_RPC, DEVNET_CONN_CONFIG);
+const devnetConn = new Connection(DEVNET_RPC, { ...DEVNET_CONN_CONFIG, fetch: countingFetch("devnet") });
 
 // Dry-run hard stop. Every write path is meant to honour `dryRun` on its own,
 // but there are a dozen send sites; a standby keeper that signs even one tx
@@ -406,7 +408,7 @@ console.log(`  registry:  ${REGISTRY_PATH} (${registry.markets.length} markets)`
 console.log(`  mode:      ${DRY_RUN ? "DRY-RUN (no on-chain writes)" : "LIVE"}`);
 console.log(`  interval:  ${CC_INTERVAL_MS}ms`);
 for (const line of describeProgramIds()) console.log(`  program:   ${line}`);
-console.log(`  alerts:    webhook ${process.env.KEEPER_ALERT_WEBHOOK_URL ? "ON" : "off"}; thresholds ${JSON.stringify(ALERT_SINK.thresholds)}`);
+console.log(`  alerts:    webhook ${process.env.KEEPER_ALERT_WEBHOOK_URL ? "ON" : "off"}; telegram ${ALERT_SINK.telegramEnabled ? "ON" : "off"}; thresholds ${JSON.stringify(ALERT_SINK.thresholds)}`);
 console.log(
   `  cranker:   ${CRANK_ENABLED ? `every ${CRANK_INTERVAL_MS}ms` : "disabled (CRANK_ENABLED=false)"}`,
   `  lp-fee:    ${LP_FEE_CRANK_ENABLED ? `every ${LP_FEE_CRANK_INTERVAL_MS}ms` : "disabled (LP_FEE_CRANK_ENABLED=false)"}`,

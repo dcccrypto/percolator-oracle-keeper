@@ -49,6 +49,7 @@ import {
 } from "@percolatorct/sdk";
 import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
 import { isLiveMarket, isTerminalMarket } from "./market-state.ts";
+import { getMultipleAccountsInfoChunked } from "./rpc-chunk.ts";
 
 /**
  * B20 (E2E 2026-09-30): Resolved markets and CloseSlab tombstones are never
@@ -600,7 +601,7 @@ function pushGenerationKey(p: { marketAddress: string; assetIndex: number }): st
 
 /**
  * Batched live-read of market_id + observation_sequence for every push this
- * cycle, via ONE `getMultipleAccountsInfo` call — not one `getAccountInfo`
+ * cycle, via `getMultipleAccountsInfo` in chunks of 100 keys (one call up to 100 markets) — not one `getAccountInfo`
  * per market. `pushAuthMarkBatch` was specifically optimized down to "~3 RPC
  * calls per cycle (was ~25)" (see `runCycle`'s doc comment in keeper-loop.ts);
  * this keeps that budget by adding exactly one more batched call, not N.
@@ -611,7 +612,7 @@ function pushGenerationKey(p: { marketAddress: string; assetIndex: number }): st
  * treat that as "skip this push this cycle" (see
  * {@link parsePushAuthMarkGenerationFields}'s doc comment), never guess.
  */
-async function fetchPushAuthMarkGenerationFields(
+export async function fetchPushAuthMarkGenerationFields(
   devnetConn: Connection,
   pushes: AuthMarkPushInput[],
   terminal: Set<string>,
@@ -622,13 +623,19 @@ async function fetchPushAuthMarkGenerationFields(
   // before they are confirmed. A confirmed read routinely misses the previous
   // cycle's push. Reading a higher (even later-dropped-fork) value is always
   // safe — the nonce only has to be strictly greater, gaps are allowed.
-  const infos = await devnetConn.getMultipleAccountsInfo(
-    uniqueAddrs.map((a) => new PublicKey(a)),
-    "processed",
-  );
+  // Chunked at 100 keys (RPC hard cap; web3.js does not chunk). A chunk that fails leaves ITS
+  // markets absent from the result (the caller already skips an absent market this cycle with a
+  // warning) and never fails the other chunks' markets — one flaky chunk must not stop every price.
+  const read = await getMultipleAccountsInfoChunked(devnetConn, uniqueAddrs.map((a) => new PublicKey(a)), "processed");
+  if (read.failedChunks > 0) {
+    console.warn(
+      `[push] generation read: ${read.failedChunks}/${read.totalChunks} chunk(s) failed — ` +
+        `${read.failedKeys} market(s) skipped this cycle (will retry next cycle)`,
+    );
+  }
   const dataByAddr = new Map<string, Uint8Array>();
   uniqueAddrs.forEach((addr, i) => {
-    const info = infos[i];
+    const info = read.infos[i];
     if (info) dataByAddr.set(addr, new Uint8Array(info.data));
   });
 

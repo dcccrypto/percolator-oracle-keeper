@@ -893,7 +893,23 @@ export async function readAllPoolPricesE6(
   entries = valid.map((v) => v.entry);
   if (entries.length === 0) return out;
   const pubkeys = valid.map((v) => v.pubkey);
-  const infos = await getMultipleAccountsChunked(mainnetConn, pubkeys);
+  // The SOL/USD reference pool is read ONLY when no registered entry supplies the rate, and used to
+  // cost its own getAccountInfo EVERY cycle. It is a static, valid pubkey: append it to the pool
+  // batch (one more key in a call that is already made; the 100-key chunking still applies) and keep
+  // the old standalone read as the fallback if the batch does not return it.
+  let refKeyIdx = -1;
+  if (solUsdReferencePool && !entries.some((e) => isSolUsdEntry(e))) {
+    try {
+      pubkeys.push(new PublicKey(solUsdReferencePool));
+      refKeyIdx = pubkeys.length - 1;
+    } catch {
+      /* malformed reference pool: the standalone read below reports it as before */
+    }
+  }
+  const allInfos = await getMultipleAccountsChunked(mainnetConn, pubkeys);
+  const refBatchInfo = refKeyIdx >= 0 ? allInfos[refKeyIdx] : undefined;
+  if (refKeyIdx >= 0) pubkeys.pop();
+  const infos = allInfos.slice(0, entries.length);
 
   // ── Pass 1: raydium-clmm + meteora-dlmm, and resolve this cycle's SOL/USD ──
   let solPriceE6: bigint | undefined;
@@ -1020,11 +1036,13 @@ export async function readAllPoolPricesE6(
   if (solPriceE6 === undefined && solUsdReferencePool) {
     try {
       const refPk = new PublicKey(solUsdReferencePool);
-      const refInfo = await withRpcBackoff(() =>
-        readAtWatermark(mainnetConn, (minContextSlot) =>
-          mainnetConn.getAccountInfoAndContext(refPk, { commitment: "confirmed", minContextSlot }),
-        ),
-      );
+      const refInfo = refBatchInfo
+        ? refBatchInfo
+        : await withRpcBackoff(() =>
+            readAtWatermark(mainnetConn, (minContextSlot) =>
+              mainnetConn.getAccountInfoAndContext(refPk, { commitment: "confirmed", minContextSlot }),
+            ),
+          );
       if (refInfo?.data) {
         const refDex = detectDexType(refInfo.owner);
         if (refDex === "raydium-clmm") {
