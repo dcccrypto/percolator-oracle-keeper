@@ -57,11 +57,12 @@
  *   6. It does not repair the engine bug; it narrows the keeper's own exposure.
  */
 import { PublicKey } from "@solana/web3.js";
+import { V22_CU_PER_WEIGHT, V22_LEG_COST } from "../positioned-refresh.ts";
 import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import type { PairingMode } from "./flags.ts";
 
-/** Per-weight-unit CU measured from the Wave A refresh CU (8 single-leg 1,016,434; 2 x 14-leg 1,199,659). */
-export const CU_PER_WEIGHT = 35_000;
+/** Per-weight-unit CU measured from the Wave A refresh CU (8 single-leg 1,016,434; 2 x 14-leg 1,199,659). One source: positioned-refresh.ts. */
+export const CU_PER_WEIGHT = V22_CU_PER_WEIGHT;
 export const MAX_TX_CU_V22 = 1_400_000;
 export const DEFAULT_WEIGHT_BUDGET = 32;
 export const DEFAULT_MAX_TXS_PER_ROUND = 16;
@@ -69,14 +70,34 @@ export const DEFAULT_MAX_TXS_PER_ROUND = 16;
 export const DEFAULT_MAX_GAP_SLOTS = 8;
 export const FLAT_ANCHOR_WEIGHT = 3;
 
-/** Weight of one refreshed / settled portfolio: 3 + its active legs on the asset (Wave A "A6"). */
-export function portfolioWeight(p: Pick<PositionedPortfolio, "longLegs" | "shortLegs">): number {
-  return 3 + p.longLegs + p.shortLegs;
+/**
+ * Weight of a SOLO portfolio (3+ legs, see V22_LEG_COST): heavier than any transaction budget, so it can only ride
+ * alone. Finite on purpose (health rows and JSON carry it).
+ */
+export const SOLO_WEIGHT = 1_000;
+
+/**
+ * Weight of one refreshed / settled portfolio: 3 + its active legs (Wave A "A6"). The legs are ALL of the portfolio's
+ * active legs (`activeLegs`, every asset: a refresh settles them all), never fewer than the legs on the asset. An
+ * account at or above V22_SOLO_MIN_LEGS legs weighs SOLO_WEIGHT: its worst settle measured 1,013,864 CU at the 4-leg
+ * cap, which leaves no room for another account beside it (positioned-refresh.ts has the numbers).
+ */
+export function portfolioWeight(p: Pick<PositionedPortfolio, "longLegs" | "shortLegs" | "activeLegs">): number {
+  return V22_LEG_COST.isSolo(p) ? SOLO_WEIGHT : 3 + V22_LEG_COST.legs(p);
 }
 
 /** The weight budget a tx of `maxCu` compute units supports once the accrue crank and headroom are paid. */
 export function weightBudgetFor(maxCu = MAX_TX_CU_V22, accrueCu = 200_000, headroomCu = 60_000, cuPerWeight = CU_PER_WEIGHT): number {
   return Math.max(1, Math.floor((maxCu - accrueCu - headroomCu) / cuPerWeight));
+}
+
+/**
+ * Compute-unit limit for a SINGLE-instruction transaction that settles `p` as part of its work (rent 106, dust 118): the
+ * instruction's own `baseUnits` (600k, sized on one leg), raised for a solo account to its worst settle plus 200k headroom
+ * (a 4-leg account: 1,213,864). A limit is a cap, not a charge; the simulation still decides whether the call is sent.
+ */
+export function legAwareTxUnits(p: Pick<PositionedPortfolio, "longLegs" | "shortLegs" | "activeLegs">, baseUnits: number): number {
+  return V22_LEG_COST.isSolo(p) ? Math.min(MAX_TX_CU_V22, Math.max(baseUnits, V22_LEG_COST.worstRefreshCu(p) + 200_000)) : baseUnits;
 }
 
 export type AccrueSource = "lp" | "anchor" | "counterparty" | "none";
@@ -144,7 +165,12 @@ function heaviestFirst(xs: ReadonlyArray<PositionedPortfolio>): PositionedPortfo
   });
 }
 
-/** Greedy pack, in the given order, into a tx with `cap` weight units for refreshes. Skips nothing that fits. */
+/**
+ * Greedy pack, in the given order, into a tx with `cap` weight units for refreshes. Skips nothing that fits. A SOLO
+ * portfolio (heavier than any budget) is taken ALONE when it is the first thing taken and `cap` is positive (the tx
+ * has an accrue crank of its own beside it, never a second account): `cap <= 0` means the tx's other occupant
+ * (a heavy LP) already uses the whole budget, so nothing rides.
+ */
 function takeUpTo(list: PositionedPortfolio[], cap: number): { taken: PositionedPortfolio[]; rest: PositionedPortfolio[] } {
   const taken: PositionedPortfolio[] = [];
   const rest: PositionedPortfolio[] = [];
@@ -154,6 +180,9 @@ function takeUpTo(list: PositionedPortfolio[], cap: number): { taken: Positioned
     if (used + w <= cap) {
       taken.push(p);
       used += w;
+    } else if (taken.length === 0 && cap > 0 && V22_LEG_COST.isSolo(p)) {
+      taken.push(p);
+      used = Number.POSITIVE_INFINITY;
     } else rest.push(p);
   }
   return { taken, rest };

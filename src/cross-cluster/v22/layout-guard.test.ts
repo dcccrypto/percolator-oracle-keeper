@@ -14,7 +14,7 @@ beforeEach(() => resetLayoutGuardMetrics());
 const B = layoutById("v2.2-b");
 
 describe("VERSION-keyed layout guard", () => {
-  it("variant B: every geometry number comes from the SDK LAYOUT_V22 (slot 2,629, leg 217, portfolio 10,603, group 806, VERSION 19)", () => {
+  it("variant B: every geometry number comes from the SDK LAYOUT_V22 (slot 2,661, leg 217, portfolio 10,603, group 806, VERSION 19)", () => {
     assert.deepEqual([B.wrapperVersion, B.slotStride, B.portfolioLegLen, B.portfolioAccountLen, B.headerLen, B.groupOff], [19, 2661, 217, 10603, 806, 592]);
     assert.deepEqual([B.slotStride, B.portfolioAccountLen, B.portfolioLegLen, B.headerLen], [LAYOUT_V22.assetSlotStride, LAYOUT_V22.portfolio.accountLen, LAYOUT_V22.portfolio.legStride, LAYOUT_V22.marketGroupLen]);
     assert.equal(rowAgreesWithSdk(B), null);

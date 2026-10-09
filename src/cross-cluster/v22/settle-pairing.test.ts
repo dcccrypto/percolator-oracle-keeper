@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_WEIGHT_BUDGET, loneLpCrankSuppressed, planSettleRound, portfolioWeight, weightBudgetFor } from "./settle-pairing.ts";
+import { DEFAULT_WEIGHT_BUDGET, SOLO_WEIGHT, loneLpCrankSuppressed, planSettleRound, portfolioWeight, weightBudgetFor } from "./settle-pairing.ts";
 import { key, pf } from "./test-helpers.ts";
 
 const LP = key(500);
@@ -9,7 +9,9 @@ const cps = (n: number, legs = 1) => Array.from({ length: n }, (_, i) => pf(i + 
 describe("SETTLE_PAIRING planner", () => {
   it("weights are 3 + legs; the budget follows the CU measurements", () => {
     assert.equal(portfolioWeight(pf(1, 1)), 4);
-    assert.equal(portfolioWeight({ longLegs: 3, shortLegs: 2 }), 8);
+    assert.equal(portfolioWeight({ longLegs: 1, shortLegs: 1 }), 5);
+    // 3+ legs is SOLO (position cap 4, worst settle 1,013,864 CU): the 14-leg Wave A weights (3 + legs) no longer apply
+    assert.equal(portfolioWeight({ longLegs: 3, shortLegs: 2 }), SOLO_WEIGHT);
     assert.equal(weightBudgetFor(), DEFAULT_WEIGHT_BUDGET);
   });
 
@@ -45,11 +47,11 @@ describe("SETTLE_PAIRING planner", () => {
   });
 
   it("no tx exceeds the weight budget (3 + legs), heaviest first", () => {
-    const c = [...cps(10, 1), ...cps(10, 6).map((x, i) => ({ ...x, pubkey: key(100 + i) }))];
+    const c = [...cps(10, 1), ...cps(10, 2).map((x, i) => ({ ...x, pubkey: key(100 + i) }))];
     const p = planSettleRound({ mode: "prefer", lp: LP, counterparties: c, weightBudget: 32 });
     for (const t of p.txs) assert.ok(t.weight <= 32, `tx ${t.index} weight ${t.weight}`);
     const firstTxWeights = p.txs[0].refresh.map(portfolioWeight);
-    assert.ok(portfolioWeight({ longLegs: 6, shortLegs: 0 }) >= Math.max(...p.txs[p.txs.length - 1].refresh.map(portfolioWeight), 0));
+    assert.ok(portfolioWeight({ longLegs: 2, shortLegs: 0 }) >= Math.max(...p.txs[p.txs.length - 1].refresh.map(portfolioWeight), 0));
     assert.ok(firstTxWeights.length > 0);
   });
 

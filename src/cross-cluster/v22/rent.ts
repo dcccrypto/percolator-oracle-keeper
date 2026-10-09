@@ -19,7 +19,7 @@ import { simulateAndSend } from "./exec.ts";
 import type { ExecContext, ExecOutcome } from "./exec.ts";
 import type { V22MarketCtx } from "./market.ts";
 import type { V22Positioned } from "./positioned.ts";
-import { portfolioWeight } from "./settle-pairing.ts";
+import { legAwareTxUnits, portfolioWeight } from "./settle-pairing.ts";
 
 export interface RentState {
   /** `market|portfolio` -> slot of the last settle (landed or dry-run). */
@@ -78,7 +78,7 @@ export async function settleRentOnce(
     const portfolio = positioned.all.find((x) => x.pubkey.toBase58() === d.portfolio);
     if (!portfolio) continue;
     const ix = buildSettleHoldingRentIxV22(ctx.sdk, exec.keeper.publicKey, portfolio.pubkey, 0, BigInt(ctx.readSlot), oracleAccounts);
-    const outcome = await simulateAndSend(exec, [ix], { job: "rent-106", label: `${ctx.label} ${d.portfolio.slice(0, 6)}`, units: RENT_TX_UNITS });
+    const outcome = await simulateAndSend(exec, [ix], { job: "rent-106", label: `${ctx.label} ${d.portfolio.slice(0, 6)}`, units: legAwareTxUnits(portfolio, RENT_TX_UNITS) });
     outcomes.push({ portfolio: d.portfolio, outcome });
     if ((outcome.kind === "sent" && outcome.landed === "landed") || outcome.kind === "dry-run" || (outcome.kind === "refused" && outcome.expected)) {
       // an expected band state still counts as "visited": retry at the cadence, not every tick

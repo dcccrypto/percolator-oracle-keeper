@@ -15,6 +15,7 @@ import { simulateAndSend } from "./exec.ts";
 import type { ExecContext, ExecOutcome } from "./exec.ts";
 import type { V22MarketCtx } from "./market.ts";
 import type { V22Positioned } from "./positioned.ts";
+import { legAwareTxUnits } from "./settle-pairing.ts";
 
 export interface DustState {
   /** `market|portfolio` -> slot until which the portfolio is not simulated again. */
@@ -50,7 +51,7 @@ export async function sweepDustOnce(
     const p = positioned.counterparties.find((x) => x.pubkey.toBase58() === k);
     if (!p) continue;
     const ix = buildSweepBandDustLegIxV22(ctx.sdk, exec.keeper.publicKey, p.pubkey, 0);
-    const outcome = await simulateAndSend(exec, [ix], { job: "dust-118", label: `${ctx.label} ${k.slice(0, 6)}`, units: DUST_TX_UNITS });
+    const outcome = await simulateAndSend(exec, [ix], { job: "dust-118", label: `${ctx.label} ${k.slice(0, 6)}`, units: legAwareTxUnits(p, DUST_TX_UNITS) });
     out.push({ portfolio: k, outcome });
     if (outcome.kind === "refused") st.cooldownUntil.set(`${ctx.marketAddress}|${k}`, BigInt(ctx.readSlot) + DUST_COOLDOWN_SLOTS);
   }

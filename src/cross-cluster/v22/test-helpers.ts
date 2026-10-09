@@ -39,6 +39,8 @@ export interface FakeConnOptions {
 
 export function fakeExecConn(o: FakeConnOptions = {}) {
   const sims: SentTx[] = [];
+  /** compute-unit limit of each simulated tx (parallel to `sims`). */
+  const simUnits: number[] = [];
   const sent: Array<SentTx & { order: number }> = [];
   let order = 0;
   let sim = 0;
@@ -54,6 +56,8 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
     async simulateTransaction(tx: { message: Parameters<typeof decode>[0] }) {
       const d = decode(tx.message);
       sims.push(d);
+      const lim = tx.message.compiledInstructions.find((i) => i.data[0] === 2 && i.data.length === 5);
+      simUnits.push(lim ? Buffer.from(lim.data).readUInt32LE(1) : -1);
       const callIndex = sim++;
       const err = o.simErr ? o.simErr(d, callIndex) : null;
       return { context: { slot: 1 }, value: { err: err ?? null, logs: o.simLogs ? o.simLogs(d, callIndex) : [], unitsConsumed: 123_456 } };
@@ -81,7 +85,7 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
       return len * 7_000;
     },
   };
-  return { conn: conn as unknown as ExecConnection & { getSlot(): Promise<number> }, sims, sent };
+  return { conn: conn as unknown as ExecConnection & { getSlot(): Promise<number> }, sims, simUnits, sent };
 }
 
 export function execCtx(conn: ExecConnection, dryRun = false): ExecContext {
@@ -168,7 +172,7 @@ export function refusePortfolio(portfolio: PublicKey, code: number, firstOnly = 
 }
 
 /** A parsable 10,603 B variant-B portfolio (SDK VERSION 19 guard): owner, capital, pnl, legs on asset 0. */
-export function portfolioBytes(o: { owner: PublicKey; capital?: bigint; pnl?: bigint; legs?: Array<{ side: 0 | 1; basis: bigint }>; matcher?: boolean }): Uint8Array {
+export function portfolioBytes(o: { owner: PublicKey; capital?: bigint; pnl?: bigint; legs?: Array<{ side: 0 | 1; basis: bigint; assetIndex?: number }>; matcher?: boolean }): Uint8Array {
   const G = LAYOUT_V22.portfolio;
   const b = Buffer.alloc(G.accountLen);
   b.writeBigUInt64LE(WRAPPER_ACCOUNT_MAGIC, 0);
@@ -190,7 +194,7 @@ export function portfolioBytes(o: { owner: PublicKey; capital?: bigint; pnl?: bi
     bitmap |= 1n << BigInt(i);
     const at = G.legsOff + i * G.legStride;
     b[at + G.leg.active] = 1;
-    b.writeUInt32LE(0, at + G.leg.assetIndex);
+    b.writeUInt32LE(l.assetIndex ?? 0, at + G.leg.assetIndex);
     b[at + G.leg.side] = l.side;
     w128(at + G.leg.basisPosQ, l.basis);
     w128(at + G.leg.lossWeight, 1n);

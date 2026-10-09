@@ -147,6 +147,15 @@ the legacy cranker / fee job / vault-LP cranker take their old paths, and `/heal
 is derived from the SDK's `LAYOUT_V22` and refused if the two ever disagree. A VERSION the SDK has no table for, a length that matches no row,
 a bad magic or a wrong kind is a loud error: counted (`layout-guard-metrics.ts`), logged once, `/health` `layoutGuard` + `status: degraded-markets`. No silent fallback.
 
+**Position cap 4 (release candidate engine `bfa3d037` / wrapper `c6ee0b6e`).** An account holds at most 4 legs and a refresh or liquidation settles all of them.
+Sizing is leg-aware and selected by the layout (`legCostModelFor`: a v2.2 layout gets `V22_LEG_COST`, every v2.1 layout gets none and keeps the single-leg
+145k / 250k / seven-per-tx arithmetic byte for byte). Typical refresh 145k / 175k / 210k / 245k for 1 to 4 legs (35k x (3 + legs)); liquidation 250k at one leg up to 729k at four;
+worst settle at the cap 1,013,864 CU (liens + ADL, real #287 hook), against the 1.4M transaction. An account with 3 or more legs (`V22_SOLO_MIN_LEGS`, the wrapper's
+`WRAPPER_PRE_CRANK_MIN_LEGS`) is planned ALONE in its own transaction (`SOLO_WEIGHT` in the settle-pairing rounds, overflow chunks of one in the legacy cranker,
+a batch of one in the drift sweep) and the single-instruction jobs (rent 106, dust 118) request `worst + 200k` for it (1,213,864). The legs counted are ALL the account's
+active legs (`activeLegs`), not only those on the asset being cranked. The keeper still cranks asset 0 only: positions on assets 1 and up are not in its positioned set.
+The keeper sends none of tags 74, 120, 121 or 122 and reads no G9 allowlist account (a test guards that); the 2,064 B allowlist body and tags 120 / 121 / 122 are in the SDK.
+
 | flag | default | what |
 |---|---|---|
 | `KEEPER_V22` | off | master switch |

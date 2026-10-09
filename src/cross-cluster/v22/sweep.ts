@@ -32,7 +32,7 @@ import { holdPushes as realHold, releasePushes as realRelease } from "../refresh
 import { BAND_EXPECTED_CODES } from "./errors.ts";
 import { simulateAndSend, simulateOnly } from "./exec.ts";
 import type { ExecContext, ExecOutcome } from "./exec.ts";
-import { DEFAULT_MAX_GAP_SLOTS, DEFAULT_MAX_TXS_PER_ROUND, DEFAULT_WEIGHT_BUDGET, planSettleRound } from "./settle-pairing.ts";
+import { DEFAULT_MAX_GAP_SLOTS, DEFAULT_MAX_TXS_PER_ROUND, DEFAULT_WEIGHT_BUDGET, legAwareTxUnits, planSettleRound } from "./settle-pairing.ts";
 import type { PlannedTx, RoundPlan } from "./settle-pairing.ts";
 import type { PairingMode } from "./flags.ts";
 
@@ -608,7 +608,7 @@ export async function runSettleRound(
         if (n >= (input.rent.max ?? RENT_SETTLES_PER_ROUND)) break;
         if (!input.rent.due.has(k) || !settled.has(k)) continue;
         n++;
-        const out = await simulateAndSend(deps.exec, [input.rent.build(c)], { job: "rent-106", label: ctx.label, units: 600_000, expected: BAND_EXPECTED_CODES });
+        const out = await simulateAndSend(deps.exec, [input.rent.build(c)], { job: "rent-106", label: ctx.label, units: legAwareTxUnits(c, 600_000), expected: BAND_EXPECTED_CODES });
         res.outcomes.push(out);
         if ((out.kind === "sent" && out.landed === "landed") || out.kind === "dry-run") {
           res.rentSettled.push(k);

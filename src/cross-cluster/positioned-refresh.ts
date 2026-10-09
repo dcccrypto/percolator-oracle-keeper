@@ -176,6 +176,12 @@ export interface PositionedPortfolio {
   longLegs: number;
   shortLegs: number;
   isLp: boolean;
+  /**
+   * ALL active legs of the portfolio, on every asset (absent on hand-built entries: then the on-asset count is
+   * used). A refresh settles every leg of the account, so its compute depends on this number, not on the legs
+   * held on the one asset being cranked (v2.2 caps it at V22_POSITION_CAP).
+   */
+  activeLegs?: number;
   /** Sum of `loss_weight` over the active legs on the asset (sweep ordering; absent on hand-built entries). */
   lossWeight?: bigint;
   /** Lowest `kf_epoch_snap` of the active long / short legs on the asset (null: no leg on that side). */
@@ -207,7 +213,9 @@ export function selectPositionedPortfolios(
     let lossWeight = 0n;
     let kfEpochSnapLong: bigint | null = null;
     let kfEpochSnapShort: bigint | null = null;
+    let activeLegs = 0;
     for (const leg of parsed.legs) {
+      if (leg.active) activeLegs++;
       if (!leg.active || leg.assetIndex !== assetIndex) continue;
       lossWeight += leg.lossWeight;
       if (leg.side === 0) {
@@ -219,7 +227,7 @@ export function selectPositionedPortfolios(
       }
     }
     if (longLegs + shortLegs === 0) continue;
-    out.push({ pubkey, longLegs, shortLegs, isLp: parsed.matcherEnabled === true, lossWeight, kfEpochSnapLong, kfEpochSnapShort });
+    out.push({ pubkey, longLegs, shortLegs, isLp: parsed.matcherEnabled === true, activeLegs, lossWeight, kfEpochSnapLong, kfEpochSnapShort });
   }
   return out;
 }
@@ -331,6 +339,100 @@ export const REPAIR_CU = 40_000;
 /** Measured on devnet (ANSEM, 2026-09-29): liquidating a bankrupt leg ~200k CU. */
 export const LIQUIDATE_CRANK_CU = 250_000;
 
+// ── Leg-aware sizing (v2.2: at most V22_POSITION_CAP legs per account) ─────────────────────────────────────────
+//
+// Everything above is SINGLE-LEG sizing: a v2.1 account holds one leg on a single-asset market, and that is what
+// 145k / 250k / seven-per-tx were measured on. v2.2 lets an account hold up to V22_POSITION_CAP (4) legs, and a
+// refresh / liquidation settles EVERY leg. The numbers below are the release candidate's own measurements
+// (ledger v22-combination-2026-10-08.md, cu-per-tag-fold-final.txt, reviewer round 2 of the liquidation-cap
+// review, engine release/v22-engine-rem bfa3d037 + wrapper release/v22-wrapper-rem c6ee0b6e):
+//
+//   typical refresh, n legs      35,000 x (3 + n): 175k / 210k / 245k at 2 / 3 / 4 legs (the Wave A "A6" weight; A6 = 4 cap-leg
+//                                refreshes + tag 77 = 1,005,351 CU, 3 x cap-leg liquidating 934,336, 2 x cap + 3 x 1-leg mix 932,383)
+//   worst settle shape, 4 legs   1,013,864 CU (2n-domain reversal + real liens + a real ADL event, #287 hook included;
+//                                852,932 without liens/ADL). Per extra leg the reviewer measured about +176k (5 legs 1,184,471,
+//                                6 legs 1,360,918 before the hook), which is how the 3-leg figure (838k) is EXTRAPOLATED, not measured
+//   liquidation crank, 4 legs    455k plain, 728,649 worst (genuine pending K loss); 1 leg 250k as before; linear between
+//
+// A 4-leg account's worst settle (1.01M) plus an accrual or a second account does not fit the 1.4M transaction cap
+// with any margin, so an account with V22_SOLO_MIN_LEGS or more legs is planned ALONE in its own transaction (the
+// wrapper treats 3+ legs as heavy for the same reason: WRAPPER_PRE_CRANK_MIN_LEGS = 3). Fewer legs are packed by the
+// typical figure and fail closed (simulation, then a smaller transaction) if a bad shape overruns.
+//
+// The model is OPT-IN: every planner takes an optional `LegCostModel` and, without one, computes exactly what it
+// always did. Only a v2.2 layout selects it (`legCostModelFor`), so the v2.1 numbers cannot move.
+
+/** `WRAPPER_MAX_PORTFOLIO_ASSETS` of the release candidate (final: founder decision 2026-10-08). The SDK mirrors it as WRAPPER_BATCH_MAX_LEGS = min(11, cap); a test pins the two together. */
+export const V22_POSITION_CAP = 4;
+/** `WRAPPER_PRE_CRANK_MIN_LEGS`: an account with this many legs or more is heavy; the keeper plans it alone. */
+export const V22_SOLO_MIN_LEGS = 3;
+/** CU per weight unit of a refresh (3 + legs), measured from Wave A (8 single-leg 1,016,434; 2 x 14-leg 1,199,659). */
+export const V22_CU_PER_WEIGHT = 35_000;
+/** Worst measured settle of a cap-leg (4) account: liens + ADL, with the real #287 hook. */
+export const V22_WORST_SETTLE_CU_AT_CAP = 1_013_864;
+/** Reviewer-measured growth of the worst settle per extra leg. */
+export const V22_WORST_SETTLE_CU_PER_LEG = 176_000;
+/** Worst measured liquidation crank of a cap-leg account (x1_seed_pending_loss_long, peak settle). */
+export const V22_LIQUIDATE_CU_AT_CAP = 728_649;
+
+export interface LegCostModel {
+  readonly id: string;
+  /** Active legs a refresh of `p` settles: the whole portfolio, never fewer than the legs on the asset. */
+  legs(p: Pick<PositionedPortfolio, "longLegs" | "shortLegs" | "activeLegs">): number;
+  /** Typical refresh CU of `p`; `baseCu` is the single-leg figure of the calling planner (145k legacy, 114k sweep). */
+  refreshCu(p: Pick<PositionedPortfolio, "longLegs" | "shortLegs" | "activeLegs">, baseCu: number): number;
+  /** Liquidation crank CU of `p`; `baseCu` is the single-leg figure (250k). */
+  liquidateCu(p: Pick<PositionedPortfolio, "longLegs" | "shortLegs" | "activeLegs">, baseCu: number): number;
+  /** Worst measured / extrapolated settle of `p`: what its own transaction must be able to absorb. */
+  worstRefreshCu(p: Pick<PositionedPortfolio, "longLegs" | "shortLegs" | "activeLegs">): number;
+  /** True when `p` is planned alone in its transaction. */
+  isSolo(p: Pick<PositionedPortfolio, "longLegs" | "shortLegs" | "activeLegs">): boolean;
+}
+
+type LegCountable = Pick<PositionedPortfolio, "longLegs" | "shortLegs" | "activeLegs">;
+const legsOf = (p: LegCountable): number => Math.max(p.activeLegs ?? 0, p.longLegs + p.shortLegs);
+const typicalRefreshCu = (p: LegCountable, baseCu: number): number => {
+  const n = legsOf(p);
+  return n <= 1 ? baseCu : Math.max(baseCu, V22_CU_PER_WEIGHT * (3 + n));
+};
+
+export const V22_LEG_COST: LegCostModel = {
+  id: "v2.2-leg-cap-4",
+  legs: legsOf,
+  refreshCu: typicalRefreshCu,
+  liquidateCu(p, baseCu) {
+    const n = legsOf(p);
+    if (n <= 1) return baseCu;
+    const slope = (V22_LIQUIDATE_CU_AT_CAP - baseCu) / (V22_POSITION_CAP - 1);
+    return Math.max(baseCu, Math.ceil((baseCu + slope * (n - 1)) / 1_000) * 1_000);
+  },
+  worstRefreshCu(p) {
+    const n = Math.max(1, legsOf(p));
+    const worst = V22_WORST_SETTLE_CU_AT_CAP - (V22_POSITION_CAP - n) * V22_WORST_SETTLE_CU_PER_LEG;
+    return Math.max(typicalRefreshCu(p, REFRESH_CRANK_CU), worst);
+  },
+  isSolo: (p) => legsOf(p) >= V22_SOLO_MIN_LEGS,
+};
+
+/**
+ * The sizing a market's layout selects: the leg-aware model on a v2.2 layout, `undefined` (the exact single-leg
+ * arithmetic) on every v2.1 layout and on an unknown one.
+ */
+export function legCostModelFor(layout: Pick<MarketLayout, "id" | "wrapperVersion"> | null | undefined): LegCostModel | undefined {
+  if (!layout) return undefined;
+  return layout.id === "v2.2-b" || layout.id === "v2.2-drift" ? V22_LEG_COST : undefined;
+}
+
+/**
+ * CU limit of a transaction that carries ONE solo account: an accrual (when it has one) plus the account's worst
+ * settle plus headroom, under the 1.4M cap. A 4-leg account: 200k + 1,013,864 + 100k = 1,313,864.
+ */
+export function soloTxComputeUnits(model: LegCostModel, p: Pick<PositionedPortfolio, "longLegs" | "shortLegs" | "activeLegs">, opts: { accrueCu?: number; headroomCu?: number } = {}): number {
+  const accrue = opts.accrueCu ?? 0;
+  const headroom = opts.headroomCu ?? ACCRUAL_TX_CU_HEADROOM;
+  return Math.min(MAX_TX_CU, accrue + model.worstRefreshCu(p) + headroom);
+}
+
 /**
  * True when a (post-refresh) portfolio holds an active leg and its equity
  * `capital + pnl` is not positive — bankrupt. The refresh crank alone only
@@ -421,8 +523,17 @@ export function planCrankTx(params: {
    * `AutoCrankPlanV16::Liquidate` once the account is current.
    */
   liquidateTargets?: ReadonlyArray<PublicKey>;
+  /**
+   * Leg-aware sizing (v2.2; see `legCostModelFor`). Omitted = the single-leg arithmetic, unchanged. With a model a
+   * solo (3+ leg) target is never packed beside the accrual: it goes to `overflow`, where `chunkOverflowTargets`
+   * gives it its own transaction, and each other target costs `refreshCu` for its leg count.
+   */
+  cost?: LegCostModel;
+  /** The LP's positioned entry (leg count): the accrual crank settles it, so a heavy LP is the accrual's cost. */
+  lp?: PositionedPortfolio | null;
 }): CrankPlan {
   const { owner, market, lpPortfolio, catchup, refreshTargets } = params;
+  const cost = params.cost;
   const repairs = params.repairs ?? [];
   const cranks: PlannedCrank[] = repairs.map((r) => ({
     kind: "repair" as const,
@@ -443,22 +554,26 @@ export function planCrankTx(params: {
     };
   }
   cranks.push({ kind: "accrue", portfolio: lpPortfolio, ix: buildObservationCrankIx(owner, market, lpPortfolio) });
-  let cu = repairCu + catchup * CATCHUP_CRANK_CU + ACCRUE_CRANK_CU;
+  // The observation crank settles the LP it targets: a heavy LP (3+ legs) makes the accrual itself the big crank.
+  const accrueCu = cost && params.lp && cost.isSolo(params.lp) ? cost.worstRefreshCu(params.lp) : ACCRUE_CRANK_CU;
+  let cu = repairCu + catchup * CATCHUP_CRANK_CU + accrueCu;
   /** Packing ceiling: the headroom is reserved, never spent on another refresh. */
   const packCap = MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM;
 
   const ordered = [...refreshTargets].sort((x, y) => Number(x.isLp) - Number(y.isLp));
   const overflow: PositionedPortfolio[] = [];
   for (const p of ordered) {
-    if (cu + REFRESH_CRANK_CU > packCap) {
+    const refreshCu = cost ? cost.refreshCu(p, REFRESH_CRANK_CU) : REFRESH_CRANK_CU;
+    if ((cost && cost.isSolo(p)) || cu + refreshCu > packCap) {
       overflow.push(p);
       continue;
     }
     cranks.push({ kind: "refresh", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
-    cu += REFRESH_CRANK_CU;
-    if (!p.isLp && (params.liquidateTargets ?? []).some((t) => t.equals(p.pubkey)) && cu + LIQUIDATE_CRANK_CU <= packCap) {
+    cu += refreshCu;
+    const liquidateCu = cost ? cost.liquidateCu(p, LIQUIDATE_CRANK_CU) : LIQUIDATE_CRANK_CU;
+    if (!p.isLp && (params.liquidateTargets ?? []).some((t) => t.equals(p.pubkey)) && cu + liquidateCu <= packCap) {
       cranks.push({ kind: "liquidate", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
-      cu += LIQUIDATE_CRANK_CU;
+      cu += liquidateCu;
     }
   }
   return { cranks, overflow, computeUnits: Math.min(MAX_TX_CU, cu + ACCRUAL_TX_CU_HEADROOM) };
@@ -480,23 +595,30 @@ export function planRefreshTx(params: {
   market: PublicKey;
   targets: ReadonlyArray<PositionedPortfolio>;
   liquidateTargets?: ReadonlyArray<PublicKey>;
+  /** Leg-aware sizing (v2.2); omitted = the single-leg arithmetic, unchanged. */
+  cost?: LegCostModel;
 }): CrankPlan {
   const { owner, market, targets } = params;
+  const cost = params.cost;
   const liq = params.liquidateTargets ?? [];
   const cranks: PlannedCrank[] = [];
   let cu = 0;
+  /** Largest worst-case settle among solo targets in this transaction: its limit must absorb it. */
+  let soloWorst = 0;
   for (const p of targets) {
     cranks.push({ kind: "refresh", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
-    cu += REFRESH_CRANK_CU;
-    if (!p.isLp && liq.some((t) => t.equals(p.pubkey)) && cu + LIQUIDATE_CRANK_CU <= MAX_TX_CU) {
+    cu += cost ? cost.refreshCu(p, REFRESH_CRANK_CU) : REFRESH_CRANK_CU;
+    if (cost && cost.isSolo(p)) soloWorst = Math.max(soloWorst, cost.worstRefreshCu(p));
+    const liquidateCu = cost ? cost.liquidateCu(p, LIQUIDATE_CRANK_CU) : LIQUIDATE_CRANK_CU;
+    if (!p.isLp && liq.some((t) => t.equals(p.pubkey)) && cu + liquidateCu <= MAX_TX_CU) {
       cranks.push({ kind: "liquidate", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
-      cu += LIQUIDATE_CRANK_CU;
+      cu += liquidateCu;
     }
   }
   // The accrual tx's 1.4M budget absorbs per-refresh variance across 7 refreshes;
   // a short follow-up has no such slack (live 2026-10-02: a lone LP refresh hit
   // ComputationalBudgetExceeded at 130k), so it gets explicit headroom.
-  return { cranks, overflow: [], computeUnits: cranks.length === 0 ? 0 : Math.min(MAX_TX_CU, cu + FOLLOWUP_CU_HEADROOM) };
+  return { cranks, overflow: [], computeUnits: cranks.length === 0 ? 0 : Math.min(MAX_TX_CU, Math.max(cu, soloWorst) + FOLLOWUP_CU_HEADROOM) };
 }
 
 /** Extra CU on every follow-up refresh tx (see planRefreshTx). */
@@ -514,9 +636,41 @@ export const REFRESHES_PER_OVERFLOW_TX = Math.floor((MAX_TX_CU - LIQUIDATE_CRANK
 export function chunkOverflowTargets(
   overflow: ReadonlyArray<PositionedPortfolio>,
   perTx: number = REFRESHES_PER_OVERFLOW_TX,
+  /**
+   * Leg-aware sizing (v2.2). Groups are then filled by each target's refresh CU (reserving the heaviest
+   * liquidation among the group's members) and a solo target (3+ legs) is ALWAYS a group of its own; `perTx` is
+   * not used. For single-leg targets this packs exactly `REFRESHES_PER_OVERFLOW_TX` per group, as before.
+   */
+  cost?: LegCostModel,
 ): PositionedPortfolio[][] {
-  const n = Math.max(1, Math.floor(perTx));
   const out: PositionedPortfolio[][] = [];
+  if (cost) {
+    let group: PositionedPortfolio[] = [];
+    let sum = 0;
+    let maxLiq = 0;
+    const flush = (): void => {
+      if (group.length > 0) out.push(group);
+      group = [];
+      sum = 0;
+      maxLiq = 0;
+    };
+    for (const p of overflow) {
+      if (cost.isSolo(p)) {
+        flush();
+        out.push([p]);
+        continue;
+      }
+      const rcu = cost.refreshCu(p, REFRESH_CRANK_CU);
+      const lcu = Math.max(maxLiq, cost.liquidateCu(p, LIQUIDATE_CRANK_CU));
+      if (group.length > 0 && sum + rcu + lcu > MAX_TX_CU) flush();
+      group.push(p);
+      sum += rcu;
+      maxLiq = Math.max(maxLiq, cost.liquidateCu(p, LIQUIDATE_CRANK_CU));
+    }
+    flush();
+    return out;
+  }
+  const n = Math.max(1, Math.floor(perTx));
   for (let i = 0; i < overflow.length; i += n) out.push(overflow.slice(i, i + n));
   return out;
 }

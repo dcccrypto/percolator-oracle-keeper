@@ -125,6 +125,7 @@ import {
   marketHasPositions,
   parseInstructionError,
   isComputeExhaustion,
+  legCostModelFor,
   MAX_TX_CU,
   chunkOverflowTargets,
   planCrankTx,
@@ -132,6 +133,7 @@ import {
   positionedSetMatchesMarket,
   selectPositionedPortfolios,
 } from "./positioned-refresh.ts";
+import type { LegCostModel } from "./positioned-refresh.ts";
 import { countLayoutProblem, holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coordination.ts";
 import { getSweepDelegate } from "./v22/delegation.ts";
 import { formatProgramError } from "./v22/errors.ts";
@@ -657,10 +659,14 @@ export async function crankOneMarket(
     // they get a second crank (the engine's Liquidate step) in the same tx.
     let liquidateTargets: PublicKey[] = [];
 
+    // Leg-aware sizing is selected by the layout: a v2.2 market (up to 4 legs per account) gets it, every v2.1 layout and an
+    // unknown one gets `undefined`, i.e. exactly the single-leg arithmetic that was here before.
+    const legCost = legCostModelFor(detection.known ? detection.layout : null);
+    const lpEntry = positionedAll.find((p) => p.isLp) ?? null;
     const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan =>
       sweepCtx
-        ? planSweepTx({ owner: keeper.publicKey, market, lpPortfolio, targets: t, cfg: sweepCfg, catchup, repairs, liquidateTargets })
-        : planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs, liquidateTargets });
+        ? planSweepTx({ owner: keeper.publicKey, market, lpPortfolio, targets: t, cfg: sweepCfg, catchup, repairs, liquidateTargets, cost: legCost })
+        : planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs, liquidateTargets, cost: legCost, lp: lpEntry });
 
     if (dryRun) {
       const plan = build(targets);
@@ -851,7 +857,7 @@ export async function crankOneMarket(
           fu = await runSweepFollowups(sweepCtx.pace.txs - 1, visitedThisCycle, {
             pickBatch: (exclude) => selectSweepBatch(sweepCtx.positioned, state.sweepCursor, sweepCtx.pace.k, exclude, epochs),
             plan: (t, accrue, liq) =>
-              planSweepTx({ owner: keeper.publicKey, market, lpPortfolio, targets: t, cfg: sweepCfg, accrue, liquidateTargets: liq }),
+              planSweepTx({ owner: keeper.publicKey, market, lpPortfolio, targets: t, cfg: sweepCfg, accrue, liquidateTargets: liq, cost: legCost }),
             simulate: (p) => simulateWith(toFuTx(p), p),
             send: (p) =>
               withRpcRetry(label, () => devnetConn.sendRawTransaction(toFuTx(p).serialize(), { skipPreflight: true, maxRetries: 2 })),
@@ -905,6 +911,7 @@ export async function crankOneMarket(
           owner: keeper.publicKey,
           market,
           overflow: plan.overflow,
+          cost: legCost,
           simulate: (p) => simulateWith(toOvTx(p), p),
           send: (p) =>
             withRpcRetry(label, () => devnetConn.sendRawTransaction(toOvTx(p).serialize(), { skipPreflight: true, maxRetries: 2 })),
@@ -1507,6 +1514,8 @@ export async function refreshOverflow(params: {
   owner: PublicKey;
   market: PublicKey;
   overflow: ReadonlyArray<PositionedPortfolio>;
+  /** Leg-aware sizing (v2.2); omitted = the single-leg arithmetic, unchanged. */
+  cost?: LegCostModel;
   simulate: (plan: CrankPlan) => Promise<SimOutcome>;
   send: (plan: CrankPlan) => Promise<string>;
   waitLanded: (signature: string) => Promise<LandOutcome>;
@@ -1520,10 +1529,10 @@ export async function refreshOverflow(params: {
   const simulate = async (plan: CrankPlan): Promise<SimOutcome> =>
     plan.cranks.length === 0 ? { err: null, logs: [], marketData: null } : params.simulate(plan);
   try {
-    for (const chunk of chunkOverflowTargets(overflow)) {
+    for (const chunk of chunkOverflowTargets(overflow, undefined, params.cost)) {
       let liquidate: PublicKey[] = [];
       const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan =>
-        planRefreshTx({ owner, market, targets: t, liquidateTargets: liquidate });
+        planRefreshTx({ owner, market, targets: t, liquidateTargets: liquidate, cost: params.cost });
       const onOptional = (c: PlannedCrank) => {
         if (c.kind === "liquidate") liquidate = liquidate.filter((x) => !x.equals(c.portfolio));
       };

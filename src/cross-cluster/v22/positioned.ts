@@ -65,10 +65,12 @@ export function analysePortfolios(
     let kfLong: bigint | null = null;
     let kfShort: bigint | null = null;
     let anyActive = false;
+    let activeLegs = 0;
     let minAbs: bigint | null = null;
     for (const leg of parsed.legs) {
       if (!leg.active) continue;
       anyActive = true;
+      activeLegs++;
       if (leg.assetIndex !== assetIndex) continue;
       lossWeight += leg.lossWeight;
       const abs = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ;
@@ -90,7 +92,7 @@ export function analysePortfolios(
       else overrideWhy = `override ${pubkey.toBase58()} is ${isLp ? "the vault LP" : anyActive ? "not flat" : parsed.matcherEnabled ? "a matcher portfolio" : "not owned by the keeper"}`;
     }
     if (longLegs + shortLegs === 0) continue;
-    all.push({ pubkey, longLegs, shortLegs, isLp, lossWeight, kfEpochSnapLong: kfLong, kfEpochSnapShort: kfShort });
+    all.push({ pubkey, longLegs, shortLegs, isLp, activeLegs, lossWeight, kfEpochSnapLong: kfLong, kfEpochSnapShort: kfShort });
     if (minAbs !== null) minLegAbs.set(pubkey.toBase58(), minAbs);
   }
   let lp: PositionedPortfolio | null = all.find((x) => x.isLp) ?? null;

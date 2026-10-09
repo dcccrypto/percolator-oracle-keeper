@@ -39,6 +39,7 @@
 import { PublicKey } from "@solana/web3.js";
 
 import { ACCRUE_CRANK_CU, CATCHUP_CRANK_CU, LIQUIDATE_CRANK_CU, MAX_TX_CU, REPAIR_CU, buildObservationCrankIx, buildRefreshCrankIx, catchupAllowsRefresh } from "./positioned-refresh.ts";
+import type { LegCostModel } from "./positioned-refresh.ts";
 import type { CrankPlan, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
 import { KF_DRIFT_FIELDS, assetSlotsOff, detectLayout, engineSlotBase, layoutById } from "./market-layout.ts";
 import type { MarketLayout, MarketLayoutId } from "./market-layout.ts";
@@ -643,8 +644,18 @@ export function planSweepTx(params: {
   catchup?: number;
   repairs?: ReadonlyArray<LivenessRepair>;
   liquidateTargets?: ReadonlyArray<PublicKey>;
+  /**
+   * Leg-aware sizing (v2.2, see `legCostModelFor`); omitted = the single-leg arithmetic, unchanged. With a model each
+   * target costs its leg count's refresh, and a solo (3+ leg) account is planned ALONE: when the batch holds one, the
+   * transaction is [accrual, that account] and every other target is deferred to the next transaction.
+   */
+  cost?: LegCostModel;
 }): SweepPlan {
-  const { owner, market, lpPortfolio, targets, cfg } = params;
+  const { owner, market, lpPortfolio, cfg } = params;
+  const cost = params.cost;
+  const soloTarget = cost ? params.targets.find((t) => cost.isSolo(t)) : undefined;
+  const targets: ReadonlyArray<PositionedPortfolio> = soloTarget ? [soloTarget] : params.targets;
+  const soloDeferred = soloTarget ? params.targets.filter((t) => t !== soloTarget) : [];
   const accrue = params.accrue ?? true;
   const catchup = accrue ? params.catchup ?? 0 : 0;
   const repairs = params.repairs ?? [];
@@ -661,31 +672,37 @@ export function planSweepTx(params: {
   }
   cu += catchup * CATCHUP_CRANK_CU;
   if (accrue && !catchupAllowsRefresh(catchup)) {
-    return { cranks, overflow: [], deferred: [...targets], computeUnits: Math.min(MAX_TX_CU, cu + cfg.headroomCu) };
+    return { cranks, overflow: [], deferred: [...params.targets], computeUnits: Math.min(MAX_TX_CU, cu + cfg.headroomCu) };
   }
   if (accrue) {
     cranks.push({ kind: "accrue", portfolio: lpPortfolio, ix: buildObservationCrankIx(owner, market, lpPortfolio) });
     cu += cfg.accrueCu;
   }
   const packCap = MAX_TX_CU - cfg.headroomCu;
-  const deferred: PositionedPortfolio[] = [];
+  const deferred: PositionedPortfolio[] = [...soloDeferred];
+  /** The limit must also absorb a solo account's WORST settle, which the typical figure that decides packing does not. */
+  let limitCu = 0;
   for (const p of targets) {
-    if (cu + cfg.refreshCu > packCap) {
+    const refreshCu = cost ? cost.refreshCu(p, cfg.refreshCu) : cfg.refreshCu;
+    const solo = !!cost && cost.isSolo(p);
+    if (cu + (solo && cost ? cost.worstRefreshCu(p) : refreshCu) > packCap) {
       deferred.push(p);
       continue;
     }
     cranks.push({ kind: "refresh", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
-    cu += cfg.refreshCu;
-    if (!p.isLp && liq.some((t) => t.equals(p.pubkey)) && cu + LIQUIDATE_CRANK_CU <= packCap) {
+    if (solo && cost) limitCu = Math.max(limitCu, cu + cost.worstRefreshCu(p));
+    cu += refreshCu;
+    const liquidateCu = cost ? cost.liquidateCu(p, LIQUIDATE_CRANK_CU) : LIQUIDATE_CRANK_CU;
+    if (!p.isLp && liq.some((t) => t.equals(p.pubkey)) && cu + liquidateCu <= packCap) {
       cranks.push({ kind: "liquidate", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
-      cu += LIQUIDATE_CRANK_CU;
+      cu += liquidateCu;
     }
   }
   return {
     cranks,
     overflow: [],
     deferred,
-    computeUnits: cranks.length === 0 ? 0 : Math.min(MAX_TX_CU, cu + cfg.headroomCu),
+    computeUnits: cranks.length === 0 ? 0 : Math.min(MAX_TX_CU, Math.max(cu, limitCu) + cfg.headroomCu),
   };
 }
 
