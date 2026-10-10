@@ -29,12 +29,45 @@
  */
 import { PublicKey } from "@solana/web3.js";
 import type { Connection } from "@solana/web3.js";
-import { V17_PORTFOLIO_ACCOUNT_LEN } from "@percolatorct/sdk";
+import { LAYOUTS_BY_VERSION, V17_PORTFOLIO_ACCOUNT_LEN } from "@percolatorct/sdk";
 import { marketMode } from "./market-state.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
 
 export const CLOSE_PROGRESS_OFF = 9185;
 export const CLOSE_PROGRESS_LEN = 184;
+
+/**
+ * Where the close-progress ledger sits in a portfolio of a given wrapper VERSION (v2.2 follow-up to K-3, 2026-10-10).
+ *
+ * The constants above are the v2.1 (VERSION 18, 9,563 B) numbers. A v2.2 portfolio (VERSION 19) is 10,603 B: 16 legs
+ * grew 152 -> 217 B (+1,040), so every field after them moves. In the engine struct (release/v22-engine-rem 3ce4cbd1
+ * src/v16.rs:26049-26050, same order as 35ddd692) `close_progress` is IMMEDIATELY followed by
+ * `resolved_payout_receipt`, and the 184-byte ledger itself is unchanged (max_close_slot @48, residual @168). So the
+ * ledger offset is the SDK's `portfolio.resolvedPayoutReceiptOff - 184` for each VERSION: 9,369 - 184 = 9,185 on v2.1
+ * (= the source-verified constant above) and 10,409 - 184 = 10,225 on v2.2. Read off the fresh v2.2 devnet: all 30
+ * VERSION-19 portfolios carry an all-zero ledger there (no close in flight).
+ */
+export interface ClosePortfolioLayout {
+  version: number;
+  /** Portfolio account length (the getProgramAccounts dataSize filter). */
+  accountLen: number;
+  /** Absolute offset of `close_progress`. */
+  closeOff: number;
+}
+export const CLOSE_LAYOUT_V21: ClosePortfolioLayout = { version: 18, accountLen: V17_PORTFOLIO_ACCOUNT_LEN, closeOff: CLOSE_PROGRESS_OFF };
+
+/** The close-ledger layout for a wrapper VERSION the pinned SDK knows; null otherwise (never a guess). */
+export function closeLayoutForVersion(version: number): ClosePortfolioLayout | null {
+  const t = LAYOUTS_BY_VERSION.get(version);
+  if (!t) return null;
+  return { version, accountLen: t.portfolio.accountLen, closeOff: t.portfolio.resolvedPayoutReceiptOff - CLOSE_PROGRESS_LEN };
+}
+
+/** Close-ledger layout of a market account (by its header VERSION). */
+export function closeLayoutForMarket(marketData: Uint8Array): ClosePortfolioLayout | null {
+  if (marketData.length < 10) return null;
+  return closeLayoutForVersion(new DataView(marketData.buffer, marketData.byteOffset, marketData.byteLength).getUint16(8, true));
+}
 
 export interface CloseProgress {
   active: boolean;
@@ -46,9 +79,13 @@ export interface CloseProgress {
   residualRemaining: bigint;
 }
 
-/** Decode the 184-byte ledger (either the full portfolio account or the slice at CLOSE_PROGRESS_OFF). */
+/**
+ * Decode the 184-byte ledger (either the full portfolio account or the slice at the ledger offset). A full account is
+ * located by its length: a v2.2 (10,603 B) portfolio reads at 10,225, anything else at the v2.1 offset.
+ */
 export function decodeCloseProgress(d: Uint8Array, isSlice = false): CloseProgress | null {
-  const o = isSlice ? 0 : CLOSE_PROGRESS_OFF;
+  const full = [...LAYOUTS_BY_VERSION.keys()].map(closeLayoutForVersion).find((l) => l !== null && l.accountLen === d.length);
+  const o = isSlice ? 0 : (full?.closeOff ?? CLOSE_PROGRESS_OFF);
   if (d.length < o + CLOSE_PROGRESS_LEN) return null;
   const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
   const u64 = (x: number) => v.getBigUint64(o + x, true);
@@ -89,23 +126,28 @@ const PORTFOLIO_MARKET_OFF = 16;
  */
 export function makeSharedCloseScan(ttlMs = 90_000, now: () => number = Date.now) {
   type Snapshot = { at: number; byMarket: Map<string, Array<{ pubkey: PublicKey; data: Uint8Array }>> };
-  let cached: Snapshot | null = null as Snapshot | null;
-  let inflight: Promise<Snapshot> | null = null;
-  const sliceLen = CLOSE_PROGRESS_OFF + CLOSE_PROGRESS_LEN - PORTFOLIO_MARKET_OFF;
+  // One snapshot per portfolio layout (v2.1 9,563 B / v2.2 10,603 B): still ONE getProgramAccounts per layout in use.
+  const cachedBy = new Map<number, Snapshot>();
+  const inflightBy = new Map<number, Promise<Snapshot>>();
   return {
     async forMarket(
       conn: Pick<Connection, "getProgramAccounts">,
       programId: PublicKey,
       market: PublicKey,
+      layout: ClosePortfolioLayout = CLOSE_LAYOUT_V21,
     ): Promise<Array<{ pubkey: PublicKey; account: { data: Uint8Array } }>> {
-      if (!cached || now() - cached.at > ttlMs) {
-        inflight ??= (async () => {
+      const sliceLen = layout.closeOff + CLOSE_PROGRESS_LEN - PORTFOLIO_MARKET_OFF;
+      const cachedNow = cachedBy.get(layout.accountLen);
+      if (!cachedNow || now() - cachedNow.at > ttlMs) {
+        let inflight = inflightBy.get(layout.accountLen);
+        if (!inflight) {
+          inflight = (async () => {
           try {
             const accs = await conn.getProgramAccounts(programId, {
               dataSlice: { offset: PORTFOLIO_MARKET_OFF, length: sliceLen },
               filters: [
-                { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
-                { memcmp: { offset: CLOSE_PROGRESS_OFF, bytes: "2" } }, // base58 of [0x01]: active == 1
+                { dataSize: layout.accountLen },
+                { memcmp: { offset: layout.closeOff, bytes: "2" } }, // base58 of [0x01]: active == 1
               ],
             });
             const byMarket = new Map<string, Array<{ pubkey: PublicKey; data: Uint8Array }>>();
@@ -113,18 +155,21 @@ export function makeSharedCloseScan(ttlMs = 90_000, now: () => number = Date.now
               const d = new Uint8Array(a.account.data);
               const key = new PublicKey(d.subarray(0, 32)).toBase58();
               const list = byMarket.get(key) ?? [];
-              list.push({ pubkey: a.pubkey, data: d.subarray(CLOSE_PROGRESS_OFF - PORTFOLIO_MARKET_OFF) });
+              list.push({ pubkey: a.pubkey, data: d.subarray(layout.closeOff - PORTFOLIO_MARKET_OFF) });
               byMarket.set(key, list);
             }
-            cached = { at: now(), byMarket };
-            return cached;
+            const snap = { at: now(), byMarket };
+            cachedBy.set(layout.accountLen, snap);
+            return snap;
           } finally {
-            inflight = null;
+            inflightBy.delete(layout.accountLen);
           }
-        })();
+          })();
+          inflightBy.set(layout.accountLen, inflight);
+        }
         await inflight;
       }
-      return (cached?.byMarket.get(market.toBase58()) ?? []).map((x) => ({ pubkey: x.pubkey, account: { data: x.data } }));
+      return (cachedBy.get(layout.accountLen)?.byMarket.get(market.toBase58()) ?? []).map((x) => ({ pubkey: x.pubkey, account: { data: x.data } }));
     },
   };
 }
@@ -146,14 +191,17 @@ export async function watchBankruptCloses(
     const [mi] = await conn.getMultipleAccountsInfo([market], "confirmed");
     // The valve only exists on LIVE markets (group.header.mode == 0).
     if (!mi || marketMode(new Uint8Array(mi.data)) !== 0) return { kind: "nothing" };
+    // The market's own VERSION picks the portfolio size + ledger offset (v2.2: 10,603 B / 10,225); never a guess.
+    const layout = closeLayoutForMarket(new Uint8Array(mi.data));
+    if (!layout) return { kind: "skipped", reason: "market VERSION has no portfolio layout in the pinned SDK" };
     const accs = shared
-      ? await shared.forMarket(conn, cfg.wrapperProgramId, market)
+      ? await shared.forMarket(conn, cfg.wrapperProgramId, market, layout)
       : await conn.getProgramAccounts(cfg.wrapperProgramId, {
-          dataSlice: { offset: CLOSE_PROGRESS_OFF, length: CLOSE_PROGRESS_LEN },
+          dataSlice: { offset: layout.closeOff, length: CLOSE_PROGRESS_LEN },
           filters: [
-            { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
+            { dataSize: layout.accountLen },
             { memcmp: { offset: 16, bytes: market.toBase58() } },
-            { memcmp: { offset: CLOSE_PROGRESS_OFF, bytes: "2" } }, // base58 of [0x01]: active == 1
+            { memcmp: { offset: layout.closeOff, bytes: "2" } }, // base58 of [0x01]: active == 1
           ],
         });
     const pending = accs
