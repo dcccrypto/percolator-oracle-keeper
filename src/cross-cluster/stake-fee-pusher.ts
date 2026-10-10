@@ -21,7 +21,8 @@
  * processor.rs:2497). A pool whose real stakers have all exited holds exactly
  * those 1,000 — PENGU, JUP, TRUMP, BURNIE, Percolator and Murphy do today —
  * and fees booked there are permanently unredeemable. So this job pushes ONLY
- * when `total_lp_supply > MINIMUM_LIQUIDITY`. Pushing tag 87 alone into such a
+ * when `real_lp_supply() > 0` (legacy / pre-fix pools: `total_lp_supply > MINIMUM_LIQUIDITY`;
+ * tranche pools on the v2.2 stake program can hold 2,000 dead shares, see the floor-flag mirror below). Pushing tag 87 alone into such a
  * pool does not help either: every later Deposit pre-accrues the unbooked
  * surplus against the same dead supply before minting (#136 guard), so the
  * atoms would still land on the dead shares. They are safest left in the
@@ -69,13 +70,13 @@ import type { Connection, Keypair } from "@solana/web3.js";
 import {
   ACCOUNTS_WITHDRAW_INSURANCE_RESERVE_TO_STAKE,
   buildAccountMetas,
-  decodeStakePool,
   deriveMarketVaultAccounts,
   deriveStakePool,
   encodeStakeAccrueFees,
   encodeWithdrawInsuranceReserveToStake,
   parseWrapperConfigV17,
 } from "@percolatorct/sdk";
+import { decodeStakePoolAnyVersion } from "./stake-pool-decode.ts";
 import { STAKE_PROGRAM_ID, WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { parseInstructionError } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
@@ -85,6 +86,37 @@ import { isLiveMarket } from "./market-state.ts";
 
 /** percolator-stake `state::MINIMUM_LIQUIDITY` — the dead-share floor (state.rs:25 @ e62aa4a). */
 export const STAKE_MINIMUM_LIQUIDITY = 1_000n;
+
+/**
+ * Per-sub-pool dead-share floors (percolator-stake fix/v22-stake-last-junior-residual @ aebbff6,
+ * state.rs `dead_lp` / `real_lp_supply` / `has_real_lp_holders`). A tranche pool can carry 0, 1,000
+ * or 2,000 dead shares, recorded in `StakePool._reserved[61]` (FLOOR_SENIOR 0x01, FLOOR_JUNIOR 0x02).
+ * A byte of 0 is a LEGACY pool — every pool on the currently deployed (pre-fix) stake program — which
+ * keeps the old rule: one floor, `total_lp_supply - 1000` (saturating).
+ *
+ * TODO(repin): this is a local mirror because the keeper pins @percolatorct/sdk cb444db, which has no
+ * floor-flag decoding. Once the pin moves to the v2.2 SDK (percolator-sdk#406, `stakeRealLpSupply` /
+ * `stakeHasRealLpHolders`), replace these with the SDK helpers and delete the mirror.
+ */
+export const STAKE_FLOOR_SENIOR = 0x01;
+export const STAKE_FLOOR_JUNIOR = 0x02;
+/** `_reserved[61]`; `_reserved` starts at 320 on v2+ pools (state.rs `offset_of!(_reserved) == 320`), 288 on v1. */
+const FLOOR_FLAGS_RESERVED_INDEX = 61;
+
+/** Raw floor-flags byte of a pool account (0 when absent / legacy). */
+export function readStakeFloorFlags(data: Uint8Array): number {
+  const reservedStart = data.length >= 384 ? 320 : 288;
+  return data[reservedStart + FLOOR_FLAGS_RESERVED_INDEX] ?? 0;
+}
+
+/** Mirror of `StakePool::real_lp_supply`. */
+export function stakeRealLpSupply(totalLpSupply: bigint, floorFlags: number): bigint {
+  const sat = (a: bigint, b: bigint): bigint => (a > b ? a - b : 0n);
+  if (floorFlags === 0) return sat(totalLpSupply, STAKE_MINIMUM_LIQUIDITY);
+  const sd = (floorFlags & STAKE_FLOOR_SENIOR) !== 0 ? STAKE_MINIMUM_LIQUIDITY : 0n;
+  const jd = (floorFlags & STAKE_FLOOR_JUNIOR) !== 0 ? STAKE_MINIMUM_LIQUIDITY : 0n;
+  return sat(sat(totalLpSupply, sd), jd);
+}
 
 const COMPUTE_UNIT_LIMIT = 200_000;
 
@@ -153,6 +185,8 @@ export interface StakeFeeState {
     slab: PublicKey;
     poolMode: number;
     totalLpSupply: bigint;
+    /** Raw `_reserved[61]` floor flags; omitted / 0 = legacy pool (total - 1000). */
+    floorFlags?: number;
     isInitialized: boolean;
     percolatorProgram: PublicKey;
   };
@@ -168,18 +202,21 @@ export function decideStakeFeePush(s: StakeFeeState, cfg: Pick<StakeFeeConfig, "
     return { action: "blocked", reason: `pool.percolator_program ${s.pool.percolatorProgram.toBase58()} is not the configured wrapper` };
   }
   if (s.pool.poolMode !== 0) return { action: "skip", reason: `pool mode ${s.pool.poolMode} is not an insurance pool` };
-  const realShares = s.pool.totalLpSupply > STAKE_MINIMUM_LIQUIDITY ? s.pool.totalLpSupply - STAKE_MINIMUM_LIQUIDITY : 0n;
-  if (realShares > cfg.minRealShares && STAKE_MINIMUM_LIQUIDITY * 10_000n > cfg.maxDeadShareBps * s.pool.totalLpSupply) {
-    const deadBps = (STAKE_MINIMUM_LIQUIDITY * 10_000n + s.pool.totalLpSupply - 1n) / s.pool.totalLpSupply;
+  const total = s.pool.totalLpSupply;
+  const realShares = stakeRealLpSupply(total, s.pool.floorFlags ?? 0);
+  // Dead shares = everything that is not real (1,000 legacy / non-tranche; up to 2,000 on a tranche pool).
+  const deadShares = total - realShares;
+  if (realShares > cfg.minRealShares && deadShares * 10_000n > cfg.maxDeadShareBps * total) {
+    const deadBps = (deadShares * 10_000n + total - 1n) / total;
     return {
       action: "skip",
-      reason: `too few real stakers: the 1,000 dead shares would take ~${deadBps} bps of the push (max ${cfg.maxDeadShareBps}; total_lp_supply=${s.pool.totalLpSupply}) — ${s.owed} atoms held in the market vault (K-1/F3)`,
+      reason: `too few real stakers: the ${deadShares} dead shares would take ~${deadBps} bps of the push (max ${cfg.maxDeadShareBps}; total_lp_supply=${total}) — ${s.owed} atoms held in the market vault (K-1/F3)`,
     };
   }
   if (realShares <= cfg.minRealShares) {
     return {
       action: "skip",
-      reason: `no real stakers (total_lp_supply=${s.pool.totalLpSupply}, dead floor ${STAKE_MINIMUM_LIQUIDITY}) — ${s.owed} atoms held in the market vault (F3)`,
+      reason: `no real stakers (total_lp_supply=${total}, real_lp_supply=${realShares}, dead ${deadShares}) — ${s.owed} atoms held in the market vault (F3)`,
     };
   }
   return { action: "push", owed: s.owed, realShares };
@@ -294,11 +331,12 @@ export async function pushStakeFeesOnce(
     const owed = wc.insuranceReserveAccruedAtoms - wc.insuranceReserveWithdrawnAtoms;
     let pool: StakeFeeState["pool"] = null;
     if (pi && pi.owner.equals(cfg.stakeProgramId)) {
-      const p = decodeStakePool(new Uint8Array(pi.data));
+      const p = decodeStakePoolAnyVersion(new Uint8Array(pi.data)); // K-4: v5 (v2.2) pools too
       pool = {
         slab: p.slab,
         poolMode: p.poolMode,
         totalLpSupply: p.totalLpSupply,
+        floorFlags: readStakeFloorFlags(new Uint8Array(pi.data)),
         isInitialized: p.isInitialized,
         percolatorProgram: p.percolatorProgram,
       };

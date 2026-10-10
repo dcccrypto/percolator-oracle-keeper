@@ -30,6 +30,11 @@ import { evaluateMarketPush, evaluatePushCycle, getAlertSink } from "./alerting.
 import type { Alert, MarketPushSample } from "./alerting.ts";
 import { getCrankRefreshHealth, getLayoutProblemCounts, isPushHeld, pruneCrankRefreshHealth } from "./refresh-coordination.ts";
 import { p2bHealthFields } from "./p2b-health.ts";
+import { v22HealthFields } from "./v22/health.ts";
+import { layoutGuardSnapshot } from "./layout-guard-metrics.ts";
+import type { LayoutGuardSnapshot } from "./layout-guard-metrics.ts";
+import { rpcMetrics } from "./rpc-metrics.ts";
+import { getCachedBlockhash, invalidateBlockhash } from "./blockhash-cache.ts";
 import type { CrankRefreshHealth } from "./refresh-coordination.ts";
 import type { SweepHealth } from "./positioned-sweep.ts";
 import {
@@ -344,10 +349,17 @@ export function sweepHealthFields(s: SweepHealth): Record<string, string | numbe
  * `layoutProblemMarkets` = markets currently unreadable, `sweepLayoutUnknown` /
  * `sweepLayoutUnsupported` = process-lifetime counts of cranker reads that hit each problem.
  */
-export function layoutProblemFields(layoutProblemMarkets: string[]): Record<string, string[] | number> {
+export function layoutProblemFields(layoutProblemMarkets: string[]): Record<string, string[] | number | LayoutGuardSnapshot> {
   const c = getLayoutProblemCounts();
-  if (layoutProblemMarkets.length === 0 && c.unknown === 0 && c.unsupported === 0) return {};
-  return { layoutProblemMarkets, sweepLayoutUnknown: c.unknown, sweepLayoutUnsupported: c.unsupported };
+  const guard = layoutGuardSnapshot();
+  if (layoutProblemMarkets.length === 0 && c.unknown === 0 && c.unsupported === 0 && guard.refusals === 0) return {};
+  return {
+    layoutProblemMarkets,
+    sweepLayoutUnknown: c.unknown,
+    sweepLayoutUnsupported: c.unsupported,
+    // v2.2: the VERSION-keyed guard's refusal counters (by reason / on-chain VERSION); present only once one fired.
+    ...(guard.refusals > 0 ? { layoutGuard: guard } : {}),
+  };
 }
 
 export function withheldFromPush(market: string, withholdPush: ((m: string) => boolean) | undefined): boolean {
@@ -488,6 +500,7 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       cycleCount: state.cycleCount,
       timeoutCount: state.timeoutCount,
       tickPublisher: state.tickPublisher.counters(),
+      rpc: rpcMetrics.snapshot(),
       lastCycleAgo:
         state.lastCycleAt !== null
           ? `${Math.floor((Date.now() - state.lastCycleAt) / 1000)}s`
@@ -497,6 +510,8 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       markets,
       // v2.1 (P2b), additive: `earnVaults` + `p2b`. `{}` (nothing added) unless the wrapper supports P2b.
       ...p2bHealthFields(),
+      // v2.2 layer, additive: `v22`. `{}` unless KEEPER_V22=on.
+      ...v22HealthFields(),
     });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(payload);
@@ -755,8 +770,6 @@ export function cloneCircuitBreakerState(state: CircuitBreakerState): CircuitBre
 
 // Blockhash cache — a fresh one is valid ~60-90s; refetch every 15s so each
 // cycle doesn't pay a getLatestBlockhash round-trip.
-let cachedBlockhash: { blockhash: string; lastValidBlockHeight: number } | null = null;
-let cachedBlockhashAt = 0;
 
 /**
  * FAST cycle: ONE getMultipleAccounts to read every mainnet DEX pool, ONE
@@ -963,10 +976,8 @@ async function runCycle(
   // ── 4. One slot + one (cached) blockhash for the whole batch ────────────────
   const nowSlot = BigInt(await devnetConn.getSlot("processed"));
   const now = Date.now();
-  if (!cachedBlockhash || now - cachedBlockhashAt > 15_000) {
-    cachedBlockhash = await devnetConn.getLatestBlockhash("processed");
-    cachedBlockhashAt = now;
-  }
+  // Shared with the cranker (blockhash-cache.ts): one fetch per 15 s for the whole process.
+  const cachedBlockhash = await getCachedBlockhash(devnetConn, "processed");
 
   // ── 4b. Wallet-balance guard (#71) ──────────────────────────────────────────
   // A keeper that cannot pay produces reverting transactions, not fresh marks.
@@ -1094,7 +1105,7 @@ async function runCycle(
   } catch (err) {
     const msg = (err instanceof Error ? err.message : String(err)).slice(0, 160);
     console.error(`[loop] batch push error — ${msg}`);
-    if (/blockhash/i.test(msg)) cachedBlockhash = null; // force refresh next cycle
+    if (/blockhash/i.test(msg)) invalidateBlockhash(devnetConn); // force refresh next cycle
     for (const p of pushes) {
       const s = state.stats.get(p.marketAddress)!;
       s.totalErrors++;

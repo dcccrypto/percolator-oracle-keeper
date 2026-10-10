@@ -63,8 +63,8 @@ function putU128(b: Buffer, off: number, v: bigint): void {
 }
 
 describe("layout table", () => {
-  it("has the three rows, internally consistent", () => {
-    assert.deepEqual(MARKET_LAYOUTS.map((l) => l.id), ["v2.1-legacy", "v2.1-drift", "v2.2-drift"]);
+  it("has the four rows, internally consistent", () => {
+    assert.deepEqual(MARKET_LAYOUTS.map((l) => l.id), ["v2.1-legacy", "v2.1-drift", "v2.2-drift", "v2.2-b"]);
     for (const l of MARKET_LAYOUTS) {
       assert.equal(l.slotStride, l.wrapperLen + l.engineSlotLen, l.id);
       // max_market_slots sits at the same absolute offset everywhere (detection reads it first)
@@ -73,7 +73,8 @@ describe("layout table", () => {
       if (l.slot.driftLong !== null && l.slot.driftShort !== null) {
         assert.equal(l.slot.driftShort, l.slot.driftLong + KF_DRIFT_FIELDS.len, l.id);
         // the drift tail is the END of the engine slot
-        assert.equal(l.slot.driftShort + KF_DRIFT_FIELDS.len, l.engineSlotLen, l.id);
+        // (variant B appends #282's 32 B slot tail AFTER the drift tail)
+        assert.equal(l.slot.driftShort + KF_DRIFT_FIELDS.len + (l.id === "v2.2-b" ? 64 : 0), l.engineSlotLen, l.id);
       } else {
         assert.equal(l.slot.driftLong, null);
         assert.equal(l.slot.driftShort, null);
@@ -366,7 +367,12 @@ describe("unknown stride: fail loudly, no legacy fallback", () => {
     assert.equal(f.marketLayout, "unknown");
     assert.equal(f.marketLayoutUnknown, true);
     assert.match(String(f.marketLayoutProblem), /matches no known layout/);
-    assert.deepEqual(layoutProblemFields(["V22/USDC"]), { layoutProblemMarkets: ["V22/USDC"], sweepLayoutUnknown: 1, sweepLayoutUnsupported: 0 });
+    const lpf = layoutProblemFields(["V22/USDC"]);
+    // the VERSION-keyed guard's refusal counters ride along (by reason and by on-chain VERSION)
+    const { layoutGuard, ...rest } = lpf as Record<string, unknown>;
+    assert.deepEqual(rest, { layoutProblemMarkets: ["V22/USDC"], sweepLayoutUnknown: 1, sweepLayoutUnsupported: 0 });
+    assert.ok((layoutGuard as { refusals: number }).refusals >= 1);
+    assert.equal((layoutGuard as { lastCode: string }).lastCode, "NO_ROW_FOR_LENGTH");
     // alert through the existing crank alert path, and the [health] line
     const sample = crankSample("V22/USDC", MARKET.toBase58(), st);
     assert.ok(sample?.layout);
@@ -406,14 +412,14 @@ describe("v2.2 portfolios vs the SDK parser (gap reported, not hand-rolled)", ()
     return b;
   };
 
-  it("the installed SDK parser reads 9563-byte portfolios, the v2.2 layout needs 10091", () => {
+  it("the SDK parser is VERSION-keyed: 9563 B at VERSION 18, 10603 B at VERSION 19; stage A (10091 B) is unsupported", () => {
     assert.equal(V17_PORTFOLIO_ACCOUNT_LEN, 9563);
     const det = detectLayout(v22Market());
     const h = layoutHealthFor(det, { storedPosLong: 9n, storedPosShort: 9n });
     assert.equal(h.kind, "unsupported");
     assert.equal(h.id, "v2.2-drift");
     assert.equal(h.provisional, true);
-    assert.match(h.problem ?? "", /10091-byte portfolios \(leg 185 B\).*parsePortfolioV17.*9563/);
+    assert.match(h.problem ?? "", /10091-byte portfolios \(leg 185 B\).*parsePortfolioV17.*10603/);
     // once the SDK parser handles the v2.2 portfolio the same market is fully supported
     assert.equal(layoutHealthFor(det, null, 10091).kind, "ok");
     // and the v2.1 layouts are supported by today's SDK

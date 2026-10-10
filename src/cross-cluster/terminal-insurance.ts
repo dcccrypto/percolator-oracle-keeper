@@ -52,7 +52,6 @@ import {
 } from "@solana/web3.js";
 import type { Connection, Keypair } from "@solana/web3.js";
 import {
-  decodeStakePool,
   deriveMarketVaultAccounts,
   deriveStakePool,
   deriveStakeVaultAuth,
@@ -62,6 +61,8 @@ import {
   V17_MARKET_GROUP_LEN,
   V17_MARKET_GROUP_OFF,
 } from "@percolatorct/sdk";
+import { decodeStakePoolAnyVersion } from "./stake-pool-decode.ts";
+import type { StakePoolView } from "./stake-pool-decode.ts";
 import { STAKE_PROGRAM_ID, WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
 import { parseInstructionError } from "./positioned-refresh.ts";
@@ -297,13 +298,13 @@ export async function windDownOnce(
   const [pool] = deriveStakePool(market, cfg.stakeProgramId);
 
   let data: Uint8Array;
-  let poolState: ReturnType<typeof decodeStakePool> | null = null;
+  let poolState: StakePoolView | null = null;
   try {
     const [mi, pi] = await conn.getMultipleAccountsInfo([market, pool], "confirmed");
     if (!mi) return res({ kind: "failed", error: "market account not found" });
     if (!mi.owner.equals(cfg.wrapperProgramId)) return res({ kind: "skipped", reason: "market not owned by the configured wrapper" });
     data = new Uint8Array(mi.data);
-    if (pi && pi.owner.equals(cfg.stakeProgramId)) poolState = decodeStakePool(new Uint8Array(pi.data));
+    if (pi && pi.owner.equals(cfg.stakeProgramId)) poolState = decodeStakePoolAnyVersion(new Uint8Array(pi.data));
   } catch (err) {
     return res({ kind: "failed", error: `account read failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}` });
   }
@@ -575,7 +576,7 @@ export async function inspectStakeBoundBudget(
     const state = decodeTerminalState(data);
     const budget = state && state.kind !== "closed" ? state.budget : null;
     if (!pi || !pi.owner.equals(cfg.stakeProgramId)) return { state, stakeBound: false, budget, support: null };
-    const p = decodeStakePool(new Uint8Array(pi.data));
+    const p = decodeStakePoolAnyVersion(new Uint8Array(pi.data));
     const [vaultAuth] = deriveStakeVaultAuth(pool, cfg.stakeProgramId);
     const stakeBound = p.slab.equals(market) && !!asset0InsuranceAuthority(data)?.equals(vaultAuth);
     if (!stakeBound) return { state, stakeBound, budget, support: null };

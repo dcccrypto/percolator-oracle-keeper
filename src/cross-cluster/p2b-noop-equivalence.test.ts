@@ -141,7 +141,7 @@ describe("/health payload", () => {
   const BASE_KEYS = [
     "walletLow", "walletBalanceSol", "status", "lastSuccessfulPushAgo", "consecutiveBatchReadFailures", "lastBatchReadError",
     "quarantinedMarkets", "lossStaleMarkets", "noPushMarkets", "markLaggingMarkets", "uptimeSec", "cycleCount", "timeoutCount",
-    "tickPublisher", "lastCycleAgo", "dryRun", "intervalMs", "markets",
+    "tickPublisher", "rpc", "lastCycleAgo", "dryRun", "intervalMs", "markets",
   ];
 
   it("no provider installed (today's programs): exactly the existing fields, in the existing order", () => {

@@ -96,6 +96,7 @@
  *   auto-crank planner; measured on devnet, the sequence above lands clean.)
  */
 import {
+  type AccountInfo,
   Connection,
   Keypair,
   PublicKey,
@@ -104,11 +105,13 @@ import {
   ComputeBudgetProgram,
   VersionedTransaction,
 } from "@solana/web3.js";
+import { getCachedBlockhash, invalidateBlockhash } from "./blockhash-cache.ts";
 import {
   encodePermissionlessCrank,
   ACCOUNTS_PERMISSIONLESS_CRANK_BASE,
   buildAccountMetas,
   V17_PORTFOLIO_ACCOUNT_LEN,
+  LAYOUTS_BY_VERSION,
   parsePortfolioV17,
 } from "@percolatorct/sdk";
 import type { CrankObservationHint } from "@percolatorct/sdk";
@@ -122,6 +125,7 @@ import {
   marketHasPositions,
   parseInstructionError,
   isComputeExhaustion,
+  legCostModelFor,
   MAX_TX_CU,
   chunkOverflowTargets,
   planCrankTx,
@@ -129,9 +133,12 @@ import {
   positionedSetMatchesMarket,
   selectPositionedPortfolios,
 } from "./positioned-refresh.ts";
+import type { LegCostModel } from "./positioned-refresh.ts";
 import { countLayoutProblem, holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coordination.ts";
+import { getSweepDelegate } from "./v22/delegation.ts";
+import { formatProgramError } from "./v22/errors.ts";
 import type { MarketLayoutHealth } from "./refresh-coordination.ts";
-import { describeUnknownLayout, detectLayout } from "./market-layout.ts";
+import { SDK_PORTFOLIO_LENS, describeUnknownLayout, detectLayout } from "./market-layout.ts";
 import type { LayoutDetection } from "./market-layout.ts";
 import {
   decodeSweepMarketState,
@@ -154,6 +161,7 @@ import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio }
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
 import { decodeAdlState } from "./adl-state.ts";
 import { isTerminalMarket } from "./market-state.ts";
+import { decodeVaultLpState, deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 import { isLockFamilyCode } from "./lock-codes.ts";
 import { isP2bSupported } from "./p2b-feature.ts";
 import { reportSeniorDraw } from "./vault-lp-crank.ts";
@@ -209,6 +217,8 @@ interface CrankMarketState {
   positionedFetchedAt: number;
   /** Set when a simulation still ended loss-stale: re-read the positioned set. */
   positionedDirty: boolean;
+  /** Portfolio account length of this market's layout (9,563 B on v2.1; 10,603 B on v2.2 variant B). */
+  portfolioLen: number;
   /** Last refresh summary logged, so steady-state cycles stay quiet. */
   lastRefreshSummary: string | null;
   decodeWarned: boolean;
@@ -277,6 +287,7 @@ export function freshCrankMarketState(): CrankMarketState {
     positioned: null,
     positionedFetchedAt: 0,
     positionedDirty: false,
+    portfolioLen: V17_PORTFOLIO_ACCOUNT_LEN,
     lastRefreshSummary: null,
     decodeWarned: false,
     obs: null,
@@ -385,7 +396,7 @@ async function withRpcRetry<T>(label: string, fn: () => Promise<T>, maxAttempts 
  * require the exact portfolio length.
  */
 export function isLpVaultPortfolio(data: Uint8Array): boolean {
-  if (data.length !== V17_PORTFOLIO_ACCOUNT_LEN) return false;
+  if (!SDK_PORTFOLIO_LENS.has(data.length)) return false;
   try {
     return parsePortfolioV17(data).matcherEnabled === true;
   } catch {
@@ -398,25 +409,59 @@ export function isLpVaultPortfolio(data: Uint8Array): boolean {
  * null if none exists yet (e.g. a brand-new market with no LP vault) — the
  * caller should skip cranking that market until discovery succeeds.
  */
-export function fetchMarketPortfolios(conn: Connection, market: PublicKey) {
+export function fetchMarketPortfolios(conn: Connection, market: PublicKey, portfolioLen: number = V17_PORTFOLIO_ACCOUNT_LEN) {
   return conn.getProgramAccounts(WRAPPER_PROGRAM_ID, {
     filters: [
-      { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
+      { dataSize: portfolioLen },
       { memcmp: { offset: 0, bytes: V17_PORTFOLIO_MAGIC.toString("base64"), encoding: "base64" } },
       { memcmp: { offset: V17_PF_MARKET_OFF, bytes: market.toBase58() } },
     ],
   });
 }
 
-async function findLpPortfolio(
-  conn: Connection,
+/**
+ * K-3: resolve the vault-LP portfolio of a market whose registry entry carries no `lpPortfolio` (every market that
+ * arrives through register-poll / the create-market wizard). Two sources, both on chain, never a guess:
+ *
+ *  1. The market's `vault_lp` state PDA (`["vault_lp", market]`, wrapper-owned, kind 9): its `lp_portfolio` field
+ *     names the portfolio directly, one read, any layout. Accepted only when that portfolio is a wrapper-owned,
+ *     matcher-enabled portfolio of THIS market (same check as the scan below).
+ *  2. Fallback: scan the market's portfolios for a matcher-enabled one, once per portfolio length the pinned SDK can
+ *     decode (VERSION 18 = 9,563 B, VERSION 19 = 10,603 B). The scan used to filter on the v2.1 length only, so a
+ *     v2.2 market (10,603 B portfolios) was never found and never cranked.
+ *
+ * Exported for tests.
+ */
+export async function findLpPortfolio(
+  conn: Pick<Connection, "getAccountInfo" | "getProgramAccounts">,
   market: PublicKey,
 ): Promise<PublicKey | null> {
-  const accounts = await fetchMarketPortfolios(conn, market);
-  for (const { pubkey, account } of accounts) {
-    if (isLpVaultPortfolio(account.data)) return pubkey;
+  try {
+    const vls = await conn.getAccountInfo(deriveVaultLpState(WRAPPER_PROGRAM_ID, market), "confirmed");
+    const st = vls && vls.owner.equals(WRAPPER_PROGRAM_ID) ? decodeVaultLpState(new Uint8Array(vls.data)) : null;
+    if (st) {
+      const pf = await conn.getAccountInfo(st.lpPortfolio, "confirmed");
+      if (pf && pf.owner.equals(WRAPPER_PROGRAM_ID) && portfolioBelongsTo(pf.data, market) && isLpVaultPortfolio(pf.data)) {
+        return st.lpPortfolio;
+      }
+      console.warn(`[cranker] ${market.toBase58().slice(0, 8)}…: vault_lp state names ${st.lpPortfolio.toBase58()}, which is not a matcher-enabled portfolio of this market — scanning instead`);
+    }
+  } catch {
+    // an RPC blip or a mock without getAccountInfo: fall through to the scan
+  }
+  for (const len of SDK_PORTFOLIO_LENS) {
+    const accounts = await fetchMarketPortfolios(conn as Connection, market, len);
+    for (const { pubkey, account } of accounts) {
+      if (isLpVaultPortfolio(account.data)) return pubkey;
+    }
   }
   return null;
+}
+
+/** The portfolio's market field (`V17_PF_MARKET_OFF`, the same offset the scan's memcmp filters on) equals `market`. */
+function portfolioBelongsTo(data: Uint8Array, market: PublicKey): boolean {
+  if (data.length < V17_PF_MARKET_OFF + 32) return false;
+  return new PublicKey(data.subarray(V17_PF_MARKET_OFF, V17_PF_MARKET_OFF + 32)).equals(market);
 }
 
 // These are single-asset markets — every registry market's only engine
@@ -457,12 +502,52 @@ export function buildCrankIx(owner: PublicKey, market: PublicKey, portfolio: Pub
   });
 }
 
+/**
+ * One getMultipleAccounts (`processed`, 100 keys per call) for every market the cycle will crank, in
+ * place of one getAccountInfo per market. Returns market address -> {value, context}. A market whose
+ * chunk failed (or that came back null) is simply absent: crankOneMarket then reads it on its own,
+ * which is the pre-existing behaviour, so a failed batch costs calls, never correctness.
+ */
+export async function readMarketsForCycle(
+  devnetConn: Pick<Connection, "getMultipleAccountsInfoAndContext">,
+  markets: ReadonlyArray<{ marketAddress: string }>,
+  states: ReadonlyMap<string, CrankMarketState>,
+): Promise<Map<string, { value: AccountInfo<Buffer>; context: { slot: number } }>> {
+  const out = new Map<string, { value: AccountInfo<Buffer>; context: { slot: number } }>();
+  // Terminal markets cost no RPC (crankOneMarket returns first); nothing to prefetch for them.
+  const wanted = markets.filter((m) => !states.get(m.marketAddress)?.terminal);
+  for (let i = 0; i < wanted.length; i += 100) {
+    const slice = wanted.slice(i, i + 100);
+    try {
+      const res = await devnetConn.getMultipleAccountsInfoAndContext(
+        slice.map((m) => new PublicKey(m.marketAddress)),
+        { commitment: "processed" },
+      );
+      if (res.value.length !== slice.length) continue;
+      slice.forEach((m, j) => {
+        const v = res.value[j];
+        if (v) out.set(m.marketAddress, { value: v, context: { slot: res.context.slot } });
+      });
+    } catch {
+      /* this chunk's markets fall back to their own read */
+    }
+  }
+  return out;
+}
+
 export async function crankOneMarket(
   devnetConn: Connection,
   keeper: Keypair,
   entry: Pick<MarketEntry, "marketAddress" | "label" | "lpPortfolio">,
   state: CrankMarketState,
   dryRun: boolean,
+  /**
+   * This cycle's market read, taken for ALL markets in one getMultipleAccounts at the start of the
+   * cycle (see readMarketsForCycle). Same `processed` commitment and the same moment the per-market
+   * reads used to fire (every market starts at once), so the data is no staler. Absent or null = read
+   * this market on its own, exactly as before.
+   */
+  prefetched?: { value: AccountInfo<Buffer> | null; context: { slot: number } } | null,
 ): Promise<void> {
   // B13: a market seen Resolved/closed stays that way (resolution is one-way,
   // a tombstone is final), so it costs no RPC and no alert from here on.
@@ -517,7 +602,9 @@ export async function crankOneMarket(
 
   try {
     // One read gives both the market state and the slot it was read at.
-    const acct = await withRpcRetry(label, () => devnetConn.getAccountInfoAndContext(market, "processed"));
+    const acct = prefetched?.value
+      ? prefetched
+      : await withRpcRetry(label, () => devnetConn.getAccountInfoAndContext(market, "processed"));
     if (!acct.value) throw new Error(`market ${marketAddress} could not find account`);
     // B13 (E2E 2026-09-30): a Resolved market / CloseSlab tombstone is never
     // cranked again. The engine refuses it, and cranking only produced critical
@@ -541,6 +628,14 @@ export async function crankOneMarket(
     // offsets would be guesses), the accrual crank alone keeps the engine clock moving, and the
     // market is reported unhealthy (error log, /health, [health] line, alert).
     const detection = detectLayout(acct.value.data);
+    if (detection.known && SDK_PORTFOLIO_LENS.has(detection.layout.portfolioAccountLen)) state.portfolioLen = detection.layout.portfolioAccountLen;
+    // v2.2 (KEEPER_V22_SWEEP): the v2.2 layer owns the positioned-refresh sweep of a variant-B market. No delegate is
+    // installed unless the flags are on, so every other market (and every market with the flags off) skips this.
+    const sweepDelegate = getSweepDelegate();
+    if (sweepDelegate && detection.known && detection.layout.id === "v2.2-b") {
+      const handled = await sweepDelegate({ conn: devnetConn, keeper, entry, marketData: acct.value.data, slot: acct.context.slot, dryRun });
+      if (handled) return;
+    }
     let pre: MarketRefreshState | null = null;
     if (detection.known) {
       try {
@@ -599,10 +694,14 @@ export async function crankOneMarket(
     // they get a second crank (the engine's Liquidate step) in the same tx.
     let liquidateTargets: PublicKey[] = [];
 
+    // Leg-aware sizing is selected by the layout: a v2.2 market (up to 4 legs per account) gets it, every v2.1 layout and an
+    // unknown one gets `undefined`, i.e. exactly the single-leg arithmetic that was here before.
+    const legCost = legCostModelFor(detection.known ? detection.layout : null);
+    const lpEntry = positionedAll.find((p) => p.isLp) ?? null;
     const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan =>
       sweepCtx
-        ? planSweepTx({ owner: keeper.publicKey, market, lpPortfolio, targets: t, cfg: sweepCfg, catchup, repairs, liquidateTargets })
-        : planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs, liquidateTargets });
+        ? planSweepTx({ owner: keeper.publicKey, market, lpPortfolio, targets: t, cfg: sweepCfg, catchup, repairs, liquidateTargets, cost: legCost })
+        : planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs, liquidateTargets, cost: legCost, lp: lpEntry });
 
     if (dryRun) {
       const plan = build(targets);
@@ -624,7 +723,7 @@ export async function crankOneMarket(
       held = true;
     }
 
-    const bh = await withRpcRetry(label, () => devnetConn.getLatestBlockhash("processed"));
+    const bh = await withRpcRetry(label, () => getCachedBlockhash(devnetConn, "processed"));
     const toTx = (plan: CrankPlan): Transaction => {
       const tx = new Transaction();
       tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: plan.computeUnits }));
@@ -706,7 +805,8 @@ export async function crankOneMarket(
       state.totalReverts++;
       state.consecutiveReverts++;
       state.lastRevertCode = code;
-      state.lastErrorMsg = `revert ${code != null ? `Custom(${code})` : JSON.stringify(resolved.sim.err)}`;
+      // v2.2: a wrapper error 104-124 is logged by NAME (PriceBandPinned(104), EngineLossStale(121), ...), same text otherwise.
+      state.lastErrorMsg = `revert ${code != null ? `Custom(${code})${code >= 104 && code <= 124 ? ` ${formatProgramError("wrapper", code)}` : ""}` : JSON.stringify(resolved.sim.err)}`;
       const computeExhausted = isComputeExhaustion(resolved.sim.err, resolved.sim.logs);
       if (computeExhausted) {
         state.lastErrorMsg += ` — compute exhausted at ${resolved.plan.computeUnits} CU (${resolved.plan.cranks.length} cranks)`;
@@ -792,7 +892,7 @@ export async function crankOneMarket(
           fu = await runSweepFollowups(sweepCtx.pace.txs - 1, visitedThisCycle, {
             pickBatch: (exclude) => selectSweepBatch(sweepCtx.positioned, state.sweepCursor, sweepCtx.pace.k, exclude, epochs),
             plan: (t, accrue, liq) =>
-              planSweepTx({ owner: keeper.publicKey, market, lpPortfolio, targets: t, cfg: sweepCfg, accrue, liquidateTargets: liq }),
+              planSweepTx({ owner: keeper.publicKey, market, lpPortfolio, targets: t, cfg: sweepCfg, accrue, liquidateTargets: liq, cost: legCost }),
             simulate: (p) => simulateWith(toFuTx(p), p),
             send: (p) =>
               withRpcRetry(label, () => devnetConn.sendRawTransaction(toFuTx(p).serialize(), { skipPreflight: true, maxRetries: 2 })),
@@ -832,7 +932,7 @@ export async function crankOneMarket(
       if (accrual !== "landed") {
         ov = { attempted: plan.overflow.length, refreshed: 0, liquidated: 0, bankruptFound: 0, pruned: [], signatures: [], error: `accrual tx ${accrual}` };
       } else {
-        const ovBh = await withRpcRetry(label, () => devnetConn.getLatestBlockhash("processed"));
+        const ovBh = await withRpcRetry(label, () => getCachedBlockhash(devnetConn, "processed"));
         const toOvTx = (p: CrankPlan): Transaction => {
           const t = new Transaction();
           t.add(ComputeBudgetProgram.setComputeUnitLimit({ units: p.computeUnits }));
@@ -846,6 +946,7 @@ export async function crankOneMarket(
           owner: keeper.publicKey,
           market,
           overflow: plan.overflow,
+          cost: legCost,
           simulate: (p) => simulateWith(toOvTx(p), p),
           send: (p) =>
             withRpcRetry(label, () => devnetConn.sendRawTransaction(toOvTx(p).serialize(), { skipPreflight: true, maxRetries: 2 })),
@@ -882,6 +983,7 @@ export async function crankOneMarket(
   } catch (err) {
     state.totalErrors++;
     state.lastErrorMsg = err instanceof Error ? err.message : String(err);
+    if (/blockhash/i.test(state.lastErrorMsg)) invalidateBlockhash(devnetConn);
     console.warn(`[cranker] ${label}: crank send failed — ${state.lastErrorMsg.slice(0, 160)}`);
     // A stale-account error (e.g. LP portfolio closed) is worth rediscovering next attempt.
     if (/AccountNotFound|could not find account/i.test(state.lastErrorMsg)) {
@@ -930,7 +1032,7 @@ async function positionedPortfoliosFor(
   }
   state.positionedFetchedAt = now;
   try {
-    const accounts = await withRpcRetry(label, () => fetchMarketPortfolios(conn, market));
+    const accounts = await withRpcRetry(label, () => fetchMarketPortfolios(conn, market, state.portfolioLen));
     const set = selectPositionedPortfolios(accounts.map((a) => ({ pubkey: a.pubkey, data: a.account.data })));
     const changed =
       cached === null ||
@@ -981,7 +1083,7 @@ export const LAYOUT_PROBLEM_LOG_EVERY = 30;
 export function layoutHealthFor(
   detection: LayoutDetection,
   pre: Pick<MarketRefreshState, "storedPosLong" | "storedPosShort"> | null,
-  sdkPortfolioLen: number = V17_PORTFOLIO_ACCOUNT_LEN,
+  sdkPortfolioLen?: number,
 ): MarketLayoutHealth {
   const hasPositions = pre ? pre.storedPosLong !== 0n || pre.storedPosShort !== 0n : null;
   if (!detection.known) {
@@ -996,6 +1098,25 @@ export function layoutHealthFor(
   }
   const L = detection.layout;
   const accountLen = L.groupOff + L.headerLen + detection.slots * L.slotStride;
+  // The portfolio length the SDK parser reads for THIS layout's VERSION (VERSION-keyed since the v2.2 SDK:
+  // 9,563 B for VERSION 18, 10,603 B for VERSION 19). An explicit argument overrides it (tests).
+  // v2.2 variant B is NEVER driven by this legacy path (its [LP crank, refresh xN] sweep settles the LP in every tx, the
+  // shape SETTLE_PAIRING exists to avoid). The v2.2 layer takes the market through the sweep delegate BEFORE this
+  // verdict is reached; anything that gets here (no KEEPER_V22 / KEEPER_V22_SWEEP, or the delegate declined) gets the
+  // accrual-only crank and a loud "unsupported" status (security review F-1 / F-5).
+  if (L.id === "v2.2-b") {
+    return {
+      id: L.id,
+      problem:
+        "variant-B (VERSION 19) market on the legacy cranker: the legacy sweep is refused for v2.2. " +
+        "Set KEEPER_V22=on and KEEPER_V22_SWEEP=on (accrual crank only until then)",
+      kind: "unsupported",
+      accountLen,
+      provisional: L.provisional,
+      hasPositions,
+    };
+  }
+  sdkPortfolioLen ??= LAYOUTS_BY_VERSION.get(L.wrapperVersion)?.portfolio.accountLen ?? V17_PORTFOLIO_ACCOUNT_LEN;
   if (L.portfolioAccountLen !== sdkPortfolioLen) {
     return {
       id: L.id,
@@ -1428,6 +1549,8 @@ export async function refreshOverflow(params: {
   owner: PublicKey;
   market: PublicKey;
   overflow: ReadonlyArray<PositionedPortfolio>;
+  /** Leg-aware sizing (v2.2); omitted = the single-leg arithmetic, unchanged. */
+  cost?: LegCostModel;
   simulate: (plan: CrankPlan) => Promise<SimOutcome>;
   send: (plan: CrankPlan) => Promise<string>;
   waitLanded: (signature: string) => Promise<LandOutcome>;
@@ -1441,10 +1564,10 @@ export async function refreshOverflow(params: {
   const simulate = async (plan: CrankPlan): Promise<SimOutcome> =>
     plan.cranks.length === 0 ? { err: null, logs: [], marketData: null } : params.simulate(plan);
   try {
-    for (const chunk of chunkOverflowTargets(overflow)) {
+    for (const chunk of chunkOverflowTargets(overflow, undefined, params.cost)) {
       let liquidate: PublicKey[] = [];
       const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan =>
-        planRefreshTx({ owner, market, targets: t, liquidateTargets: liquidate });
+        planRefreshTx({ owner, market, targets: t, liquidateTargets: liquidate, cost: params.cost });
       const onOptional = (c: PlannedCrank) => {
         if (c.kind === "liquidate") liquidate = liquidate.filter((x) => !x.equals(c.portfolio));
       };
@@ -1776,8 +1899,10 @@ export async function startRecoveryCrankLoop(
     // market's errors are already fully isolated inside crankOneMarket / the
     // per-iteration try/catch below, so Promise.allSettled here is defense in
     // depth, not a correctness requirement — it just keeps cycle time flat.
+    const cycleMarkets = [...registry.markets];
+    const prefetched = await readMarketsForCycle(devnetConn, cycleMarkets, states).catch(() => new Map());
     await Promise.allSettled(
-      registry.markets.map(async (m) => {
+      cycleMarkets.map(async (m) => {
         // Lazily track markets registered AFTER boot (added live by the register-poll
         // loop, or hot-reloaded — see registry-reload.ts). The states Map was seeded
         // only from the markets present at startup, so without this a newly-registered
@@ -1790,7 +1915,7 @@ export async function startRecoveryCrankLoop(
           console.log(`[cranker] now tracking newly-registered market ${m.label} (${m.marketAddress.slice(0, 8)}…)`);
         }
         try {
-          await crankOneMarket(devnetConn, keeper, m, state, config.dryRun);
+          await crankOneMarket(devnetConn, keeper, m, state, config.dryRun, prefetched.get(m.marketAddress));
         } catch (err) {
           // Defense in depth: crankOneMarket already isolates errors per-market,
           // but never let an unexpected throw kill the whole loop.

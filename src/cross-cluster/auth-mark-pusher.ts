@@ -42,13 +42,12 @@ import {
   buildAccountMetas,
   parseAssetOracleProfileV17,
   parseAssetControlSequencesV17,
-  V17_MARKET_GROUP_LEN,
-  V17_MARKET_ASSET_SLOT_LEN,
+  tokenPriceToLotE6V22,
   V17_ASSET_ORACLE_PROFILE_LEN,
-  V17_ASSET_ORACLE_WRAPPER_LEN,
 } from "@percolatorct/sdk";
-import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
+import { assetSlotOffset, selectMarketGroupOffset, VERSION_19 } from "../wrapper-market-group-offset.ts";
 import { isLiveMarket, isTerminalMarket } from "./market-state.ts";
+import { getMultipleAccountsInfoChunked } from "./rpc-chunk.ts";
 
 /**
  * B20 (E2E 2026-09-30): Resolved markets and CloseSlab tombstones are never
@@ -174,10 +173,8 @@ export async function fetchOracleAuthority(
       }
     }
 
-    const profileOff =
-      groupOffResult.marketGroupOff +
-      V17_MARKET_GROUP_LEN +
-      assetIndex * V17_MARKET_ASSET_SLOT_LEN;
+    // K-2: the slot base uses THIS version's group length and stride (VERSION 19: 806 / 2,661), not the v2.1 constants.
+    const profileOff = assetSlotOffset(groupOffResult, assetIndex);
     // parseAssetOracleProfileV17 requires V17_ASSET_ORACLE_PROFILE_LEN (400)
     // bytes after profileOff — check up front so a too-short buffer returns
     // null (skip) instead of throwing inside the parse call. The v17-only
@@ -249,27 +246,65 @@ function readU64LE(data: Uint8Array, off: number): bigint {
 // Returns null on any parse failure (bad magic/version, unrecognized VERSION,
 // or a buffer too short for this asset's slot) — callers must skip this push
 // this cycle, never guess a value.
-function parsePushAuthMarkGenerationFields(
+export function parsePushAuthMarkGenerationFields(
   data: Uint8Array,
   assetIndex: number,
-): { marketId: bigint; observationSequence: bigint } | null {
+): { marketId: bigint; observationSequence: bigint; lotExp: number } | null {
   const groupOffResult = selectMarketGroupOffset(data);
   if (!groupOffResult.ok) return null;
-  const profileOff =
-    groupOffResult.marketGroupOff +
-    V17_MARKET_GROUP_LEN +
-    assetIndex * V17_MARKET_ASSET_SLOT_LEN;
+  const profileOff = assetSlotOffset(groupOffResult, assetIndex);
 
-  const engineAssetOff = profileOff + V17_ASSET_ORACLE_WRAPPER_LEN;
+  const engineAssetOff = profileOff + groupOffResult.wrapperSlotLen;
   if (data.length < engineAssetOff + 8) return null;
   const marketId = readU64LE(data, engineAssetOff);
 
+  const lotExp = readMarketLotExp(data, groupOffResult.version, profileOff);
+  if (lotExp === null) return null;
+
   try {
     const seqs = parseAssetControlSequencesV17(data, profileOff);
-    return { marketId, observationSequence: seqs.oracleObservation + 1n };
+    return { marketId, observationSequence: seqs.oracleObservation + 1n, lotExp };
   } catch {
     return null;
   }
+}
+
+// ── K-1: per-lot mark scaling (v2.2 lot_exp) ──────────────────────────────────
+//
+// A v2.2 market's base unit is a LOT of 10^lot_exp tokens and every mark is PER LOT (percolator-prog
+// release/v22-wrapper-rem 6c078a0e, v16_program.rs:776-782: `AssetOracleProfileV16::_padding0[PROFILE_LOT_EXP_IDX = 0]`
+// = profile byte +19, `LOT_EXP_MAX = 15`; the program only validates and keeps it immutable, "the SDK / keeper /
+// indexer do the unit conversion"). The DEX pipeline produces a per-TOKEN USD price, so PushAuthMark must carry
+// price x 10^lot_exp. Same rule as the seed kit and the stop-gap pusher (relaunch/v22/plan22.ts `perLotPriceE6`).
+// lot_exp is read from the market account on every push (never from config), next to market_id / the nonce.
+
+/** Program constant `LOT_EXP_MAX` (RC constants.rs). */
+export const LOT_EXP_MAX = 15;
+/** Engine `MAX_ORACLE_PRICE` (percolator src/lib.rs): a per-lot mark above it is refused on chain. */
+export const MAX_ORACLE_PRICE_E6 = 1_000_000_000_000n;
+/** Profile byte holding lot_exp (`_padding0[0]`), relative to the asset's wrapper slot / oracle profile. */
+export const PROFILE_LOT_EXP_OFF = 19;
+
+/**
+ * lot_exp of the asset whose profile starts at `profileOff`. 0 on VERSION < 19 (the byte is padding there, always zero
+ * on v2.1, but it is never read). null (= skip the push, never guess) when the byte is above LOT_EXP_MAX or out of range.
+ */
+export function readMarketLotExp(data: Uint8Array, version: number, profileOff: number): number | null {
+  if (version < VERSION_19) return 0;
+  const off = profileOff + PROFILE_LOT_EXP_OFF;
+  if (off >= data.length) return null;
+  const v = data[off];
+  return v <= LOT_EXP_MAX ? v : null;
+}
+
+/**
+ * Per-lot e6 mark for a per-token e6 price: `tokenPriceE6 * 10^lotExp` (exact, via the SDK's shared lot helper).
+ * null when the inputs are invalid or the mark would exceed MAX_ORACLE_PRICE (the push is skipped, not clamped).
+ */
+export function perLotMarkE6(tokenPriceE6: bigint, lotExp: number): bigint | null {
+  if (tokenPriceE6 <= 0n || !Number.isInteger(lotExp) || lotExp < 0 || lotExp > LOT_EXP_MAX) return null;
+  const mark = tokenPriceToLotE6V22(tokenPriceE6, lotExp);
+  return mark > MAX_ORACLE_PRICE_E6 ? null : mark;
 }
 
 // ── Push instruction ──────────────────────────────────────────────────────────
@@ -380,6 +415,15 @@ export async function pushAuthMark(
     return { pushed: false, authorityMismatch: false, priceE6, nowSlot };
   }
 
+  // ── 3b. K-1: per-lot mark (price x 10^lot_exp, lot_exp read from this account) ─
+  const markE6 = perLotMarkE6(priceE6, genFields.lotExp);
+  if (markE6 === null) {
+    console.warn(
+      `[pusher] ${marketAddress.slice(0, 8)}… per-lot mark out of range (price ${priceE6} x 10^${genFields.lotExp}) — skipping`,
+    );
+    return { pushed: false, authorityMismatch: false, priceE6, nowSlot };
+  }
+
   // ── 4. Build instruction (using keeper's web3.js TransactionInstruction) ─
   const ix = buildPushAuthMarkIx(
     keeper.publicKey,
@@ -387,7 +431,7 @@ export async function pushAuthMark(
     assetIndex,
     genFields.marketId,
     nowSlot,
-    priceE6,
+    markE6,
     genFields.observationSequence,
   );
 
@@ -498,7 +542,14 @@ type AuthMarkPushInput = { marketAddress: string; assetIndex: number; priceE6: b
  * fields could not be read never reaches this shape (it is reported via
  * `skippedMarkets` instead — see `pushAuthMarkBatch`).
  */
-type AuthMarkPushItem = AuthMarkPushInput & { marketId: bigint; observationSequence: bigint };
+type AuthMarkPushItem = AuthMarkPushInput & {
+  marketId: bigint;
+  observationSequence: bigint;
+  /** K-1: the market's lot exponent (0 on v2.1 / single-token markets). */
+  lotExp: number;
+  /** K-1: what PushAuthMark carries: `priceE6` (per token) x 10^lotExp. */
+  markE6: bigint;
+};
 
 /**
  * Build one PushAuthMark tx for a slice of markets and return it with its
@@ -524,7 +575,7 @@ function buildPushTx(
         p.assetIndex,
         p.marketId,
         nowSlot,
-        p.priceE6,
+        p.markE6,
         p.observationSequence,
       ),
     );
@@ -600,7 +651,7 @@ function pushGenerationKey(p: { marketAddress: string; assetIndex: number }): st
 
 /**
  * Batched live-read of market_id + observation_sequence for every push this
- * cycle, via ONE `getMultipleAccountsInfo` call — not one `getAccountInfo`
+ * cycle, via `getMultipleAccountsInfo` in chunks of 100 keys (one call up to 100 markets) — not one `getAccountInfo`
  * per market. `pushAuthMarkBatch` was specifically optimized down to "~3 RPC
  * calls per cycle (was ~25)" (see `runCycle`'s doc comment in keeper-loop.ts);
  * this keeps that budget by adding exactly one more batched call, not N.
@@ -611,28 +662,34 @@ function pushGenerationKey(p: { marketAddress: string; assetIndex: number }): st
  * treat that as "skip this push this cycle" (see
  * {@link parsePushAuthMarkGenerationFields}'s doc comment), never guess.
  */
-async function fetchPushAuthMarkGenerationFields(
+export async function fetchPushAuthMarkGenerationFields(
   devnetConn: Connection,
   pushes: AuthMarkPushInput[],
   terminal: Set<string>,
-): Promise<Map<string, { marketId: bigint; observationSequence: bigint }>> {
+): Promise<Map<string, { marketId: bigint; observationSequence: bigint; lotExp: number }>> {
   const uniqueAddrs = [...new Set(pushes.map((p) => p.marketAddress))];
   // "processed", not "confirmed" (#Custom19, 2026-09-28): the watermark this
   // reads is advanced ONLY by this keeper's own pushes, which land ~1-3 slots
   // before they are confirmed. A confirmed read routinely misses the previous
   // cycle's push. Reading a higher (even later-dropped-fork) value is always
   // safe — the nonce only has to be strictly greater, gaps are allowed.
-  const infos = await devnetConn.getMultipleAccountsInfo(
-    uniqueAddrs.map((a) => new PublicKey(a)),
-    "processed",
-  );
+  // Chunked at 100 keys (RPC hard cap; web3.js does not chunk). A chunk that fails leaves ITS
+  // markets absent from the result (the caller already skips an absent market this cycle with a
+  // warning) and never fails the other chunks' markets — one flaky chunk must not stop every price.
+  const read = await getMultipleAccountsInfoChunked(devnetConn, uniqueAddrs.map((a) => new PublicKey(a)), "processed");
+  if (read.failedChunks > 0) {
+    console.warn(
+      `[push] generation read: ${read.failedChunks}/${read.totalChunks} chunk(s) failed — ` +
+        `${read.failedKeys} market(s) skipped this cycle (will retry next cycle)`,
+    );
+  }
   const dataByAddr = new Map<string, Uint8Array>();
   uniqueAddrs.forEach((addr, i) => {
-    const info = infos[i];
+    const info = read.infos[i];
     if (info) dataByAddr.set(addr, new Uint8Array(info.data));
   });
 
-  const result = new Map<string, { marketId: bigint; observationSequence: bigint }>();
+  const result = new Map<string, { marketId: bigint; observationSequence: bigint; lotExp: number }>();
   for (const p of pushes) {
     const key = pushGenerationKey(p);
     if (result.has(key)) continue;
@@ -649,6 +706,7 @@ async function fetchPushAuthMarkGenerationFields(
       result.set(key, {
         marketId: fields.marketId,
         observationSequence: nextObservationSequence(key, fields.observationSequence),
+        lotExp: fields.lotExp,
       });
     }
   }
@@ -924,7 +982,15 @@ export async function pushAuthMarkBatch(
       missingGeneration.push(p.marketAddress);
       continue;
     }
-    pushable.push({ ...p, marketId: fields.marketId, observationSequence: fields.observationSequence });
+    const markE6 = perLotMarkE6(p.priceE6, fields.lotExp);
+    if (markE6 === null) {
+      console.warn(
+        `[push] ${p.marketAddress.slice(0, 8)}… per-lot mark out of range (price ${p.priceE6} x 10^${fields.lotExp}) — skipped this cycle`,
+      );
+      missingGeneration.push(p.marketAddress);
+      continue;
+    }
+    pushable.push({ ...p, marketId: fields.marketId, observationSequence: fields.observationSequence, lotExp: fields.lotExp, markE6 });
   }
   if (missingGeneration.length > 0) {
     console.warn(
@@ -947,7 +1013,7 @@ export async function pushAuthMarkBatch(
   if (dryRun) {
     console.log(
       `[DRY-RUN] PushAuthMark × ${pushable.length} in ${chunks.length} tx(s) @ slot ${nowSlot} ` +
-        `(${pushable.map((p) => `$${(Number(p.priceE6) / 1e6).toFixed(4)}`).join(", ")})`,
+        `(${pushable.map((p) => `$${(Number(p.priceE6) / 1e6).toFixed(4)}${p.lotExp ? ` x1e${p.lotExp} = mark ${p.markE6}` : ""}`).join(", ")})`,
     );
     return {
       pushed: false,

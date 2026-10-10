@@ -126,7 +126,7 @@ describe("selectMarketGroupOffset", () => {
   it("resolves a VERSION 17 account to 592", () => {
     const r = selectMarketGroupOffset(makeHeader(VERSION_17));
     assert.equal(r.ok, true);
-    assert.deepEqual(r, { ok: true, version: 17, marketGroupOff: 592 });
+    assert.deepEqual(r, { ok: true, version: VERSION_17, marketGroupOff: 592, marketGroupLen: 758, assetSlotStride: 2325, wrapperSlotLen: 1024 });
   });
 
   it("resolves a VERSION 16 account to 448 — NOT to the v17 offset", () => {
@@ -135,7 +135,8 @@ describe("selectMarketGroupOffset", () => {
     // plausible-looking garbage.
     const r = selectMarketGroupOffset(makeHeader(VERSION_16));
     assert.equal(r.ok, true);
-    assert.deepEqual(r, { ok: true, version: 16, marketGroupOff: 448 });
+    // K-2 (2026-10-10): the result now carries the version's full geometry; v16 keeps the v2.1 group length / stride.
+    assert.deepEqual(r, { ok: true, version: 16, marketGroupOff: 448, marketGroupLen: 758, assetSlotStride: 2325, wrapperSlotLen: 1024 });
     assert.notEqual(
       (r as { marketGroupOff: number }).marketGroupOff,
       V17_MARKET_GROUP_OFF,
@@ -151,13 +152,14 @@ describe("selectMarketGroupOffset", () => {
   });
 
   it("fails closed on an unrecognized VERSION rather than guessing an offset", () => {
-    // A future VERSION 18 with another config growth must NOT be decoded with
-    // the v17 offset. This is the assertion that turns the next layout change
-    // from a silent misread into a visible skip.
-    const r = selectMarketGroupOffset(makeHeader(18));
+    // A future VERSION 20 with another layout change must NOT be decoded with
+    // a known offset. This is the assertion that turns the next layout change
+    // from a silent misread into a visible skip. (Was 18 until the SDK's
+    // V17_EXPECTED_VERSION became 18 and 19 became v2.2; updated 2026-10-10, K-2.)
+    const r = selectMarketGroupOffset(makeHeader(20));
     assert.equal(r.ok, false);
     assert.equal((r as { reason: string }).reason, "unrecognized-version");
-    assert.equal((r as { version: number }).version, 18);
+    assert.equal((r as { version: number }).version, 20);
   });
 
   it("fails closed on a buffer too short to contain the VERSION field", () => {
@@ -174,15 +176,17 @@ describe("selectMarketGroupOffset", () => {
     const view = backing.subarray(32);
     const r = selectMarketGroupOffset(view);
     assert.equal(r.ok, true);
-    assert.deepEqual(r, { ok: true, version: 17, marketGroupOff: 592 });
+    assert.deepEqual(r, { ok: true, version: VERSION_17, marketGroupOff: 592, marketGroupLen: 758, assetSlotStride: 2325, wrapperSlotLen: 1024 });
   });
 
-  it("the version table has an entry for exactly the two known versions", () => {
+  it("the version table has an entry for exactly the three known versions (16, 18 = SDK V17_EXPECTED_VERSION, 19 = v2.2)", () => {
+    assert.equal(VERSION_17, 18);
     assert.deepEqual(
       Object.keys(MARKET_GROUP_OFF_BY_VERSION).map(Number).sort((a, b) => a - b),
-      [16, 17],
+      [16, 18, 19],
     );
     assert.equal(MARKET_GROUP_OFF_BY_VERSION[16], 448);
-    assert.equal(MARKET_GROUP_OFF_BY_VERSION[17], 592);
+    assert.equal(MARKET_GROUP_OFF_BY_VERSION[18], 592);
+    assert.equal(MARKET_GROUP_OFF_BY_VERSION[19], 592);
   });
 });
