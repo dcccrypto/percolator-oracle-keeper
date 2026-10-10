@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@percolatorct/sdk':
-        specifier: github:dcccrypto/percolator-sdk#cb444dbeb8f590d9113b4c68457212c099b65598
-        version: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/cb444dbeb8f590d9113b4c68457212c099b65598(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+        specifier: file:/Users/khubair/percolator-ops/artifacts/sdk-v22-e8c4421/percolatorct-sdk-9.0.0-candidate-e8c4421.tgz
+        version: file:../../percolator-ops/artifacts/sdk-v22-e8c4421/percolatorct-sdk-9.0.0-candidate-e8c4421.tgz(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@solana/web3.js':
         specifier: 1.99.0
         version: 1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -186,8 +186,8 @@ packages:
     resolution: {integrity: sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==}
     engines: {node: ^14.21.3 || >=16}
 
-  '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/cb444dbeb8f590d9113b4c68457212c099b65598':
-    resolution: {tarball: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/cb444dbeb8f590d9113b4c68457212c099b65598}
+  '@percolatorct/sdk@file:../../percolator-ops/artifacts/sdk-v22-e8c4421/percolatorct-sdk-9.0.0-candidate-e8c4421.tgz':
+    resolution: {integrity: sha512-MChppehDYfzsQZUcWtuwft00+rPCm/d7fdSLnxtTzPekhFYacXOE8bGUEBX7jZhBQoEUa8hdn/y9HvREe7Gd0w==, tarball: file:../../percolator-ops/artifacts/sdk-v22-e8c4421/percolatorct-sdk-9.0.0-candidate-e8c4421.tgz}
     version: 9.0.0-candidate
     engines: {node: '>=20.0.0'}
 
@@ -628,7 +628,7 @@ snapshots:
 
   '@noble/hashes@1.8.0': {}
 
-  '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/cb444dbeb8f590d9113b4c68457212c099b65598(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
+  '@percolatorct/sdk@file:../../percolator-ops/artifacts/sdk-v22-e8c4421/percolatorct-sdk-9.0.0-candidate-e8c4421.tgz(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
       '@noble/curves': 1.9.7
       '@solana/spl-token': 0.4.14(@solana/web3.js@1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
