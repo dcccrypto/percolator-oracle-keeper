@@ -161,6 +161,7 @@ import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio }
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
 import { decodeAdlState } from "./adl-state.ts";
 import { isTerminalMarket } from "./market-state.ts";
+import { decodeVaultLpState, deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 import { isLockFamilyCode } from "./lock-codes.ts";
 import { isP2bSupported } from "./p2b-feature.ts";
 import { reportSeniorDraw } from "./vault-lp-crank.ts";
@@ -418,15 +419,49 @@ export function fetchMarketPortfolios(conn: Connection, market: PublicKey, portf
   });
 }
 
-async function findLpPortfolio(
-  conn: Connection,
+/**
+ * K-3: resolve the vault-LP portfolio of a market whose registry entry carries no `lpPortfolio` (every market that
+ * arrives through register-poll / the create-market wizard). Two sources, both on chain, never a guess:
+ *
+ *  1. The market's `vault_lp` state PDA (`["vault_lp", market]`, wrapper-owned, kind 9): its `lp_portfolio` field
+ *     names the portfolio directly, one read, any layout. Accepted only when that portfolio is a wrapper-owned,
+ *     matcher-enabled portfolio of THIS market (same check as the scan below).
+ *  2. Fallback: scan the market's portfolios for a matcher-enabled one, once per portfolio length the pinned SDK can
+ *     decode (VERSION 18 = 9,563 B, VERSION 19 = 10,603 B). The scan used to filter on the v2.1 length only, so a
+ *     v2.2 market (10,603 B portfolios) was never found and never cranked.
+ *
+ * Exported for tests.
+ */
+export async function findLpPortfolio(
+  conn: Pick<Connection, "getAccountInfo" | "getProgramAccounts">,
   market: PublicKey,
 ): Promise<PublicKey | null> {
-  const accounts = await fetchMarketPortfolios(conn, market);
-  for (const { pubkey, account } of accounts) {
-    if (isLpVaultPortfolio(account.data)) return pubkey;
+  try {
+    const vls = await conn.getAccountInfo(deriveVaultLpState(WRAPPER_PROGRAM_ID, market), "confirmed");
+    const st = vls && vls.owner.equals(WRAPPER_PROGRAM_ID) ? decodeVaultLpState(new Uint8Array(vls.data)) : null;
+    if (st) {
+      const pf = await conn.getAccountInfo(st.lpPortfolio, "confirmed");
+      if (pf && pf.owner.equals(WRAPPER_PROGRAM_ID) && portfolioBelongsTo(pf.data, market) && isLpVaultPortfolio(pf.data)) {
+        return st.lpPortfolio;
+      }
+      console.warn(`[cranker] ${market.toBase58().slice(0, 8)}…: vault_lp state names ${st.lpPortfolio.toBase58()}, which is not a matcher-enabled portfolio of this market — scanning instead`);
+    }
+  } catch {
+    // an RPC blip or a mock without getAccountInfo: fall through to the scan
+  }
+  for (const len of SDK_PORTFOLIO_LENS) {
+    const accounts = await fetchMarketPortfolios(conn as Connection, market, len);
+    for (const { pubkey, account } of accounts) {
+      if (isLpVaultPortfolio(account.data)) return pubkey;
+    }
   }
   return null;
+}
+
+/** The portfolio's market field (`V17_PF_MARKET_OFF`, the same offset the scan's memcmp filters on) equals `market`. */
+function portfolioBelongsTo(data: Uint8Array, market: PublicKey): boolean {
+  if (data.length < V17_PF_MARKET_OFF + 32) return false;
+  return new PublicKey(data.subarray(V17_PF_MARKET_OFF, V17_PF_MARKET_OFF + 32)).equals(market);
 }
 
 // These are single-asset markets — every registry market's only engine

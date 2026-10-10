@@ -70,13 +70,13 @@ import type { Connection, Keypair } from "@solana/web3.js";
 import {
   ACCOUNTS_WITHDRAW_INSURANCE_RESERVE_TO_STAKE,
   buildAccountMetas,
-  decodeStakePool,
   deriveMarketVaultAccounts,
   deriveStakePool,
   encodeStakeAccrueFees,
   encodeWithdrawInsuranceReserveToStake,
   parseWrapperConfigV17,
 } from "@percolatorct/sdk";
+import { decodeStakePoolAnyVersion } from "./stake-pool-decode.ts";
 import { STAKE_PROGRAM_ID, WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { parseInstructionError } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
@@ -331,7 +331,7 @@ export async function pushStakeFeesOnce(
     const owed = wc.insuranceReserveAccruedAtoms - wc.insuranceReserveWithdrawnAtoms;
     let pool: StakeFeeState["pool"] = null;
     if (pi && pi.owner.equals(cfg.stakeProgramId)) {
-      const p = decodeStakePool(new Uint8Array(pi.data));
+      const p = decodeStakePoolAnyVersion(new Uint8Array(pi.data)); // K-4: v5 (v2.2) pools too
       pool = {
         slab: p.slab,
         poolMode: p.poolMode,
