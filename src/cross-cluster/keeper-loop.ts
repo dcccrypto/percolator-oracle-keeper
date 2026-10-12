@@ -30,7 +30,13 @@ import { evaluateMarketPush, evaluatePushCycle, getAlertSink } from "./alerting.
 import type { Alert, MarketPushSample } from "./alerting.ts";
 import { getCrankRefreshHealth, getLayoutProblemCounts, isPushHeld, pruneCrankRefreshHealth } from "./refresh-coordination.ts";
 import { p2bHealthFields } from "./p2b-health.ts";
+import { v22HealthFields } from "./v22/health.ts";
+import { layoutGuardSnapshot } from "./layout-guard-metrics.ts";
+import type { LayoutGuardSnapshot } from "./layout-guard-metrics.ts";
+import { rpcMetrics } from "./rpc-metrics.ts";
+import { getCachedBlockhash, invalidateBlockhash } from "./blockhash-cache.ts";
 import type { CrankRefreshHealth } from "./refresh-coordination.ts";
+import { healthFileConfigFromEnv, startHealthFileMirror } from "./health-file.ts";
 import type { SweepHealth } from "./positioned-sweep.ts";
 import {
   type WalletBalanceState,
@@ -274,7 +280,7 @@ export function publishLandedTicks(
  * has ended loss-stale (stale count > 0 after the keeper's refreshes) for
  * ALERT_LOSS_STALE_CYCLES cycles: every risk-increasing trade reverts Custom(21).
  */
-export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<string, string | number | boolean | null> {
+export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<string, string | number | boolean | null | NonNullable<CrankRefreshHealth["adlAssets"]>> {
   if (!h) return { crankStatus: null };
   return {
     ...(h.layout
@@ -286,6 +292,12 @@ export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<str
         }
       : {}),
     ...(h.sweep ? sweepHealthFields(h.sweep) : {}),
+    // K-9: ADL (reduce-only) state, only when the cranker decoded it (v2.1 and v2.2 layouts).
+    ...(h.adl
+      ? { adlReduceOnly: h.adl.reduceOnly, adlALong: h.adl.aLong, adlAShort: h.adl.aShort, adlOiLong: h.adl.oiEffLong, adlOiShort: h.adl.oiEffShort }
+      : {}),
+    // Multi-asset markets: every non-Disabled asset (QA retest 4: asset 0 alone hid the other assets).
+    ...(h.adlAssets ? { adlAssets: h.adlAssets, adlReduceOnlyAssets: h.adlAssets.filter((x) => x.reduceOnly).map((x) => x.asset).join(",") } : {}),
     crankStatus: h.status,
     // Sweep markets carry stale portfolios by design (every accrual re-stales them); there
     // `lossStale` means what users feel: a risk-increasing order would be refused now.
@@ -344,10 +356,17 @@ export function sweepHealthFields(s: SweepHealth): Record<string, string | numbe
  * `layoutProblemMarkets` = markets currently unreadable, `sweepLayoutUnknown` /
  * `sweepLayoutUnsupported` = process-lifetime counts of cranker reads that hit each problem.
  */
-export function layoutProblemFields(layoutProblemMarkets: string[]): Record<string, string[] | number> {
+export function layoutProblemFields(layoutProblemMarkets: string[]): Record<string, string[] | number | LayoutGuardSnapshot> {
   const c = getLayoutProblemCounts();
-  if (layoutProblemMarkets.length === 0 && c.unknown === 0 && c.unsupported === 0) return {};
-  return { layoutProblemMarkets, sweepLayoutUnknown: c.unknown, sweepLayoutUnsupported: c.unsupported };
+  const guard = layoutGuardSnapshot();
+  if (layoutProblemMarkets.length === 0 && c.unknown === 0 && c.unsupported === 0 && guard.refusals === 0) return {};
+  return {
+    layoutProblemMarkets,
+    sweepLayoutUnknown: c.unknown,
+    sweepLayoutUnsupported: c.unsupported,
+    // v2.2: the VERSION-keyed guard's refusal counters (by reason / on-chain VERSION); present only once one fired.
+    ...(guard.refusals > 0 ? { layoutGuard: guard } : {}),
+  };
 }
 
 export function withheldFromPush(market: string, withholdPush: ((m: string) => boolean) | undefined): boolean {
@@ -488,6 +507,7 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       cycleCount: state.cycleCount,
       timeoutCount: state.timeoutCount,
       tickPublisher: state.tickPublisher.counters(),
+      rpc: rpcMetrics.snapshot(),
       lastCycleAgo:
         state.lastCycleAt !== null
           ? `${Math.floor((Date.now() - state.lastCycleAt) / 1000)}s`
@@ -497,6 +517,8 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       markets,
       // v2.1 (P2b), additive: `earnVaults` + `p2b`. `{}` (nothing added) unless the wrapper supports P2b.
       ...p2bHealthFields(),
+      // v2.2 layer, additive: `v22`. `{}` unless KEEPER_V22=on.
+      ...v22HealthFields(),
     });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(payload);
@@ -547,6 +569,12 @@ function maybeResetAuthorityLatches(): void {
 // to mainnet without that.
 const MARK_WINDOW_MS = Number(process.env.CC_MARK_WINDOW_MS ?? 15_000);
 const markSmoother = createMarkSmoother({ windowMs: MARK_WINDOW_MS });
+/**
+ * The same median over the same samples, at e12, for the per-LOT mark of v2.2 lot markets (per-lot precision, QA
+ * 2026-10-12). Every decision (withholding, circuit breaker, health) still uses the e6 smoother above; this one only
+ * supplies extra digits for a price the e6 path already accepted (auth-mark-pusher.ts perLotMarkFromE12 guards that).
+ */
+const markSmootherE12 = createMarkSmoother({ windowMs: MARK_WINDOW_MS });
 
 function parseCrossClusterPositiveNumberEnv(
   name: string,
@@ -755,8 +783,6 @@ export function cloneCircuitBreakerState(state: CircuitBreakerState): CircuitBre
 
 // Blockhash cache — a fresh one is valid ~60-90s; refetch every 15s so each
 // cycle doesn't pay a getLatestBlockhash round-trip.
-let cachedBlockhash: { blockhash: string; lastValidBlockHeight: number } | null = null;
-let cachedBlockhashAt = 0;
 
 /**
  * FAST cycle: ONE getMultipleAccounts to read every mainnet DEX pool, ONE
@@ -822,6 +848,7 @@ async function runCycle(
   // ── 2. Read ALL pool prices in ONE getMultipleAccounts (DEX-pool source) ────
   let prices: Map<string, bigint>;
   const priceSkipReasons = new Map<string, string>();
+  const pricesE12 = new Map<string, bigint>();
   try {
     prices = await readAllPoolPricesE6(
       mainnetConn,
@@ -831,6 +858,7 @@ async function runCycle(
       // market is registered — see the param's doc comment.
       process.env.SOL_USD_REFERENCE_POOL,
       priceSkipReasons,
+      pricesE12,
     );
   } catch (err) {
     const msg = (err instanceof Error ? err.message : String(err)).slice(0, 160);
@@ -845,7 +873,7 @@ async function runCycle(
   state.lastBatchReadError = null;
 
   // ── 3. Build the pushable set for this cycle ────────────────────────────────
-  const pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }> = [];
+  const pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint; priceE12?: bigint }> = [];
   const smoothNowMs = Date.now();
   // Smooth once per POOL per cycle, not once per market: N markets sharing a
   // pool would insert N identical samples per cycle, silently shrinking the
@@ -853,6 +881,7 @@ async function runCycle(
   // the 180s window to ~149s — undoing the widening that was deployed
   // precisely because 90s was insufficient).
   const smoothedThisCycle = new Map<string, bigint | null>();
+  const smoothedE12ThisCycle = new Map<string, bigint | null>();
   const pendingCircuitBreakerStates = new Map<string, CircuitBreakerState>();
   for (const entry of registry.markets) {
     if (notPushable.has(entry.marketAddress)) continue;
@@ -878,6 +907,8 @@ async function runCycle(
     if (priceE6 === undefined) {
       priceE6 = markSmoother.smooth(entry.poolAddress, rawPriceE6, smoothNowMs);
       smoothedThisCycle.set(entry.poolAddress, priceE6);
+      // Same sample, same instant, at e12 (the e6 value x 1e6 when the read produced no e12), so the two windows stay aligned.
+      smoothedE12ThisCycle.set(entry.poolAddress, markSmootherE12.smooth(entry.poolAddress, pricesE12.get(entry.poolAddress) ?? rawPriceE6 * 1_000_000n, smoothNowMs));
     }
     if (priceE6 === null) {
       stat.totalErrors++;
@@ -952,10 +983,13 @@ async function runCycle(
     pendingCircuitBreakerStates.set(entry.marketAddress, deferred);
 
     stat.lastPriceE6 = publish.priceE6;
+    // e12 rides along only when the breaker published the smoothed price itself (not a clamp / hold).
+    const smoothedE12 = publish.priceE6 === priceE6 ? smoothedE12ThisCycle.get(entry.poolAddress) : null;
     pushes.push({
       marketAddress: entry.marketAddress,
       assetIndex: entry.assetIndex,
       priceE6: publish.priceE6,
+      ...(smoothedE12 ? { priceE12: smoothedE12 } : {}),
     });
   }
   if (pushes.length === 0) return;
@@ -963,10 +997,8 @@ async function runCycle(
   // ── 4. One slot + one (cached) blockhash for the whole batch ────────────────
   const nowSlot = BigInt(await devnetConn.getSlot("processed"));
   const now = Date.now();
-  if (!cachedBlockhash || now - cachedBlockhashAt > 15_000) {
-    cachedBlockhash = await devnetConn.getLatestBlockhash("processed");
-    cachedBlockhashAt = now;
-  }
+  // Shared with the cranker (blockhash-cache.ts): one fetch per 15 s for the whole process.
+  const cachedBlockhash = await getCachedBlockhash(devnetConn, "processed");
 
   // ── 4b. Wallet-balance guard (#71) ──────────────────────────────────────────
   // A keeper that cannot pay produces reverting transactions, not fresh marks.
@@ -1094,7 +1126,7 @@ async function runCycle(
   } catch (err) {
     const msg = (err instanceof Error ? err.message : String(err)).slice(0, 160);
     console.error(`[loop] batch push error — ${msg}`);
-    if (/blockhash/i.test(msg)) cachedBlockhash = null; // force refresh next cycle
+    if (/blockhash/i.test(msg)) invalidateBlockhash(devnetConn); // force refresh next cycle
     for (const p of pushes) {
       const s = state.stats.get(p.marketAddress)!;
       s.totalErrors++;
@@ -1278,6 +1310,24 @@ export async function startKeeperLoop(
       `[keeper] Health: http://${config.healthBind}:${config.healthPort}/health`,
     );
   });
+  // Optional file mirror of /health for readers without access to the port (KEEPER_HEALTH_FILE; health-file.ts).
+  const healthFile = healthFileConfigFromEnv(process.env);
+  if (healthFile) {
+    const host = config.healthBind === "0.0.0.0" ? "127.0.0.1" : config.healthBind;
+    const readHealth = (): Promise<string> =>
+      new Promise((resolve, reject) => {
+        const req = http.get({ host, port: config.healthPort, path: "/health", timeout: 5_000 }, (r) => {
+          let body = "";
+          r.setEncoding("utf8");
+          r.on("data", (c: string) => (body += c));
+          r.on("end", () => resolve(body));
+        });
+        req.on("timeout", () => req.destroy(new Error("health read timeout")));
+        req.on("error", reject);
+      });
+    startHealthFileMirror(healthFile, readHealth, `http://${host}:${config.healthPort}/health BUILDTAG=${process.env.BUILDTAG ?? "?"}`);
+    console.log(`[keeper] Health file: ${healthFile.file} every ${healthFile.intervalMs}ms`);
+  }
 
   // Graceful shutdown
   let stopping = false;

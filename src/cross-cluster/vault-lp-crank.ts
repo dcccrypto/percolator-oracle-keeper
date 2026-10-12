@@ -27,6 +27,7 @@ import { staleResolveWindow } from "./market-state.ts";
 import type { StaleResolveWindow } from "./market-state.ts";
 import { exhaustedAlert, getExhaustedRegistry } from "./p3-exhausted-resolve.ts";
 import type { ExhaustedRegistry } from "./p3-exhausted-resolve.ts";
+import { loneLpCrankSuppressedFor, triggerProtectiveRound } from "./v22/delegation.ts";
 
 export type SeniorDrawEvent =
   | { kind: "draw"; deficit: bigint; moved: bigint; unfunded: bigint }
@@ -37,11 +38,24 @@ export type SeniorDrawEvent =
 export function parseSeniorDrawLogs(logs: ReadonlyArray<string> | null | undefined): SeniorDrawEvent[] {
   const out: SeniorDrawEvent[] = [];
   for (const l of logs ?? []) {
-    let m = l.match(/p3_senior_draw_booked moved=(\d+) junior_cover=(\d+) senior_loss=(\d+) C=(\d+) outstanding=(\d+)/);
-    if (m) {
-      out.push({ kind: "booked", moved: BigInt(m[1]), juniorCover: BigInt(m[2]), seniorLoss: BigInt(m[3]), seniorClaim: BigInt(m[4]), outstanding: BigInt(m[5]) });
-      continue;
+    // `booked`: parsed BY FIELD NAME so both wrapper shapes work. v2.1: `... moved= junior_cover= senior_loss= C= outstanding=`;
+    // v2.2 puts `nav= stray= c_eff= harvestable=` first (v16_program.rs:32580). Every field the alert needs must be present.
+    if (/p3_senior_draw_booked\b/.test(l)) {
+      const f = (name: string): bigint | null => {
+        const mm = l.match(new RegExp(`(?:^|\\s)${name}=(\\d+)`));
+        return mm ? BigInt(mm[1]) : null;
+      };
+      const moved = f("moved");
+      const juniorCover = f("junior_cover");
+      const seniorLoss = f("senior_loss");
+      const seniorClaim = f("C");
+      const outstanding = f("outstanding");
+      if (moved !== null && juniorCover !== null && seniorLoss !== null && seniorClaim !== null && outstanding !== null) {
+        out.push({ kind: "booked", moved, juniorCover, seniorLoss, seniorClaim, outstanding });
+        continue;
+      }
     }
+    let m: RegExpMatchArray | null;
     m = l.match(/p3_senior_draw_restored to_seniors=(\d+) C=(\d+) outstanding=(\d+)/);
     if (m) {
       out.push({ kind: "restored", toSeniors: BigInt(m[1]), seniorClaim: BigInt(m[2]), outstanding: BigInt(m[3]) });
@@ -114,7 +128,7 @@ export class VaultLpCranker {
   private readonly lookup = new Map<string, { vaultLp: PublicKey | null; at: number }>();
   private readonly lastMark = new Map<string, bigint>();
   private readonly inflight = new Set<string>();
-  readonly stats = { cranked: 0, benign: 0, failed: 0 };
+  readonly stats = { cranked: 0, benign: 0, failed: 0, suppressed: 0 };
 
   constructor(
     private readonly conn: VaultLpCrankConnection,
@@ -152,7 +166,19 @@ export class VaultLpCranker {
   }
 
   /** Call after a push LANDED for `marketAddress` at `priceE6`. Returns what happened (for tests/logs). */
-  async onPushLanded(marketAddress: string, priceE6: bigint, label = marketAddress): Promise<"no-move" | "busy" | "not-bound" | "cranked" | "benign" | "failed"> {
+  async onPushLanded(marketAddress: string, priceE6: bigint, label = marketAddress): Promise<"no-move" | "busy" | "not-bound" | "cranked" | "benign" | "failed" | "suppressed"> {
+    // v2.2 SETTLE_PAIRING / VAULT_LP_LONE_CRANK=off: a LONE LP crank settles the LP without its counterparties, which
+    // can strand value at a price peak (settle-pairing.ts). The suppressor is installed only when a v2.2 flag asks for
+    // it; with nothing installed this is a no-op and the method is unchanged.
+    if (loneLpCrankSuppressedFor(marketAddress)) {
+      this.stats.suppressed++;
+      // Not a lone LP crank: if the LP itself needs protection the v2.2 layer runs a full PAIRED round instead.
+      if (this.lastMark.get(marketAddress) !== priceE6) {
+        this.lastMark.set(marketAddress, priceE6);
+        triggerProtectiveRound(marketAddress);
+      }
+      return "suppressed";
+    }
     const prev = this.lastMark.get(marketAddress);
     if (prev === priceE6) return "no-move";
     this.lastMark.set(marketAddress, priceE6);

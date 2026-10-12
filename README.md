@@ -132,3 +132,88 @@ When supported (tick every `P2B_TICK_MS`, one batched snapshot read per tick):
 
 Independent of the gate: tag 78 on a bound vault appends `[7]` ext and `[8]` vault LP once the registry ext
 flag (byte 161) is set (it is 0 on every pre-P2b program). See `.env.example` for every knob.
+
+## v2.2 keeper (KEEPER_V22, default OFF)
+
+Entry point is `src/cross-cluster.ts` (the Railway / launchd launcher runs `tsx src/cross-cluster.ts`; `src/index.ts` is not the live entry).
+Everything below is flag-gated and default OFF: with no `KEEPER_V22*` variable set the v2.2 layer is never created,
+the legacy cranker / fee job / vault-LP cranker take their old paths, and `/health` gains no key.
+
+**SDK pin.** `@percolatorct/sdk` = `github:dcccrypto/percolator-sdk#ecb6215ec634e2a284bcc0f409c4ca5df6cb43a1`
+(percolator-sdk#406, branch `feat/v22-sdk`: `LAYOUT_V22` variant B, VERSION-keyed layout guard, v2.2 builders, compute presets).
+`@solana/web3.js` is 1.99.0 (the SDK's peer). To move the pin: change the ref in `package.json`, `pnpm install`, `npm install --package-lock-only`.
+
+**Layout.** `market-layout.ts` keeps one table; the variant-B row (`v2.2-b`: group 806, slot 2,661, leg 217, portfolio 10,603, VERSION 19)
+is derived from the SDK's `LAYOUT_V22` and refused if the two ever disagree. A VERSION the SDK has no table for, a length that matches no row,
+a bad magic or a wrong kind is a loud error: counted (`layout-guard-metrics.ts`), logged once, `/health` `layoutGuard` + `status: degraded-markets`. No silent fallback.
+
+**Position cap 4 (release candidate engine `bfa3d037` / wrapper `c6ee0b6e`).** An account holds at most 4 legs and a refresh or liquidation settles all of them.
+Sizing is leg-aware and selected by the layout (`legCostModelFor`: a v2.2 layout gets `V22_LEG_COST`, every v2.1 layout gets none and keeps the single-leg
+145k / 250k / seven-per-tx arithmetic byte for byte). Typical refresh 145k / 175k / 210k / 245k for 1 to 4 legs (35k x (3 + legs)); liquidation 250k at one leg up to 729k at four;
+worst settle at the cap 1,013,864 CU (liens + ADL, real #287 hook), against the 1.4M transaction. An account with 3 or more legs (`V22_SOLO_MIN_LEGS`, the wrapper's
+`WRAPPER_PRE_CRANK_MIN_LEGS`) is planned ALONE in its own transaction (`SOLO_WEIGHT` in the settle-pairing rounds, overflow chunks of one in the legacy cranker,
+a batch of one in the drift sweep) and the single-instruction jobs (rent 106, dust 118) request `worst + 200k` for it (1,213,864). The legs counted are ALL the account's
+active legs (`activeLegs`), not only those on the asset being cranked. The keeper still cranks asset 0 only: positions on assets 1 and up are not in its positioned set.
+The keeper sends none of tags 74, 120, 121 or 122 and reads no G9 allowlist account (a test guards that); the 2,064 B allowlist body and tags 120 / 121 / 122 are in the SDK.
+
+| flag | default | what |
+|---|---|---|
+| `KEEPER_V22` | off | master switch |
+| `KEEPER_V22_DRY_RUN` | off | simulate and log "would send", send nothing (also implied by `DRY_RUN`) |
+| `KEEPER_V22_TICK_MS` | 20000 | loop tick |
+| `KEEPER_V22_FEE_CRANK_BOND` | off | tag 78 on bond markets: LP crank (tag 5) first, then 78 with ext + writable LP + tranche |
+| `KEEPER_V22_SWEEP` | off | positioned-refresh sweep for variant-B markets, leg-weight budget (3 + legs), heaviest first |
+| `KEEPER_V22_SETTLE_PAIRING` | prefer | `off` / `prefer` / `strict`; acts only with the sweep on. See `v22/settle-pairing.ts` |
+| `KEEPER_V22_ACCRUE_ANCHORS` | none | `market:flatPortfolio,...` accrue-only crank targets (else discovered) |
+| `KEEPER_V22_HOLDING_RENT` / `_RENT_CADENCE_SLOTS` | off / 9000 | tag 106 on rent markets |
+| `KEEPER_V22_DUST_SWEEP` | off | tag 118 (own flag; keep off on a wrapper without the bilateral fix) |
+| `KEEPER_V22_G9` | off | tag 111 propose -> 9,000 slots -> draw, restore |
+| `KEEPER_V22_G9_DRY_RUN` | **on** | G9 logs only until set to `off` |
+| `KEEPER_V22_G9_ALLOW_ANY_ORACLE_MODE` | off | skip the Hybrid-only gate (devnet testing) |
+| `KEEPER_V22_G9_DRAW_CAP_ATOMS` | u64 max | cap passed to draw / restore |
+| `KEEPER_V22_MAINNET_BUILD` | off | G9 modes 0/2 pass the allowlist PDA + leg accounts |
+| `KEEPER_V22_STAKE_SYNC` / `_INTERVAL_MS` | off / 60000 | stake v5 tag 31 |
+| `KEEPER_V22_EARN_EXIT` | off | tag 77 on `keeper_ok` requests, only on a loss-current book |
+| `VAULT_LP_LONE_CRANK` | on | `off` suppresses the lone vault-LP crank after every landed push (works without `KEEPER_V22`) |
+
+**SETTLE_PAIRING.** Engine tag 5 on a portfolio settles only that portfolio, then accrues; a loss is booked at once, counterparties' gains
+only when they are settled. The LP settled alone at a peak strands value. Policy: the round tracks which counterparties ACTUALLY settled
+(landed refresh, or the program said "already current", Custom(22)). The LP tx is sent only if every positioned counterparty settled, or under
+`prefer` when the only misses are portfolios the program REFUSED (band 104/111/112/113, hard refusal; counted in `unpairedLpSettles`);
+`strict` holds the LP in that case. A counterparty tx that did not LAND holds the LP in both modes: there is no "force after N rounds".
+A multi-tx round sends the counterparty txs first (parallel, pushes held) and the LP tx LAST, only inside `maxGapSlots` (8); a round that
+exceeds it backs off 1 then 2 rounds (counted `gapBackoffRounds`) instead of re-sending phase 1 every tick.
+A refused refresh is isolated (pruned, the rest re-sent) and the portfolio is quarantined (150 slots for a band state, 1,500 for a hard refusal).
+Accrue-only: the no-observation crank does NOT accrue (Custom(22) unless already accrued); an observation crank accrues through whichever portfolio it
+targets. The accrue goes through the KEEPER'S OWN flat portfolio when one exists (never a user's; verified by the program: a NoAction crank succeeds iff it accrued),
+else through the tx's first counterparty (counted `counterpartyAccrues`). A landed Custom(22) on the accrue (a parallel tx accrued the same slot) means "already accrued": re-sent refresh-only.
+The observation crank carries the Hybrid oracle leg accounts (without them the wrapper answers NotEnoughAccountKeys).
+Tag 78 runs at the END of a paired round (alone, the LP was just settled), tag 106 rent settles ride the round in place of that portfolio's refresh
+(the sweep-off timer paths are the only lone ones, and exist only without pairing). Any LP-alone settle that remains (78 timer path without the sweep, `prefer` overflow) is counted.
+
+LP protection latency. The 1.5 s lone LP crank is suppressed on v2.2 markets while sweep + pairing are on, so the LP's own senior-draw / liquidation protection
+waits for the next round: up to one crank cycle (`CRANK_INTERVAL_MS`, default 20 s) plus the round (about 1-5 s). Exception: on every landed push the v2.2 layer checks
+the LP (senior draw pending, or equity <= 20% of capital: a coarse heuristic, the program decides) and, if so, runs a full PAIRED round immediately (about one round, 1-5 s). A protective
+round may go with phase-1 failures but still puts the LP last in a tx WITH counterparties, never alone. No lone LP crank is reintroduced.
+
+What it cannot guarantee: multi-tx rounds are not atomic (expected gap 1-4 slots, cap 8; funding/rent keep accruing, other writers' pushes can move K); only a single-tx
+round is exactly atomic; anyone can still crank the LP alone (tag 5 is permissionless); the positioned set is a read; a portfolio the program keeps refusing can never be settled by
+any keeper action (`prefer` counts it, `strict` freezes the LP until it clears, see `quarantinedNow`); beyond `maxTxsPerRound` (16) `prefer` settles the LP with counterparties unvisited
+(counted) and `strict` skips the LP that round; the accrue-through-a-counterparty fallback settles that counterparty alone at the new K for the round's duration; the LP's rent is not settled under pairing
+(rent is index-based and timing-invariant). Defence in depth: the engine fix is separate.
+
+Env parsing is STRICT (on/1/true/yes, off/0/false/no). Scope: `KEEPER_V22` and `VAULT_LP_LONE_CRANK` are validated on EVERY start; the other `KEEPER_V22_*` variables are read and validated only when `KEEPER_V22` is on. **Operator: audit the live (Railway) env for stray `KEEPER_V22*` / `VAULT_LP_LONE_CRANK` values before deploying this build**: a malformed `VAULT_LP_LONE_CRANK` stops even a flags-off keeper at boot (fail closed).
+
+Rent (tag 106) is NOT substituted for a refresh (106 forces the Refresh action, so a liquidatable counterparty would not be liquidated, and every 106 write-locks the LP, serialising phase 1). It runs after the LP tx of a round, one tx per portfolio, sequentially, only for portfolios the round already refreshed with the plain crank and only when the LP settled. Each 106 accrues and settles ONE counterparty to a K newer than the LP's (the LP tx came first); the LP stays behind until the NEXT round's LP tx (about one cycle). With N per round that mirror window is N sequential txs. `RENT_SETTLES_PER_ROUND` (sweep.ts) is 1 by default: the window is then one portfolio for one cycle. Rent is index-based and timing-invariant, so a slower rent cadence costs nothing (1 per 20 s round still covers 180 portfolios per default 9,000-slot cadence; a bigger book is simply settled less often than the cadence).
+
+Refusal classification: only an error with a program Custom code is a refusal of that portfolio (22 = current, 104/111/112/113 = band state, anything else = hard). An error with no code (compute exhaustion, account in use, blockhash, RPC) shrinks the tx, blames and quarantines nobody, and the cut counterparties HOLD the LP in both modes. Cool-downs start at 150 slots and lengthen (450, 1,500) only when the same portfolio repeats the same code; at most 2 quarantines per round unless each carries a distinct code.
+
+Protective rounds: triggered by the wrapper's own senior-draw signal (a read-only simulation of the LP crank whose logs carry `p3_senior_draw`) or `senior_draw_outstanding > 0`. The signal means "the LP's certified equity is NEGATIVE at this mark and a draw is due (or unfunded)": that is LATE, not "near liquidation" (an LP that is liquidatable with positive equity does not fire it). The earlier case is covered by the time bound below. Cadence: signal at most every 5 s per market; outstanding-only at most every 30 s; after a protective round that did not settle the LP the next waits 10, 20, 40, 80, 120 s (reset on success).
+
+Persistent no-code failures: a portfolio whose refresh fails BY ITSELF without a program code (found by read-only single-refresh probe simulations) is counted per portfolio; after 3 rounds in a row it is treated as program-refused for pairing (quarantine 450 slots, `deferralEscalations`, a `[v22][WARN]` log, `persistentDeferrals` in /health), so `prefer` proceeds; `strict` keeps holding but shows the same alert. A tx that is merely too heavy (no single refresh fails alone) is cut and counts nobody. Time bound: if the keeper has not settled the vault LP for `KEEPER_V22_LP_MAX_UNSETTLED_MS` (default 300000, 5 min) while the market is otherwise healthy, one full paired round with the LP last runs regardless (the protective shape; counted `lpTimeBoundRounds`, retried at most every bound/5).
+
+Booked / draw log parsing (`p3_senior_draw*`) accepts both the v2.1 and the v2.2 wrapper line shapes (fields matched by name; fixtures in `v22/re-review.test.ts`).
+
+Anchor: `node --import tsx/esm src/v22-create-anchor.ts <market>` (operator tool, never run by the keeper) creates the keeper's own flat portfolio at the layout's exact length; it needs `KEEPER_V22_CREATE_ANCHOR=on`, is dry-run unless `KEEPER_V22_CREATE_ANCHOR_DRY_RUN=off`, and refuses (before simulating or sending) unless the market account is owned by the configured wrapper program and has a supported wrapper VERSION. The `KEEPER_V22_ACCRUE_ANCHORS` override must pass the same keeper-owned / flat check as discovery.
+
+Every v2.2 send is simulated first (`v22/exec.ts`); refusals are logged by name (`PriceBandPinned(104)`, `InsuranceReadingsDiverged(44)`); band states 104/111/112/113 are expected, counted, never alerted.

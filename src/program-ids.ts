@@ -155,7 +155,15 @@ export function resolveProgramIds(env: Env): ProgramIds {
   }
   const stakeEnv = nonEmpty(env.STAKE_PROGRAM_ID);
   const matcherEnv = nonEmpty(env.MATCHER_PROGRAM_ID);
-  const nftEnv = nonEmpty(env.NFT_PROGRAM_ID);
+  // KEEPER_NFT_PROGRAM_ID is an alias that exists because the SDK (dist, module scope) THROWS AT IMPORT on any
+  // NFT_PROGRAM_ID env value outside its own table, with no bypass flag. A fresh-ID keeper whose NFT id is not in
+  // the SDK yet therefore cannot set NFT_PROGRAM_ID at all; it sets KEEPER_NFT_PROGRAM_ID instead (the SDK never reads it).
+  const nftAlias = nonEmpty(env.KEEPER_NFT_PROGRAM_ID);
+  const nftPlain = nonEmpty(env.NFT_PROGRAM_ID);
+  if (nftAlias && nftPlain && nftAlias.trim() !== nftPlain.trim()) {
+    throw new Error(`KEEPER_NFT_PROGRAM_ID (${nftAlias}) and NFT_PROGRAM_ID (${nftPlain}) disagree - remove one`);
+  }
+  const nftEnv = nftAlias ?? nftPlain;
 
   const programSet = resolveProgramSet(env);
   const set = programIdSet(programSet);
@@ -171,7 +179,7 @@ export function resolveProgramIds(env: Env): ProgramIds {
     ["PROGRAM_ID", wrapperEnv ? undefined : legacyEnv, "wrapper"],
     ["STAKE_PROGRAM_ID", stakeEnv, "stake"],
     ["MATCHER_PROGRAM_ID", matcherEnv, "matcher"],
-    ["NFT_PROGRAM_ID", nftEnv, "nft"],
+    [nftAlias ? "KEEPER_NFT_PROGRAM_ID" : "NFT_PROGRAM_ID", nftEnv, "nft"],
   ];
   for (const [name, v, slot] of crossChecks) {
     if (!v) continue;
@@ -204,7 +212,7 @@ export function resolveProgramIds(env: Env): ProgramIds {
     ["PROGRAM_ID", wrapperEnv ? undefined : legacyEnv],
     ["STAKE_PROGRAM_ID", stakeEnv],
     ["MATCHER_PROGRAM_ID", matcherEnv],
-    ["NFT_PROGRAM_ID", nftEnv],
+    [nftAlias ? "KEEPER_NFT_PROGRAM_ID" : "NFT_PROGRAM_ID", nftEnv],
   ];
   for (const [name, v] of envValues) {
     if (!v) continue;
@@ -225,9 +233,9 @@ export function resolveProgramIds(env: Env): ProgramIds {
     wrapper: parseKey(wrapperSrc.s, wrapperSrc.v),
     stake: parseKey(stakeEnv ? "STAKE_PROGRAM_ID" : `builtin ${setLabel}.stake`, stakeEnv ?? set.stake),
     matcher: parseKey(matcherEnv ? "MATCHER_PROGRAM_ID" : `builtin ${setLabel}.matcher`, matcherEnv ?? set.matcher),
-    nft: parseKey(nftEnv ? "NFT_PROGRAM_ID" : `builtin ${setLabel}.nft`, nftEnv ?? set.nft),
+    nft: parseKey(nftEnv ? (nftAlias ? "KEEPER_NFT_PROGRAM_ID" : "NFT_PROGRAM_ID") : `builtin ${setLabel}.nft`, nftEnv ?? set.nft),
     source: {
-      nft: nftEnv ? "env NFT_PROGRAM_ID" : `builtin ${setLabel}.nft`,
+      nft: nftEnv ? `env ${nftAlias ? "KEEPER_NFT_PROGRAM_ID" : "NFT_PROGRAM_ID"}` : `builtin ${setLabel}.nft`,
       wrapper: wrapperSrc.s,
       stake: stakeEnv ? "env STAKE_PROGRAM_ID" : `builtin ${setLabel}.stake`,
       matcher: matcherEnv ? "env MATCHER_PROGRAM_ID" : `builtin ${setLabel}.matcher`,

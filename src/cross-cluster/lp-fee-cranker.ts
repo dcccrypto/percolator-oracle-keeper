@@ -69,6 +69,8 @@ import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
 import { decodeTerminalState, isTerminalFlat, marketMode } from "./market-state.ts";
 import { decodeVaultLpState, deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 import { isP2bSupported } from "./p2b-feature.ts";
+import { bondFeeDelegated } from "./v22/delegation.ts";
+import { lpVaultRegistryBondFlag } from "./v22/market.ts";
 
 import { lpVaultRegistryBound, lpVaultRegistryExtFlag } from "./registry-flags.ts";
 export { LP_VAULT_REGISTRY_BOUND_FLAG_OFF, lpVaultRegistryBound } from "./registry-flags.ts";
@@ -172,6 +174,10 @@ export async function crankLpFeesOnce(
   } catch (err) {
     return { error: (err as Error).message };
   }
+  // v2.2 (KEEPER_V22_FEE_CRANK_BOND): once the v2.2 fee job owns tag 78 on BOND markets, this job steps aside for a
+  // bond-flagged registry (it would send the pre-bond account list, which the program refuses). Nothing is delegated
+  // unless the flag is on, so with it off this line never fires.
+  if (bondFeeDelegated() && lpVaultRegistryBondFlag(new Uint8Array(registryInfo.data))) return "skipped";
   // Resolved + terminal-flat is harvestable only through the bound-vault path.
   if (resolvedHarvest && !bound) return "skipped";
   let domainIdx = LP_VAULT_DOMAIN_FALLBACK;

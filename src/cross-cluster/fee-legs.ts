@@ -16,10 +16,8 @@ import {
   parseAssetOracleProfileV17,
   parseWrapperConfigV17,
   V17_ASSET_ORACLE_PROFILE_LEN,
-  V17_MARKET_ASSET_SLOT_LEN,
-  V17_MARKET_GROUP_LEN,
 } from "@percolatorct/sdk";
-import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
+import { assetSlotOffset, selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
 
 export interface FeeLegs {
   protocolOwed: bigint;
@@ -34,7 +32,7 @@ export function readFeeLegs(data: Uint8Array): FeeLegs {
   let creatorClaimable: bigint | null = null;
   const g = selectMarketGroupOffset(data);
   if (g.ok) {
-    const profileOff = g.marketGroupOff + V17_MARKET_GROUP_LEN + 0 * V17_MARKET_ASSET_SLOT_LEN;
+    const profileOff = assetSlotOffset(g, 0); // K-2: per-VERSION group length (806 on VERSION 19)
     if (data.length >= profileOff + V17_ASSET_ORACLE_PROFILE_LEN) {
       creatorClaimable = parseAssetOracleProfileV17(data, profileOff).creatorFeeClaimableAtoms;
     }

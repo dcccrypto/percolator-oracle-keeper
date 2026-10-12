@@ -11,14 +11,58 @@ import { V17_MARKET_GROUP_LEN, V17_MARKET_GROUP_OFF } from "@percolatorct/sdk";
 const WRAPPER_MAGIC = 0x5045_5243_5631_3600n;
 const KIND_MARKET = 1;
 const KIND_CLOSED_MARKET = 8;
-const H_MODE = 626;
-const H_INSURANCE_DOMAIN_BUDGET_REMAINING_TOTAL = 461;
-/** `materialized_portfolio_count` u64 @ group+517 (engine 35ddd692 source). Wrapper tag 41 on a Resolved market requires it to be 0. */
-const H_MATERIALIZED_PORTFOLIO_COUNT = 517;
-/** `resolved_slot` u64 @ group+627 (engine 35ddd692 source): the PDA grace clock. */
-const H_RESOLVED_SLOT = 627;
-/** `c_tot` u128 @ group+317 (engine 35ddd692 source). Terminal-flat = materialized == 0 && c_tot == 0. */
-const H_C_TOT = 317;
+
+/**
+ * Group-header offsets (relative to MARKET_GROUP_OFF) per wrapper VERSION. VERSION 18 = engine 35ddd692
+ * `MarketGroupV16HeaderAccount`. VERSION 19 (v2.2, K-2): the embedded `V16ConfigAccount` grew +48 B (band / rent
+ * words), so every field after it moves +48: the struct order (engine release/v22-engine-rem 3ce4cbd1
+ * src/v16.rs:8930-8976: ... insurance_domain_budget_remaining_total, ..., materialized_portfolio_count, ...,
+ * current_slot, 3 x u8, recovery_reason, mode u8, resolved_slot u64, ...) is unchanged and every field is
+ * byte-aligned Pod. The VERSION-19 numbers equal the SDK LAYOUT_V22 `group` row (mode 674, materialized 565,
+ * budget 509, c_tot 365) and were read off the fresh v2.2 slabs on 2026-10-10 (mode 0, resolved_slot 0, c_tot /
+ * materialized / budget consistent with the seed state).
+ */
+interface GroupHeaderOffsets {
+  groupOff: number;
+  groupLen: number;
+  mode: number;
+  budgetRemainingTotal: number;
+  materializedPortfolioCount: number;
+  resolvedSlot: number;
+  cTot: number;
+}
+const GROUP_V18: GroupHeaderOffsets = {
+  groupOff: V17_MARKET_GROUP_OFF,
+  groupLen: V17_MARKET_GROUP_LEN,
+  mode: 626,
+  budgetRemainingTotal: 461,
+  /** `materialized_portfolio_count` u64. Wrapper tag 41 on a Resolved market requires it to be 0. */
+  materializedPortfolioCount: 517,
+  /** `resolved_slot` u64: the PDA grace clock. */
+  resolvedSlot: 627,
+  /** `c_tot` u128. Terminal-flat = materialized == 0 && c_tot == 0. */
+  cTot: 317,
+};
+const GROUP_V19: GroupHeaderOffsets = {
+  groupOff: 592,
+  groupLen: 806,
+  mode: 674,
+  budgetRemainingTotal: 509,
+  materializedPortfolioCount: 565,
+  resolvedSlot: 675,
+  cTot: 365,
+};
+const GROUP_BY_VERSION: Readonly<Record<number, GroupHeaderOffsets>> = { 18: GROUP_V18, 19: GROUP_V19 };
+/** Wrapper VERSIONs whose market header this module decodes. */
+export const TERMINAL_STATE_VERSIONS: ReadonlySet<number> = new Set(Object.keys(GROUP_BY_VERSION).map(Number));
+
+/** The header table for a wrapper account of a known VERSION (magic checked), else null. Never a guess. */
+function groupOffsetsFor(d: Uint8Array): GroupHeaderOffsets | null {
+  if (d.length < 16) return null;
+  const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
+  if (v.getBigUint64(0, true) !== WRAPPER_MAGIC) return null;
+  return GROUP_BY_VERSION[v.getUint16(8, true)] ?? null;
+}
 
 /**
  * P3 07a1d0eb: on a BOUND vault, tag 78 also runs on a Resolved market that is
@@ -46,37 +90,35 @@ function u64(d: Uint8Array, off: number): bigint {
   return new DataView(d.buffer, d.byteOffset, d.byteLength).getBigUint64(off, true);
 }
 
-/** null: not a VERSION-18 wrapper account of kind 1/8, or too short. Never a guess. */
+/** null: not a VERSION-18/19 wrapper account of kind 1/8, or too short. Never a guess. */
 export function decodeTerminalState(d: Uint8Array): TerminalState | null {
-  if (d.length < 16) return null;
-  const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
-  if (v.getBigUint64(0, true) !== WRAPPER_MAGIC || v.getUint16(8, true) !== 18) return null;
+  const h = groupOffsetsFor(d);
+  if (!h) return null;
   const kind = d[10];
   if (kind === KIND_CLOSED_MARKET) return { kind: "closed" };
   if (kind !== KIND_MARKET) return null;
-  const g = V17_MARKET_GROUP_OFF;
-  if (d.length < g + V17_MARKET_GROUP_LEN) return null;
-  const off = g + H_INSURANCE_DOMAIN_BUDGET_REMAINING_TOTAL;
+  const g = h.groupOff;
+  if (d.length < g + h.groupLen) return null;
+  const off = g + h.budgetRemainingTotal;
   const budget = u64(d, off) | (u64(d, off + 8) << 64n);
-  const materializedPortfolios = u64(d, g + H_MATERIALIZED_PORTFOLIO_COUNT);
-  return d[g + H_MODE] === MODE_RESOLVED
+  const materializedPortfolios = u64(d, g + h.materializedPortfolioCount);
+  return d[g + h.mode] === MODE_RESOLVED
     ? {
         kind: "resolved",
         budget,
         materializedPortfolios,
-        resolvedSlot: u64(d, g + H_RESOLVED_SLOT),
-        cTot: u64(d, g + H_C_TOT) | (u64(d, g + H_C_TOT + 8) << 64n),
+        resolvedSlot: u64(d, g + h.resolvedSlot),
+        cTot: u64(d, g + h.cTot) | (u64(d, g + h.cTot + 8) << 64n),
       }
     : { kind: "live", budget, materializedPortfolios };
 }
 
 
-/** Engine market mode byte (0 Live, 1 Resolved, 2 Recovery) of a VERSION-18 kind-1 market; null otherwise. */
+/** Engine market mode byte (0 Live, 1 Resolved, 2 Recovery) of a VERSION-18/19 kind-1 market; null otherwise. */
 export function marketMode(d: Uint8Array): number | null {
-  if (d.length < V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN) return null;
-  const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
-  if (v.getBigUint64(0, true) !== WRAPPER_MAGIC || v.getUint16(8, true) !== 18 || d[10] !== KIND_MARKET) return null;
-  return d[V17_MARKET_GROUP_OFF + H_MODE];
+  const h = groupOffsetsFor(d);
+  if (!h || d[10] !== KIND_MARKET || d.length < h.groupOff + h.groupLen) return null;
+  return d[h.groupOff + h.mode];
 }
 
 /**

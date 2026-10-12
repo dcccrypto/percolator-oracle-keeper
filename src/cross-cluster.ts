@@ -45,6 +45,7 @@
  *                           pinned set selected by KEEPER_DEVNET_V21; PROGRAM_ID is a legacy alias for the wrapper) — see program-ids.ts
  *   DEVNET_RPC_ORIGIN       Origin header for an Origin-restricted devnet RPC key (optional)
  *   KEEPER_ALERT_WEBHOOK_URL  https webhook for [ALERT] lines (optional; Slack/Discord-compatible `text`)
+ *   KEEPER_ALERT_TELEGRAM_BOT_TOKEN / KEEPER_ALERT_TELEGRAM_CHAT_ID  Telegram delivery for [ALERT] lines (optional; both or neither)
  *   ALERT_SLOT_LAG_WARN / ALERT_SLOT_LAG_CRITICAL / ALERT_CRANK_REVERTS / ALERT_ZERO_PUSH_CYCLES /
  *   ALERT_LAPSED_BUCKET_CYCLES / ALERT_BANKRUPT_CYCLES / ALERT_COOLDOWN_MS  alert thresholds (alerting.ts)
  *   ALERT_MARKET_NO_PUSH_CYCLES (default 40) / ALERT_MARK_LAG_MS (120000) / ALERT_MARK_LAG_PCT (10) /
@@ -61,6 +62,7 @@
  *   P2B_ALLOCATE_INTERVAL_MS (60000) / P2B_ALLOCATE_JITTER_PCT (25) / P2B_ALLOCATE_CU (600000)   tag 103 pacing
  *   P2B_WIND_DOWN_MAX_PER_MARKET (3) / _MAX_PER_CYCLE (8) / _MAX_SIMS (6) / _MAX_MARK_AGE_SLOTS (140) / _CU (600000) / _COOLDOWN_MS (60000)   tag 104
  *   HEDGED_LOCKOUT_UTIL_BPS (9000) / HEDGED_LOCKOUT_FLAT_BPS (300) / HEDGED_LOCKOUT_INTERVAL_MS (30000)
+ *   KEEPER_V22 (off) + KEEPER_V22_* / VAULT_LP_LONE_CRANK   v2.2 layer, every flag default OFF: see cross-cluster/v22/flags.ts and the README
  *   EARN_GAP_INTERVAL_MS (60000) / EARN_GAP_ALERT_BPS (100) / EARN_GAP_ALERT_CYCLES (3)   R3-M1 par-E3 gap
  *
  * CLI flags:
@@ -114,6 +116,10 @@ import { P2bLoop, p2bLoopConfigFromEnv, startP2bLoop } from "./cross-cluster/p2b
 import type { P2bLoopConfig } from "./cross-cluster/p2b-loop.ts";
 import { setP2bHealthProvider } from "./cross-cluster/p2b-health.ts";
 import { fetchMarketPortfolios } from "./cross-cluster/recovery-cranker.ts";
+import { v22FlagsFromEnv, describeV22Flags } from "./cross-cluster/v22/flags.ts";
+import { V22Loop, startV22Loop } from "./cross-cluster/v22/loop.ts";
+import { setLoneLpCrankSuppressor } from "./cross-cluster/v22/delegation.ts";
+import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -375,10 +381,10 @@ if (registry.markets.length === 0) {
   }
 }
 
-const mainnetConn = new Connection(MAINNET_RPC, "confirmed");
+const mainnetConn = new Connection(MAINNET_RPC, { commitment: "confirmed", fetch: countingFetch("mainnet") });
 // DEVNET_RPC_ORIGIN replaces the uncommitted `httpHeaders: { Origin }` edit the
 // live machine carried here (Origin-restricted Helius key; see rpc-headers.ts).
-const devnetConn = new Connection(DEVNET_RPC, DEVNET_CONN_CONFIG);
+const devnetConn = new Connection(DEVNET_RPC, { ...DEVNET_CONN_CONFIG, fetch: countingFetch("devnet") });
 
 // Dry-run hard stop. Every write path is meant to honour `dryRun` on its own,
 // but there are a dozen send sites; a standby keeper that signs even one tx
@@ -402,7 +408,7 @@ console.log(`  registry:  ${REGISTRY_PATH} (${registry.markets.length} markets)`
 console.log(`  mode:      ${DRY_RUN ? "DRY-RUN (no on-chain writes)" : "LIVE"}`);
 console.log(`  interval:  ${CC_INTERVAL_MS}ms`);
 for (const line of describeProgramIds()) console.log(`  program:   ${line}`);
-console.log(`  alerts:    webhook ${process.env.KEEPER_ALERT_WEBHOOK_URL ? "ON" : "off"}; thresholds ${JSON.stringify(ALERT_SINK.thresholds)}`);
+console.log(`  alerts:    webhook ${process.env.KEEPER_ALERT_WEBHOOK_URL ? "ON" : "off"}; telegram ${ALERT_SINK.telegramEnabled ? "ON" : "off"}; thresholds ${JSON.stringify(ALERT_SINK.thresholds)}`);
 console.log(
   `  cranker:   ${CRANK_ENABLED ? `every ${CRANK_INTERVAL_MS}ms` : "disabled (CRANK_ENABLED=false)"}`,
   `  lp-fee:    ${LP_FEE_CRANK_ENABLED ? `every ${LP_FEE_CRANK_INTERVAL_MS}ms` : "disabled (LP_FEE_CRANK_ENABLED=false)"}`,
@@ -438,6 +444,32 @@ if (!REGISTER_SOURCE_URL && !DRY_RUN) {
 // exactly why this closes the SOL/JUP/TRUMP boot-gap.
 // B7: the boot states go to the loop, so its first cycle does not re-crank a
 // market in the slot the boot crank already covered (a benign Custom(22)).
+// v2.2 layer (KEEPER_V22=on; default OFF, then nothing below is created and every legacy path is unchanged).
+// Installed BEFORE the boot crank so the first crank of a variant-B market already goes through the v2.2 sweep
+// delegate. See cross-cluster/v22/loop.ts and the README "v2.2 keeper" section for every flag.
+const V22_FLAGS = v22FlagsFromEnv();
+if (V22_FLAGS.enabled) {
+  const v22Loop = new V22Loop({
+    conn: devnetConn,
+    keeper,
+    programId: CFG_WRAPPER_PROGRAM_ID,
+    markets: () => registry.markets,
+    flags: V22_FLAGS,
+    dryRun: DRY_RUN,
+    mainnetBuild: V22_FLAGS.mainnetBuild,
+  });
+  v22Loop.install();
+  console.log(`[v22] layer ON ${JSON.stringify(describeV22Flags(V22_FLAGS))}${DRY_RUN || V22_FLAGS.dryRun ? " (DRY-RUN: simulate and log, send nothing)" : ""}`);
+  void startV22Loop(v22Loop, V22_FLAGS.tickMs).catch((err: unknown) => {
+    console.error(`[v22] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`);
+  });
+} else if (!V22_FLAGS.loneLpCrank) {
+  // The lone-LP-crank switch is meaningful on its own (it is the settle-pairing hazard), so it works without KEEPER_V22.
+  // Parsed by the same strict parser as every other v2.2 flag (off/0/false/no).
+  setLoneLpCrankSuppressor(() => true);
+  console.log("[v22] VAULT_LP_LONE_CRANK=off: the lone vault-LP crank after a landed push is suppressed on every market");
+}
+
 const bootCrankStates = CRANK_ENABLED ? await crankAllOnce(devnetConn, keeper, registry, DRY_RUN) : undefined;
 
 // Recovery crank loop runs concurrently on its own interval — deliberately

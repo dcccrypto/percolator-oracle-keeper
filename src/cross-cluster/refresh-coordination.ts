@@ -44,6 +44,7 @@ export function isPushHeld(market: string, nowMs: number = Date.now()): boolean 
 }
 
 import type { SweepHealth } from "./positioned-sweep.ts";
+import { resetLayoutGuardMetrics } from "./layout-guard-metrics.ts";
 
 export interface CrankRefreshHealth {
   /** stale_account_count_long/short at this cycle's pre-crank read. */
@@ -77,6 +78,13 @@ export interface CrankRefreshHealth {
    * laggard counts, pace. Absent on legacy markets, so their /health is unchanged.
    */
   sweep?: SweepHealth;
+  /**
+   * K-9: ADL state of asset 0 at this cycle's pre-crank read (adl-state.ts). Absent when the account could not be
+   * decoded (unknown layout), so a market the decoder cannot read shows no ADL fields rather than a guess.
+   */
+  adl?: { reduceOnly: boolean; aLong: string; aShort: string; oiEffLong: string; oiEffShort: string };
+  /** Multi-asset markets only: the ADL state of every non-Disabled asset slot (adl-state.ts adlHealthOf). */
+  adlAssets?: Array<{ asset: number; reduceOnly: boolean; aLong: string; aShort: string; oiEffLong: string; oiEffShort: string }>;
 }
 
 /** Layout verdict for one market read. */
@@ -140,4 +148,5 @@ export function resetRefreshCoordination(): void {
   refreshHealth.clear();
   layoutProblemCounts.unknown = 0;
   layoutProblemCounts.unsupported = 0;
+  resetLayoutGuardMetrics();
 }

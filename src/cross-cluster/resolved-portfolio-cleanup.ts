@@ -82,9 +82,11 @@ import {
   RESOLVED_RECEIPT_ACCOUNT_OFF_P3,
   RESOLVED_RECEIPT_LEN_P3,
   V17_PORTFOLIO_ACCOUNT_LEN,
+  LAYOUTS_BY_VERSION,
 } from "@percolatorct/sdk";
 import { parseInstructionError } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
+import { getMultipleAccountsInfoChunked } from "./rpc-chunk.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 
 export const WRAPPER_TAG_CLOSE_PORTFOLIO = 8;
@@ -427,6 +429,35 @@ function why(err: unknown, logs: string[] | null, ixIndex: Record<number, string
 }
 
 /**
+ * K-10: the portfolio account length of `market`'s program version, for the discovery scans below.
+ *
+ * Both scans filtered on the v2.1 length (9,563 B), so on a v2.2 market (VERSION 19, 10,603 B portfolios) they found
+ * nothing and a Resolved v2.2 market was never wound down. The length now comes from the market account's own header
+ * VERSION through the SDK layout table (the same table `parsePortfolioV17` / `decodeResolvedPayoutReceiptP3` already
+ * resolve every portfolio with, so the receipt offset 9,369 / 10,409 needs no change here). The header survives a
+ * CloseSlab tombstone. A VERSION the pinned SDK has no table for THROWS (the callers report "portfolio discovery
+ * failed"; nothing is scanned at a guessed size). An unreadable / absent market account keeps the v2.1 length.
+ */
+export function portfolioLenForMarketData(data: Uint8Array | null | undefined): number {
+  if (!data || data.length < 10) return V17_PORTFOLIO_ACCOUNT_LEN;
+  const version = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint16(8, true);
+  const t = LAYOUTS_BY_VERSION.get(version);
+  if (!t) throw new Error(`market VERSION ${version} has no portfolio layout in the pinned SDK`);
+  return t.portfolio.accountLen;
+}
+
+async function portfolioLenForMarket(conn: Pick<CleanupConnection, "getAccountInfo">, market: PublicKey): Promise<number> {
+  let data: Uint8Array | null = null;
+  try {
+    const info = await conn.getAccountInfo(market, "confirmed");
+    data = info ? new Uint8Array(info.data) : null;
+  } catch {
+    data = null; // unreadable this cycle: v2.1 length (a wrong-size scan finds nothing and the next cycle retries)
+  }
+  return portfolioLenForMarketData(data);
+}
+
+/**
  * One cleanup pass for a Resolved market. Never throws. dryRun simulates only.
  */
 export async function cleanupResolvedPortfolios(
@@ -445,7 +476,7 @@ export async function cleanupResolvedPortfolios(
   try {
     const accs = await conn.getProgramAccounts(cfg.wrapperProgramId, {
       filters: [
-        { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
+        { dataSize: await portfolioLenForMarket(conn, market) },
         { memcmp: { offset: 0, bytes: V17_PORTFOLIO_MAGIC.toString("base64"), encoding: "base64" } },
         { memcmp: { offset: 16, bytes: market.toBase58() } },
       ],
@@ -570,8 +601,9 @@ export async function cleanupResolvedPortfolios(
   const atas = pfs.map((p) => ownerAta(p.owner, collateralMint));
   let ataExists: boolean[];
   try {
-    const infos = await conn.getMultipleAccountsInfo(atas, "confirmed");
-    ataExists = infos.map((i) => i !== null);
+    // Chunked at 100 (RPC cap): a resolved market can hold >100 portfolios. A failed chunk reads as "absent" (undefined -> false), as a whole-call failure did.
+    const { infos } = await getMultipleAccountsInfoChunked(conn, atas, "confirmed");
+    ataExists = infos.map((i) => i != null);
   } catch {
     ataExists = atas.map(() => false);
   }
@@ -769,7 +801,7 @@ export async function cleanupResolvedPortfolios(
     const cands = pfs.filter((q) => pdaOwnerKind(q.owner, market, cfg) !== "lp-registry");
     let infos: Array<{ data: Buffer | Uint8Array } | null> = [];
     try {
-      infos = cands.length ? await conn.getMultipleAccountsInfo(cands.map((q) => q.pubkey), "confirmed") : [];
+      infos = cands.length ? (await getMultipleAccountsInfoChunked(conn, cands.map((q) => q.pubkey), "confirmed")).infos.map((i) => i ?? null) : [];
     } catch {
       infos = [];
     }
@@ -885,7 +917,7 @@ export async function closeFinalizedReceiptPortfolios(
   try {
     accs = await conn.getProgramAccounts(cfg.wrapperProgramId, {
       filters: [
-        { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
+        { dataSize: await portfolioLenForMarket(conn, market) },
         { memcmp: { offset: 0, bytes: V17_PORTFOLIO_MAGIC.toString("base64"), encoding: "base64" } },
         { memcmp: { offset: 16, bytes: market.toBase58() } },
       ],
