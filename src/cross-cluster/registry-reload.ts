@@ -45,6 +45,8 @@ export interface RegistryReloadConfig {
   registryPath: string;
   /** Milliseconds between reload checks (default 15_000). */
   intervalMs?: number;
+  /** v1 wind-down: never admit a market that is not already tracked. */
+  freezeIntake?: boolean;
 }
 
 const DEFAULT_RELOAD_INTERVAL_MS = 15_000;
@@ -65,6 +67,7 @@ function sameEntry(a: MarketEntry, b: MarketEntry): boolean {
 export function reloadRegistryOnce(
   registry: Registry,
   registryPath: string,
+  opts: { freezeIntake?: boolean } = {},
 ): { added: number; removed: number; updated: number } {
   let onDisk: Registry;
   try {
@@ -81,6 +84,12 @@ export function reloadRegistryOnce(
     return { added: 0, removed: 0, updated: 0 };
   }
 
+  // Frozen intake: a market that is not already tracked is never admitted from
+  // disk. Removals and updates of tracked markets still apply.
+  if (opts.freezeIntake) {
+    const tracked = new Set(registry.markets.map((m) => m.marketAddress));
+    onDisk = { ...onDisk, markets: onDisk.markets.filter((m) => tracked.has(m.marketAddress)) };
+  }
   const onDiskByAddr = new Map(onDisk.markets.map((m) => [m.marketAddress, m]));
   const inMemByAddr = new Map(registry.markets.map((m) => [m.marketAddress, m]));
 
@@ -147,7 +156,7 @@ export async function startRegistryReloadLoop(
   while (!stopping) {
     const cycleStart = Date.now();
     try {
-      reloadRegistryOnce(registry, config.registryPath);
+      reloadRegistryOnce(registry, config.registryPath, { freezeIntake: config.freezeIntake });
     } catch (err) {
       // Defense in depth: reloadRegistryOnce already isolates every failure
       // mode internally, but never let an unexpected throw kill this loop.
