@@ -39,6 +39,8 @@ import {
 import {
   ACCOUNTS_PUSH_AUTH_MARK,
   buildAccountMetas,
+  decodeAssetGrowthV19,
+  isDexPinned,
   parseAssetOracleProfileV17,
   parseAssetControlSequencesV17,
   tokenPriceToLotE6V22,
@@ -590,6 +592,12 @@ type AuthMarkPushInput = {
 type AuthMarkPushItem = AuthMarkPushInput & {
   marketId: bigint;
   observationSequence: bigint;
+  /**
+   * F-3 (percolator-prog #564): the asset's depth is pinned to its DEX pool (growth byte 44 bit 6, read live, or learned from a
+   * 129 refusal of a mode-1 push). While true this item NEVER carries a mode-1 depth: the wrapper refuses that push whole, mark
+   * included. It goes out as mode 2 (with a matching pin) or the 35 B form.
+   */
+  dexPinned?: boolean;
   /** K-1: the market's lot exponent (0 on v2.1 / single-token markets). */
   lotExp: number;
   /** K-1: what PushAuthMark carries: `priceE6` (per token) x 10^lotExp. */
@@ -711,6 +719,62 @@ function assetAcceptsPush(data: Uint8Array, assetIndex: number): boolean {
 /** K-6: multi-asset pushes already logged as skipped for an inactive asset (logged once per key). */
 const inactiveLogged = new Set<string>();
 
+/** What the per-cycle generation read returns for one (market, asset). */
+export type PushGenerationFields = {
+  marketId: bigint;
+  observationSequence: bigint;
+  lotExp: number;
+  /** F-3: growth byte 44 bit 6 (`DEPTH_DEX_PINNED`). `null` = unknown (no growth record / unreadable / pre-v2.2 layout). */
+  dexPinned: boolean | null;
+};
+
+/**
+ * F-3 (percolator-prog #564 @ 4db44b69): whether the asset's depth is pinned to its DEX pool, from the SDK's growth decoder.
+ * Growth off -> `false` (the wrapper's tag 123 writes no bit there and its push guard never runs). Any decode failure -> `null`
+ * (unknown: the pusher then relies on what a 129 refusal taught it). Never throws.
+ */
+export function readDexPinned(data: Uint8Array, assetIndex: number): boolean | null {
+  try {
+    return isDexPinned(decodeAssetGrowthV19(data, assetIndex));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * F-3: (market, asset) keys the chain refused a mode-1 push for with 129 (so pinned) while the live read could not say. Kept until
+ * a live read says "not pinned" (tag 123 op 0). Bounded by the registry (pruned with the other per-market state).
+ */
+const learnedDexPinned = new Set<string>();
+/** F-3: keys already logged for a suppressed mode-1 depth (logged once, until the pin goes). */
+const mode1SuppressedLogged = new Set<string>();
+
+/** F-3: the pin state the pusher acts on: the live bit when known, else what a 129 taught it. */
+function effectiveDexPinned(key: string, live: boolean | null): boolean {
+  if (live === false) {
+    learnedDexPinned.delete(key);
+    mode1SuppressedLogged.delete(key);
+    return false;
+  }
+  return live === true || learnedDexPinned.has(key);
+}
+
+/** F-3: one structured line (`[push][F3] {json}`) per pin event, grep-able by `event`. */
+export function f3PinLogLine(event: "depth_mode1_suppressed_dex_pinned" | "depth_mode1_refused_129_dex_pinned" | "depth_mode2_refused_129_on_pinned", f: {
+  market: string;
+  assetIndex: number;
+  depthSource?: string;
+  action: string;
+}): string {
+  return `[push][F3] ${JSON.stringify({ event, finding: "DEATH F-3 / SEC-RC L-2", code: event === "depth_mode1_suppressed_dex_pinned" ? null : 129, ...f })}`;
+}
+
+/** Test hook: forget every F-3 learned pin / log latch. */
+export function resetF3PinStateForTests(): void {
+  learnedDexPinned.clear();
+  mode1SuppressedLogged.clear();
+}
+
 /**
  * Batched live-read of market_id + observation_sequence for every push this
  * cycle, via `getMultipleAccountsInfo` in chunks of 100 keys (one call up to 100 markets) — not one `getAccountInfo`
@@ -730,7 +794,7 @@ export async function fetchPushAuthMarkGenerationFields(
   terminal: Set<string>,
   /** K-6: multi-asset pushes whose asset is not Active / DrainOnly (skipped, by generation key). */
   inactive?: Set<string>,
-): Promise<Map<string, { marketId: bigint; observationSequence: bigint; lotExp: number }>> {
+): Promise<Map<string, PushGenerationFields>> {
   const uniqueAddrs = [...new Set(pushes.map((p) => p.marketAddress))];
   // "processed", not "confirmed" (#Custom19, 2026-09-28): the watermark this
   // reads is advanced ONLY by this keeper's own pushes, which land ~1-3 slots
@@ -753,7 +817,7 @@ export async function fetchPushAuthMarkGenerationFields(
     if (info) dataByAddr.set(addr, new Uint8Array(info.data));
   });
 
-  const result = new Map<string, { marketId: bigint; observationSequence: bigint; lotExp: number }>();
+  const result = new Map<string, PushGenerationFields>();
   for (const p of pushes) {
     const key = pushGenerationKey(p);
     if (result.has(key)) continue;
@@ -775,6 +839,7 @@ export async function fetchPushAuthMarkGenerationFields(
         marketId: fields.marketId,
         observationSequence: nextObservationSequence(key, fields.observationSequence),
         lotExp: fields.lotExp,
+        dexPinned: readDexPinned(data, p.assetIndex),
       });
     }
   }
@@ -837,6 +902,8 @@ export function pruneAuthMarkPusherState(keep: ReadonlySet<string>): void {
   for (const m of [...terminalLogged]) if (!keep.has(m)) terminalLogged.delete(m);
   for (const m of [...soloUntil.keys()]) if (!keep.has(m)) soloUntil.delete(m);
   for (const m of [...landedRevertTimes.keys()]) if (!keep.has(m)) landedRevertTimes.delete(m);
+  for (const k of [...learnedDexPinned]) if (!keep.has(generationKeyMarket(k))) learnedDexPinned.delete(k);
+  for (const k of [...mode1SuppressedLogged]) if (!keep.has(generationKeyMarket(k))) mode1SuppressedLogged.delete(k);
 }
 
 /** The market part of a {@link pushGenerationKey} (`${market}:${assetIndex}`). */
@@ -1150,7 +1217,22 @@ export async function pushAuthMarkBatch(
     }
     // Mode 2 only for the pin made for THIS asset slot and generation; anything else stays on the attested path.
     const dex = p.dex && p.dex.assetIndex === p.assetIndex && p.dex.marketId === fields.marketId ? p.dex : undefined;
-    pushable.push({ ...p, dex, marketId: fields.marketId, observationSequence: fields.observationSequence, lotExp: fields.lotExp, markE6 });
+    // F-3: on a DEX-pinned asset a mode-1 push is refused WHOLE (129, mark included), so the price would go stale. Never send
+    // one: mode 2 when the pin is usable, else the 35 B form (absent depth: the conservative direction).
+    const key = pushGenerationKey(p);
+    const dexPinned = effectiveDexPinned(key, fields.dexPinned);
+    let depth = p.depth;
+    if (dexPinned && !dex && depth) {
+      depth = null;
+      if (!mode1SuppressedLogged.has(key)) {
+        mode1SuppressedLogged.add(key);
+        console.warn(f3PinLogLine("depth_mode1_suppressed_dex_pinned", {
+          market: p.marketAddress, assetIndex: p.assetIndex, depthSource: fields.dexPinned === true ? "chain" : "learned-129",
+          action: "35 B push (no depth) instead of mode 1; mode 2 resumes once the pin is readable",
+        }));
+      }
+    }
+    pushable.push({ ...p, dex, depth, dexPinned, marketId: fields.marketId, observationSequence: fields.observationSequence, lotExp: fields.lotExp, markE6 });
   }
   if (supersededKeys.length > 0) {
     console.warn(`[push] cycle ${opts.cycle} superseded by a later cycle — not sending its older price for ${supersededKeys.length} asset(s)`);
@@ -1333,8 +1415,8 @@ export async function pushAuthMarkBatch(
     let pending = chunk;
     let refreshed = false;
     // Each non-refresh iteration removes one market, so this is bounded.
-    // (+ one downgrade per mode-2 market, which does not shrink `pending`.)
-    for (let guard = 0; pending.length > 0 && guard <= 2 * chunk.length + 2; guard++) {
+    // (+ at most two downgrades per market, which do not shrink `pending`: mode 2 -> mode 1 / 35 B, and F-3 mode 1 -> 35 B.)
+    for (let guard = 0; pending.length > 0 && guard <= 3 * chunk.length + 2; guard++) {
       const simErr = await preflight(pending);
       if (!simErr) {
         await send(pending);
@@ -1373,16 +1455,36 @@ export async function pushAuthMarkBatch(
       // Round 2: 129 on a mode-2 push = the pin no longer matches the chain. That is not a bad market: fall back to the
       // attested path (mode 1 if the cycle has a depth, else 35 B) for THIS cycle, log once, no strike, and let the
       // caller re-read the pin next cycle.
+      // F-3: on a DEX-pinned asset the attested path is closed too (mode 1 -> 129), so the fallback is the 35 B form.
       if (failing.custom === WRAPPER_ERR_DEPTH_SOURCE_INVALID && culprit.dex) {
         dexRefusedMarkets.push(culprit.marketAddress);
         if (!dexRefusalLogged.has(culprit.marketAddress)) {
           dexRefusalLogged.add(culprit.marketAddress);
           console.warn(
             `[push] ${culprit.marketAddress.slice(0, 8)}… mode-2 depth refused (Custom(129) DepthSourceInvalid) — ` +
-              `falling back to the attested path this cycle; the depth source is re-read next cycle`,
+              `falling back to the ${culprit.dexPinned ? "35 B form (DEX-pinned: mode 1 is refused too)" : "attested path"} this cycle; ` +
+              `the depth source is re-read next cycle`,
           );
+          if (culprit.dexPinned) {
+            console.warn(f3PinLogLine("depth_mode2_refused_129_on_pinned", {
+              market: culprit.marketAddress, assetIndex: culprit.assetIndex, action: "35 B push this round; pin re-read next cycle",
+            }));
+          }
         }
-        pending = pending.map((p, i) => (i === failing.position ? { ...p, dex: undefined } : p));
+        pending = pending.map((p, i) => (i === failing.position ? { ...p, dex: undefined, ...(p.dexPinned ? { depth: null } : {}) } : p));
+        continue;
+      }
+      // F-3: 129 on a MODE-1 push = the asset is DEX-pinned on chain (byte 44 bit 6) though this cycle's read did not say so
+      // (a pin made after the read, or an unreadable growth record). Not a bad market: learn the pin, log it structurally,
+      // and resend THIS market as the 35 B form in the same round (no strike), so its price does not go stale.
+      if (failing.custom === WRAPPER_ERR_DEPTH_SOURCE_INVALID && !culprit.dex && culprit.depth) {
+        const key = pushGenerationKey(culprit);
+        learnedDexPinned.add(key);
+        mode1SuppressedLogged.add(key);
+        console.warn(f3PinLogLine("depth_mode1_refused_129_dex_pinned", {
+          market: culprit.marketAddress, assetIndex: culprit.assetIndex, action: "resent as 35 B this round; mode 1 suppressed until the pin is cleared",
+        }));
+        pending = pending.map((p, i) => (i === failing.position ? { ...p, depth: null, dexPinned: true } : p));
         continue;
       }
       strike(culprit, simErr);
