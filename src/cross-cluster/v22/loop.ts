@@ -203,19 +203,23 @@ export class V22Loop {
     const f = this.d.flags;
     const dry = this.d.dryRun || f.dryRun;
     const parts: string[] = [];
-    if (f.feeCrankBond && ctx.bond) {
-      const r = this.rtFor(ctx.marketAddress);
-      const positioned = await this.positionedFor(ctx, r);
-      const res = await crankBondFee(this.sweepDeps(), ctx, positioned, { mode: pairingActive(f) ? f.pairing : "off", weightBudget: weightBudgetFor() });
-      parts.push(`78(bond) ${res.kind === "skipped" ? `skipped: ${res.reason}` : res.kind}`);
-    } else {
-      const o = await crankLpFeesOnce(this.d.conn as never, this.d.keeper, ctx.marketAddress, dry);
-      parts.push(`78 ${typeof o === "string" ? o : o.error}`);
+    // Never alongside a v2.2 settle round on the same market (a round may be settling the vault LP): defer to the next tick.
+    const r = this.rtFor(ctx.marketAddress);
+    if (r.sweepInflight) return "deferred: a v2.2 settle round is in flight on this market";
+    {
+      if (f.feeCrankBond && ctx.bond) {
+        const positioned = await this.positionedFor(ctx, r);
+        const res = await crankBondFee(this.sweepDeps(), ctx, positioned, { mode: pairingActive(f) ? f.pairing : "off", weightBudget: weightBudgetFor() });
+        parts.push(`78(bond) ${res.kind === "skipped" ? `skipped: ${res.reason}` : res.kind}`);
+      } else {
+        const o = await crankLpFeesOnce(this.d.conn as never, this.d.keeper, ctx.marketAddress, dry);
+        parts.push(`78 ${typeof o === "string" ? o : o.error}`);
+      }
+      const stakeCfg = { ...stakeFeeConfigFromEnv(process.env), minPushAtoms: 1n };
+      const st = await pushStakeFeesOnce(this.d.conn as never, this.d.keeper, ctx.marketAddress, dry, stakeCfg);
+      parts.push(`87+12 ${st.kind}${st.kind === "skipped" ? `: ${st.reason}` : st.kind === "failed" ? `: ${st.error}` : st.kind === "waiting" || st.kind === "blocked" ? `: ${st.reason}` : ""}`);
+      return parts.join("; ");
     }
-    const stakeCfg = { ...stakeFeeConfigFromEnv(process.env), minPushAtoms: 1n };
-    const st = await pushStakeFeesOnce(this.d.conn as never, this.d.keeper, ctx.marketAddress, dry, stakeCfg);
-    parts.push(`87+12 ${st.kind}${st.kind === "skipped" ? `: ${st.reason}` : st.kind === "failed" ? `: ${st.error}` : st.kind === "waiting" || st.kind === "blocked" ? `: ${st.reason}` : ""}`);
-    return parts.join("; ");
   }
 
   /**

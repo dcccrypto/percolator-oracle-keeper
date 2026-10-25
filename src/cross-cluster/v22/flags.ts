@@ -40,6 +40,11 @@
  *   KEEPER_V22_STALE_RESOLVE_MIN_OBS_MS   continuous healthy observation AND source-unavailable time required before a resolve (default 1800000 = 30 min)
  *   KEEPER_V22_STALE_RESOLVE_MASS_THRESHOLD  more matured markets than this at once = outage-shaped: resolve none, alert (default 3)
  *   KEEPER_V22_STALE_RESOLVE_MAX_PER_CYCLE   resolves per tick (default 1)
+ *   KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW  comma-separated market addresses: ONLY these unregistered markets whose oracle authority is
+ *                                 this keeper may be resolved (default none = they are HELD with an alert: register them or decide)
+ *   KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_MAX / _PCT  global source-health hold: more than MAX (default 3), or more than PCT percent (default 50,
+ *                                 and at least 2) of the markets the keeper can push lack a usable source price at once = a price-reader
+ *                                 regression, not dead markets: resolve no pushable market, alert
  *   KEEPER_V22_STALE_RESOLVE_RETRY_MS        wait after an attempt that did not resolve before the next one on that market (default 600000)
  *   KEEPER_V22_LIFECYCLE_MAX_GAP_MS          a gap between two observations longer than this breaks "continuous" (default 120000)
  *   KEEPER_V22_NEVER_CONNECTED_GRACE_SLOTS   price age before a market with no push path is called NEVER-CONNECTED (default 1500, about 10 min)
@@ -70,6 +75,9 @@ export interface LifecycleConfig {
   minObservationMs: number;
   massThreshold: number;
   maxResolvesPerCycle: number;
+  unregisteredAllow: string[];
+  sourceLossMax: number;
+  sourceLossPct: number;
   resolveRetryMs: number;
   maxGapMs: number;
   neverConnectedGraceSlots: number;
@@ -87,6 +95,9 @@ export const LIFECYCLE_DEFAULTS: LifecycleConfig = {
   minObservationMs: 1_800_000,
   massThreshold: 3,
   maxResolvesPerCycle: 1,
+  unregisteredAllow: [],
+  sourceLossMax: 3,
+  sourceLossPct: 50,
   resolveRetryMs: 600_000,
   maxGapMs: 120_000,
   neverConnectedGraceSlots: 1_500,
@@ -178,6 +189,19 @@ function staleResolveMode(env: Env): StaleResolveMode {
   throw new V22FlagError("KEEPER_V22_STALE_RESOLVE", raw, "off | dry | on");
 }
 
+function addressList(env: Env, key: string): string[] {
+  const raw = env[key];
+  if (raw === undefined || raw.trim() === "") return [];
+  const out: string[] = [];
+  for (const part of raw.split(",")) {
+    const a = part.trim();
+    if (a === "") continue;
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(a)) throw new V22FlagError(key, raw, "comma-separated base58 addresses");
+    if (!out.includes(a)) out.push(a);
+  }
+  return out;
+}
+
 function lifecycleFromEnv(env: Env): LifecycleConfig {
   const stateRaw = env.KEEPER_V22_LIFECYCLE_STATE_FILE?.trim();
   if (stateRaw && !stateRaw.startsWith("/")) throw new V22FlagError("KEEPER_V22_LIFECYCLE_STATE_FILE", stateRaw, "an absolute path");
@@ -187,6 +211,13 @@ function lifecycleFromEnv(env: Env): LifecycleConfig {
     minObservationMs: posInt(env, "KEEPER_V22_STALE_RESOLVE_MIN_OBS_MS", LIFECYCLE_DEFAULTS.minObservationMs),
     massThreshold: posInt(env, "KEEPER_V22_STALE_RESOLVE_MASS_THRESHOLD", LIFECYCLE_DEFAULTS.massThreshold),
     maxResolvesPerCycle: posInt(env, "KEEPER_V22_STALE_RESOLVE_MAX_PER_CYCLE", LIFECYCLE_DEFAULTS.maxResolvesPerCycle),
+    unregisteredAllow: addressList(env, "KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW"),
+    sourceLossMax: posInt(env, "KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_MAX", LIFECYCLE_DEFAULTS.sourceLossMax),
+    sourceLossPct: (() => {
+      const v = posInt(env, "KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_PCT", LIFECYCLE_DEFAULTS.sourceLossPct);
+      if (v > 100) throw new V22FlagError("KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_PCT", String(v), "1..100");
+      return v;
+    })(),
     resolveRetryMs: posInt(env, "KEEPER_V22_STALE_RESOLVE_RETRY_MS", LIFECYCLE_DEFAULTS.resolveRetryMs),
     maxGapMs: posInt(env, "KEEPER_V22_LIFECYCLE_MAX_GAP_MS", LIFECYCLE_DEFAULTS.maxGapMs),
     neverConnectedGraceSlots: posInt(env, "KEEPER_V22_NEVER_CONNECTED_GRACE_SLOTS", LIFECYCLE_DEFAULTS.neverConnectedGraceSlots),

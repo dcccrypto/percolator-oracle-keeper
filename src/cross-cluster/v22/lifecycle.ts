@@ -25,7 +25,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Alert, AlertSink } from "../alerting.ts";
 import { markTerminal } from "../push-deadline.ts";
-import { buildV22MarketCtx } from "./market.ts";
+import { buildV22MarketCtx, loadV22Market } from "./market.ts";
 import type { V22MarketCtx } from "./market.ts";
 import type { LifecycleConfig } from "./flags.ts";
 import { classifyMarket, observeQuiet, openInterestIsZero, quietMsOf, tradeFeeAccrualSum } from "./lifecycle-classify.ts";
@@ -37,6 +37,9 @@ import type { AttemptRecord, GuardName, ResolveDecision, ResolveInput } from "./
 import { redactErrorText } from "./redact.ts";
 
 export const LIFECYCLE_ALERT_SCOPE = "v22-lifecycle";
+
+/** A pushable market whose source has not been read usable for this long, while the push loop runs, lacks a source now. */
+export const SOURCE_FRESH_MS = 60_000;
 
 /** Wrapper account header the discovery scan matches: MAGIC (8, LE) + VERSION 19 (u16 LE) + KIND 1 (market). */
 const WRAPPER_MAGIC_LE = Buffer.from([0x00, 0x36, 0x31, 0x56, 0x43, 0x52, 0x45, 0x50]);
@@ -68,7 +71,7 @@ export function fileStore(file: string): LifecycleStore {
         fs.writeFileSync(tmp, JSON.stringify({ version: 1, markets: rec }));
         fs.renameSync(tmp, file);
       } catch {
-        // a failed save keeps the previous file; the clock is only a lower bound anyway
+        // a failed save keeps the previous file; the clock restarts from the last good save
       }
     },
   };
@@ -134,6 +137,11 @@ export class LifecycleEngine {
   private tickReadFailures = 0;
   private massHold = false;
   private outageShaped = 0;
+  private sourceLossHold = false;
+  private sourceLossCount = 0;
+  private pushableCount = 0;
+  /** Markets that had a registry row at any time in this process (labels the held-unregistered alert). */
+  private readonly everRegistered = new Set<string>();
   private lastCounts: Record<string, number> = {};
 
   constructor(private readonly d: LifecycleDeps) {
@@ -184,7 +192,9 @@ export class LifecycleEngine {
   observe(ctx: V22MarketCtx): MarketLifecycle | null {
     if (!this.d.cfg.classify) return null;
     try {
-      const t = this.classifyCtx(ctx, this.d.registered(ctx.marketAddress), ctx.label);
+      const reg = this.d.registered(ctx.marketAddress);
+      if (reg) this.everRegistered.add(ctx.marketAddress);
+      const t = this.classifyCtx(ctx, reg, ctx.label);
       this.observed.set(ctx.marketAddress, t);
       return t.lc;
     } catch (err) {
@@ -195,39 +205,58 @@ export class LifecycleEngine {
 
   // ── Discovery of wrapper markets that have no registry row ─────────────────────────────────────────────────────────
 
+  /** Which unregistered markets are re-read between scans: only what the current mode acts on (item: no per-tick reads for a market nothing will act on). */
+  private rereadBand(t: Tracked): boolean {
+    const k = t.lc.price.kind;
+    if (this.effectiveMode() !== "off" && (k === "warn" || k === "matured")) return true;
+    return this.d.cfg.warnBandFees && !!this.d.forceFees && k === "warn";
+  }
+
   private async discover(): Promise<void> {
     const nowMs = this.now();
     if (this.d.cfg.discoveryMs <= 0) return;
     const due = nowMs - this.lastDiscoveryAt >= this.d.cfg.discoveryMs;
-    let addrs: string[];
     if (due) {
       this.lastDiscoveryAt = nowMs;
-      // Keys only (dataSlice length 0): the scan costs one cheap call, the account bytes are read afterwards for the few that matter.
+      // Keys only (dataSlice length 0): the scan costs one cheap call. Each unregistered market is then loaded in full (market +
+      // registry PDA + vault_lp_state, the same read the registered ones get) so a pool-bearing market has its accounts derivable.
       const res = await this.d.conn.getProgramAccounts(this.d.programId, {
         dataSlice: { offset: 0, length: 0 },
         filters: [{ memcmp: { offset: 0, bytes: MARKET_HEADER_V22.toString("base64"), encoding: "base64" } }],
       });
-      addrs = res.map((a) => a.pubkey.toBase58()).filter((a) => !this.d.registered(a));
+      const addrs = res.map((a) => a.pubkey.toBase58()).filter((a) => !this.d.registered(a));
       for (const k of [...this.unreg.keys()]) if (!addrs.includes(k)) this.unreg.delete(k);
-    } else {
-      // Between scans only the unregistered markets that are in (or near) a dead band are re-read, every tick.
-      addrs = [...this.unreg.entries()].filter(([, t]) => t.lc.price.kind === "warn" || t.lc.price.kind === "matured").map(([k]) => k);
+      for (const addr of addrs) {
+        const label = `unregistered ${addr.slice(0, 8)}`;
+        const load = await loadV22Market(this.d.conn, { marketAddress: addr, label }, this.d.programId);
+        if (!load.ok) {
+          this.unreg.delete(addr);
+          continue;
+        }
+        const t = this.classifyCtx(load.ctx, false, label);
+        if (t.lc.terminal !== null) this.unreg.delete(addr);
+        else this.unreg.set(addr, t);
+      }
+      return;
     }
+    // Between scans: ONE batched read of the market accounts that the current mode acts on; registry / vault-LP data is reused.
+    const addrs = [...this.unreg.entries()].filter(([, t]) => this.rereadBand(t)).map(([k]) => k);
     for (let i = 0; i < addrs.length; i += 100) {
       const chunk = addrs.slice(i, i + 100);
       const res = await this.d.conn.getMultipleAccountsInfoAndContext(chunk.map((a) => new PublicKey(a)), "processed");
       res.value.forEach((info, j) => {
         const addr = chunk[j];
-        if (!info || !info.owner.equals(this.d.programId)) {
+        const prev = this.unreg.get(addr);
+        if (!prev || !info || !info.owner.equals(this.d.programId)) {
           this.unreg.delete(addr);
           return;
         }
-        const built = buildV22MarketCtx({ marketAddress: addr, label: `unregistered ${addr.slice(0, 8)}`, programId: this.d.programId, data: new Uint8Array(info.data), readSlot: res.context.slot, registryData: null, vaultLpStateData: null });
+        const built = buildV22MarketCtx({ marketAddress: addr, label: prev.label, programId: this.d.programId, data: new Uint8Array(info.data), readSlot: res.context.slot, registryData: prev.ctx.registryData, vaultLpStateData: null, lpHint: prev.ctx.lpPortfolio });
         if (!built.ok) {
           this.unreg.delete(addr);
           return;
         }
-        const t = this.classifyCtx(built.ctx, false, built.ctx.label);
+        const t = this.classifyCtx(built.ctx, false, prev.label);
         if (t.lc.terminal !== null) this.unreg.delete(addr);
         else this.unreg.set(addr, t);
       });
@@ -275,7 +304,8 @@ export class LifecycleEngine {
 
   // ── Alerts ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-  private alertsFor(all: Tracked[]): { never: Alert[]; warn: Alert[]; matured: Alert[]; interest: Alert[] } {
+  private alertsFor(all: Tracked[]): { never: Alert[]; warn: Alert[]; matured: Alert[]; interest: Alert[]; unregHeld: Alert[] } {
+    const unregHeld: Alert[] = [];
     const never: Alert[] = [];
     const warn: Alert[] = [];
     const matured: Alert[] = [];
@@ -310,17 +340,26 @@ export class LifecycleEngine {
           data: { market: addr, ageSlots: lc.price.ageSlots.toString(), keeperCanPush: lc.keeperCanPush, neverConnected: lc.neverConnected ?? null },
         });
       }
+      if (lc.price.kind === "matured" && lc.keeperIsAuthority && !lc.registered && !this.d.cfg.unregisteredAllow.includes(addr)) {
+        unregHeld.push({
+          kind: "stale-resolve-held",
+          severity: "warn",
+          subject: t.label,
+          message: `${addr} is matured, its oracle authority is THIS keeper, and it has no registry row${this.everRegistered.has(addr) ? " (it WAS registered earlier in this process: a hot-reload pruned it?)" : ""}. It may be revivable by pushing, so the keeper will NOT resolve it: register it, or resolve it by operator decision (or add it to KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW).`,
+          data: { market: addr, everRegistered: this.everRegistered.has(addr) },
+        });
+      }
       if (lc.deadInterest) {
         interest.push({
           kind: "market-dead-interest",
           severity: "warn",
           subject: t.label,
-          message: `DEAD-INTEREST: ${addr} is priced, open interest is 0 and no trade-fee accrual has been observed for ${Math.floor(lc.quietMs / 86_400_000)} days (observation-based lower bound). Retirement is a deliberate admin action; the keeper does not do it.`,
+          message: `DEAD-INTEREST: ${addr} is priced, open interest is 0 and no trade-fee accrual has been observed for ${Math.floor(lc.quietMs / 86_400_000)} days (observation-based: OI 0 and unchanged trade-fee counters; a no-fee trade is invisible). Retirement is a deliberate admin action; the keeper does not do it.`,
           data: { market: addr, quietDays: Math.floor(lc.quietMs / 86_400_000) },
         });
       }
     }
-    return { never, warn, matured, interest };
+    return { never, warn, matured, interest, unregHeld };
   }
 
   private async reconcileAlerts(all: Tracked[]): Promise<void> {
@@ -330,9 +369,10 @@ export class LifecycleEngine {
       await this.d.sink.reconcile(`${LIFECYCLE_ALERT_SCOPE}:dead-price-warn`, a.warn);
       await this.d.sink.reconcile(`${LIFECYCLE_ALERT_SCOPE}:dead-price-matured`, a.matured);
       await this.d.sink.reconcile(`${LIFECYCLE_ALERT_SCOPE}:dead-interest`, a.interest);
-      const held: Alert[] = this.massHold
-        ? [{ kind: "stale-resolve-held", severity: "critical", subject: "*", message: `${this.outageShaped} pushable markets are matured while the keeper has a usable source for them: outage-shaped. The keeper is NOT resolving any market; check RPC / the push loop.`, data: { outageShapedMatured: this.outageShaped, threshold: this.d.cfg.massThreshold } }]
-        : [];
+      await this.d.sink.reconcile(`${LIFECYCLE_ALERT_SCOPE}:unregistered-held`, a.unregHeld);
+      const held: Alert[] = [];
+      if (this.massHold) held.push({ kind: "stale-resolve-held", severity: "critical", subject: "*", message: `${this.outageShaped} keeper-authority markets are matured while the keeper has a usable source for them (or they lost their registry row): outage-shaped. The keeper is NOT resolving any market; check RPC / the push loop / the registry.`, data: { outageShapedMatured: this.outageShaped, threshold: this.d.cfg.massThreshold } });
+      if (this.sourceLossHold) held.push({ kind: "stale-resolve-held", severity: "critical", subject: "source-health", message: `${this.sourceLossCount} of ${this.pushableCount} pushable markets have no usable source price at once: a price-reader regression, not dead markets. The keeper is NOT resolving any pushable market.`, data: { lacking: this.sourceLossCount, pushable: this.pushableCount, max: this.d.cfg.sourceLossMax, pct: this.d.cfg.sourceLossPct } });
       await this.d.sink.reconcile(`${LIFECYCLE_ALERT_SCOPE}:resolve-held`, held);
     } catch (err) {
       this.log(`[v22][lifecycle] alert delivery failed: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
@@ -341,12 +381,16 @@ export class LifecycleEngine {
 
   // ── Fee collection in the warn band ────────────────────────────────────────────────────────────────────────────────
 
-  /** Pure plan: which warn-band registry markets get a forced fee round this tick (closest to maturity first, bounded, spaced). */
+  /**
+   * Pure plan: which warn-band markets get a forced fee round this tick (closest to maturity first, bounded, spaced). Unregistered
+   * markets are included: tags 78 and 87 + stake 12 are permissionless and every account is derived from chain (registry PDA,
+   * vault_lp_state, stake pool PDA), none from registry.json; discovery loads the registry / vault-LP accounts for them.
+   */
   planWarnBandFees(all: ReadonlyArray<Tracked>, nowMs: number): Tracked[] {
     const c = this.d.cfg;
     if (!c.warnBandFees || !this.d.forceFees) return [];
     return all
-      .filter((t) => t.registered && t.lc.price.kind === "warn" && nowMs - (this.lastFeeAt.get(t.ctx.marketAddress) ?? Number.NEGATIVE_INFINITY) >= c.warnBandFeeSpacingMs)
+      .filter((t) => t.lc.price.kind === "warn" && nowMs - (this.lastFeeAt.get(t.ctx.marketAddress) ?? Number.NEGATIVE_INFINITY) >= c.warnBandFeeSpacingMs)
       .sort((a, b) => (b.lc.price.kind === "warn" && a.lc.price.kind === "warn" ? b.lc.price.pctBps - a.lc.price.pctBps : 0))
       .slice(0, c.warnBandFeeMaxPerTick);
   }
@@ -357,6 +401,8 @@ export class LifecycleEngine {
       this.lastFeeAt.set(t.ctx.marketAddress, nowMs);
       try {
         const s = await (this.d.forceFees as (c: V22MarketCtx) => Promise<string>)(t.ctx);
+        // "deferred:" = a v2.2 round is in flight on this market; try again next tick instead of burning the spacing.
+        if (s.startsWith("deferred:")) this.lastFeeAt.delete(t.ctx.marketAddress);
         this.lastFee.set(t.ctx.marketAddress, s);
         this.log(`[v22][lifecycle] ${t.label}: warn-band fee round: ${s}`);
       } catch (err) {
@@ -382,6 +428,8 @@ export class LifecycleEngine {
       continuousMs: this.ledger.continuousMs(nowMs),
       sourceUnavailableMs: this.ledger.sourceUnavailableMs(addr, nowMs),
       maturedCount,
+      allowlisted: this.d.cfg.unregisteredAllow.includes(addr),
+      sourceLossHold: this.sourceLossHold,
       resolvedThisCycle: this.resolvedThisCycle,
       attempt: this.attempts.get(addr),
       nowMs,
@@ -389,10 +437,23 @@ export class LifecycleEngine {
     };
   }
 
-  /** Outage-shaped = matured markets the keeper could push and still holds (or recently held) a usable source for. */
+  /**
+   * Two global holds, computed once per tick before the alerts and the decisions:
+   *  - outage-shaped matured markets (see ResolveInput.maturedCount): keeper-authority markets matured while the keeper still has a
+   *    usable source for them, or while they have no registry row. Foreign-authority markets are never counted.
+   *  - source health: how many markets the keeper can push lack a usable source price RIGHT NOW (no usable read for SOURCE_FRESH_MS
+   *    while the push loop runs). Many at once is a price-reader regression, not many dead pools.
+   */
   private assessOutage(all: Tracked[], nowMs: number): void {
-    this.outageShaped = all.filter((t) => t.lc.price.kind === "matured" && t.lc.keeperCanPush && this.ledger.sourceUnavailableMs(t.ctx.marketAddress, nowMs) < this.d.cfg.minObservationMs).length;
+    this.outageShaped = all.filter(
+      (t) => t.lc.price.kind === "matured" && t.lc.keeperIsAuthority && (!t.lc.registered || this.ledger.sourceUnavailableMs(t.ctx.marketAddress, nowMs) < this.d.cfg.minObservationMs),
+    ).length;
     this.massHold = this.outageShaped > this.d.cfg.massThreshold;
+    const pushable = all.filter((t) => t.lc.keeperCanPush && t.lc.terminal === null);
+    this.pushableCount = pushable.length;
+    this.sourceLossCount = pushable.filter((t) => this.ledger.sourceAgeMs(t.ctx.marketAddress, nowMs) > SOURCE_FRESH_MS).length;
+    const c = this.d.cfg;
+    this.sourceLossHold = this.sourceLossCount > c.sourceLossMax || (this.sourceLossCount >= 2 && this.sourceLossCount * 100 > c.sourceLossPct * this.pushableCount);
   }
 
   private async resolveMatured(all: Tracked[]): Promise<void> {
@@ -522,6 +583,7 @@ export class LifecycleEngine {
       counts: { ...this.lastCounts, unregisteredTracked: this.unreg.size },
       outageShapedMatured: this.outageShaped,
       massHold: this.massHold,
+      sourceHealth: { pushable: this.pushableCount, lacking: this.sourceLossCount, hold: this.sourceLossHold },
       resolvesSent: this.resolvesSent,
       lastDiscoveryAgoMs: Number.isFinite(this.lastDiscoveryAt) ? nowMs - this.lastDiscoveryAt : null,
       markets,

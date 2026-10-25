@@ -28,9 +28,13 @@
  *                        LAST-TRADE SIGNAL: there is none on chain. The wrapper stores no last-trade slot, and the engine
  *                        keeps no fill counter. What the keeper can observe is the trade-fee accrual counters in the
  *                        wrapper config (protocol + LP + insurance-reserve accrued atoms; monotonic, bumped by trades), so
- *                        "quiet" = those counters unchanged and OI = 0 since the keeper first saw it that way. The clock is
- *                        a LOWER BOUND (a restart without the state file restarts it), it can never be too old, and a
- *                        zero-fee market cannot show a trade at all. Under-reporting is the safe direction here.
+ *                        "quiet" = those counters unchanged and OI = 0 since the keeper first saw it that way. In memory only,
+ *                        the clock restarts at every boot (it under-counts). With KEEPER_V22_LIFECYCLE_STATE_FILE it spans
+ *                        keeper downtime: that is still right because the first observation after a restart compares the
+ *                        counters with the persisted ones, so any trade-fee accrual during the downtime restarts the clock.
+ *                        What neither mode can see is a trade that paid no fee (trade_fee_base_bps = 0), and an OI that
+ *                        opened and closed with no fee accrual: such a market can read "quiet" while it is not. That is why
+ *                        DEAD-INTEREST only alerts.
  *   no-resolve-window    Live with permissionless_resolve_stale_slots == 0: nobody can resolve it permissionlessly.
  *   terminal             Resolved / Recovery / closed: not classified further.
  *   healthy              none of the above.
@@ -62,6 +66,10 @@ export interface MarketLifecycle {
   neverConnected: NeverConnectedReason | null;
   /** Registered and the keeper is asset 0's oracle authority: the keeper can push this market. */
   keeperCanPush: boolean;
+  /** The keeper is asset 0's oracle authority, registered or not. */
+  keeperIsAuthority: boolean;
+  /** The market has a registry row NOW. */
+  registered: boolean;
   /** null = could not be read. */
   oiZero: boolean | null;
   /** ms the market has been observed quiet (OI 0, trade-fee counters unchanged); 0 when not quiet or unknown. */
@@ -149,7 +157,7 @@ export function classifyMarket(i: ClassifyInput): MarketLifecycle {
   const mode = marketMode(i.data);
   const terminal: MarketLifecycle["terminal"] = t === null ? null : t.kind !== "live" ? t.kind : mode === 2 ? "recovery" : null;
   if (terminal !== null || t === null) {
-    return { terminal, price: { kind: "not-live" }, lastGoodOracleSlot: null, neverConnected: null, keeperCanPush: false, oiZero: null, quietMs: 0, deadInterest: false, classes: ["terminal"] };
+    return { terminal, price: { kind: "not-live" }, lastGoodOracleSlot: null, neverConnected: null, keeperCanPush: false, keeperIsAuthority: false, registered: i.registered, oiZero: null, quietMs: 0, deadInterest: false, classes: ["terminal"] };
   }
   const price = priceBandOf(i.data, i.readSlot);
   const lastGood = price.kind === "matured" ? price.lastGoodOracleSlot : price.kind === "not-live" ? null : i.readSlot - price.ageSlots;
@@ -175,7 +183,7 @@ export function classifyMarket(i: ClassifyInput): MarketLifecycle {
   if (deadInterest) classes.push("dead-interest");
   if (price.kind === "no-window") classes.push("no-resolve-window");
   if (classes.length === 0) classes.push("healthy");
-  return { terminal: null, price, lastGoodOracleSlot: lastGood, neverConnected, keeperCanPush, oiZero, quietMs: i.quietMs, deadInterest, classes };
+  return { terminal: null, price, lastGoodOracleSlot: lastGood, neverConnected, keeperCanPush, keeperIsAuthority, registered: i.registered, oiZero, quietMs: i.quietMs, deadInterest, classes };
 }
 
 // ── DEAD-INTEREST quiet clock ───────────────────────────────────────────────────────────────────────────────────────
@@ -190,7 +198,7 @@ export interface QuietEntry {
 /**
  * Track how long a market has been quiet. A market is quiet while OI is 0 and the trade-fee accrual sum has not moved.
  * Any observation that is not quiet (OI > 0, OI unknown, a counter change) restarts the clock at `nowMs`.
- * `prev` undefined = first sight: the clock starts now (a lower bound, never an over-estimate).
+ * `prev` undefined = first sight: the clock starts now.
  */
 export function observeQuiet(prev: QuietEntry | undefined, o: { oiZero: boolean | null; feeSum: bigint | null; nowMs: number }): QuietEntry {
   const feeSum = o.feeSum === null ? (prev?.feeSum ?? "0") : o.feeSum.toString();

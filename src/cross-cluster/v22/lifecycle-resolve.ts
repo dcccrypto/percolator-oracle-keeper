@@ -20,6 +20,14 @@
  *   mass-maturity        at most `massThreshold` OUTAGE-SHAPED matured markets (see ResolveInput.maturedCount: markets the keeper
  *                        could push and was not without a source for). More is an outage: resolve none, alert. Foreign-authority /
  *                        unregistered / genuinely source-dead markets are not outage evidence and never trip it.
+ *   keeper-authority-unregistered  a market whose oracle authority IS this keeper but that has no registry row (never added, lagging
+ *                        registration, or a hot-reload that pruned the row) is a market the keeper may be able to revive: it is HELD
+ *                        with an alert ("register or resolve: operator decision") unless its address is in
+ *                        KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW. A market that was registered earlier in this process is not
+ *                        special: unregistered now + keeper authority = held. Only FOREIGN-authority markets resolve without source evidence.
+ *   source-health        a keeper-side price-reader regression looks like many "source dead" markets while continuity holds. If more
+ *                        than sourceLossMax, or more than sourceLossPct percent (and at least 2), of the markets the keeper can push
+ *                        lack a usable source at the same moment, no PUSHABLE market is resolved.
  *   source-unavailable   (b) a market this keeper CAN push (registry row and asset 0 oracle authority = this keeper) is resolved only
  *                        when its source price has been unavailable for >= minObservationMs inside the continuous window.
  *                        If the keeper has a usable source it must PUSH (which re-advances last_good_oracle_slot), not resolve.
@@ -73,6 +81,8 @@ export type GuardName =
   | "matured"
   | "keeper-continuity"
   | "mass-maturity"
+  | "keeper-authority-unregistered"
+  | "source-health"
   | "source-unavailable"
   | "not-attempted"
   | "cycle-bound";
@@ -91,13 +101,17 @@ export interface ResolveInput {
   /** ledger.sourceUnavailableMs(market, now) */
   sourceUnavailableMs: number;
   /**
-   * OUTAGE-SHAPED matured markets: matured, Live, window enabled, the keeper CAN push them (registry row + oracle authority is
-   * this keeper) and it has NOT been without a usable source for minObservationMs. Those are markets the keeper was supposed to
-   * keep alive and did not: the signature of a keeper outage. Matured markets the keeper cannot push (foreign oracle authority,
-   * no registry row: the live backlog of dead and NEVER-CONNECTED markets) and pushable markets whose source really is dead are
-   * NOT counted, so a legitimate backlog never blocks itself; the per-tick bound drains it gradually.
+   * OUTAGE-SHAPED matured markets: matured, Live, window enabled, whose oracle authority IS this keeper, and either unregistered
+   * (a revivable market that lost its row) or registered with a usable source within minObservationMs. Those are markets the keeper
+   * was supposed to keep alive and did not: the signature of a keeper outage. Foreign-authority markets (the live backlog of dead and
+   * NEVER-CONNECTED markets) and pushable markets whose source really is dead are NOT counted, so a legitimate backlog never blocks
+   * itself; the per-tick bound drains it gradually.
    */
   maturedCount: number;
+  /** The address is in KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW. */
+  allowlisted: boolean;
+  /** Global source-health hold (see the source-health guard). */
+  sourceLossHold: boolean;
   /** Resolves already started this tick. */
   resolvedThisCycle: number;
   attempt: AttemptRecord | undefined;
@@ -126,6 +140,14 @@ export const RESOLVE_GUARDS: ReadonlyArray<Guard> = [
   {
     name: "mass-maturity",
     check: (i) => (i.maturedCount > i.cfg.massThreshold ? `${i.maturedCount} pushable markets matured with a usable source (> ${i.cfg.massThreshold}): outage-shaped, resolving none` : null),
+  },
+  {
+    name: "keeper-authority-unregistered",
+    check: (i) => (i.lc.keeperIsAuthority && !i.lc.registered && !i.allowlisted ? "oracle authority is THIS keeper but the market has no registry row: register it or resolve it by operator decision (KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW)" : null),
+  },
+  {
+    name: "source-health",
+    check: (i) => (i.lc.keeperCanPush && i.sourceLossHold ? "many pushable markets lack a source price at once (price-reader regression?): not resolving pushable markets" : null),
   },
   {
     name: "source-unavailable",

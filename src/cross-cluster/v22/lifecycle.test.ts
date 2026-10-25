@@ -203,6 +203,8 @@ function green(o: Partial<ResolveInput> = {}): ResolveInput {
     continuousMs: 3_600_000,
     sourceUnavailableMs: 3_600_000,
     maturedCount: 0,
+    allowlisted: false,
+    sourceLossHold: false,
     resolvedThisCycle: 0,
     attempt: undefined,
     nowMs: 10_000_000,
@@ -226,6 +228,8 @@ describe("stale resolve guards: each blocks its unsafe input, and the test fails
     { guard: "matured", bad: green({ lc: lcOf({ age: 10_000n }) }) },
     { guard: "keeper-continuity", bad: green({ continuousMs: 60_000 }) },
     { guard: "mass-maturity", bad: green({ maturedCount: 4 }) },
+    { guard: "keeper-authority-unregistered", bad: green({ lc: lcOf({ registered: false }) }) },
+    { guard: "source-health", bad: green({ sourceLossHold: true }) },
     { guard: "source-unavailable", bad: green({ sourceUnavailableMs: 60_000 }) },
     { guard: "not-attempted", bad: green({ attempt: { atMs: 9_900_000, landed: false } }) },
     { guard: "not-attempted", bad: green({ attempt: { atMs: 0, landed: true } }) },
@@ -250,12 +254,24 @@ describe("stale resolve guards: (b) the source rule only applies to markets the 
     const d = decideResolve(green({ sourceUnavailableMs: 0 }));
     assert.equal(d.action === "hold" && d.guard, "source-unavailable");
   });
-  it("a foreign-authority / unregistered market has no keeper source to wait for: only maturity and continuity apply", () => {
-    for (const lc of [lcOf({ authority: OTHER }), lcOf({ registered: false })]) {
+  it("a FOREIGN-authority market has no keeper source to wait for: only maturity and continuity apply", () => {
+    for (const lc of [lcOf({ authority: OTHER }), lcOf({ authority: OTHER, registered: false })]) {
       assert.equal(lc.keeperCanPush, false);
-      assert.deepEqual(decideResolve(green({ lc, sourceUnavailableMs: 0 })), { action: "resolve" });
+      assert.equal(lc.keeperIsAuthority, false);
+      assert.deepEqual(decideResolve(green({ lc, sourceUnavailableMs: 0, sourceLossHold: true })), { action: "resolve" }, "foreign markets are not pushable: the source-health hold does not apply either");
       assert.equal(decideResolve(green({ lc, sourceUnavailableMs: 0, continuousMs: 0 })).action, "hold", "but a keeper that was not observing still never resolves it");
     }
+  });
+  it("an UNREGISTERED market whose oracle authority is THIS keeper is held (revivable by a push), unless allowlisted", () => {
+    const lc = lcOf({ registered: false });
+    assert.equal(lc.keeperIsAuthority, true);
+    const d = decideResolve(green({ lc }));
+    assert.equal(d.action === "hold" && d.guard, "keeper-authority-unregistered");
+    assert.deepEqual(decideResolve(green({ lc, allowlisted: true })), { action: "resolve" }, "the explicit allowlist is the operator decision");
+  });
+  it("the source-health hold blocks PUSHABLE markets only", () => {
+    const d = decideResolve(green({ sourceLossHold: true }));
+    assert.equal(d.action === "hold" && d.guard, "source-health");
   });
 });
 
@@ -407,11 +423,15 @@ interface World {
   exec: ReturnType<typeof fakeExecConn>;
   gpaCalls: Array<{ filters: unknown[]; dataSlice?: unknown }>;
   slotFails: boolean;
+  /** Runs inside every simulation (lets a test change the world between the simulation and the send). */
+  onSim?: () => void;
 }
 
 function world(): World {
-  const exec = fakeExecConn({ slot: () => Number(SLOT_NOW) });
+  let hook: (() => void) | undefined;
+  const exec = fakeExecConn({ slot: () => Number(SLOT_NOW), simErr: () => (hook?.(), null) });
   const w = { now: 100_000_000, markets: new Map<string, Uint8Array>(), registered: new Set<string>(), exec, gpaCalls: [] as World["gpaCalls"], slotFails: false } as World;
+  Object.defineProperty(w, "onSim", { get: () => hook, set: (f: (() => void) | undefined) => { hook = f; } });
   w.conn = Object.assign(exec.conn, {
     async getSlot() {
       if (w.slotFails) throw new Error("rpc down");
@@ -654,9 +674,9 @@ describe("engine: discovery of wrapper markets with no registry row", () => {
     assert.equal(w.gpaCalls.length, 2);
   });
 
-  it("an unregistered matured market is resolved by tag 39 (no row: no keeper source to wait for)", async () => {
+  it("an unregistered matured FOREIGN-authority market is resolved by tag 39", async () => {
     const w = world();
-    const unreg = addMarket(w, matured({ authority: keeper.publicKey }), false);
+    const unreg = addMarket(w, matured({ authority: OTHER }), false);
     const { e, ledger } = engineFor(w, { discoveryMs: 600_000, staleResolve: "on" });
     primeLedger(ledger, w, 3_600_000);
     await runTick(e, w, []);
@@ -709,13 +729,142 @@ describe("warn-band fee forcing (tags 78 / 87 + stake 12)", () => {
     await runTick(e, w, [warned.ctx]);
     assert.equal(calls.length, 0);
   });
-  it("unregistered markets (no vault, no pool) are not forced", async () => {
+  it("unregistered markets ARE forced (tags 78 / 87+12 are permissionless and derive every account from chain), behind the same flag", async () => {
     const w = world();
     const calls: string[] = [];
     const warned = addMarket(w, warn(), false);
     const { e } = engineFor(w, { warnBandFees: true }, { forceFees: async (c) => (calls.push(c.marketAddress), "ok") });
     await runTick(e, w, [warned.ctx]);
-    assert.equal(calls.length, 0);
+    assert.deepEqual(calls, [warned.addr]);
+  });
+  it("a round the loop defers (a v2.2 settle round is in flight) does not burn the spacing", async () => {
+    const w = world();
+    let n = 0;
+    const warned = addMarket(w, warn());
+    const { e } = engineFor(w, { warnBandFees: true }, { forceFees: async () => (++n === 1 ? "deferred: in flight" : "ok") });
+    await runTick(e, w, [warned.ctx]);
+    w.now += 1_000;
+    await runTick(e, w, [warned.ctx]);
+    assert.equal(n, 2, "retried on the next tick, not after the spacing");
+  });
+});
+
+describe("engine: review fixes", () => {
+  it("a keeper-authority UNREGISTERED matured market is HELD with an alert, never resolved; the allowlist releases exactly that address", async () => {
+    const w = world();
+    const held = addMarket(w, matured({ authority: keeper.publicKey }), false);
+    const { e, sink, ledger } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [held.ctx]);
+    assert.equal(w.exec.sent.length, 0);
+    assert.equal(e.view(held.addr)?.resolve?.guard, "keeper-authority-unregistered");
+    assert.equal(sink.active("v22-lifecycle:unregistered-held").length, 1);
+    const w2 = world();
+    const ok = addMarket(w2, matured({ authority: keeper.publicKey }), false);
+    const other = addMarket(w2, matured({ authority: keeper.publicKey }), false);
+    const a = engineFor(w2, { staleResolve: "on", unregisteredAllow: [ok.addr], massThreshold: 10 });
+    primeLedger(a.ledger, w2, 3_600_000);
+    await runTick(a.e, w2, [ok.ctx, other.ctx]);
+    assert.deepEqual(w2.exec.sent.map((s) => s.keys[0][0]), [ok.addr]);
+  });
+
+  it("a market registered earlier in this process whose row is then PRUNED (registry hot-reload) is held, not resolved", async () => {
+    const w = world();
+    const { addr, ctx } = addMarket(w, matured({ authority: keeper.publicKey }));
+    const { e, ledger, sink } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    ledger.recordSource(addr, true, w.now - 3_500_000); // its source stopped being recorded when the row went away
+    w.registered.delete(addr);
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length, 0);
+    assert.equal(e.view(addr)?.resolve?.guard, "keeper-authority-unregistered");
+    assert.equal(sink.active("v22-lifecycle:unregistered-held").length, 1);
+  });
+
+  it("keeper-authority unregistered matured markets count toward the mass guard (a registry wipe is outage-shaped)", async () => {
+    const w = world();
+    const ms = [0, 1, 2, 3].map(() => addMarket(w, matured({ authority: keeper.publicKey }), false));
+    const foreign = addMarket(w, matured({ authority: OTHER }), false);
+    const { e, ledger } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [...ms.map((m) => m.ctx), foreign.ctx]);
+    assert.equal((e.healthFields() as { massHold: boolean }).massHold, true);
+    assert.equal(w.exec.sent.length, 0, "even the foreign one waits while the board looks outage-shaped");
+  });
+
+  it("source-health: many pushable markets without a source at once hold every pushable resolve (a price-reader regression); one dead pool among healthy ones still resolves", async () => {
+    const w = world();
+    const dead = [0, 1, 2, 3].map(() => addMarket(w, matured({ authority: keeper.publicKey })));
+    const a = engineFor(w, { staleResolve: "on" });
+    primeLedger(a.ledger, w, 3_600_000); // no usable source recorded for any of them
+    await runTick(a.e, w, dead.map((m) => m.ctx));
+    assert.equal(w.exec.sent.length, 0);
+    const h = a.e.healthFields() as { sourceHealth: { pushable: number; lacking: number; hold: boolean } };
+    assert.deepEqual(h.sourceHealth, { pushable: 4, lacking: 4, hold: true });
+    assert.equal(a.sink.active("v22-lifecycle:resolve-held").some((x) => x.subject === "source-health" && x.severity === "critical"), true);
+    // negative control: one dead pool among ten healthy pushable markets is not a regression
+    const w2 = world();
+    const one = addMarket(w2, matured({ authority: keeper.publicKey }));
+    const healthy = Array.from({ length: 10 }, () => addMarket(w2, market({ lastGood: ageToLastGood(50n), authority: keeper.publicKey })));
+    const b = engineFor(w2, { staleResolve: "on" });
+    primeLedger(b.ledger, w2, 3_600_000);
+    for (const m of healthy) b.ledger.recordSource(m.addr, true, w2.now - 1_000);
+    await runTick(b.e, w2, [one.ctx, ...healthy.map((m) => m.ctx)]);
+    assert.deepEqual(w2.exec.sent.map((s) => s.keys[0][0]), [one.addr]);
+  });
+
+  it("post-simulation reguard is wired: a keeper that stops observing DURING the simulation does not send", async () => {
+    const w = world();
+    const { addr, ctx } = addMarket(w, matured({ authority: OTHER }));
+    const { e, ledger } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    w.onSim = () => {
+      w.now += 10 * 60_000; // the loop stalled for 10 minutes while the simulation was in flight: both streams silent > maxGap
+    };
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sims.length, 1, "it did simulate");
+    assert.equal(w.exec.sent.length, 0, "but the re-evaluated guards held the send");
+    assert.equal(e.view(addr)?.resolve?.guard, "matured");
+    // negative control: the same world with no stall sends
+    const w2 = world();
+    const m2 = addMarket(w2, matured({ authority: OTHER }));
+    const b = engineFor(w2, { staleResolve: "on" });
+    primeLedger(b.ledger, w2, 3_600_000);
+    await runTick(b.e, w2, [m2.ctx]);
+    assert.equal(w2.exec.sent.length, 1);
+  });
+
+  it("outage count ignores FOREIGN authority even when a usable source is recorded for them (negative control for the authority term)", async () => {
+    const w = world();
+    const ms = [0, 1, 2, 3, 4].map(() => addMarket(w, matured({ authority: OTHER })));
+    const { e, ledger } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    for (const m of ms) ledger.recordSource(m.addr, true, w.now - 1_000);
+    await runTick(e, w, ms.map((m) => m.ctx));
+    assert.equal((e.healthFields() as { outageShapedMatured: number }).outageShapedMatured, 0);
+    assert.equal((e.healthFields() as { massHold: boolean }).massHold, false);
+    assert.equal(w.exec.sent.length, 1);
+  });
+
+  it("discovery: with resolve OFF and no fee forcing an unregistered warn/matured market is NOT re-read between scans; dry/on or warn-band fees re-read only what they act on", async () => {
+    const reads = async (over: Partial<LifecycleConfig>, withFees = false) => {
+      const w = world();
+      addMarket(w, matured({ authority: OTHER }), false);
+      addMarket(w, market({ lastGood: ageToLastGood(12_000n), authority: OTHER }), false);
+      // (a full load of one market is always 3 accounts; a between-scans re-read is a batch of the markets it acts on, 1 or 2 here)
+      let batched = 0;
+      const orig = w.conn.getMultipleAccountsInfoAndContext as (pks: PublicKey[]) => Promise<unknown>;
+      (w.conn as unknown as Record<string, unknown>).getMultipleAccountsInfoAndContext = async (pks: PublicKey[]) => (pks.length !== 3 ? (batched++, orig(pks)) : orig(pks));
+      const { e } = engineFor(w, { discoveryMs: 600_000, ...over }, withFees ? { forceFees: async () => "ok" } : {});
+      await runTick(e, w, []); // the scan itself
+      const afterScan = batched;
+      w.now += 20_000;
+      await runTick(e, w, []);
+      return batched - afterScan;
+    };
+    assert.equal(await reads({}), 0, "mode off: nothing is re-read between scans");
+    assert.equal(await reads({ staleResolve: "dry" }) > 0, true);
+    assert.equal(await reads({ warnBandFees: true }, true) > 0, true, "warn-band fee forcing re-reads the warn market");
   });
 });
 
@@ -732,6 +881,16 @@ describe("flags", () => {
     assert.equal(v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_STALE_RESOLVE: " ON " }).lifecycle.staleResolve, "on");
     for (const bad of ["yes", "1", "true", "enabled", "of"]) assert.throws(() => v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_STALE_RESOLVE: bad }), V22FlagError, bad);
     assert.equal(v22FlagsFromEnv({ KEEPER_V22_STALE_RESOLVE: "on" }).lifecycle.staleResolve, "off", "the layer is off: the variable is not even read");
+  });
+  it("the unregistered allowlist and the source-loss knobs parse strictly", () => {
+    const a = Keypair.generate().publicKey.toBase58();
+    const f = v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW: ` ${a}, ${a} ,`, KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_MAX: "5", KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_PCT: "25" });
+    assert.deepEqual(f.lifecycle.unregisteredAllow, [a]);
+    assert.equal(f.lifecycle.sourceLossMax, 5);
+    assert.equal(f.lifecycle.sourceLossPct, 25);
+    assert.deepEqual(v22FlagsFromEnv({ KEEPER_V22: "on" }).lifecycle.unregisteredAllow, []);
+    assert.throws(() => v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW: "not an address" }), V22FlagError);
+    assert.throws(() => v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_PCT: "101" }), V22FlagError);
   });
   it("numeric knobs are validated; a relative state-file path is refused", () => {
     const f = v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_STALE_RESOLVE_MASS_THRESHOLD: "7", KEEPER_V22_DEAD_INTEREST_DAYS: "30", KEEPER_V22_LIFECYCLE_DISCOVERY_MS: "0", KEEPER_V22_LIFECYCLE_STATE_FILE: "/tmp/x.json" });
@@ -775,5 +934,17 @@ describe("V22Loop wiring", () => {
     // KEEPER_V22_LIFECYCLE=off removes the block entirely
     const off = new V22Loop({ conn: f.conn as never, keeper, programId: WRAPPER_PROGRAM_ID, markets: () => [], flags: v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_LIFECYCLE: "off" }), dryRun: false, log: () => {} });
     assert.equal("lifecycle" in off.healthFields(), false);
+  });
+
+  it("forceFeesFor defers while a v2.2 settle round is in flight on the market, and sends nothing", async () => {
+    const { V22Loop } = await import("./loop.ts");
+    const { fakeLoopConn, v22Ctx } = await import("./test-helpers.ts");
+    const f = fakeLoopConn({ market: market({ lastGood: ageToLastGood(12_000n) }), readSlot: Number(SLOT_NOW) });
+    const loop = new V22Loop({ conn: f.conn as never, keeper, programId: WRAPPER_PROGRAM_ID, markets: () => [], flags: v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_WARN_BAND_FEES: "on" }), dryRun: false, log: () => {} });
+    const ctx = v22Ctx({});
+    loop["rtFor"](ctx.marketAddress).sweepInflight = true;
+    const r = await loop["forceFeesFor"](ctx);
+    assert.match(r, /^deferred:/);
+    assert.equal(f.sims.length + f.sent.length, 0);
   });
 });

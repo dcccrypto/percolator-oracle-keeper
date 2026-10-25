@@ -105,6 +105,12 @@ export class ObservationLedger {
     return Math.max(0, nowMs - start);
   }
 
+  /** ms since a usable source price was last seen for `market`; Infinity when never seen by this process. */
+  sourceAgeMs(market: string, nowMs: number): number {
+    const t = this.usableAt.get(market);
+    return t === undefined ? Number.POSITIVE_INFINITY : Math.max(0, nowMs - t);
+  }
+
   lastUsableSourceAt(market: string): number | null {
     return this.usableAt.get(market) ?? null;
   }
