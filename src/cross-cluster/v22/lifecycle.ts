@@ -261,7 +261,8 @@ export class LifecycleEngine {
           }
           const t = this.classifyCtx(built.ctx, false, label);
           if (t.lc.terminal !== null) {
-            this.terminalSeen.add(addr);
+            // Only Resolved / closed are one-way; Recovery can return to Live, so it is re-read at the next scan.
+            if (t.lc.terminal !== "recovery") this.terminalSeen.add(addr);
             this.unreg.delete(addr);
           } else this.unreg.set(addr, t);
         });
@@ -287,7 +288,7 @@ export class LifecycleEngine {
         }
         const t = this.classifyCtx(built.ctx, false, prev.label);
         if (t.lc.terminal !== null) {
-          this.terminalSeen.add(addr);
+          if (t.lc.terminal !== "recovery") this.terminalSeen.add(addr);
           this.unreg.delete(addr);
         } else this.unreg.set(addr, t);
       });

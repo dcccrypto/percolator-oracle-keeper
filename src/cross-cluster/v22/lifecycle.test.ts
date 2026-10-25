@@ -34,12 +34,13 @@ const keeper = Keypair.generate();
 const OTHER = Keypair.generate().publicKey;
 
 /** A v2.2 market with the lifecycle-relevant words set. */
-function market(o: { staleSlots?: bigint; lastGood?: bigint; authority?: PublicKey; resolved?: boolean; oi?: bigint; feeSum?: bigint; lifecycle?: number } = {}): Uint8Array {
+function market(o: { staleSlots?: bigint; lastGood?: bigint; authority?: PublicKey; resolved?: boolean; recovery?: boolean; oi?: bigint; feeSum?: bigint; lifecycle?: number } = {}): Uint8Array {
   const b = Buffer.from(v22MarketBytes({ lifecycle: o.lifecycle }));
   b.writeBigUInt64LE(o.staleSlots ?? STALE, 16 + 136);
   b.writeBigUInt64LE(o.lastGood ?? SLOT_NOW, 16 + 152);
   if (o.authority) Buffer.from(o.authority.toBytes()).copy(b, assetSlotsOff(L) + 120);
   if (o.resolved) b[MODE_OFF] = 1;
+  if (o.recovery) b[MODE_OFF] = 2;
   if (o.oi) b.writeBigUInt64LE(o.oi, engineSlotBase(L, 0) + 289);
   if (o.feeSum) b.writeBigUInt64LE(o.feeSum, 16 + 464);
   return new Uint8Array(b);
@@ -890,6 +891,22 @@ describe("engine: review fixes", () => {
     await runTick(e, w, []);
     assert.equal(w.gpaCalls.length, 2);
     assert.deepEqual(sizes, [90], "the 10 Resolved markets are cached terminal: 30 markets x 3 accounts in one read");
+  });
+
+  it("discovery does not cache Recovery as terminal (it can return to Live): Recovery markets are re-read on the next scan", async () => {
+    const w = world();
+    for (let i = 0; i < 5; i++) addMarket(w, matured({ authority: OTHER }), false);
+    for (let i = 0; i < 5; i++) addMarket(w, matured({ authority: OTHER, recovery: true }), false);
+    const sizes: number[] = [];
+    const orig = w.conn.getMultipleAccountsInfoAndContext as (pks: PublicKey[]) => Promise<unknown>;
+    (w.conn as unknown as Record<string, unknown>).getMultipleAccountsInfoAndContext = async (pks: PublicKey[]) => (sizes.push(pks.length), orig(pks));
+    const { e } = engineFor(w, { discoveryMs: 600_000 });
+    await runTick(e, w, []);
+    assert.deepEqual(sizes, [30]);
+    sizes.length = 0;
+    w.now += 600_000;
+    await runTick(e, w, []);
+    assert.deepEqual(sizes, [30], "the 5 Recovery markets are read again: 10 markets x 3 accounts");
   });
 
   it("source-health: many pushable markets without a source at once hold every pushable resolve (a price-reader regression); one dead pool among healthy ones still resolves", async () => {
