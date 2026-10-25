@@ -28,6 +28,8 @@
  *   source-health        a keeper-side price-reader regression looks like many "source dead" markets while continuity holds. If more
  *                        than sourceLossMax, or more than sourceLossPct percent (and at least 2), of the markets the keeper can push
  *                        lack a usable source at the same moment, no PUSHABLE market is resolved.
+ *   source-group-loss    correlation hold: if all (or GROUP_LOSS_PCT percent, at least 2) of the pushable markets that share one DEX type lack a
+ *                        usable source at once, resolves of that group are held (one DEX / quote asset failing in the price reader).
  *   source-unavailable   (b) a market this keeper CAN push (registry row and asset 0 oracle authority = this keeper) is resolved only
  *                        when its source price has been unavailable for >= minObservationMs inside the continuous window.
  *                        If the keeper has a usable source it must PUSH (which re-advances last_good_oracle_slot), not resolve.
@@ -83,6 +85,7 @@ export type GuardName =
   | "mass-maturity"
   | "keeper-authority-unregistered"
   | "source-health"
+  | "source-group-loss"
   | "source-unavailable"
   | "not-attempted"
   | "cycle-bound";
@@ -101,17 +104,20 @@ export interface ResolveInput {
   /** ledger.sourceUnavailableMs(market, now) */
   sourceUnavailableMs: number;
   /**
-   * OUTAGE-SHAPED matured markets: matured, Live, window enabled, whose oracle authority IS this keeper, and either unregistered
-   * (a revivable market that lost its row) or registered with a usable source within minObservationMs. Those are markets the keeper
-   * was supposed to keep alive and did not: the signature of a keeper outage. Foreign-authority markets (the live backlog of dead and
-   * NEVER-CONNECTED markets) and pushable markets whose source really is dead are NOT counted, so a legitimate backlog never blocks
-   * itself; the per-tick bound drains it gradually.
+   * OUTAGE-SHAPED matured markets: matured, Live, window enabled, whose oracle authority IS this keeper, and either (a) PRUNED:
+   * registered earlier in this process and not registered now, and not allowlisted (a shrinking registry), or (b) registered with a
+   * usable source within minObservationMs. Those are markets the keeper was supposed to keep alive and did not: the signature of a
+   * keeper outage or a registry wipe. NOT counted: foreign-authority markets (the live backlog), pushable markets whose source really is
+   * dead, allowlisted markets, and markets that were never registered (a standing set, held individually and alerted separately), so a
+   * legitimate backlog never blocks itself; the per-tick bound drains it gradually.
    */
   maturedCount: number;
   /** The address is in KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW. */
   allowlisted: boolean;
   /** Global source-health hold (see the source-health guard). */
   sourceLossHold: boolean;
+  /** This market's DEX-type group is source-lost together (see the source-group-loss guard). */
+  groupLossHold: boolean;
   /** Resolves already started this tick. */
   resolvedThisCycle: number;
   attempt: AttemptRecord | undefined;
@@ -148,6 +154,10 @@ export const RESOLVE_GUARDS: ReadonlyArray<Guard> = [
   {
     name: "source-health",
     check: (i) => (i.lc.keeperCanPush && i.sourceLossHold ? "many pushable markets lack a source price at once (price-reader regression?): not resolving pushable markets" : null),
+  },
+  {
+    name: "source-group-loss",
+    check: (i) => (i.lc.keeperCanPush && i.groupLossHold ? "every (or nearly every) pushable market of this market's DEX type lacks a source at once (price-reader regression for that DEX?): not resolving this group" : null),
   },
   {
     name: "source-unavailable",

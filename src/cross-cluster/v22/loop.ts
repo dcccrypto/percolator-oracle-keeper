@@ -80,7 +80,7 @@ export interface V22LoopDeps {
   keeper: Keypair;
   programId: PublicKey;
   /** The live registry (hot-reloaded in place). */
-  markets: () => ReadonlyArray<Pick<MarketEntry, "marketAddress" | "label" | "lpPortfolio">>;
+  markets: () => ReadonlyArray<Pick<MarketEntry, "marketAddress" | "label" | "lpPortfolio"> & Partial<Pick<MarketEntry, "dexType" | "assets">>>;
   flags: V22Flags;
   /** Global DRY_RUN / --dry-run. */
   dryRun: boolean;
@@ -184,6 +184,13 @@ export class V22Loop {
         registered: (m) => this.d.markets().some((x) => x.marketAddress === m),
         sink: { reconcile: (scope, a) => sink.reconcile(scope, a), fire: async (scope, a) => ("fire" in sink && typeof sink.fire === "function" ? (sink as Pick<AlertSink, "fire">).fire(scope, a) : false) },
         forceFees: lc.warnBandFees ? (ctx) => this.forceFeesFor(ctx) : undefined,
+        sourceGroup: (m) => {
+          const row = this.d.markets().find((x) => x.marketAddress === m);
+          if (!row) return null;
+          if (row.dexType) return row.dexType;
+          const dex = [...new Set((row.assets ?? []).map((a) => (a.source === "pool" ? (a.dexType ?? "pool") : "fixed")))].sort();
+          return dex.length > 0 ? dex.join("+") : null;
+        },
         now: d.now,
         log: this.log,
       });

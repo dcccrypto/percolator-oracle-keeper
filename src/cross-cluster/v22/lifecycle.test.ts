@@ -205,6 +205,7 @@ function green(o: Partial<ResolveInput> = {}): ResolveInput {
     maturedCount: 0,
     allowlisted: false,
     sourceLossHold: false,
+    groupLossHold: false,
     resolvedThisCycle: 0,
     attempt: undefined,
     nowMs: 10_000_000,
@@ -230,6 +231,7 @@ describe("stale resolve guards: each blocks its unsafe input, and the test fails
     { guard: "mass-maturity", bad: green({ maturedCount: 4 }) },
     { guard: "keeper-authority-unregistered", bad: green({ lc: lcOf({ registered: false }) }) },
     { guard: "source-health", bad: green({ sourceLossHold: true }) },
+    { guard: "source-group-loss", bad: green({ groupLossHold: true }) },
     { guard: "source-unavailable", bad: green({ sourceUnavailableMs: 60_000 }) },
     { guard: "not-attempted", bad: green({ attempt: { atMs: 9_900_000, landed: false } }) },
     { guard: "not-attempted", bad: green({ attempt: { atMs: 0, landed: true } }) },
@@ -462,7 +464,7 @@ function addMarket(w: World, data: Uint8Array, registered = true): { addr: strin
   return { addr, ctx: load.ctx };
 }
 
-function engineFor(w: World, over: Partial<LifecycleConfig> = {}, extra: { dryRun?: boolean; forceFees?: (c: V22MarketCtx) => Promise<string>; ledger?: ObservationLedger } = {}) {
+function engineFor(w: World, over: Partial<LifecycleConfig> = {}, extra: { dryRun?: boolean; forceFees?: (c: V22MarketCtx) => Promise<string>; ledger?: ObservationLedger; sourceGroup?: (m: string) => string | null } = {}) {
   const sink = new FakeSink();
   const ledger = extra.ledger ?? new ObservationLedger(120_000);
   const logs: string[] = [];
@@ -475,6 +477,7 @@ function engineFor(w: World, over: Partial<LifecycleConfig> = {}, extra: { dryRu
     registered: (m) => w.registered.has(m),
     sink,
     forceFees: extra.forceFees,
+    sourceGroup: extra.sourceGroup,
     ledger,
     store: null,
     now: () => w.now,
@@ -781,15 +784,112 @@ describe("engine: review fixes", () => {
     assert.equal(sink.active("v22-lifecycle:unregistered-held").length, 1);
   });
 
-  it("keeper-authority unregistered matured markets count toward the mass guard (a registry wipe is outage-shaped)", async () => {
+  it("a registry WIPE is outage-shaped: 4 markets registered earlier in this process and pruned now trip the mass guard and block even foreign-authority resolves", async () => {
     const w = world();
-    const ms = [0, 1, 2, 3].map(() => addMarket(w, matured({ authority: keeper.publicKey }), false));
+    const ms = [0, 1, 2, 3].map(() => addMarket(w, matured({ authority: keeper.publicKey })));
     const foreign = addMarket(w, matured({ authority: OTHER }), false);
     const { e, ledger } = engineFor(w, { staleResolve: "on" });
     primeLedger(ledger, w, 3_600_000);
+    e.beginTick();
+    for (const m of ms) e.observe(m.ctx); // registered: seen by this process (no decisions yet)
+    for (const m of ms) w.registered.delete(m.addr); // the hot-reload prunes them
+    w.now += 20_000;
     await runTick(e, w, [...ms.map((m) => m.ctx), foreign.ctx]);
-    assert.equal((e.healthFields() as { massHold: boolean }).massHold, true);
-    assert.equal(w.exec.sent.length, 0, "even the foreign one waits while the board looks outage-shaped");
+    const h = e.healthFields() as { massHold: boolean; prunedMatured: number };
+    assert.equal(h.prunedMatured, 4);
+    assert.equal(h.massHold, true);
+    assert.equal(w.exec.sent.length, 0, "the board looks like a registry wipe: nothing resolves");
+  });
+
+  it("LIVE SHAPE: 7 never-registered keeper-authority + 20 foreign-authority matured + 11 healthy registered: the 7 are held and alerted, the backlog drains at the per-tick bound", async () => {
+    const w = world();
+    const keeperUnreg = Array.from({ length: 7 }, () => addMarket(w, matured({ authority: keeper.publicKey }), false));
+    const foreign = Array.from({ length: 20 }, () => addMarket(w, matured({ authority: OTHER }), false));
+    const healthy = Array.from({ length: 11 }, () => addMarket(w, market({ lastGood: ageToLastGood(50n), authority: keeper.publicKey })));
+    const { e, sink, ledger } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    for (const m of healthy) ledger.recordSource(m.addr, true, w.now - 1_000);
+    const all = [...keeperUnreg, ...foreign, ...healthy].map((m) => m.ctx);
+    const sentSet = new Set<string>();
+    for (let tick = 0; tick < 3; tick++) {
+      await runTick(e, w, all);
+      w.now += 20_000;
+      for (const m of healthy) ledger.recordSource(m.addr, true, w.now - 1_000);
+      ledger.noteTick(true, w.now);
+      ledger.noteSourceCycle(true, w.now);
+    }
+    const h = e.healthFields() as { massHold: boolean; outageShapedMatured: number; heldUnregisteredKeeperAuthority: number };
+    assert.equal(h.massHold, false, "the standing 7 are NOT an outage signal");
+    assert.equal(h.outageShapedMatured, 0);
+    assert.equal(h.heldUnregisteredKeeperAuthority, 7);
+    for (const x of w.exec.sent) sentSet.add(x.keys[0][0]);
+    assert.equal(w.exec.sent.length, 3, "one per tick");
+    assert.equal(sentSet.size, 3, "three distinct markets");
+    for (const a of sentSet) assert.equal(foreign.some((f) => f.addr === a), true, "only foreign-authority markets were resolved");
+    for (const k of keeperUnreg) assert.equal(sentSet.has(k.addr), false);
+    assert.equal(sink.active("v22-lifecycle:unregistered-held").length, 7);
+  });
+
+  it("allowlisted keeper-authority unregistered markets are not counted as outage-shaped either", async () => {
+    const w = world();
+    const ms = [0, 1, 2, 3, 4].map(() => addMarket(w, matured({ authority: keeper.publicKey }), false));
+    const { e, ledger } = engineFor(w, { staleResolve: "on", unregisteredAllow: ms.map((m) => m.addr), massThreshold: 3 });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, ms.map((m) => m.ctx));
+    const h = e.healthFields() as { massHold: boolean; heldUnregisteredKeeperAuthority: number };
+    assert.equal(h.massHold, false);
+    assert.equal(h.heldUnregisteredKeeperAuthority, 0);
+    assert.equal(w.exec.sent.length, 1);
+  });
+
+  it("correlation hold: every pushable market of one DEX type lacking a source at once holds THAT group only; one dead pool of a group of three does not", async () => {
+    const w = world();
+    const ray = [0, 1].map(() => addMarket(w, matured({ authority: keeper.publicKey })));
+    const pump = [0, 1, 2].map(() => addMarket(w, market({ lastGood: ageToLastGood(50n), authority: keeper.publicKey })));
+    const meteora = addMarket(w, matured({ authority: keeper.publicKey }));
+    const group = (m: string): string | null => (ray.some((r) => r.addr === m) ? "raydium-clmm" : pump.some((p) => p.addr === m) ? "pumpswap" : "meteora-dlmm");
+    const mk = (extraPumpDead: number) => {
+      const a = engineFor(w, { staleResolve: "on", sourceLossMax: 50, sourceLossPct: 100 }, { sourceGroup: group });
+      primeLedger(a.ledger, w, 3_600_000);
+      pump.slice(extraPumpDead).forEach((p) => a.ledger.recordSource(p.addr, true, w.now - 1_000));
+      a.ledger.recordSource(meteora.addr, true, w.now - 3_500_000); // meteora: its own lone dead pool, source long gone
+      return a;
+    };
+    const a = mk(3);
+    await runTick(a.e, w, [...ray, ...pump, meteora].map((m) => m.ctx));
+    const h = a.e.healthFields() as { sourceHealth: { groupHolds: Record<string, { lacking: number; total: number }> } };
+    assert.deepEqual(Object.keys(h.sourceHealth.groupHolds).sort(), ["pumpswap", "raydium-clmm"].sort(), "both raydium markets and all three pump markets lack a source");
+    assert.equal(a.sink.active("v22-lifecycle:resolve-held").some((x) => x.subject === "source-group:raydium-clmm"), true);
+    assert.equal(a.e.view(ray[0].addr)?.resolve?.guard, "source-group-loss");
+    // the lone meteora market (a group of 1) is not a correlation: it resolves
+    assert.deepEqual(w.exec.sent.map((s) => s.keys[0][0]), [meteora.addr]);
+    // negative control: with 1 of 3 pump markets lacking, no pump hold
+    const w2 = world();
+    const p3 = [0, 1, 2].map(() => addMarket(w2, matured({ authority: keeper.publicKey })));
+    const b = engineFor(w2, { staleResolve: "on", sourceLossMax: 50, sourceLossPct: 100 }, { sourceGroup: () => "pumpswap" });
+    primeLedger(b.ledger, w2, 3_600_000);
+    b.ledger.recordSource(p3[1].addr, true, w2.now - 1_000);
+    b.ledger.recordSource(p3[2].addr, true, w2.now - 1_000);
+    await runTick(b.e, w2, p3.map((m) => m.ctx));
+    assert.deepEqual((b.e.healthFields() as { sourceHealth: { groupHolds: object } }).sourceHealth.groupHolds, {});
+  });
+
+  it("discovery is batched and caches terminal markets: 40 unregistered markets = 1 gPA + 2 reads; Resolved ones are not re-read on the next scan", async () => {
+    const w = world();
+    for (let i = 0; i < 30; i++) addMarket(w, matured({ authority: OTHER }), false);
+    for (let i = 0; i < 10; i++) addMarket(w, matured({ authority: OTHER, resolved: true }), false);
+    const sizes: number[] = [];
+    const orig = w.conn.getMultipleAccountsInfoAndContext as (pks: PublicKey[]) => Promise<unknown>;
+    (w.conn as unknown as Record<string, unknown>).getMultipleAccountsInfoAndContext = async (pks: PublicKey[]) => (sizes.push(pks.length), orig(pks));
+    const { e } = engineFor(w, { discoveryMs: 600_000 });
+    await runTick(e, w, []);
+    assert.equal(w.gpaCalls.length, 1);
+    assert.deepEqual(sizes, [99, 21], "40 markets x 3 accounts = 120 accounts in two batched reads (33 markets, then 7)");
+    sizes.length = 0;
+    w.now += 600_000;
+    await runTick(e, w, []);
+    assert.equal(w.gpaCalls.length, 2);
+    assert.deepEqual(sizes, [90], "the 10 Resolved markets are cached terminal: 30 markets x 3 accounts in one read");
   });
 
   it("source-health: many pushable markets without a source at once hold every pushable resolve (a price-reader regression); one dead pool among healthy ones still resolves", async () => {
@@ -800,7 +900,7 @@ describe("engine: review fixes", () => {
     await runTick(a.e, w, dead.map((m) => m.ctx));
     assert.equal(w.exec.sent.length, 0);
     const h = a.e.healthFields() as { sourceHealth: { pushable: number; lacking: number; hold: boolean } };
-    assert.deepEqual(h.sourceHealth, { pushable: 4, lacking: 4, hold: true });
+    assert.deepEqual(h.sourceHealth, { pushable: 4, lacking: 4, hold: true, groupHolds: {} });
     assert.equal(a.sink.active("v22-lifecycle:resolve-held").some((x) => x.subject === "source-health" && x.severity === "critical"), true);
     // negative control: one dead pool among ten healthy pushable markets is not a regression
     const w2 = world();
@@ -881,6 +981,11 @@ describe("flags", () => {
     assert.equal(v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_STALE_RESOLVE: " ON " }).lifecycle.staleResolve, "on");
     for (const bad of ["yes", "1", "true", "enabled", "of"]) assert.throws(() => v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_STALE_RESOLVE: bad }), V22FlagError, bad);
     assert.equal(v22FlagsFromEnv({ KEEPER_V22_STALE_RESOLVE: "on" }).lifecycle.staleResolve, "off", "the layer is off: the variable is not even read");
+  });
+  it("the group-loss knob parses (1..100)", () => {
+    assert.equal(v22FlagsFromEnv({ KEEPER_V22: "on" }).lifecycle.groupLossPct, 100);
+    assert.equal(v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_STALE_RESOLVE_GROUP_LOSS_PCT: "75" }).lifecycle.groupLossPct, 75);
+    assert.throws(() => v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_STALE_RESOLVE_GROUP_LOSS_PCT: "101" }), V22FlagError);
   });
   it("the unregistered allowlist and the source-loss knobs parse strictly", () => {
     const a = Keypair.generate().publicKey.toBase58();

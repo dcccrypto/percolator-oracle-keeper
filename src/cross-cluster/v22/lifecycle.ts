@@ -25,7 +25,9 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Alert, AlertSink } from "../alerting.ts";
 import { markTerminal } from "../push-deadline.ts";
-import { buildV22MarketCtx, loadV22Market } from "./market.ts";
+import { deriveLpVaultRegistry } from "@percolatorct/sdk";
+import { deriveVaultLpState } from "../resolved-portfolio-cleanup.ts";
+import { buildV22MarketCtx } from "./market.ts";
 import type { V22MarketCtx } from "./market.ts";
 import type { LifecycleConfig } from "./flags.ts";
 import { classifyMarket, observeQuiet, openInterestIsZero, quietMsOf, tradeFeeAccrualSum } from "./lifecycle-classify.ts";
@@ -90,6 +92,8 @@ export interface LifecycleDeps {
   sink: Pick<AlertSink, "reconcile" | "fire">;
   /** Forced fee round for a warn-band market: tag 78 then tag 87 + stake 12. Returns a one-line summary. Absent = no forcing. */
   forceFees?: (ctx: V22MarketCtx) => Promise<string>;
+  /** The price-source group of a registered market (its registry DEX type), for the correlation hold; null = unknown / not grouped. */
+  sourceGroup?: (marketAddress: string) => string | null;
   ledger?: ObservationLedger;
   store?: LifecycleStore | null;
   now?: () => number;
@@ -138,6 +142,12 @@ export class LifecycleEngine {
   private massHold = false;
   private outageShaped = 0;
   private sourceLossHold = false;
+  /** Keeper-authority matured markets with no row that were NEVER registered here: held individually, alerted, not an outage signal. */
+  private heldUnregistered = 0;
+  private prunedMatured = 0;
+  private groupLossHolds = new Map<string, { lacking: number; total: number }>();
+  /** Markets seen Resolved / closed (one-way): never re-read by the discovery scan. */
+  private readonly terminalSeen = new Set<string>();
   private sourceLossCount = 0;
   private pushableCount = 0;
   /** Markets that had a registry row at any time in this process (labels the held-unregistered alert). */
@@ -224,18 +234,37 @@ export class LifecycleEngine {
         dataSlice: { offset: 0, length: 0 },
         filters: [{ memcmp: { offset: 0, bytes: MARKET_HEADER_V22.toString("base64"), encoding: "base64" } }],
       });
-      const addrs = res.map((a) => a.pubkey.toBase58()).filter((a) => !this.d.registered(a));
+      const addrs = res.map((a) => a.pubkey.toBase58()).filter((a) => !this.d.registered(a) && !this.terminalSeen.has(a));
       for (const k of [...this.unreg.keys()]) if (!addrs.includes(k)) this.unreg.delete(k);
-      for (const addr of addrs) {
-        const label = `unregistered ${addr.slice(0, 8)}`;
-        const load = await loadV22Market(this.d.conn, { marketAddress: addr, label }, this.d.programId);
-        if (!load.ok) {
-          this.unreg.delete(addr);
-          continue;
+      // ONE batched read per 99 accounts (33 markets x [market, registry PDA, vault_lp_state PDA]); Resolved / closed markets seen before
+      // are skipped (terminal is one-way), so a scan costs 1 gPA + ceil(3N / 99) reads for the N live unregistered markets.
+      const PER = 33;
+      for (let i = 0; i < addrs.length; i += PER) {
+        const chunk = addrs.slice(i, i + PER);
+        const keys: PublicKey[] = [];
+        for (const a of chunk) {
+          const m = new PublicKey(a);
+          keys.push(m, deriveLpVaultRegistry(this.d.programId, m)[0], deriveVaultLpState(this.d.programId, m));
         }
-        const t = this.classifyCtx(load.ctx, false, label);
-        if (t.lc.terminal !== null) this.unreg.delete(addr);
-        else this.unreg.set(addr, t);
+        const r = await this.d.conn.getMultipleAccountsInfoAndContext(keys, "processed");
+        chunk.forEach((addr, j) => {
+          const [m, reg, vls] = [r.value[3 * j], r.value[3 * j + 1], r.value[3 * j + 2]];
+          if (!m || !m.owner.equals(this.d.programId)) {
+            this.unreg.delete(addr);
+            return;
+          }
+          const label = `unregistered ${addr.slice(0, 8)}`;
+          const built = buildV22MarketCtx({ marketAddress: addr, label, programId: this.d.programId, data: new Uint8Array(m.data), readSlot: r.context.slot, registryData: reg ? new Uint8Array(reg.data) : null, vaultLpStateData: vls ? new Uint8Array(vls.data) : null });
+          if (!built.ok) {
+            this.unreg.delete(addr);
+            return;
+          }
+          const t = this.classifyCtx(built.ctx, false, label);
+          if (t.lc.terminal !== null) {
+            this.terminalSeen.add(addr);
+            this.unreg.delete(addr);
+          } else this.unreg.set(addr, t);
+        });
       }
       return;
     }
@@ -257,8 +286,10 @@ export class LifecycleEngine {
           return;
         }
         const t = this.classifyCtx(built.ctx, false, prev.label);
-        if (t.lc.terminal !== null) this.unreg.delete(addr);
-        else this.unreg.set(addr, t);
+        if (t.lc.terminal !== null) {
+          this.terminalSeen.add(addr);
+          this.unreg.delete(addr);
+        } else this.unreg.set(addr, t);
       });
     }
   }
@@ -371,8 +402,9 @@ export class LifecycleEngine {
       await this.d.sink.reconcile(`${LIFECYCLE_ALERT_SCOPE}:dead-interest`, a.interest);
       await this.d.sink.reconcile(`${LIFECYCLE_ALERT_SCOPE}:unregistered-held`, a.unregHeld);
       const held: Alert[] = [];
-      if (this.massHold) held.push({ kind: "stale-resolve-held", severity: "critical", subject: "*", message: `${this.outageShaped} keeper-authority markets are matured while the keeper has a usable source for them (or they lost their registry row): outage-shaped. The keeper is NOT resolving any market; check RPC / the push loop / the registry.`, data: { outageShapedMatured: this.outageShaped, threshold: this.d.cfg.massThreshold } });
+      if (this.massHold) held.push({ kind: "stale-resolve-held", severity: "critical", subject: "*", message: `${this.outageShaped} keeper-authority markets are matured while the keeper has a usable source for them (or were registered earlier in this process and their row is gone: ${this.prunedMatured}): outage-shaped. The keeper is NOT resolving any market; check RPC / the push loop / the registry.`, data: { outageShapedMatured: this.outageShaped, threshold: this.d.cfg.massThreshold } });
       if (this.sourceLossHold) held.push({ kind: "stale-resolve-held", severity: "critical", subject: "source-health", message: `${this.sourceLossCount} of ${this.pushableCount} pushable markets have no usable source price at once: a price-reader regression, not dead markets. The keeper is NOT resolving any pushable market.`, data: { lacking: this.sourceLossCount, pushable: this.pushableCount, max: this.d.cfg.sourceLossMax, pct: this.d.cfg.sourceLossPct } });
+      for (const [g, v] of this.groupLossHolds) held.push({ kind: "stale-resolve-held", severity: "critical", subject: `source-group:${g}`, message: `${v.lacking} of ${v.total} pushable markets of DEX type "${g}" have no usable source price at once: a price-reader regression for that DEX is likelier than that many dead pools. The keeper is NOT resolving that group.`, data: { group: g, lacking: v.lacking, total: v.total, pct: this.d.cfg.groupLossPct } });
       await this.d.sink.reconcile(`${LIFECYCLE_ALERT_SCOPE}:resolve-held`, held);
     } catch (err) {
       this.log(`[v22][lifecycle] alert delivery failed: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
@@ -430,6 +462,7 @@ export class LifecycleEngine {
       maturedCount,
       allowlisted: this.d.cfg.unregisteredAllow.includes(addr),
       sourceLossHold: this.sourceLossHold,
+      groupLossHold: this.groupOf(addr) !== null && this.groupLossHolds.has(this.groupOf(addr) as string),
       resolvedThisCycle: this.resolvedThisCycle,
       attempt: this.attempts.get(addr),
       nowMs,
@@ -444,16 +477,39 @@ export class LifecycleEngine {
    *  - source health: how many markets the keeper can push lack a usable source price RIGHT NOW (no usable read for SOURCE_FRESH_MS
    *    while the push loop runs). Many at once is a price-reader regression, not many dead pools.
    */
+  private groupOf(addr: string): string | null {
+    return this.d.sourceGroup?.(addr) ?? null;
+  }
+
   private assessOutage(all: Tracked[], nowMs: number): void {
-    this.outageShaped = all.filter(
-      (t) => t.lc.price.kind === "matured" && t.lc.keeperIsAuthority && (!t.lc.registered || this.ledger.sourceUnavailableMs(t.ctx.marketAddress, nowMs) < this.d.cfg.minObservationMs),
-    ).length;
+    const allow = this.d.cfg.unregisteredAllow;
+    const maturedKeeperAuth = all.filter((t) => t.lc.price.kind === "matured" && t.lc.keeperIsAuthority && !allow.includes(t.ctx.marketAddress));
+    // (a) PRUNED: registered earlier in this process, gone now (a shrinking registry); (b) registered with a usable source recently.
+    const pruned = maturedKeeperAuth.filter((t) => !t.lc.registered && this.everRegistered.has(t.ctx.marketAddress));
+    const aliveButUnpushed = maturedKeeperAuth.filter((t) => t.lc.registered && this.ledger.sourceUnavailableMs(t.ctx.marketAddress, nowMs) < this.d.cfg.minObservationMs);
+    this.prunedMatured = pruned.length;
+    this.outageShaped = pruned.length + aliveButUnpushed.length;
     this.massHold = this.outageShaped > this.d.cfg.massThreshold;
+    // never-registered keeper-authority markets: a standing set that is held one by one and alerted, NOT an outage signal.
+    this.heldUnregistered = maturedKeeperAuth.filter((t) => !t.lc.registered && !this.everRegistered.has(t.ctx.marketAddress)).length;
+
     const pushable = all.filter((t) => t.lc.keeperCanPush && t.lc.terminal === null);
+    const lacks = (t: Tracked): boolean => this.ledger.sourceAgeMs(t.ctx.marketAddress, nowMs) > SOURCE_FRESH_MS;
     this.pushableCount = pushable.length;
-    this.sourceLossCount = pushable.filter((t) => this.ledger.sourceAgeMs(t.ctx.marketAddress, nowMs) > SOURCE_FRESH_MS).length;
+    this.sourceLossCount = pushable.filter(lacks).length;
     const c = this.d.cfg;
     this.sourceLossHold = this.sourceLossCount > c.sourceLossMax || (this.sourceLossCount >= 2 && this.sourceLossCount * 100 > c.sourceLossPct * this.pushableCount);
+    // Correlation: pushable markets that share a price-source group (DEX type) and lack a source together.
+    const groups = new Map<string, Tracked[]>();
+    for (const t of pushable) {
+      const g = this.groupOf(t.ctx.marketAddress);
+      if (g !== null) groups.set(g, [...(groups.get(g) ?? []), t]);
+    }
+    this.groupLossHolds = new Map();
+    for (const [g, ts] of groups) {
+      const lacking = ts.filter(lacks).length;
+      if (ts.length >= 2 && lacking >= 2 && lacking * 100 >= c.groupLossPct * ts.length) this.groupLossHolds.set(g, { lacking, total: ts.length });
+    }
   }
 
   private async resolveMatured(all: Tracked[]): Promise<void> {
@@ -583,7 +639,9 @@ export class LifecycleEngine {
       counts: { ...this.lastCounts, unregisteredTracked: this.unreg.size },
       outageShapedMatured: this.outageShaped,
       massHold: this.massHold,
-      sourceHealth: { pushable: this.pushableCount, lacking: this.sourceLossCount, hold: this.sourceLossHold },
+      sourceHealth: { pushable: this.pushableCount, lacking: this.sourceLossCount, hold: this.sourceLossHold, groupHolds: Object.fromEntries(this.groupLossHolds) },
+      heldUnregisteredKeeperAuthority: this.heldUnregistered,
+      prunedMatured: this.prunedMatured,
       resolvesSent: this.resolvesSent,
       lastDiscoveryAgoMs: Number.isFinite(this.lastDiscoveryAt) ? nowMs - this.lastDiscoveryAt : null,
       markets,

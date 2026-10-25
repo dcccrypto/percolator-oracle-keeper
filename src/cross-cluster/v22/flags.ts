@@ -42,6 +42,8 @@
  *   KEEPER_V22_STALE_RESOLVE_MAX_PER_CYCLE   resolves per tick (default 1)
  *   KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW  comma-separated market addresses: ONLY these unregistered markets whose oracle authority is
  *                                 this keeper may be resolved (default none = they are HELD with an alert: register them or decide)
+ *   KEEPER_V22_STALE_RESOLVE_GROUP_LOSS_PCT  correlation hold: when at least this percent (default 100; the group needs >= 2 pushable markets) of the
+ *                                 pushable markets sharing one DEX type lack a usable source at once, resolves of that group are held
  *   KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_MAX / _PCT  global source-health hold: more than MAX (default 3), or more than PCT percent (default 50,
  *                                 and at least 2) of the markets the keeper can push lack a usable source price at once = a price-reader
  *                                 regression, not dead markets: resolve no pushable market, alert
@@ -78,6 +80,7 @@ export interface LifecycleConfig {
   unregisteredAllow: string[];
   sourceLossMax: number;
   sourceLossPct: number;
+  groupLossPct: number;
   resolveRetryMs: number;
   maxGapMs: number;
   neverConnectedGraceSlots: number;
@@ -98,6 +101,7 @@ export const LIFECYCLE_DEFAULTS: LifecycleConfig = {
   unregisteredAllow: [],
   sourceLossMax: 3,
   sourceLossPct: 50,
+  groupLossPct: 100,
   resolveRetryMs: 600_000,
   maxGapMs: 120_000,
   neverConnectedGraceSlots: 1_500,
@@ -213,6 +217,11 @@ function lifecycleFromEnv(env: Env): LifecycleConfig {
     maxResolvesPerCycle: posInt(env, "KEEPER_V22_STALE_RESOLVE_MAX_PER_CYCLE", LIFECYCLE_DEFAULTS.maxResolvesPerCycle),
     unregisteredAllow: addressList(env, "KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW"),
     sourceLossMax: posInt(env, "KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_MAX", LIFECYCLE_DEFAULTS.sourceLossMax),
+    groupLossPct: (() => {
+      const v = posInt(env, "KEEPER_V22_STALE_RESOLVE_GROUP_LOSS_PCT", LIFECYCLE_DEFAULTS.groupLossPct);
+      if (v > 100) throw new V22FlagError("KEEPER_V22_STALE_RESOLVE_GROUP_LOSS_PCT", String(v), "1..100");
+      return v;
+    })(),
     sourceLossPct: (() => {
       const v = posInt(env, "KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_PCT", LIFECYCLE_DEFAULTS.sourceLossPct);
       if (v > 100) throw new V22FlagError("KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_PCT", String(v), "1..100");
