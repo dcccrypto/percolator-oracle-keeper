@@ -80,7 +80,6 @@ interface LevSdk {
   deriveLevGuardV22(programId: PublicKey, market: PublicKey): [PublicKey, number];
   deriveVaultLpStateV22(programId: PublicKey, market: PublicKey): [PublicKey, number];
   deriveVaultLpExtV22(programId: PublicKey, market: PublicKey): [PublicKey, number];
-  levKeyTagV22(key: PublicKey): bigint;
   levLpStopTriggeredV22(g: Pick<LevGuardV22, "navps" | "navPeakCur" | "navPeakPrev" | "navRef">): boolean;
   levW1RoundLiveV22(g: Pick<LevGuardV22, "roundActive" | "roundOpenSlot">, nowSlot: bigint): boolean;
 }
@@ -98,6 +97,7 @@ export const decodeLevGuardV22 = sdk.decodeLevGuardV22;
 export const deriveLevGuardV22 = sdk.deriveLevGuardV22;
 export const deriveVaultLpStateV22 = sdk.deriveVaultLpStateV22;
 export const deriveVaultLpExtV22 = sdk.deriveVaultLpExtV22;
-export const levKeyTagV22 = sdk.levKeyTagV22;
+// NOT re-exported: `levKeyTagV22` of f1cada61 reads `new DataView(key.toBytes().buffer)` WITHOUT the byteOffset, and `PublicKey.toBytes()` is a view
+// into Node's 8 KiB Buffer pool, so it returns the pool's first bytes (the same tag for every key). Use `keyTagOf` in lev-guard.ts.
 export const levLpStopTriggeredV22 = sdk.levLpStopTriggeredV22;
 export const levW1RoundLiveV22 = sdk.levW1RoundLiveV22;
