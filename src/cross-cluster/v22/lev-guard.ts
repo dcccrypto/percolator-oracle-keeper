@@ -27,6 +27,7 @@ import type { Connection } from "@solana/web3.js";
 import * as fs from "node:fs";
 import {
   deriveDepthSourceV22,
+  parsePortfolioV17,
   buildLevGuardLpStopIxV22,
   buildLevGuardPokeIxV22,
   buildLevGuardReportIxV22,
@@ -44,7 +45,6 @@ import { fetchMarketPortfolios } from "../recovery-cranker.ts";
 import { detectLayout } from "../market-layout.ts";
 import { decodeVaultLpState } from "../resolved-portfolio-cleanup.ts";
 import { decodeActiveDepthSource } from "../depth-source.ts";
-import { analysePortfolios } from "./positioned.ts";
 import { simulateAndSend } from "./exec.ts";
 import type { ExecConnection, ExecContext, ExecOutcome } from "./exec.ts";
 import { V22FlagError, parseFlag } from "./flags.ts";
@@ -121,8 +121,21 @@ export function levGuardConfigFromEnv(env: Env = process.env): LevGuardConfig {
 
 export const levGuardEnabled = (c: LevGuardConfig): boolean => c.poke || c.holderJob || c.w1;
 
-/** Load the risk key. Never throws and never logs the file's contents: null on any failure (the reason names the path only). */
+/**
+ * Load the risk key. Never logs the file's contents. THROWS (a clear startup error) when the file is group- or world-readable (mode & 0o077 != 0);
+ * any other failure (missing, unreadable, not a 64-byte keypair array) logs the path only and returns null (REPORT disabled).
+ */
 export function loadRiskKey(path: string, log: (s: string) => void = console.log): Keypair | null {
+  try {
+    const mode = fs.statSync(path).mode;
+    if ((mode & 0o077) !== 0) {
+      throw new Error(`KEEPER_LEV_RISK_KEY_PATH ${path} is group- or world-readable (mode ${(mode & 0o777).toString(8)}); refusing to load it. chmod 600 the file`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("KEEPER_LEV_RISK_KEY_PATH")) throw err;
+    log(`[lev-guard] KEEPER_LEV_RISK_KEY_PATH ${path}: unreadable; REPORT disabled`);
+    return null;
+  }
   try {
     const raw: unknown = JSON.parse(fs.readFileSync(path, "utf8"));
     if (!Array.isArray(raw) || raw.length !== 64 || !raw.every((x) => Number.isInteger(x) && x >= 0 && x <= 255)) {
@@ -181,12 +194,16 @@ export interface LevGuardStats {
   tightens: { sent: number; dryRun: number; refused: number; failed: number };
   reports: { sent: number; dryRun: number; refused: number; failed: number; skipped: number };
   holderRuns: number;
+  /** program-owned kind-17 account at a guard PDA with an unexpected length (alerted) */
+  guardBadLength: number;
   holderDropped: Record<string, number>;
   w1: { checks: number; roundsOpened: number; txs: number; victimsListed: number; closed: number; nothingToDo: number; refused: number; failed: number };
 }
 
 const NO_EXPECTED: ReadonlySet<number> = new Set();
 const NOTHING_TO_DO: ReadonlySet<number> = new Set([LP_STOP_NOT_TRIGGERED]);
+/** Guard account lengths the program may produce: 16 + 344 + 4096, and the burst-memory build 16 + 360 + 4096. */
+const GUARD_LENGTHS: readonly number[] = [4456, 4472];
 const GUARD_RECHECK_MS = 600_000;
 const VAULT_LP_TTL_MS = 600_000;
 
@@ -242,6 +259,7 @@ export class LevGuardKeeper {
     tightens: { sent: 0, dryRun: 0, refused: 0, failed: 0 },
     reports: { sent: 0, dryRun: 0, refused: 0, failed: 0, skipped: 0 },
     holderRuns: 0,
+    guardBadLength: 0,
     holderDropped: {},
     w1: { checks: 0, roundsOpened: 0, txs: 0, victimsListed: 0, closed: 0, nothingToDo: 0, refused: 0, failed: 0 },
   };
@@ -269,7 +287,11 @@ export class LevGuardKeeper {
     return { programId: this.d.programId, market };
   }
 
-  /** Cached: does the market's guard PDA exist (program-owned, 4,456 B, header kind 17)? A positive answer is final; a negative one is rechecked every 10 min. */
+  /**
+   * Cached: does the market's guard PDA exist (program-owned, header kind 17, length 4,456 B or 4,472 B (burst-memory build, record 360 B))?
+   * A positive answer is final; a negative one is rechecked every 10 min. A program-owned kind-17 account of any OTHER length is counted
+   * (`stats.guardBadLength`) and logged as an ALERT, and treated as no guard.
+   */
   async hasGuard(marketAddress: string): Promise<boolean> {
     const s = this.m(marketAddress);
     const t = this.now();
@@ -277,7 +299,12 @@ export class LevGuardKeeper {
     if (s.guard && t - s.guard.checkedAt < GUARD_RECHECK_MS) return false;
     try {
       const info = await this.d.conn.getAccountInfo(deriveLevGuardV22(this.d.programId, new PublicKey(marketAddress))[0], "confirmed");
-      const present = !!info && info.owner.equals(this.d.programId) && info.data.length === 4456 && info.data[10] === 17;
+      const owned = !!info && info.owner.equals(this.d.programId) && info.data.length > 10 && info.data[10] === 17;
+      const present = owned && GUARD_LENGTHS.includes(info!.data.length);
+      if (owned && !present) {
+        this.stats.guardBadLength++;
+        this.log(`[lev-guard][ALERT] ${marketAddress}: the guard PDA is program-owned kind 17 but ${info!.data.length} B (expected ${GUARD_LENGTHS.join(" or ")}); treated as no guard`);
+      }
       s.guard = { present, checkedAt: t };
       return present;
     } catch {
@@ -291,6 +318,7 @@ export class LevGuardKeeper {
       const market = new PublicKey(marketAddress);
       const [info, slot] = await Promise.all([this.d.conn.getAccountInfo(deriveLevGuardV22(this.d.programId, market)[0], "confirmed"), this.d.conn.getSlot("confirmed")]);
       if (!info || !info.owner.equals(this.d.programId)) return null;
+      // decodeLevGuardV22 (SDK 0a6ac576) accepts exactly 4,456 B or 4,472 B and throws on any other length (-> null below).
       return { guard: decodeLevGuardV22(new Uint8Array(info.data)), slot: BigInt(slot) };
     } catch {
       return null;
@@ -536,7 +564,7 @@ export class LevGuardKeeper {
   // ── 3. W1 ────────────────────────────────────────────────────────────────────────────────────
 
   /**
-   * One W1 run for a market: read the guard; when the stop holds or a round is open, open the round if needed (op 5 with no victims) and cut the
+   * One W1 run for a market: read the guard; when the stop holds or a round is open, cut the
    * opposing portfolios in batches until the round closes, the program answers 135, nothing is left to list, or `w1MaxTxs` is reached.
    */
   async w1Once(marketAddress: string, label: string): Promise<string> {
@@ -600,17 +628,9 @@ export class LevGuardKeeper {
       }
       return null;
     };
-    // Open the round when the stop holds but no round is live: op 5 with no victims opens it (the program picks the cut ratio and the LP side).
-    if (!live0) {
-      const o = await send([]);
-      const why = stop(o);
-      if (why) return why;
-      gs = await this.readGuard(marketAddress);
-      if (!gs) return "guard unreadable after open";
-      if (!gs.guard.roundActive) return "stop acknowledged, nothing to cut";
-      this.stats.w1.roundsOpened++;
-    }
-    // The round is open: list the opposing portfolios in batches.
+    // The portfolios (one read). The round-opening call MUST carry the first batch of victims: the program opens the round and then answers 135 when
+    // nothing was cut, which reverts the open. So the LP side comes from the vault LP's own net position when no round is open (guard.roundLpLong
+    // when one is), and a call that lists no victim is never sent.
     const mdata = await this.d.conn.getAccountInfo(market, "confirmed");
     if (!mdata) return "market unreadable";
     const det = detectLayout(new Uint8Array(mdata.data));
@@ -619,16 +639,27 @@ export class LevGuardKeeper {
     const all = await load(market, det.layout.portfolioAccountLen);
     const s = this.m(marketAddress);
     const batch = Math.min(this.d.config.w1BatchSize, W1_MAX_VICTIMS_PER_TX);
+    const asset = gs.guard.assetIndex;
+    let opening = !live0;
+    let lpSide: boolean | null = null;
+    if (opening) {
+      const lpData = all.find((x) => x.pubkey.equals(lp))?.data;
+      const net = lpData ? netPosOnAsset(lpData, asset) : null;
+      lpSide = net === null || net === 0n ? null : net > 0n;
+      if (lpSide === null) return "stop holds but the vault LP has no readable net position on the asset: nothing to cut";
+    }
     let txs = 0;
     for (;;) {
       const g = gs.guard;
-      if (!levW1RoundLiveV22(g, gs.slot)) {
+      if (!opening && !levW1RoundLiveV22(g, gs.slot)) {
         this.stats.w1.closed++;
         s.w1Listed.clear();
         return `round closed after ${txs} tx(s)`;
       }
-      const victims = w1Victims(all, { guard: g, lp, portfolioLen: det.layout.portfolioAccountLen, listed: s.w1Listed });
-      if (victims.length === 0) return `round ${g.roundId} open, no opposing portfolio left to list (${txs} tx(s))`;
+      const lpLong = opening ? (lpSide as boolean) : g.roundLpLong;
+      // an opening call starts a fresh round: the touched set resets on chain
+      const victims = w1Victims(all, { assetIndex: asset, lpLong, roundId: g.roundId, touchedTags: opening ? [] : g.touchedTags, lp, listed: s.w1Listed });
+      if (victims.length === 0) return opening ? "stop holds, no opposing portfolio to cut (no call sent)" : `round ${g.roundId} open, no opposing portfolio left to list (${txs} tx(s))`;
       if (txs >= this.d.config.w1MaxTxs) return `round ${g.roundId} still open after ${txs} tx(s) (limit); continues next cycle`;
       const list = victims.slice(0, batch);
       for (const v of list) s.w1Listed.add(`${g.roundId}:${v.toBase58()}`);
@@ -642,6 +673,15 @@ export class LevGuardKeeper {
       }
       const next = await this.readGuard(marketAddress);
       if (!next) return "guard unreadable after batch";
+      if (opening) {
+        opening = false;
+        this.stats.w1.roundsOpened++;
+        if (!next.guard.roundActive) {
+          this.stats.w1.closed++;
+          s.w1Listed.clear();
+          return `round opened and closed in the first call (${list.length} portfolio(s))`;
+        }
+      }
       gs = next;
     }
   }
@@ -657,20 +697,33 @@ export class LevGuardKeeper {
   }
 }
 
+/** Signed net position of a portfolio on one asset (sum of `basis_pos_q` over its active legs on it), or null when it does not decode. */
+export function netPosOnAsset(data: Uint8Array, assetIndex: number): bigint | null {
+  try {
+    let net = 0n;
+    for (const leg of parsePortfolioV17(data).legs) if (leg.active && leg.assetIndex === assetIndex) net += leg.basisPosQ;
+    return net;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * The opposing user portfolios for an open round: users with a leg on the guard's asset on the side OPPOSITE the vault LP (`round_lp_long`: the
- * LP long faces users short). Never the LP itself; portfolios already cut this round (the guard's touched tags) or already listed by this keeper
- * this round are skipped. Sorted by key, so the batches are deterministic.
+ * The opposing user portfolios: users whose EFFECTIVE (signed net) position on the asset is opposite the vault LP's (`lpLong`: the LP long faces users
+ * with a negative net). Never the LP itself; portfolios already cut this round (the guard's touched tags) or already listed by this keeper this
+ * round are skipped. Sorted by key, so the batches are deterministic.
  */
 export function w1Victims(
   accounts: ReadonlyArray<{ pubkey: PublicKey; data: Uint8Array }>,
-  p: { guard: Pick<LevGuardV22, "assetIndex" | "roundLpLong" | "roundId" | "touchedTags">; lp: PublicKey; portfolioLen: number; listed: ReadonlySet<string> },
+  p: { assetIndex: number; lpLong: boolean; roundId: bigint; touchedTags: readonly bigint[]; lp: PublicKey; listed: ReadonlySet<string> },
 ): PublicKey[] {
-  const pos = analysePortfolios(accounts, { assetIndex: p.guard.assetIndex, lpPortfolio: p.lp, portfolioLen: p.portfolioLen });
-  const touched = new Set(p.guard.touchedTags);
-  return pos.counterparties
-    .filter((x) => !x.pubkey.equals(p.lp) && (p.guard.roundLpLong ? x.shortLegs > 0 : x.longLegs > 0))
-    .filter((x) => !touched.has(keyTagOf(x.pubkey)) && !p.listed.has(`${p.guard.roundId}:${x.pubkey.toBase58()}`))
-    .map((x) => x.pubkey)
-    .sort((a, b) => (a.toBase58() < b.toBase58() ? -1 : 1));
+  const touched = new Set(p.touchedTags);
+  const out: PublicKey[] = [];
+  for (const x of accounts) {
+    if (x.pubkey.equals(p.lp) || touched.has(keyTagOf(x.pubkey)) || p.listed.has(`${p.roundId}:${x.pubkey.toBase58()}`)) continue;
+    const net = netPosOnAsset(x.data, p.assetIndex);
+    if (net === null || net === 0n) continue;
+    if (p.lpLong ? net < 0n : net > 0n) out.push(x.pubkey);
+  }
+  return out.sort((a, b) => (a.toBase58() < b.toBase58() ? -1 : 1));
 }

@@ -508,6 +508,14 @@ if (V22_FLAGS.enabled) {
 // (KEEPER_LEV_HOLDER_JOB, optional KEEPER_LEV_RISK_KEY_PATH) and the W1 LP-stop cranker (KEEPER_LEV_W1). All default OFF; with all of them off nothing
 // is constructed, no instruction is built and /health gains no key. See cross-cluster/v22/lev-guard.ts.
 const LEV_GUARD_CONFIG = levGuardConfigFromEnv();
+function loadRiskKeyOrExit(path: string): Keypair | null {
+  try {
+    return loadRiskKey(path);
+  } catch (err) {
+    console.error(`[fatal] ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
 const levGuard = levGuardEnabled(LEV_GUARD_CONFIG)
   ? new LevGuardKeeper({
       conn: devnetConn,
@@ -515,7 +523,7 @@ const levGuard = levGuardEnabled(LEV_GUARD_CONFIG)
       programId: CFG_WRAPPER_PROGRAM_ID,
       dryRun: DRY_RUN || V22_FLAGS.dryRun,
       config: LEV_GUARD_CONFIG,
-      riskKey: LEV_GUARD_CONFIG.holderJob && LEV_GUARD_CONFIG.riskKeyPath ? loadRiskKey(LEV_GUARD_CONFIG.riskKeyPath) : null,
+      riskKey: LEV_GUARD_CONFIG.holderJob && LEV_GUARD_CONFIG.riskKeyPath ? loadRiskKeyOrExit(LEV_GUARD_CONFIG.riskKeyPath) : null,
     })
   : null;
 if (levGuard) {

@@ -7,6 +7,9 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ComputeBudgetProgram, Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import { WRAPPER_ACCOUNT_MAGIC, LAYOUT_V22, deriveDepthSourceV22 } from "@percolatorct/sdk";
 import { WRAPPER_PROGRAM_ID } from "../../program-ids.ts";
@@ -39,7 +42,7 @@ import {
   totalsByOwner,
 } from "./lev-guard-math.ts";
 import type { OwnerView, TokenAccountView } from "./lev-guard-math.ts";
-import { LEV_GUARD_DEFAULTS, LevGuardKeeper, keyTagOf, W1_MAX_VICTIMS_PER_TX, levGuardConfigFromEnv, levGuardEnabled, loadRiskKey, w1Victims } from "./lev-guard.ts";
+import { LEV_GUARD_DEFAULTS, LevGuardKeeper, keyTagOf, netPosOnAsset, W1_MAX_VICTIMS_PER_TX, levGuardConfigFromEnv, levGuardEnabled, loadRiskKey, w1Victims } from "./lev-guard.ts";
 import type { LevGuardConfig } from "./lev-guard.ts";
 import { fakeExecConn, key, portfolioBytes, v22MarketBytes, vaultLpStateBytes } from "./test-helpers.ts";
 import { levGuardHealthFields, setLevGuardHealthProvider } from "./health.ts";
@@ -372,6 +375,19 @@ describe("flags", () => {
     assert.equal(loadRiskKey("/definitely/not/here.json", (s) => logs.push(s)), null);
     assert.ok(logs.every((l) => !/\[\s*\d+\s*,/.test(l)));
   });
+  it("L-4: a group- or world-readable risk-key file is refused at startup; 0600 loads", () => {
+    const dir = fs.mkdtempSync(join(tmpdir(), "levkey-"));
+    const f = join(dir, "k.json");
+    const kp = Keypair.generate();
+    fs.writeFileSync(f, JSON.stringify([...kp.secretKey]), { mode: 0o600 });
+    fs.chmodSync(f, 0o600);
+    assert.ok(loadRiskKey(f, () => {})?.publicKey.equals(kp.publicKey));
+    for (const m of [0o640, 0o604, 0o644, 0o660]) {
+      fs.chmodSync(f, m);
+      assert.throws(() => loadRiskKey(f, () => {}), /group- or world-readable.*chmod 600/);
+    }
+    fs.rmSync(dir, { recursive: true });
+  });
   it("/health gains no levGuard key unless a provider is installed", () => {
     setLevGuardHealthProvider(null);
     assert.deepEqual(levGuardHealthFields(), {});
@@ -407,6 +423,54 @@ describe("flags off: no instruction is built and no RPC is made", () => {
       if (only === "holderJob") assert.equal(c.base.sims.length, 0, "the holder job runs on its own timer, not on a push");
       if (only === "poke") assert.deepEqual(tags, [6], "poke only: one 6-account op 4");
     }
+  });
+});
+
+const TRIG_LEN = { navps: 400_000_000_000n, navPeakCur: 1_000_000_000_000n, navRef: 1_000_000_000_000n };
+describe("guard account length (K-2)", () => {
+  const withLen = (len: number, kind = 17, owner: PublicKey = PROGRAM) => {
+    const w = world();
+    const d = new Uint8Array(len);
+    d.set(guardBytes({ market: w.market }).subarray(0, Math.min(len, 4456)));
+    d[10] = kind;
+    w.accounts.set(w.guardKey.toBase58(), { owner, data: d });
+    return w;
+  };
+  it("4456 B and the burst-memory 4472 B are both a guard: poke is built for both", async () => {
+    for (const len of [4456, 4472]) {
+      const w = withLen(len);
+      const c = levConn({ accounts: w.accounts });
+      const { k } = keeperOf(c.conn, cfg({ poke: true }));
+      assert.equal(await k.hasGuard(w.market.toBase58()), true, `len ${len}`);
+      assert.equal(await k.pokeOnce(w.market.toBase58(), "T", "push"), "sent");
+    }
+  });
+  it("any other length at a program-owned kind-17 guard PDA is alerted and counted, and treated as no guard", async () => {
+    const w = withLen(4460);
+    const c = levConn({ accounts: w.accounts });
+    const { k, logs } = keeperOf(c.conn, cfg({ poke: true }));
+    assert.equal(await k.hasGuard(w.market.toBase58()), false);
+    assert.equal(k.stats.guardBadLength, 1);
+    assert.ok(logs.some((l) => l.includes("[ALERT]") && l.includes("4460")));
+    assert.equal(c.base.sims.length, 0);
+  });
+  it("a foreign-owned or other-kind account is silently no guard (no alert)", async () => {
+    for (const w of [withLen(4456, 17, key(5)), withLen(4456, 16)]) {
+      const c = levConn({ accounts: w.accounts });
+      const { k, logs } = keeperOf(c.conn, cfg({ poke: true }));
+      assert.equal(await k.hasGuard(w.market.toBase58()), false);
+      assert.equal(logs.length, 0);
+    }
+  });
+  it("a real 4472 B guard (record 360 B) decodes through the SDK and W1 reads it", async () => {
+    const w = world(TRIG_LEN);
+    const d = new Uint8Array(4472);
+    d.set(guardBytes({ market: w.market, ...TRIG_LEN }).subarray(0, 16 + 344));
+    d[10] = 17;
+    w.accounts.set(w.guardKey.toBase58(), { owner: PROGRAM, data: d });
+    const c = levConn({ accounts: w.accounts });
+    const { k } = keeperOf(c.conn, cfg({ w1: true }), { loadPortfolios: async () => [] });
+    assert.notEqual(await k.w1Once(w.market.toBase58(), "T"), "guard unreadable");
   });
 });
 
@@ -735,60 +799,108 @@ describe("W1 (KEEPER_LEV_W1)", () => {
     assert.equal(levW1RoundLiveV22(decodeLevGuardV22(guardBytes({ market: key(1), roundActive: true, roundOpenSlot: 100n })), 9_101n), false, "a round older than 9000 slots is stale");
   });
 
-  it("w1Victims: only users opposite the LP, never the LP, skips already-cut (touched) and already-listed, on the guard's asset only", () => {
+  it("w1Victims: only users whose EFFECTIVE net position is opposite the LP's, never the LP, skips touched and already-listed, on the guard's asset only", () => {
     const lp = key(501);
     const lpAcc = { pubkey: lp, data: portfolioBytes({ owner: key(1), legs: [{ side: 0, basis: 1000n }] }) };
-    const accounts = [lpAcc, acc(1, 1), acc(2, 1), acc(3, 0), acc(4, 1, 5), acc(5, 1), { pubkey: key(9999), data: new Uint8Array(10) }];
-    const g = decodeLevGuardV22(guardBytes({ market: key(1), roundActive: true, roundLpLong: true, roundId: 7n, touched: [user(2)] }));
-    const out = w1Victims(accounts, { guard: g, lp, portfolioLen: 10603, listed: new Set([`7:${user(5).toBase58()}`]) });
-    assert.deepEqual(out.map((k) => k.toBase58()), [user(1).toBase58()], "u1 only: u2 touched, u3 is on the LP's side, u4 is another asset, u5 already listed");
-    const short = decodeLevGuardV22(guardBytes({ market: key(1), roundActive: true, roundLpLong: false, roundId: 7n }));
-    const longSide = w1Victims(accounts, { guard: short, lp, portfolioLen: 10603, listed: new Set() });
-    assert.deepEqual(longSide.map((k) => k.toBase58()), [user(3).toBase58()], "LP short: users long");
+    // u6: one long and one bigger short leg on the asset: net short (effective side), not "has a short leg"
+    const mixed = { pubkey: user(6), data: portfolioBytes({ owner: key(3006), legs: [{ side: 0, basis: 10n }, { side: 1, basis: -50n }] }) };
+    // u7: net long although it also holds a small short leg: on the LP's side
+    const mixedLong = { pubkey: user(7), data: portfolioBytes({ owner: key(3007), legs: [{ side: 0, basis: 80n }, { side: 1, basis: -5n }] }) };
+    const accounts = [lpAcc, acc(1, 1), acc(2, 1), acc(3, 0), acc(4, 1, 5), acc(5, 1), mixed, mixedLong, { pubkey: key(9999), data: new Uint8Array(10) }];
+    const base = { assetIndex: 0, roundId: 7n, lp };
+    const out = w1Victims(accounts, { ...base, lpLong: true, touchedTags: [keyTagOf(user(2))], listed: new Set([`7:${user(5).toBase58()}`]) });
+    assert.deepEqual(out.map((k) => k.toBase58()).sort(), [user(1), user(6)].map((k) => k.toBase58()).sort(), "u1 and the net-short u6 only");
+    const longSide = w1Victims(accounts, { ...base, lpLong: false, touchedTags: [], listed: new Set() });
+    assert.deepEqual(longSide.map((k) => k.toBase58()).sort(), [user(3), user(7)].map((k) => k.toBase58()).sort(), "LP short: users net long");
     assert.ok(!out.some((k) => k.equals(lp)) && !longSide.some((k) => k.equals(lp)));
+    assert.equal(netPosOnAsset(lpAcc.data, 0), 1000n);
+    assert.equal(netPosOnAsset(new Uint8Array(10), 0), null);
   });
 
-  /** A fake whose op 5 mutates the guard: the first (empty) call opens a round; every listed batch is "cut"; the round closes after `closeAfter` batches. */
-  function w1Rig(o: { opposing: number; batch: number; closeAfter?: number; simErr?: (keys: string[][]) => unknown; dryRun?: boolean; maxTxs?: number; slot?: number; guard?: Partial<GuardOpts> }) {
+  /**
+   * A fake that MODELS `lev_guard_lp_stop`: no live round + stop holds -> the call opens a round, cuts the listed victims that are opposite the LP
+   * and untouched, and if NOTHING was cut it answers 135, which REVERTS the open (no state change). A live round with no victim listed also
+   * answers 135. The round closes after `closeAfter` cutting batches.
+   */
+  function w1Rig(o: { opposing: number; batch: number; closeAfter?: number; simErr?: (keys: string[][]) => unknown; dryRun?: boolean; maxTxs?: number; slot?: number; guard?: Partial<GuardOpts>; lpShort?: boolean }) {
     const w = world({ ...TRIG, ...o.guard });
     const guardKey = w.guardKey.toBase58();
+    const slotNow = o.slot ?? 1000;
     let touched: PublicKey[] = [];
     let batches = 0;
+    const lpSide = o.lpShort ? 1 : 0;
+    const lpAcc = { pubkey: w.lp, data: portfolioBytes({ owner: key(1), legs: [{ side: lpSide, basis: o.lpShort ? -100_000n : 100_000n }] }) };
+    // users opposite the LP: shorts when the LP is long (and vice versa), plus two on the LP's side
+    const opp = Array.from({ length: o.opposing }, (_, i) => acc(i + 1, o.lpShort ? 0 : 1));
+    const portfolios = [lpAcc, ...opp, acc(900, o.lpShort ? 1 : 0), acc(901, o.lpShort ? 1 : 0)];
+    const oppSet = new Set(opp.map((x) => x.pubkey.toBase58()));
+    const cur = () => decodeLevGuardV22(w.accounts.get(guardKey)!.data);
     const rewrite = (p: Partial<GuardOpts>): void => {
-      const cur = decodeLevGuardV22(w.accounts.get(guardKey)!.data);
-      w.accounts.set(guardKey, { owner: PROGRAM, data: guardBytes({ market: w.market, navps: cur.navps, navPeakCur: cur.navPeakCur, navRef: cur.navRef, roundId: cur.roundId, touched, ...p }) });
+      const g = cur();
+      w.accounts.set(guardKey, { owner: PROGRAM, data: guardBytes({ market: w.market, navps: g.navps, navPeakCur: g.navPeakCur, navRef: g.navRef, roundId: g.roundId, touched, ...p }) });
+    };
+    const err = (code: number) => ({ InstructionError: [2, { Custom: code }] });
+    const model = (keys: string[][]): unknown => {
+      const victims = keys[0].slice(6);
+      const g = cur();
+      const live = levW1RoundLiveV22(g, BigInt(slotNow));
+      const touchedSet = new Set(live ? touched.map((t) => t.toBase58()) : []);
+      const cut = victims.filter((v) => oppSet.has(v) && !touchedSet.has(v));
+      if (!live) {
+        if (!levLpStopTriggeredV22(g)) return err(135);
+        if (cut.length === 0) return err(135); // the round open is reverted with the error
+      } else if (victims.length === 0) return err(135);
+      return null;
     };
     const c = levConn({
       accounts: w.accounts,
-      slot: () => o.slot ?? 1000,
-      simErr: o.simErr,
+      slot: () => slotNow,
+      simErr: (keys) => o.simErr?.(keys) ?? model(keys),
       onSend: (data, keys) => {
         if (hex(data) !== "7c05") return;
-        const victims = keys.slice(6);
-        if (victims.length === 0) {
-          rewrite({ roundActive: true, roundLpLong: true, roundId: 1n, roundOpenSlot: 900n, touched: [] });
-          return;
-        }
+        const g = cur();
+        const live = levW1RoundLiveV22(g, BigInt(slotNow));
+        if (!live) touched = [];
+        const victims = keys.slice(6).filter((v) => oppSet.has(v) && !touched.some((t) => t.toBase58() === v));
         batches++;
         touched = [...touched, ...victims.map((v) => new PublicKey(v))];
         if (batches >= (o.closeAfter ?? 99)) rewrite({ roundActive: false, roundId: 1n, touched });
-        else rewrite({ roundActive: true, roundLpLong: true, roundId: 1n, roundOpenSlot: 900n, touched });
+        else rewrite({ roundActive: true, roundLpLong: !o.lpShort, roundId: 1n, roundOpenSlot: BigInt(slotNow) - 100n, touched });
       },
     });
-    const lpAcc = { pubkey: w.lp, data: portfolioBytes({ owner: key(1), legs: [{ side: 0, basis: 100_000n }] }) };
-    const portfolios = [lpAcc, ...Array.from({ length: o.opposing }, (_, i) => acc(i + 1, 1)), acc(900, 0), acc(901, 0)];
     const h = keeperOf(c.conn, cfg({ w1: true, w1BatchSize: o.batch, ...(o.maxTxs ? { w1MaxTxs: o.maxTxs } : {}) }), { dryRun: o.dryRun, loadPortfolios: async () => portfolios });
     return { ...w, c, ...h, lpAcc };
   }
 
-  it("opens the round (empty op 5), then cuts the opposing portfolios in batches of the configured size until round_active is 0; the LP is never listed, nobody twice", async () => {
+  it("K-1: the round-opening op 5 carries the first batch of victims (the program reverts an opening call that cuts nothing); a no-victim call is never sent", async () => {
+    const r = w1Rig({ opposing: 5, batch: 2, closeAfter: 3 });
+    const out = await r.k.w1Once(r.market.toBase58(), "T");
+    assert.match(out, /round closed after 3 tx/);
+    assert.deepEqual(r.c.base.sent.map((t) => t.keys[0].length - 6), [2, 2, 1], "the FIRST call already lists victims");
+    assert.ok(r.c.base.sims.every((x) => x.keys[0].length > 6), "no simulated call without a victim");
+    // negative control: the model really does revert an empty opening call
+    const empty = w1Rig({ opposing: 0, batch: 2 });
+    assert.match(await empty.k.w1Once(empty.market.toBase58(), "T"), /no opposing portfolio to cut \(no call sent\)/);
+    assert.equal(empty.c.base.sims.length, 0, "nothing opposing: no call at all (and never 'nothing to do' concluded from a no-victim call)");
+  });
+
+  it("K-1: the LP side comes from the vault LP's net position: an LP that is SHORT is cut against the long users", async () => {
+    const r = w1Rig({ opposing: 3, batch: 5, closeAfter: 1, lpShort: true });
+    const out = await r.k.w1Once(r.market.toBase58(), "T");
+    assert.match(out, /round (closed|opened and closed)/);
+    assert.equal(r.c.base.sent.length, 1);
+    const listed = r.c.base.sent[0].keys[0].slice(6);
+    assert.deepEqual(listed.sort(), [1, 2, 3].map((n) => user(n).toBase58()).sort());
+  });
+
+  it("opens the round with the first batch, then cuts the opposing portfolios in batches of the configured size until round_active is 0; the LP is never listed, nobody twice", async () => {
     const r = w1Rig({ opposing: 7, batch: 3, closeAfter: 3 });
     const out = await r.k.w1Once(r.market.toBase58(), "T");
     assert.match(out, /round closed after 3 tx/);
     const tx = r.c.base.sent;
-    assert.equal(tx.length, 4, "1 open + 3 batches (3 + 3 + 1)");
+    assert.equal(tx.length, 3, "the opening call is the first batch: 3 + 3 + 1");
     const sizes = tx.map((t) => t.keys[0].length - 6);
-    assert.deepEqual(sizes, [0, 3, 3, 1]);
+    assert.deepEqual(sizes, [3, 3, 1]);
     const seen = new Set<string>();
     for (const t of tx) for (const v of t.keys[0].slice(6)) {
       assert.ok(!seen.has(v), "no portfolio listed twice");
@@ -816,10 +928,11 @@ describe("W1 (KEEPER_LEV_W1)", () => {
   });
 
   it("135 in the middle of a round (the round closed under us) ends the run", async () => {
-    const r = w1Rig({ opposing: 6, batch: 2, simErr: (keys) => (keys[0].length > 6 ? { InstructionError: [2, { Custom: 135 }] } : null) });
+    let calls = 0;
+    const r = w1Rig({ opposing: 6, batch: 2, simErr: () => (++calls >= 2 ? { InstructionError: [2, { Custom: 135 }] } : null) });
     const out = await r.k.w1Once(r.market.toBase58(), "T");
     assert.equal(out, "nothing to do (135)");
-    assert.equal(r.c.base.sent.length, 1, "only the round-opening call was sent");
+    assert.equal(r.c.base.sent.length, 1, "only the first (round-opening) batch was sent");
   });
 
   it("neither stop nor live round: no instruction at all", async () => {
@@ -829,7 +942,7 @@ describe("W1 (KEEPER_LEV_W1)", () => {
     assert.equal(r.k.stats.w1.checks, 1);
   });
 
-  it("a round already live is continued without re-opening (no empty op 5)", async () => {
+  it("a round already live is continued with the guard\'s own LP side (no re-open)", async () => {
     const r = w1Rig({ opposing: 3, batch: 5, closeAfter: 1, guard: { roundActive: true, roundLpLong: true, roundOpenSlot: 900n, roundId: 1n, navps: 1_000_000_000_000n } });
     const out = await r.k.w1Once(r.market.toBase58(), "T");
     assert.match(out, /round closed/);
@@ -847,14 +960,14 @@ describe("W1 (KEEPER_LEV_W1)", () => {
     const limited = w1Rig({ opposing: 20, batch: 2, maxTxs: 3 });
     const out = await limited.k.w1Once(limited.market.toBase58(), "T");
     assert.match(out, /still open after 3 tx\(s\) \(limit\)/);
-    assert.equal(limited.c.base.sent.length, 4);
+    assert.equal(limited.c.base.sent.length, 3);
     const few = w1Rig({ opposing: 2, batch: 5 }); // never closes on its own
     const out2 = await few.k.w1Once(few.market.toBase58(), "T");
     assert.match(out2, /no opposing portfolio left to list/);
-    assert.equal(few.c.base.sent.length, 2, "open + one batch of 2");
+    assert.equal(few.c.base.sent.length, 1, "one batch of 2 (the opening call), then nobody left");
   });
 
-  it("dry-run: the round-opening op 5 is simulated and logged, nothing is sent", async () => {
+  it("dry-run: the round-opening op 5 (with victims) is simulated and logged, nothing is sent", async () => {
     const r = w1Rig({ opposing: 4, batch: 2, dryRun: true });
     const out = await r.k.w1Once(r.market.toBase58(), "T");
     assert.equal(out, "dry-run (would send)");
