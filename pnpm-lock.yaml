@@ -16,6 +16,9 @@ importers:
       '@percolatorct/sdk':
         specifier: github:dcccrypto/percolator-sdk#3a435f004ea66ca1a68e93c36d7ccefb2bd4ba28
         version: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/3a435f004ea66ca1a68e93c36d7ccefb2bd4ba28(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+      '@percolatorct/sdk-lev-guard':
+        specifier: github:dcccrypto/percolator-sdk#f1cada61746e8c4a5670dc1326fc5ee12d799099
+        version: '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/f1cada61746e8c4a5670dc1326fc5ee12d799099(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)'
       '@solana/web3.js':
         specifier: 1.99.0
         version: 1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -193,6 +196,11 @@ packages:
 
   '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/3a435f004ea66ca1a68e93c36d7ccefb2bd4ba28':
     resolution: {tarball: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/3a435f004ea66ca1a68e93c36d7ccefb2bd4ba28}
+    version: 9.0.0-candidate
+    engines: {node: '>=20.0.0'}
+
+  '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/f1cada61746e8c4a5670dc1326fc5ee12d799099':
+    resolution: {tarball: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/f1cada61746e8c4a5670dc1326fc5ee12d799099}
     version: 9.0.0-candidate
     engines: {node: '>=20.0.0'}
 
@@ -627,6 +635,18 @@ snapshots:
   '@noble/hashes@1.8.0': {}
 
   '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/3a435f004ea66ca1a68e93c36d7ccefb2bd4ba28(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
+    dependencies:
+      '@noble/curves': 1.9.7
+      '@solana/spl-token': 0.4.14(@solana/web3.js@1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+      '@solana/web3.js': 1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
+    transitivePeerDependencies:
+      - bufferutil
+      - encoding
+      - fastestsmallesttextencoderdecoder
+      - typescript
+      - utf-8-validate
+
+  '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/f1cada61746e8c4a5670dc1326fc5ee12d799099(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
       '@noble/curves': 1.9.7
       '@solana/spl-token': 0.4.14(@solana/web3.js@1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
