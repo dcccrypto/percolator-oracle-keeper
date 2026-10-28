@@ -21,7 +21,8 @@ import {
   levLpStopTriggeredV22,
   levW1RoundLiveV22,
   decodeLevGuardV22,
-} from "./lev-sdk.ts";
+  levKeyTagV22,
+} from "@percolatorct/sdk";
 import {
   BPS_MAX,
   INCINERATOR,
@@ -334,10 +335,11 @@ describe("report fields", () => {
 });
 
 describe("touched tag", () => {
-  it("keyTagOf is the first 8 bytes of the key, LE, for pooled and unpooled buffers (the SDK's levKeyTagV22 is wrong for pooled ones)", () => {
+  it("keyTagOf is the first 8 bytes of the key, LE, for pooled and unpooled buffers and equals the SDK's fixed levKeyTagV22", () => {
     for (let i = 0; i < 20; i++) {
       const k = Keypair.generate().publicKey;
       assert.equal(keyTagOf(k), Buffer.from(k.toBase58() ? k.toBuffer() : []).readBigUInt64LE(0));
+      assert.equal(keyTagOf(k), levKeyTagV22(k));
       assert.equal(keyTagOf(k), new DataView(Uint8Array.from(k.toBuffer()).buffer).getBigUint64(0, true));
     }
     assert.notEqual(keyTagOf(key(2001)), keyTagOf(key(2002)));

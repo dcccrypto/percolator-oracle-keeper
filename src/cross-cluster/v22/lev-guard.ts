@@ -25,8 +25,8 @@
 import { Keypair, PublicKey } from "@solana/web3.js";
 import type { Connection } from "@solana/web3.js";
 import * as fs from "node:fs";
-import { deriveDepthSourceV22 } from "@percolatorct/sdk";
 import {
+  deriveDepthSourceV22,
   buildLevGuardLpStopIxV22,
   buildLevGuardPokeIxV22,
   buildLevGuardReportIxV22,
@@ -37,8 +37,8 @@ import {
   levLpStopTriggeredV22,
   levW1RoundLiveV22,
   LEV_SLOTS_PER_DAY_V22,
-} from "./lev-sdk.ts";
-import type { LevGuardV22 } from "./lev-sdk.ts";
+} from "@percolatorct/sdk";
+import type { LevGuardV22 } from "@percolatorct/sdk";
 import { STAKE_PROGRAM_ID } from "../../program-ids.ts";
 import { fetchMarketPortfolios } from "../recovery-cranker.ts";
 import { detectLayout } from "../market-layout.ts";
@@ -191,8 +191,8 @@ const GUARD_RECHECK_MS = 600_000;
 const VAULT_LP_TTL_MS = 600_000;
 
 /**
- * The tag the program stores for a cut portfolio: the first 8 bytes of its key as a LE u64. Local on purpose: the SDK's `levKeyTagV22` (f1cada61)
- * ignores the byteOffset of the pooled buffer `PublicKey.toBytes()` returns and yields the wrong number (see lev-sdk.ts).
+ * The tag the program stores for a cut portfolio: the first 8 bytes of its key as a LE u64. Kept local (the SDK's `levKeyTagV22` is fixed at 7aeb7a13;
+ * a test pins the two to each other).
  */
 export function keyTagOf(k: PublicKey): bigint {
   const b = k.toBytes();
