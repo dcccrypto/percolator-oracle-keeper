@@ -28,6 +28,9 @@ interface Host {
   noBlockTime?: boolean;
   slotFn?: (nowMs: number) => number; // exact slot as a function of the clock
   frozen?: boolean; // slot does not advance with the clock (a stuck node)
+  /** getLatestBlockhash answers with a context slot this far behind the host's own getSlot (2026-10-29 Helius). */
+  bhLag?: number;
+  callStatus?: number; // HTTP status for real calls only; probes (genesis/slot/block time) succeed
 }
 
 /** Scripted transport keyed by URL. Records every (url, method) it sees. */
@@ -43,6 +46,11 @@ function makeNet(hosts: Record<string, Host>, nowMs: () => number = () => 1_000_
     if (method === "getBlockTime") {
       if (h.noBlockTime) return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32004, message: "Block not available" } }), { status: 200 });
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: Math.floor(nowMs() / 1000) - (h.blockAgeSec ?? 8) }), { status: 200 });
+    }
+    if (h.callStatus && method !== "getGenesisHash" && method !== "getSlot" && method !== "getBlockTime") return new Response("Internal server error", { status: h.callStatus });
+    if (method === "getLatestBlockhash" && h.bhLag !== undefined && (h.status ?? 200) === 200) {
+      const slot = (h.slot ?? 1000) + Math.floor(((nowMs() - 1_000_000) * 2.5) / 1000) - h.bhLag;
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { context: { slot }, value: { blockhash: `bh:${url}`, lastValidBlockHeight: slot + 150 } } }), { status: 200 });
     }
     if (method === "getGenesisHash" || method === "getSlot") {
       if (h.status && h.status !== 200) return new Response(h.body ?? "x", { status: h.status });
@@ -713,5 +721,75 @@ describe("rpc-failover: R153 round 5 (block-time overturn is primary-only; clock
     await call(f).catch(() => undefined);
     await new Promise((r) => setTimeout(r, 10));
     assert.ok(f.snapshot().endpoints[0].state === "ok" || logs.some((l) => /primary rejected as lagging|overturned/.test(l)));
+  });
+});
+
+// 2026-10-29 17:49Z: Helius devnet (every key) answered getLatestBlockhash with ONE frozen blockhash at context slot
+// 516,495,267 while its getSlot was current (516,499,0xx), i.e. ~3,800 slots stale and past lastValidBlockHeight. HTTP 200,
+// so nothing failed over: every push, crank and fee tx was signed with a dead blockhash, dropped, and the v2.2 board
+// stopped updating. getSlot-based freshness cannot see this; the blockhash reply's own context slot can.
+describe("rpc-failover: stale getLatestBlockhash (2026-10-29)", () => {
+  const blockhash = (f: RpcFailover, commitment = "processed") =>
+    f.fetch(P, { method: "POST", body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getLatestBlockhash", params: [{ commitment }] }) });
+  const bhOf = async (r: Response) => ((await r.json()) as { result: { value: { blockhash: string } } }).result.value.blockhash;
+
+  it("a primary whose blockhash is far behind its own slot: the blockhash comes from the fallback, reads stay on the primary", async () => {
+    const { f, logs } = mk({ [P]: { bhLag: 3_800 }, [F1]: { bhLag: 2 } }, [P, F1]);
+    assert.equal(await bhOf(await blockhash(f)), `bh:${F1}`);
+    assert.equal(await who(await call(f)), `ok:${P}`, "only blockhash requests leave the primary");
+    const s = f.snapshot();
+    assert.equal(s.activeIndex, 0);
+    assert.equal(s.status, "rpc-degraded");
+    assert.equal(s.reason, "stale-blockhash");
+    assert.equal(s.endpoints[0].blockhashStale, true);
+    assert.ok(logs.some((l) => /\[ALERT\].*stale blockhash.*#0.*3800 slots behind/.test(l)), logs.join("\n"));
+    assert.ok(!logs.join("\n").includes(SECRET));
+  });
+
+  it("a blockhash within the allowance is served by the primary (normal processed/confirmed/finalized lag)", async () => {
+    const { f, logs } = mk({ [P]: { bhLag: 40 }, [F1]: { bhLag: 0 } }, [P, F1]);
+    for (const c of ["processed", "confirmed", "finalized"]) assert.equal(await bhOf(await blockhash(f, c)), `bh:${P}`);
+    assert.equal(f.snapshot().status, "ok");
+    assert.equal(f.snapshot().endpoints[0].blockhashStale, false);
+    assert.ok(!logs.some((l) => /stale blockhash/.test(l)));
+  });
+
+  it("every endpoint stale: fails fast with rpc-degraded instead of handing out a dead blockhash", async () => {
+    const { f } = mk({ [P]: { bhLag: 3_800 }, [F1]: { bhLag: 3_800 } }, [P, F1]);
+    await assert.rejects(blockhash(f), /rpc-degraded: no devnet RPC endpoint is serving a fresh blockhash/);
+  });
+
+  it("the stale endpoint is retried after its cooldown and cleared (logged) once its blockhash is fresh again", async () => {
+    const { f, net, tick, logs } = mk({ [P]: { bhLag: 3_800 }, [F1]: { bhLag: 0 } }, [P, F1], { backoffBaseMs: 2_000 });
+    assert.equal(await bhOf(await blockhash(f)), `bh:${F1}`);
+    tick(1_000);
+    assert.equal(await bhOf(await blockhash(f)), `bh:${F1}`, "inside the cooldown the primary is not asked");
+    net.hosts[P] = { bhLag: 1 };
+    tick(2_000);
+    assert.equal(await bhOf(await blockhash(f)), `bh:${P}`);
+    assert.equal(f.snapshot().endpoints[0].blockhashStale, false);
+    assert.equal(f.snapshot().status, "ok");
+    assert.ok(logs.some((l) => /blockhash fresh again/.test(l)));
+  });
+
+  it("a stale blockhash never moves the active endpoint (sends keep their endpoint)", async () => {
+    const { f, net } = mk({ [P]: { bhLag: 3_800 }, [F1]: { bhLag: 0 } }, [P, F1]);
+    await blockhash(f);
+    await call(f, "sendTransaction");
+    assert.ok(net.calls.some((c) => c.url === P && c.method === "sendTransaction"));
+    assert.equal(f.snapshot().switches, 0);
+  });
+});
+
+// 2026-10-16 22:10-22:45Z: Helius devnet answered HTTP 500 "Internal server error" for 35 min; pushes stopped. 500 was not a
+// failover status (only 429 / 502-504 / network errors were).
+describe("rpc-failover: HTTP 500 (2026-10-16)", () => {
+  it("a 500 on the primary is served by the fallback, which becomes active (same as 502-504)", async () => {
+    const { f, net } = mk({ [P]: { callStatus: 500 }, [F1]: {} }, [P, F1]);
+    assert.equal(await who(await call(f)), `ok:${F1}`);
+    assert.equal(net.calls.filter((c) => c.url === P && c.method === "getBalance").length, 1, "the primary was really tried");
+    assert.equal(f.snapshot().activeIndex, 1);
+    assert.equal(f.snapshot().reason, "on-fallback");
+    assert.equal(await who(await call(f)), `ok:${F1}`);
   });
 });

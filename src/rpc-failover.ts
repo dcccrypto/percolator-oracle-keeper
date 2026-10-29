@@ -8,7 +8,7 @@
  * HOW: web3.js funnels every request (reads, simulate, sendRawTransaction, confirmation polling) through the
  * `fetch` given to `new Connection(url, { fetch })`. `createRpcFailover(...).fetch` is such a fetch: it rewrites
  * the request URL to the currently active endpoint and fails over down an ordered list on 429 / "max usage
- * reached" / 502-504 / repeated network errors. Because it sits at that seam it covers reads AND sends, and any
+ * reached" / 500 / 502-504 / repeated network errors. Because it sits at that seam it covers reads AND sends, and any
  * Connection built with it (the keeper's, the pusher's, the preflight's).
  *
  * SAFETY, per endpoint, before it is ever used (and again after each outage):
@@ -17,6 +17,13 @@
  *  - freshness: `getSlot` is compared with the best recently seen slot across endpoints (projected forward by
  *    elapsed time). An endpoint lagging more than `maxSlotLag` (default 50) is treated as down. Re-checked
  *    every `slotCheckIntervalMs` while in use.
+ *  - blockhash freshness: a `getLatestBlockhash` reply whose own `context.slot` is more than `maxBlockhashLag`
+ *    (default 75) behind the best known slot is NOT handed out. On 2026-10-29 17:49Z Helius devnet (every key)
+ *    served one frozen blockhash ~3,800 slots old while its getSlot was current: HTTP 200, so nothing failed over,
+ *    and every push / crank / fee tx was signed with a dead blockhash and dropped. That endpoint is skipped for
+ *    blockhash requests only (its reads and sends stay where they are) on an exponential cooldown, re-tried after
+ *    it, and `/health` says `rpc-degraded` / `stale-blockhash` meanwhile. No fresh blockhash anywhere = a
+ *    `rpc-degraded` error, never a dead blockhash.
  *
  * RECOVERY: the primary is re-probed in the background (exponential cooldown, `primaryRetryMs` floor) and
  * becomes active again as soon as it passes the same checks.
@@ -127,6 +134,9 @@ export interface RpcFailoverOptions {
   /** Override for tests / other clusters; defaults to GENESIS_HASH[cluster]. */
   expectedGenesis?: string;
   maxSlotLag?: number; // default 50
+  /** A getLatestBlockhash reply served more than this many slots behind the best known slot is refused. Default 75
+   *  (a blockhash lives ~150 blocks; this keeps at least half of that, and admits a normal `finalized` lag). */
+  maxBlockhashLag?: number;
   slotCheckIntervalMs?: number; // default 10_000
   primaryRetryMs?: number; // default 30_000
   backoffBaseMs?: number; // default 2_000
@@ -176,12 +186,17 @@ interface Endpoint {
   slotAt: number;
   lastVetAt: number;
   vetting: Promise<boolean> | null;
+  /** Stale-blockhash state (see the header): skip for getLatestBlockhash until this time. */
+  bhStale: boolean;
+  bhStaleUntil: number;
+  bhBackoffExp: number;
+  bhLag: number | null;
 }
 
 export interface RpcFailoverSnapshot {
   cluster: FailoverCluster;
   status: "ok" | "rpc-degraded";
-  reason: "primary-active" | "on-fallback" | "all-endpoints-down";
+  reason: "primary-active" | "on-fallback" | "all-endpoints-down" | "stale-blockhash";
   active: string; // redacted
   activeIndex: number;
   endpoints: Array<{
@@ -195,6 +210,10 @@ export interface RpcFailoverSnapshot {
     lastError: string | null;
     slot: number | null;
     slotLag: number | null;
+    /** Its last getLatestBlockhash reply was stale; skipped for blockhashes until `blockhashRetryInMs`. */
+    blockhashStale: boolean;
+    blockhashRetryInMs: number;
+    blockhashLagSlots: number | null;
   }>;
   floorSlot: number | null; // highest accepted slot (public chain data)
   switches: number;
@@ -209,6 +228,7 @@ export class RpcFailover {
     Pick<
       RpcFailoverOptions,
       | "maxSlotLag"
+      | "maxBlockhashLag"
       | "slotCheckIntervalMs"
       | "primaryRetryMs"
       | "backoffBaseMs"
@@ -258,6 +278,7 @@ export class RpcFailover {
     this.expectedGenesis = opts.expectedGenesis ?? GENESIS_HASH[opts.cluster];
     this.cfg = {
       maxSlotLag: opts.maxSlotLag ?? 50,
+      maxBlockhashLag: opts.maxBlockhashLag ?? 75,
       slotCheckIntervalMs: opts.slotCheckIntervalMs ?? 10_000,
       primaryRetryMs: opts.primaryRetryMs ?? 30_000,
       backoffBaseMs: opts.backoffBaseMs ?? 2_000,
@@ -293,6 +314,10 @@ export class RpcFailover {
       slotAt: 0,
       lastVetAt: 0,
       vetting: null,
+      bhStale: false,
+      bhStaleUntil: 0,
+      bhBackoffExp: 0,
+      bhLag: null,
     }));
   }
 
@@ -714,11 +739,62 @@ export class RpcFailover {
     return (status === 402 || status === 403) && /max usage reached|rate limit|quota/i.test(body);
   }
 
+  /** Best slot known now: the freshest (<60 s) observation of any genesis-verified, confirmed endpoint, projected forward. */
+  private bestKnownSlot(): number | null {
+    const t = this.now();
+    let best: number | null = null;
+    for (const o of this.eps) {
+      if (o.slot === null || o.refused || !o.genesisOk || !o.confirmed) continue;
+      const age = t - o.slotAt;
+      if (age > 60_000) continue;
+      const projected = o.slot + Math.floor((age / 1000) * this.cfg.slotsPerSecond);
+      if (best === null || projected > best) best = projected;
+    }
+    return best;
+  }
+
+  /** Slots a getLatestBlockhash reply is behind the best known slot, or null when it cannot be judged. */
+  private async blockhashLag(res: Response): Promise<number | null> {
+    const best = this.bestKnownSlot();
+    if (best === null) return null;
+    try {
+      const j = (await res.clone().json()) as { result?: { context?: { slot?: unknown } } };
+      const slot = j.result?.context?.slot;
+      return typeof slot === "number" && Number.isFinite(slot) ? best - slot : null;
+    } catch {
+      return null; // not JSON / an RPC error body: web3.js reports it; nothing to judge
+    }
+  }
+
+  private markBlockhashStale(ep: Endpoint, lag: number): void {
+    const t = this.now();
+    const wait = Math.min(this.cfg.backoffMaxMs, this.cfg.backoffBaseMs * 2 ** ep.bhBackoffExp);
+    ep.bhBackoffExp = Math.min(ep.bhBackoffExp + 1, 30);
+    ep.bhStaleUntil = t + wait;
+    ep.bhLag = lag;
+    if (!ep.bhStale) {
+      this.logLine(
+        `[ALERT] stale blockhash from endpoint #${ep.idx} ${ep.label}: getLatestBlockhash served ${lag} slots behind the best known slot ` +
+          `(max ${this.cfg.maxBlockhashLag}); every tx signed with it would be dropped. Blockhashes come from the other endpoints; retry in ${Math.round(wait / 1000)}s`,
+      );
+    }
+    ep.bhStale = true;
+  }
+
+  private markBlockhashFresh(ep: Endpoint, lag: number | null): void {
+    if (ep.bhStale) this.logLine(`endpoint #${ep.idx} ${ep.label}: blockhash fresh again${lag === null ? "" : ` (${lag} slots behind)`}`);
+    ep.bhStale = false;
+    ep.bhStaleUntil = 0;
+    ep.bhBackoffExp = 0;
+    ep.bhLag = lag;
+  }
+
   private async doFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
     this.maybeProbePrimary();
     const body0 = typeof init?.body === "string" ? init.body : "";
     const isWrite = /"method"\s*:\s*"(sendTransaction|requestAirdrop)"/.test(body0);
     const isStatusPoll = /"method"\s*:\s*"(getSignatureStatuses|getSignatureStatus|getTransaction|isBlockhashValid|getBlockHeight)"/.test(body0);
+    const isBlockhash = /"method"\s*:\s*"getLatestBlockhash"/.test(body0);
     const t0 = this.now();
     // F4: confirmation/status polls follow the endpoint that took the send (a different node may not know the signature yet).
     const first = isStatusPoll && this.pin && t0 < this.pin.until ? this.pin.idx : this.active;
@@ -727,7 +803,12 @@ export class RpcFailover {
     const activeAtStart = this.active;
     let lastRes: Response | null = null;
     let lastErr: unknown = null;
+    let staleBlockhash = false;
     for (const ep of order) {
+      if (isBlockhash && ep.bhStale && this.now() < ep.bhStaleUntil) {
+        staleBlockhash = true;
+        continue;
+      }
       if (!(await this.usable(ep))) continue;
       if (isWrite && !ep.confirmed) {
         skippedUnconfirmed = true; // F1: never send through an endpoint whose freshness could not be established
@@ -761,18 +842,32 @@ export class RpcFailover {
         this.authFail(ep, `HTTP ${res.status}`);
         continue;
       }
-      if (res.status >= 502 && res.status <= 504) {
+      // 500 too: 2026-10-16 22:10-22:45Z Helius devnet answered "500 Internal server error" for 35 min (JSON-RPC errors are 200).
+      if (res.status === 500 || (res.status >= 502 && res.status <= 504)) {
         lastRes = res;
         if (++ep.consecutiveFailures >= this.cfg.networkErrorThreshold) this.markDown(ep, `HTTP ${res.status}`);
         continue;
       }
       ep.consecutiveFailures = 0;
+      if (isBlockhash && res.status === 200) {
+        const lag = await this.blockhashLag(res);
+        if (lag !== null && lag > this.cfg.maxBlockhashLag) {
+          this.markBlockhashStale(ep, lag);
+          staleBlockhash = true;
+          continue; // a dead blockhash is worse than none: try the next endpoint, never move `active` for it
+        }
+        this.markBlockhashFresh(ep, lag);
+      }
       this.allDownSince = null;
       if (isWrite) this.pin = { idx: ep.idx, until: this.now() + this.cfg.pinMs };
-      const pinnedServe = isStatusPoll && ep.idx === first && first !== this.active;
+      // A blockhash served elsewhere because the active endpoint's was stale does not move `active` (its reads/sends are fine).
+      const pinnedServe = (isStatusPoll && ep.idx === first && first !== this.active) || (isBlockhash && this.eps[this.active].bhStale && ep.idx !== this.active);
       // Only the request that saw the current active endpoint fail may move it (a concurrent primary recovery wins).
       if (!pinnedServe && this.active === activeAtStart) this.setActive(ep, ep.idx === 0 ? "primary serving" : `failover from #${this.active}`);
       return res;
+    }
+    if (isBlockhash && staleBlockhash) {
+      throw new Error(`rpc-degraded: no ${this.cluster} RPC endpoint is serving a fresh blockhash (stale beyond ${this.cfg.maxBlockhashLag} slots); not signing with a dead one`);
     }
     // Nothing answered: fail loudly but rate-limited, never crash.
     const t = this.now();
@@ -804,10 +899,11 @@ export class RpcFailover {
     const t = this.now();
     const allDown = this.isAllDown();
     const bestAll = Math.max(-1, ...this.eps.filter((e) => e.slot !== null && !e.refused).map((e) => (e.slot as number) + Math.floor(((t - e.slotAt) / 1000) * this.cfg.slotsPerSecond)));
+    const activeBhStale = this.eps[this.active].bhStale;
     return {
       cluster: this.cluster,
-      status: allDown || this.active !== 0 ? "rpc-degraded" : "ok",
-      reason: allDown ? "all-endpoints-down" : this.active !== 0 ? "on-fallback" : "primary-active",
+      status: allDown || this.active !== 0 || activeBhStale ? "rpc-degraded" : "ok",
+      reason: allDown ? "all-endpoints-down" : this.active !== 0 ? "on-fallback" : activeBhStale ? "stale-blockhash" : "primary-active",
       active: this.eps[this.active].label,
       activeIndex: this.active,
       endpoints: this.eps.map((e) => ({
@@ -821,6 +917,9 @@ export class RpcFailover {
         lastError: e.lastError,
         slot: e.slot,
         slotLag: e.slot !== null && bestAll >= 0 ? Math.max(0, bestAll - (e.slot + Math.floor(((t - e.slotAt) / 1000) * this.cfg.slotsPerSecond))) : null,
+        blockhashStale: e.bhStale,
+        blockhashRetryInMs: e.bhStale ? Math.max(0, e.bhStaleUntil - t) : 0,
+        blockhashLagSlots: e.bhLag,
       })),
       floorSlot: this.floorSlot,
       switches: this.switches,
@@ -874,6 +973,7 @@ export function failoverFromEnv(
     urls: [primaryUrl, ...fallbacks],
     base,
     maxSlotLag: envNumber(env.RPC_MAX_SLOT_LAG, 50),
+    maxBlockhashLag: envNumber(env.RPC_MAX_BLOCKHASH_LAG, 75),
     slotCheckIntervalMs: envNumber(env.RPC_SLOT_CHECK_MS, 10_000),
     primaryRetryMs: envNumber(env.RPC_PRIMARY_RETRY_MS, 30_000),
     backoffBaseMs: envNumber(env.RPC_BACKOFF_BASE_MS, 2_000),
