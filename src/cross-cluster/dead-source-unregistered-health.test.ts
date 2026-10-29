@@ -5,7 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_THRESHOLDS, evaluateMarketPush, thresholdsFromEnv, type MarketPushSample } from "./alerting.ts";
-import { makeHealthHandler, marketPushSample, newMarketStat, recordRawPrice } from "./keeper-loop.ts";
+import { makeHealthHandler, marketPushSample, newMarketStat, noteDepthAttempt, recordRawPrice } from "./keeper-loop.ts";
 import { createWalletBalanceState } from "./wallet-balance-guard.ts";
 
 const T = DEFAULT_THRESHOLDS;
@@ -120,5 +120,31 @@ describe("/health surfaces both", () => {
     assert.equal(h.status, "ok");
     assert.equal("sourceFrozenMarkets" in h, false);
     assert.equal("unregisteredMarkets" in h, false);
+  });
+});
+
+describe("#174 gap 3: 'could not read the reserve' is visible, not a silent 35 B push", () => {
+  it("a constant-product market that keeps sending no depth while depth push is on raises depth-unavailable after the window; any depth clears it", () => {
+    const stat = newMarketStat({ label: "CPMM", marketAddress: "C", poolAddress: "p", dexType: "pumpswap" });
+    noteDepthAttempt(stat, true, false, NOW - T.depthAbsentMs - 1);
+    noteDepthAttempt(stat, true, false, NOW - 1_000); // still absent: the clock does not restart
+    const r = evaluateMarketPush(marketPushSample(stat, false), T, NOW);
+    assert.equal(r.status, "ok", "advisory: the consequence is paged by the v22 depth-capacity alert");
+    assert.deepEqual(r.active.map((a) => [a.kind, a.severity]), [["depth-unavailable", "warn"]]);
+    noteDepthAttempt(stat, true, true, NOW);
+    assert.deepEqual(evaluateMarketPush(marketPushSample(stat, false), T, NOW).active, []);
+  });
+
+  it("not expected (flag off / non-CPMM venue) never starts the clock; under the window nothing fires", () => {
+    const stat = newMarketStat({ label: "DLMM", marketAddress: "D", poolAddress: "p", dexType: "meteora-dlmm" });
+    noteDepthAttempt(stat, false, false, NOW - 10 * T.depthAbsentMs);
+    assert.equal(stat.depthAbsentSince, null);
+    noteDepthAttempt(stat, true, false, NOW - T.depthAbsentMs + 1);
+    assert.deepEqual(evaluateMarketPush(marketPushSample(stat, false), T, NOW).active, []);
+  });
+
+  it("ALERT_DEPTH_ABSENT_MS is configurable and rejects garbage", () => {
+    assert.equal(thresholdsFromEnv({ ALERT_DEPTH_ABSENT_MS: "60000" }).depthAbsentMs, 60_000);
+    assert.throws(() => thresholdsFromEnv({ ALERT_DEPTH_ABSENT_MS: "-1" }));
   });
 });

@@ -159,6 +159,8 @@ interface MarketStat {
   lastDepthE6: bigint | null;
   /** G8: where that depth came from (null when lastDepthE6 is null). */
   lastDepthSource: string | null;
+  /** #174: unix ms since which a constant-product market sent no depth with depth push on (null = it sent one, or none expected). */
+  depthAbsentSince: number | null;
 }
 
 /**
@@ -197,6 +199,7 @@ export function newMarketStat(m: {
     lastRawPriceE6: 0n,
     lastDepthE6: null,
     lastDepthSource: null,
+    depthAbsentSince: null,
   };
 }
 
@@ -215,6 +218,19 @@ export function recordRawPrice(
     stat.sourceUnchangedSince = nowMs;
     stat.lastRawPriceE6 = rawPriceE6;
   }
+}
+
+/**
+ * #174: track how long a market that SHOULD attest depth (KEEPER_PUSH_DEPTH on, constant-product venue) has gone without one. The depth
+ * is null for "the venue has no liquidity" and for "the reserve could not be read this cycle" alike; either way the on-chain sticky cap
+ * is halving, so the run is surfaced (depth-unavailable) instead of being an invisible 35 B push.
+ */
+export function noteDepthAttempt(stat: Pick<MarketStat, "depthAbsentSince">, expected: boolean, got: boolean, nowMs: number): void {
+  if (!expected || got) {
+    stat.depthAbsentSince = null;
+    return;
+  }
+  if (stat.depthAbsentSince === null) stat.depthAbsentSince = nowMs;
 }
 
 /**
@@ -698,6 +714,7 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
         lastError: terminalStatus ? null : stat.lastErrorMsg,
         depthE6: stat.lastDepthE6 === null ? null : stat.lastDepthE6.toString(),
         depthSource: stat.lastDepthSource,
+        ...(stat.depthAbsentSince !== null ? { depthAbsentFor: `${Math.floor((nowMs - stat.depthAbsentSince) / 1000)}s` } : {}),
         ...crankHealthFields(getCrankRefreshHealth(addr)),
       };
     }
@@ -1462,6 +1479,7 @@ async function runCycle(
     if (publish.priceE6 !== priceE6) smoothedE12 = null;
     // G8: flag off / non-CPMM / reserve unknown -> null -> the exact 35 B bytes of today.
     const depth = resolvePushDepth(pushDepthOn, attestReservesUsdE6.get(entry.poolAddress));
+    noteDepthAttempt(stat, pushDepthOn && entry.dexType === "pumpswap", depth !== null, smoothNowMs);
     if (depth) attestedDepthPools.set(entry.key, entry.poolAddress);
     pushes.push({
       key: entry.key,
@@ -1792,6 +1810,7 @@ export function marketPushSample(stat: MarketStat, terminal: boolean, unregister
     sourceUnchangedSince: stat.sourceUnchangedSince,
     terminal,
     unregistered,
+    depthAbsentSince: stat.depthAbsentSince,
   };
 }
 

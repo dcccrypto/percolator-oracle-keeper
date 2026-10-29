@@ -69,6 +69,8 @@ export type AlertKind =
   | "mark-lagging"
   | "source-frozen"
   | "market-unregistered"
+  | "depth-cap-zero"
+  | "depth-unavailable"
   | "lapsed-bucket"
   | "bankrupt-unliquidated"
   | "fee-leg-blocked"
@@ -150,6 +152,11 @@ export interface AlertThresholds {
    */
   sourceDeadMs: number;
   /**
+   * #174: ms a constant-product market may keep sending NO depth while KEEPER_PUSH_DEPTH is on (unreadable reserve / no SOL-USD rate this
+   * cycle) before depth-unavailable fires. Each hour without a reading halves the on-chain sticky depth cap.
+   */
+  depthAbsentMs: number;
+  /**
    * R3.24: alert when a LIVE band market's pin is within this many slots of `band_max_pin_slots` (BandPinExpired
    * resolves it at that point, by anyone's crank). Default 4,500 = half the default Pmax of 9,000.
    */
@@ -172,6 +179,7 @@ export const DEFAULT_THRESHOLDS: AlertThresholds = {
   markLagPct: 10,
   sourceFrozenMs: 2 * 3_600_000,
   sourceDeadMs: 6 * 3_600_000,
+  depthAbsentMs: 30 * 60_000,
   bandPinExpirySlots: 4_500,
 };
 
@@ -205,6 +213,7 @@ export function thresholdsFromEnv(env: Env): AlertThresholds {
     markLagPct: envInt(env, "ALERT_MARK_LAG_PCT", DEFAULT_THRESHOLDS.markLagPct),
     sourceFrozenMs: envInt(env, "ALERT_SOURCE_FROZEN_MS", DEFAULT_THRESHOLDS.sourceFrozenMs),
     sourceDeadMs: envInt(env, "ALERT_SOURCE_DEAD_MS", DEFAULT_THRESHOLDS.sourceDeadMs),
+    depthAbsentMs: envInt(env, "ALERT_DEPTH_ABSENT_MS", DEFAULT_THRESHOLDS.depthAbsentMs),
     bandPinExpirySlots: envInt(env, "ALERT_BAND_PIN_EXPIRY_SLOTS", DEFAULT_THRESHOLDS.bandPinExpirySlots),
   };
   if (t.slotLagCritical < t.slotLagWarn) {
@@ -532,6 +541,8 @@ export interface MarketPushSample {
    * status with a critical alert. Absent = false.
    */
   unregistered?: boolean;
+  /** #174: unix ms since which this market (depth push on, constant-product venue) has sent no depth; null = it sent one / none expected. */
+  depthAbsentSince?: number | null;
 }
 
 export type MarketPushStatus = "ok" | "no-push" | "mark-lagging" | "source-frozen" | "unregistered";
@@ -607,6 +618,18 @@ export function evaluateMarketPush(
         `the pool price has not changed for ${mins} min — the pool may be dead or its active bin never moves; ` +
         "the keeper keeps republishing it as a fresh mark",
       data: { market: s.market, unchangedMinutes: mins },
+    });
+  }
+  if (s.depthAbsentSince != null && nowMs - s.depthAbsentSince >= t.depthAbsentMs) {
+    const mins = Math.floor((nowMs - s.depthAbsentSince) / 60_000);
+    active.push({
+      kind: "depth-unavailable",
+      severity: "warn",
+      subject: s.label,
+      message:
+        `no depth has been attested for ${mins} min although KEEPER_PUSH_DEPTH is on and this is a constant-product pool (reserve unreadable, no SOL/USD rate, or a drained pool): ` +
+        "the market is pushed as a 35-byte mark, so its on-chain sticky depth cap halves every hour and, once it reaches 0, opens close (see depth-cap-zero)",
+      data: { market: s.market, absentMinutes: mins },
     });
   }
   return { status, active };
