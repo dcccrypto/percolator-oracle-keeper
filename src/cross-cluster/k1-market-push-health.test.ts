@@ -116,7 +116,7 @@ describe("K-3 source frozen (WIF/KMNO shape)", () => {
     recordRawPrice(stat, 250_800n, NOW - T.sourceFrozenMs - 1);
     recordRawPrice(stat, 250_800n, NOW - 1_000); // same price again: the clock does not restart
     const r = evaluateMarketPush(marketPushSample(stat, false), T, NOW);
-    assert.equal(r.status, "ok");
+    assert.equal(r.status, "source-frozen");
     assert.deepEqual(r.active.map((a) => a.kind), ["source-frozen"]);
     assert.equal(r.active[0].severity, "warn");
     recordRawPrice(stat, 250_801n, NOW); // any change restarts it
