@@ -121,7 +121,7 @@ import { fetchMarketPortfolios } from "./cross-cluster/recovery-cranker.ts";
 import { v22FlagsFromEnv, describeV22Flags } from "./cross-cluster/v22/flags.ts";
 import { V22Loop, startV22Loop } from "./cross-cluster/v22/loop.ts";
 import { setLoneLpCrankSuppressor } from "./cross-cluster/v22/delegation.ts";
-import { LevGuardKeeper, levGuardConfigFromEnv, levGuardEnabled, loadRiskKey } from "./cross-cluster/v22/lev-guard.ts";
+import { LevGuardKeeper, levGuardConfigFromEnv, levGuardDryRunDecision, levGuardEnabled, loadRiskKey } from "./cross-cluster/v22/lev-guard.ts";
 import { setLevGuardHealthProvider } from "./cross-cluster/v22/health.ts";
 import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
 import { failoverFromEnv, parseFallbackUrls } from "./rpc-failover.ts";
@@ -508,6 +508,8 @@ if (V22_FLAGS.enabled) {
 // (KEEPER_LEV_HOLDER_JOB, optional KEEPER_LEV_RISK_KEY_PATH) and the W1 LP-stop cranker (KEEPER_LEV_W1). All default OFF; with all of them off nothing
 // is constructed, no instruction is built and /health gains no key. See cross-cluster/v22/lev-guard.ts.
 const LEV_GUARD_CONFIG = levGuardConfigFromEnv();
+// GH#226: fail-safe dry-run decision for this subsystem (see levGuardDryRunDecision); never throws (N-6).
+const LEV_GUARD_DRY = levGuardDryRunDecision(process.env, DRY_RUN, V22_FLAGS, LEV_GUARD_CONFIG);
 function loadRiskKeyOrExit(path: string): Keypair | null {
   try {
     return loadRiskKey(path);
@@ -521,27 +523,21 @@ const levGuard = levGuardEnabled(LEV_GUARD_CONFIG)
       conn: devnetConn,
       keeper,
       programId: CFG_WRAPPER_PROGRAM_ID,
-      dryRun: DRY_RUN || V22_FLAGS.dryRun || LEV_GUARD_CONFIG.dryRun,
+      dryRun: LEV_GUARD_DRY.dryRun,
       config: LEV_GUARD_CONFIG,
       riskKey: LEV_GUARD_CONFIG.holderJob && LEV_GUARD_CONFIG.riskKeyPath ? loadRiskKeyOrExit(LEV_GUARD_CONFIG.riskKeyPath) : null,
     })
   : null;
 if (levGuard) {
   setLevGuardHealthProvider(() => levGuard.healthFields());
-  const levDryRun = DRY_RUN || V22_FLAGS.dryRun || LEV_GUARD_CONFIG.dryRun;
+  const levDryRun = LEV_GUARD_DRY.dryRun;
   // GH#226: state the mode positively. It used to be the ABSENCE of a "(DRY-RUN)" suffix that meant
   // live, and an absent parenthetical is not something an operator notices.
   console.log(
     `[lev-guard] ON mode=${levDryRun ? "DRY-RUN (simulate and log, send nothing)" : "LIVE (sends real transactions)"} poke=${LEV_GUARD_CONFIG.poke} holderJob=${LEV_GUARD_CONFIG.holderJob} w1=${LEV_GUARD_CONFIG.w1} riskKey=${!!(LEV_GUARD_CONFIG.holderJob && LEV_GUARD_CONFIG.riskKeyPath)}`,
   );
-  // GH#226: the trap this fixes. KEEPER_V22_DRY_RUN reads as "the v2.2 jobs simulate", but with
-  // KEEPER_V22 off it is not read at all (N-6, deliberately) and never covered these jobs. Say so
-  // instead of silently going live. Presence only -- parsing it here would re-break N-6.
-  if (!levDryRun && process.env.KEEPER_V22_DRY_RUN !== undefined && !V22_FLAGS.enabled) {
-    console.warn(
-      "[lev-guard] WARNING: KEEPER_V22_DRY_RUN is set but KEEPER_V22 is off, so it is not read and does NOT apply to the leverage-guard jobs. This subsystem is LIVE. Use KEEPER_LEV_DRY_RUN=1 (or DRY_RUN=true) to simulate it.",
-    );
-  }
+  // GH#226: KEEPER_V22_DRY_RUN with KEEPER_V22 off is honoured fail-safe for this subsystem; say so.
+  if (LEV_GUARD_DRY.warning) console.warn(LEV_GUARD_DRY.warning);
   if (LEV_GUARD_CONFIG.holderJob) {
     // each market runs at most once per KEEPER_LEV_HOLDER_INTERVAL_MS; this timer only checks who is due
     setInterval(() => {
