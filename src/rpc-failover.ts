@@ -17,6 +17,12 @@
  *  - freshness: `getSlot` is compared with the best recently seen slot across endpoints (projected forward by
  *    elapsed time). An endpoint lagging more than `maxSlotLag` (default 50) is treated as down. Re-checked
  *    every `slotCheckIntervalMs` while in use.
+ *  - plausibility: a slot above what the chain can have reached since the anchor is suspect-ahead. The chain's speed is
+ *    MEASURED (`getRecentPerformanceSamples`, chain-reported so the keeper's clock plays no part) from the two endpoints
+ *    that corroborate the baseline; until then, or with no corroborating peer, it is bounded by `slotsPerSecond`
+ *    (default 5, env `RPC_SLOTS_PER_SECOND`). On 2026-10-29 devnet ran ~4.2 slots/s against a hard-coded 2.5 and the
+ *    guard locked out every honest endpoint ~80 s after boot. If two genesis-verified endpoints AGREE above the ceiling,
+ *    the ceiling is what was wrong: it is re-anchored, the rate re-measured, and an [ALERT] logged.
  *  - blockhash freshness: a `getLatestBlockhash` reply whose own `context.slot` is more than `maxBlockhashLag`
  *    (default 75) behind the best known slot is NOT handed out. On 2026-10-29 17:49Z Helius devnet (every key)
  *    served one frozen blockhash ~3,800 slots old while its getSlot was current: HTTP 200, so nothing failed over,
@@ -80,8 +86,23 @@ export const GENESIS_HASH = {
   devnet: "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
   mainnet: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
 } as const;
-/** Real chain speed is ~2.5 slots/s; ceilings allow 15% over it. (R153 round 4: 1.5x left 1.25 slots/s of slack.) */
+/** Ceilings allow 15% over the chain's (measured) speed. (R153 round 4: 1.5x left 1.25 slots/s of slack.) */
 export const HEADROOM = 1.15;
+/**
+ * Upper bound on chain speed used for the plausibility ceiling until the speed is measured (and the most a single,
+ * uncorroborated rate report may claim). Devnet measured 4.1-4.2 slots/s on 2026-10-29; mainnet runs ~2.5.
+ */
+export const DEFAULT_MAX_SLOTS_PER_SECOND = 5;
+/**
+ * Solana's target speed (400 ms slots). Used ONLY to project an observation forward before the speed is measured.
+ * Under-projecting is the lenient direction (a lag check loosens by seconds); over-projecting would make honest
+ * endpoints and blockhashes look stale, so the upper bound is never used for projection.
+ */
+export const NOMINAL_SLOTS_PER_SECOND = 2.5;
+/** Sanity cap on a corroborated measurement. */
+const MAX_MEASURED_SLOTS_PER_SECOND = 50;
+/** Two endpoints' rate reports corroborate each other when within this fraction of the larger. */
+const RATE_AGREEMENT = 0.2;
 
 export type FailoverCluster = keyof typeof GENESIS_HASH;
 
@@ -144,8 +165,10 @@ export interface RpcFailoverOptions {
   /** Consecutive network errors / 5xx before an endpoint is marked down. Default 3. */
   networkErrorThreshold?: number;
   probeTimeoutMs?: number; // default 5_000
-  /** Slot rate used to project a recent (<60 s) observation forward. Devnet/mainnet run ~2.5/s. Default 2.5. */
+  /** Upper bound on chain speed (slots/s) until it is measured; also caps an uncorroborated rate report. Default 5. */
   slotsPerSecond?: number;
+  /** Re-measure the chain speed at the next agreement of two endpoints once the measurement is this old. Default 600_000. */
+  rateRefreshMs?: number;
   /** How long after a send the sending endpoint is preferred for status/confirmation polls (F4). Default 60_000. */
   pinMs?: number;
   /** If every endpoint has been rejected (lagging or suspect-ahead) for this long and they agree with each other, re-seed the floor. Default 300_000. */
@@ -216,6 +239,8 @@ export interface RpcFailoverSnapshot {
     blockhashLagSlots: number | null;
   }>;
   floorSlot: number | null; // highest accepted slot (public chain data)
+  /** Chain speed in slots/s: measured (null until then), the configured bound, and the ceiling's rate (with HEADROOM). */
+  slotRate: { measured: number | null; corroborated: boolean; bound: number; ceiling: number; measuredAgoMs: number | null };
   switches: number;
   lastSwitchAt: string | null;
 }
@@ -236,6 +261,7 @@ export class RpcFailover {
       | "networkErrorThreshold"
       | "probeTimeoutMs"
       | "slotsPerSecond"
+      | "rateRefreshMs"
       | "pinMs"
       | "floorReseedMs"
       | "allDownAlertMs"
@@ -268,6 +294,12 @@ export class RpcFailover {
   private allDownSince: number | null = null;
   private allDownAlertedAt = 0;
   private pin: { idx: number; until: number } | null = null;
+  /** Chain speed (slots/s) from getRecentPerformanceSamples; null until measured. */
+  private measuredRate: number | null = null;
+  /** Measured from two agreeing endpoints (may exceed the bound) or from one (capped at the bound). */
+  private rateCorroborated = false;
+  private rateAt = 0;
+  private aboveCeilingAlertAt = 0;
 
   constructor(opts: RpcFailoverOptions) {
     if (opts.urls.length === 0) throw new Error("RpcFailover: at least one endpoint URL is required");
@@ -285,7 +317,8 @@ export class RpcFailover {
       backoffMaxMs: opts.backoffMaxMs ?? 300_000,
       networkErrorThreshold: opts.networkErrorThreshold ?? 3,
       probeTimeoutMs: opts.probeTimeoutMs ?? 5_000,
-      slotsPerSecond: opts.slotsPerSecond ?? 2.5,
+      slotsPerSecond: opts.slotsPerSecond ?? DEFAULT_MAX_SLOTS_PER_SECOND,
+      rateRefreshMs: opts.rateRefreshMs ?? 600_000,
       pinMs: opts.pinMs ?? 60_000,
       floorReseedMs: opts.floorReseedMs ?? 300_000,
       allDownAlertMs: opts.allDownAlertMs ?? 120_000,
@@ -319,6 +352,16 @@ export class RpcFailover {
       bhBackoffExp: 0,
       bhLag: null,
     }));
+  }
+
+  /** Speed for the plausibility ceiling (before HEADROOM): measured, else the configured bound. */
+  private ceilRate(): number {
+    return this.measuredRate ?? this.cfg.slotsPerSecond;
+  }
+
+  /** Speed for projecting an observation forward: measured, else the nominal speed (never the upper bound). */
+  private projRate(): number {
+    return this.measuredRate ?? Math.min(this.cfg.slotsPerSecond, NOMINAL_SLOTS_PER_SECOND);
   }
 
   /** Pass as `new Connection(primaryUrl, { fetch: failover.fetch })`. */
@@ -372,7 +415,7 @@ export class RpcFailover {
       if (o === except || o.slot === null || o.refused || !o.genesisOk) continue;
       const age = t - o.slotAt;
       if (age > 60_000) continue;
-      out.push(o.slot + Math.floor((age / 1000) * this.cfg.slotsPerSecond));
+      out.push(o.slot + Math.floor((age / 1000) * this.projRate()));
     }
     return out;
   }
@@ -425,22 +468,59 @@ export class RpcFailover {
   }
 
   /**
-   * Highest slot any reply may show now: a FIXED line from the anchor (slot, time) at the chain's real speed with 50%
-   * headroom, plus 2x the lag bound. Because accepted raises never move the anchor, a lying endpoint cannot creep the
-   * floor upward vet by vet: the most it can ever add is this line's own slack (100 slots + 1.25 slots per second).
+   * Highest slot any reply may show now: a FIXED line from the anchor (slot, time) at the chain's measured speed with
+   * HEADROOM, plus 2x the lag bound. Because accepted raises never move the anchor, a lying endpoint cannot creep the
+   * floor upward vet by vet: the most it can ever add is this line's own slack (100 slots + 15% of the chain's speed).
    */
   private floorCeiling(): number | null {
     if (this.anchor === null) return null;
-    return this.anchor.slot + ((this.now() - this.anchor.at) / 1000) * this.cfg.slotsPerSecond * HEADROOM + 2 * this.cfg.maxSlotLag;
+    return this.anchor.slot + ((this.now() - this.anchor.at) / 1000) * this.ceilRate() * HEADROOM + 2 * this.cfg.maxSlotLag;
+  }
+
+  /** One endpoint's own report of the chain's speed: slots per second over its last five ~60 s samples. */
+  private async reportedRate(ep: Endpoint): Promise<number | null> {
+    const r = await this.rpc(ep, "getRecentPerformanceSamples", [5]);
+    if (r.err !== undefined || !Array.isArray(r.result)) return null;
+    let slots = 0;
+    let secs = 0;
+    for (const x of r.result as Array<{ numSlots?: unknown; samplePeriodSecs?: unknown }>) {
+      if (typeof x?.numSlots !== "number" || typeof x?.samplePeriodSecs !== "number" || x.samplePeriodSecs <= 0) continue;
+      slots += x.numSlots;
+      secs += x.samplePeriodSecs;
+    }
+    const rate = secs > 0 ? slots / secs : NaN;
+    return Number.isFinite(rate) && rate > 0 ? rate : null;
+  }
+
+  /**
+   * Measure the chain's speed from endpoints that just agreed on the slot. Two reports that agree with each other are
+   * believed (the larger, so the ceiling stays an upper bound); a lone report, or two that disagree, is capped at the
+   * configured bound, so no single endpoint can loosen the ceiling. A failed measurement keeps the previous one.
+   */
+  private async measureRate(eps: readonly Endpoint[], force = false): Promise<void> {
+    const t = this.now();
+    if (!force && this.measuredRate !== null && t - this.rateAt < this.cfg.rateRefreshMs) return;
+    this.rateAt = t; // also rate-limits retries when no endpoint answers
+    const rates = (await Promise.all(eps.slice(0, 2).map((e) => this.reportedRate(e)))).filter((r): r is number => r !== null);
+    if (rates.length === 0) return;
+    const hi = Math.max(...rates);
+    const corroborated = rates.length === 2 && hi - Math.min(...rates) <= RATE_AGREEMENT * hi;
+    const rate = corroborated ? Math.min(hi, MAX_MEASURED_SLOTS_PER_SECOND) : Math.min(hi, this.cfg.slotsPerSecond);
+    const prev = this.measuredRate;
+    this.measuredRate = rate;
+    this.rateCorroborated = corroborated;
+    if (prev === null || Math.abs(rate - prev) > 0.1 * prev) {
+      this.logLine(`chain speed ${rate.toFixed(2)} slots/s (${corroborated ? "two endpoints agree" : `uncorroborated: capped at ${this.cfg.slotsPerSecond}`}${prev === null ? "" : `; was ${prev.toFixed(2)}`}); plausibility ceiling ${(rate * HEADROOM).toFixed(2)} slots/s`);
+    }
   }
 
   /**
    * Quiet probes of the other endpoints for a first baseline. Each peer is GENESIS-checked first (a wrong-cluster
    * peer is refused and contributes nothing); slots are returned, not stored, so nothing here can touch the floor.
    */
-  private async peerSlots(except: Endpoint): Promise<number[]> {
+  private async peerSlots(except: Endpoint): Promise<Array<{ ep: Endpoint; slot: number }>> {
     const t = this.now();
-    const out: number[] = [];
+    const out: Array<{ ep: Endpoint; slot: number }> = [];
     await Promise.all(
       this.eps
         .filter((o) => o !== except && !o.refused && t >= o.downUntil)
@@ -458,7 +538,7 @@ export class RpcFailover {
             o.genesisOk = true;
           }
           const r = await this.rpc(o, "getSlot");
-          if (r.err === undefined && typeof r.result === "number") out.push(r.result);
+          if (r.err === undefined && typeof r.result === "number") out.push({ ep: o, slot: r.result });
           else this.markDown(o, r.err ?? "slot probe returned no slot");
         }),
     );
@@ -479,7 +559,7 @@ export class RpcFailover {
     const raws = live.map((e) => e.rawSlot as number).sort((x, y) => x - y);
     const ats = live.map((e) => e.rawAt);
     // replies were taken at different moments; allow the chain's own movement between them on top of maxSlotLag
-    const tolerance = this.cfg.maxSlotLag + HEADROOM * this.cfg.slotsPerSecond * ((Math.max(...ats) - Math.min(...ats)) / 1000);
+    const tolerance = this.cfg.maxSlotLag + HEADROOM * this.ceilRate() * ((Math.max(...ats) - Math.min(...ats)) / 1000);
     if (raws[raws.length - 1] - raws[0] > tolerance) return;
     const proj = raws;
     // SAFE CHOICE, deliberately: the median of the RAW replies, not of replies projected forward by elapsed time. The
@@ -540,9 +620,11 @@ export class RpcFailover {
       // First baseline: this endpoint's slot must be corroborated by another GENESIS-VERIFIED endpoint within
       // maxSlotLag, or by a fresh block time. A lone (possibly bogus) reply never sets the floor.
       const peers = await this.peerSlots(ep);
-      const agree = peers.filter((p) => Math.abs(p - slot) <= this.cfg.maxSlotLag);
+      const agreePeers = peers.filter((p) => Math.abs(p.slot - slot) <= this.cfg.maxSlotLag);
+      const agree = agreePeers.map((p) => p.slot);
       if (agree.length > 0) {
         this.accept(ep, slot);
+        await this.measureRate([ep, agreePeers[0].ep]);
         const hi = Math.max(slot, ...agree);
         if (hi > (this.floorSlot ?? 0)) this.floorSlot = hi; // corroborated by a second genesis-verified endpoint
         this.floorCorroborated = true;
@@ -571,7 +653,26 @@ export class RpcFailover {
       // (a) plausibility: a reply far above what the chain could have reached since the floor was set is
       //     suspect-ahead. It is treated as down, logged, and NEVER raises the floor.
       const ceil = this.floorCeiling() as number;
+      // Two genesis-verified endpoints agreeing above the ceiling outrank the keeper's own estimate of the chain's speed.
+      let aboveCeilingAgree: number[] = [];
       if (slot > ceil) {
+        const peers = (await this.peerSlots(ep)).filter((p) => Math.abs(p.slot - slot) <= this.cfg.maxSlotLag);
+        if (peers.length > 0) {
+          aboveCeilingAgree = peers.map((p) => p.slot);
+          const t = this.now();
+          const was = this.ceilRate();
+          await this.measureRate([ep, peers[0].ep], true);
+          if (t - this.aboveCeilingAlertAt >= 300_000) {
+            this.aboveCeilingAlertAt = t;
+            this.logLine(
+              `[ALERT] endpoints #${ep.idx} and #${peers[0].ep.idx} agree at slot ~${slot}, above the plausibility ceiling ${Math.floor(ceil)} ` +
+                `(assumed <= ${(was * HEADROOM).toFixed(2)} slots/s): the chain is faster than assumed or the keeper clock stepped back; ` +
+                `re-anchoring (chain speed now ${this.ceilRate().toFixed(2)} slots/s)`,
+            );
+          }
+        }
+      }
+      if (slot > ceil && aboveCeilingAgree.length === 0) {
         ep.suspectAhead = true;
         if (ep.laggingSince === null) ep.laggingSince = this.now();
         this.markDown(ep, `suspect-ahead: slot ${slot} exceeds what the chain can have reached (${Math.floor(ceil)}); floor ${this.floorSlot} unchanged`);
@@ -581,7 +682,7 @@ export class RpcFailover {
       ep.suspectAhead = false;
       const t = this.now();
       const others = this.recentOthers(ep);
-      const agreeing = others.filter((o) => Math.abs(o - slot) <= this.cfg.maxSlotLag);
+      const agreeing = [...others.filter((o) => Math.abs(o - slot) <= this.cfg.maxSlotLag), ...aboveCeilingAgree];
       // (a2) corroborated raises only: a reply more than maxSlotLag above EVERY other recent endpoint is believed only
       //      if another endpoint agrees with it, or if it is the only live endpoint (nothing to compare against).
       if (others.length > 0 && agreeing.length === 0 && slot - Math.max(...others) > this.cfg.maxSlotLag) {
@@ -607,7 +708,7 @@ export class RpcFailover {
           // Only the operator's primary may overturn on its own block time (the "returning primary" case); a fallback can
           // only overturn through agreement. A lying/lagging fallback that reports a fresh block time gets nothing.
           // Wall-clock arbiter: this endpoint's own block time dates its slot; the chain head cannot be further ahead
-          // than (slot-20) + age*2.5. A floor beyond that by more than the lag bound (+ ~6 s of clock skew) is a lie.
+          // than (slot-20) + age*speed. A floor beyond that by more than the lag bound (+ ~6 s of clock skew) is a lie.
           const head = await this.headEstimate(ep, slot);
           if (head !== null && floor - Math.max(slot, head) > this.cfg.maxSlotLag + (this.skewMeasured ? 8 : 15)) {
             why = `this endpoint's block time (chain head ~${Math.floor(head)})`;
@@ -642,6 +743,11 @@ export class RpcFailover {
         this.anchor = { slot: Math.min(slot, ...agreeing), at: t };
         this.floorCorroborated = true;
         this.floorSource = ep.idx;
+        // a rate that was never measured / is due for a refresh: measure against an endpoint that just agreed
+        if (this.measuredRate === null || t - this.rateAt >= this.cfg.rateRefreshMs) {
+          const peer = this.eps.find((o) => o !== ep && o.genesisOk && !o.refused && o.slot !== null && t - o.slotAt <= 60_000);
+          if (peer) await this.measureRate([ep, peer]);
+        }
       } else if (raised) {
         this.floorCorroborated = false;
         this.floorSource = ep.idx;
@@ -675,14 +781,14 @@ export class RpcFailover {
 
   /**
    * Measure the keeper's clock error ONCE, from an endpoint that agrees with a peer (so it is at the chain head):
-   * the block 20 slots back should be ~8 s old. Beyond the allowance every block-time path is disabled with an [ALERT]
+   * the block 20 slots back should be 20/speed s old (8 s at 2.5/s). Beyond the allowance every block-time path is disabled with an [ALERT]
    * (a skewed clock would let a lagging node pass as fresh, or a fresh one look stale).
    */
   private async measureSkew(ep: Endpoint, slot: number): Promise<void> {
     if (this.skewMeasured || this.blockTimeDisabled) return;
     const bt = await this.rpc(ep, "getBlockTime", [Math.max(0, slot - 20)]);
     if (bt.err !== undefined || typeof bt.result !== "number") return;
-    const skew = this.now() / 1000 - bt.result - 8;
+    const skew = this.now() / 1000 - bt.result - 20 / this.projRate();
     this.skewMeasured = true;
     this.logLine(`keeper clock vs chain: ${skew.toFixed(1)}s (allowance ${this.cfg.clockSkewAllowanceSec}s)`);
     if (Math.abs(skew) > this.cfg.clockSkewAllowanceSec) {
@@ -697,14 +803,15 @@ export class RpcFailover {
   private async headEstimate(ep: Endpoint, slot: number): Promise<number | null> {
     if (!this.skewMeasured || this.blockTimeDisabled) return null;
     const age = await this.blockAgeSec(ep, slot);
-    return age === null ? null : Math.max(0, slot - 20) + age * this.cfg.slotsPerSecond;
+    return age === null ? null : Math.max(0, slot - 20) + age * this.projRate();
   }
 
   /** Wall-clock anchor: the block time of a recent slot must be close to now. */
   private async blockTimeFresh(ep: Endpoint, slot: number, markStale = true): Promise<"fresh" | "stale" | "unknown"> {
     const ageSec = await this.blockAgeSec(ep, slot);
     if (ageSec === null) return "unknown";
-    const maxAge = this.cfg.maxSlotLag * 0.4 + 8 + (this.skewMeasured ? 4 : 10); // lag bound + 20-slot offset + clock margin
+    // lag bound + 20-slot offset (at the projection speed: lenient before measurement) + clock margin
+    const maxAge = (this.cfg.maxSlotLag + 20) / this.projRate() + (this.skewMeasured ? 4 : 10);
     if (ageSec > maxAge) {
       if (!markStale) return "stale";
       this.markDown(ep, `stale: block time of slot ${slot - 20} is ${Math.round(ageSec)}s old (max ${Math.round(maxAge)}s)`);
@@ -747,7 +854,7 @@ export class RpcFailover {
       if (o.slot === null || o.refused || !o.genesisOk || !o.confirmed) continue;
       const age = t - o.slotAt;
       if (age > 60_000) continue;
-      const projected = o.slot + Math.floor((age / 1000) * this.cfg.slotsPerSecond);
+      const projected = o.slot + Math.floor((age / 1000) * this.projRate());
       if (best === null || projected > best) best = projected;
     }
     return best;
@@ -898,7 +1005,8 @@ export class RpcFailover {
   snapshot(): RpcFailoverSnapshot {
     const t = this.now();
     const allDown = this.isAllDown();
-    const bestAll = Math.max(-1, ...this.eps.filter((e) => e.slot !== null && !e.refused).map((e) => (e.slot as number) + Math.floor(((t - e.slotAt) / 1000) * this.cfg.slotsPerSecond)));
+    const pr = this.projRate();
+    const bestAll = Math.max(-1, ...this.eps.filter((e) => e.slot !== null && !e.refused).map((e) => (e.slot as number) + Math.floor(((t - e.slotAt) / 1000) * pr)));
     const activeBhStale = this.eps[this.active].bhStale;
     return {
       cluster: this.cluster,
@@ -916,12 +1024,19 @@ export class RpcFailover {
         downForMs: Math.max(0, e.downUntil - t),
         lastError: e.lastError,
         slot: e.slot,
-        slotLag: e.slot !== null && bestAll >= 0 ? Math.max(0, bestAll - (e.slot + Math.floor(((t - e.slotAt) / 1000) * this.cfg.slotsPerSecond))) : null,
+        slotLag: e.slot !== null && bestAll >= 0 ? Math.max(0, bestAll - (e.slot + Math.floor(((t - e.slotAt) / 1000) * pr))) : null,
         blockhashStale: e.bhStale,
         blockhashRetryInMs: e.bhStale ? Math.max(0, e.bhStaleUntil - t) : 0,
         blockhashLagSlots: e.bhLag,
       })),
       floorSlot: this.floorSlot,
+      slotRate: {
+        measured: this.measuredRate,
+        corroborated: this.rateCorroborated,
+        bound: this.cfg.slotsPerSecond,
+        ceiling: this.ceilRate() * HEADROOM,
+        measuredAgoMs: this.measuredRate === null ? null : Math.max(0, t - this.rateAt),
+      },
       switches: this.switches,
       lastSwitchAt: this.lastSwitchAt === null ? null : new Date(this.lastSwitchAt).toISOString(),
     };
@@ -974,6 +1089,7 @@ export function failoverFromEnv(
     base,
     maxSlotLag: envNumber(env.RPC_MAX_SLOT_LAG, 50),
     maxBlockhashLag: envNumber(env.RPC_MAX_BLOCKHASH_LAG, 75),
+    slotsPerSecond: envNumber(env.RPC_SLOTS_PER_SECOND, DEFAULT_MAX_SLOTS_PER_SECOND),
     slotCheckIntervalMs: envNumber(env.RPC_SLOT_CHECK_MS, 10_000),
     primaryRetryMs: envNumber(env.RPC_PRIMARY_RETRY_MS, 30_000),
     backoffBaseMs: envNumber(env.RPC_BACKOFF_BASE_MS, 2_000),
