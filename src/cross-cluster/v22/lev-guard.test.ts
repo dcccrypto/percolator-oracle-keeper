@@ -468,6 +468,16 @@ describe("flags off: no instruction is built and no RPC is made", () => {
       if (only === "poke") assert.deepEqual(tags, [6], "poke only: one 6-account op 4");
     }
   });
+
+  it("D19: KEEPER_LEV_W1 without KEEPER_LEV_POKE still samples the NAV (op 4) BEFORE the W1 check: W1 decides on the stored index", async () => {
+    // The stored index says "no stop" (a stale sample); only a fresh op 4 / op 5 sample would show the loss.
+    const w = world({ navps: 1_000_000_000_000n, navPeakCur: 1_000_000_000_000n });
+    const c = levConn({ accounts: w.accounts });
+    const { k } = keeperOf(c.conn, cfg({ w1: true }));
+    await k.onPushLanded(w.market.toBase58(), "T");
+    const tags = c.base.sims.map((s) => s.keys[0].length);
+    assert.deepEqual(tags, [6], "W1 on: the push hook pokes first (one 6-account op 4), or the stored index is never refreshed by this keeper");
+  });
 });
 
 const TRIG_LEN = { navps: 400_000_000_000n, navPeakCur: 1_000_000_000_000n, navRef: 1_000_000_000_000n };
