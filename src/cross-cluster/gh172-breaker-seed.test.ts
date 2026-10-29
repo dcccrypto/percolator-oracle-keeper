@@ -26,7 +26,9 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { getOnChainMarkE6, recordOnChainMarks, resetOnChainMarks } from "./push-deadline.ts";
+import { getOnChainMarkE6, getOnChainTokenPriceUsd, recordOnChainMarks, resetOnChainMarks } from "./push-deadline.ts";
+import { PROFILE_LOT_EXP_OFF } from "./auth-mark-pusher.ts";
+import { assetSlotOffset, selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
 import { checkCircuitBreaker, type CircuitBreakerState } from "../circuit-breaker.ts";
 import {
   getCrossClusterCircuitBreakerState,
@@ -136,7 +138,7 @@ describe("GH#172 the seeding WIRING, not just the decode", () => {
       marketAddress: MARKET,
       assetIndex: 0,
     });
-    assert.equal(st.lastPrice, 31, "seeded from raw_oracle_target_price 31.000000");
+    assert.equal(st.lastPrice, 0.00031, "seeded from raw_oracle_target_price 31.000000 per lot at lot_exp 5 = 0.00031 per token");
   });
 
   it("a fresh state is UNSEEDED when the market has not been read — behaviour is unchanged", () => {
@@ -165,5 +167,33 @@ describe("GH#172 the seeding WIRING, not just the decode", () => {
       assetIndex: 0,
     });
     assert.equal(again.lastPrice, 42, "the seed must apply only on creation");
+  });
+});
+
+describe("GH#172 the seed is per TOKEN: the on-chain mark is per lot (token price x 10^lot_exp)", () => {
+  beforeEach(() => { resetOnChainMarks(); resetCrossClusterCircuitBreakerStates(); });
+
+  it("a lot_exp 3 market seeds the breaker at mark / 10^3, not at the per-lot mark", () => {
+    const b = liveMarketBytes();
+    const g = selectMarketGroupOffset(b);
+    assert.equal(g.ok, true);
+    if (!g.ok) return;
+    const off = assetSlotOffset(g, 0) + PROFILE_LOT_EXP_OFF;
+    assert.equal(b[off], 5, "the live fixture is a lot_exp 5 market (its per-lot mark 31 is a per-token 0.00031)");
+    b[off] = 3;
+    recordOnChainMarks(MARKET, b);
+    assert.equal(getOnChainMarkE6(MARKET, 0), EXPECTED_PUSHED_MARK_E6, "the cached mark is the per-lot value as read");
+    assert.equal(getOnChainTokenPriceUsd(MARKET, 0), 0.031);
+    const st = getCrossClusterCircuitBreakerState(MARKET, "T", { marketAddress: MARKET, assetIndex: 0 });
+    assert.equal(st.lastPrice, 0.031, "a per-token push of ~0.031 must not trip against a per-lot 31 baseline");
+  });
+
+  it("an unreadable lot_exp leaves the unit unseeded (fail-open, never a wrongly scaled baseline)", () => {
+    const b = liveMarketBytes();
+    const g = selectMarketGroupOffset(b);
+    if (!g.ok) throw new Error("fixture");
+    b[assetSlotOffset(g, 0) + PROFILE_LOT_EXP_OFF] = 200; // > LOT_EXP_MAX
+    recordOnChainMarks(MARKET, b);
+    assert.equal(getOnChainTokenPriceUsd(MARKET, 0), null);
   });
 });

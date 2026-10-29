@@ -37,6 +37,7 @@ import { decodeTerminalState, marketMode, staleResolveWindow } from "./market-st
 import { detectLayout, engineSlotBase } from "./market-layout.ts";
 import { decodeMarketRefreshState } from "./positioned-refresh.ts";
 import { V22_ASSET_BAND_OFF, V22_CONFIG_OFF } from "./v22/market.ts";
+import { parsePushAuthMarkGenerationFields } from "./auth-mark-pusher.ts";
 
 const LIFECYCLE_ACTIVE = 2;
 const LIFECYCLE_DRAIN_ONLY = 3;
@@ -175,7 +176,8 @@ export function recordPushDeadline(marketAddress: string, data: Uint8Array, read
 // per-slot step cap, which would make the baseline drift conservative-but-wrong after a gap.
 
 /** `market` or `market:assetIndex` -> that asset's `raw_oracle_target_price` (e6) at the last read. */
-const marksByUnit = new Map<string, bigint>();
+// The mark is PER LOT (token price x 10^lot_exp, auth-mark-pusher.ts K-1); `lotExp` rides with it so the breaker can be seeded in per-TOKEN units.
+const marksByUnit = new Map<string, { mark: bigint; lotExp: number }>();
 
 /** The cache key the push loop uses for a unit: single-asset markets key on the market alone. */
 export function markUnitKey(marketAddress: string, assetIndex: number): string {
@@ -197,7 +199,11 @@ export function recordOnChainMarks(marketAddress: string, data: Uint8Array): voi
       // Only a tradable asset has a mark worth trusting as a baseline.
       if (lifecycle !== LIFECYCLE_ACTIVE && lifecycle !== LIFECYCLE_DRAIN_ONLY) continue;
       const mark = u64(data, base + det.layout.asset.rawOracleTargetPrice);
-      if (mark > 0n) marksByUnit.set(markUnitKey(marketAddress, i), mark);
+      if (mark <= 0n) continue;
+      // lot_exp of this asset: without it the per-lot mark cannot be compared with the breaker's per-token price (a lot_exp > 0 market would trip on every restart).
+      const lotExp = parsePushAuthMarkGenerationFields(data, i)?.lotExp;
+      if (lotExp === undefined) continue; // unknown unit: leave unseeded (fail-open, logged by the breaker)
+      marksByUnit.set(markUnitKey(marketAddress, i), { mark, lotExp });
     }
   } catch {
     // leave unseeded
@@ -206,7 +212,13 @@ export function recordOnChainMarks(marketAddress: string, data: Uint8Array): voi
 
 /** The cached last-pushed mark (e6) for a unit, or null when nothing has been read for it yet. */
 export function getOnChainMarkE6(marketAddress: string, assetIndex: number): bigint | null {
-  return marksByUnit.get(markUnitKey(marketAddress, assetIndex)) ?? null;
+  return marksByUnit.get(markUnitKey(marketAddress, assetIndex))?.mark ?? null;
+}
+
+/** The cached last-pushed mark as a per-TOKEN USD number (mark e6 / 1e6 / 10^lot_exp), or null when unknown. */
+export function getOnChainTokenPriceUsd(marketAddress: string, assetIndex: number): number | null {
+  const m = marksByUnit.get(markUnitKey(marketAddress, assetIndex));
+  return m ? Number(m.mark) / 1e6 / 10 ** m.lotExp : null;
 }
 
 /** Test seam. */

@@ -56,7 +56,7 @@ import {
   recordPostPushReads,
 } from "./depth-bracketing.ts";
 import { getMarketAccrual, laggingAssets, multiAssetKey, priceUnitsOfRegistry, pruneMarketAccrual } from "./multi-asset.ts";
-import { DEADLINE_FRESH_MS, getOnChainMarkE6, getPushDeadline, isKnownTerminal, markTerminal, prunePushDeadlines, refreshPushDeadlines } from "./push-deadline.ts";
+import { DEADLINE_FRESH_MS, getOnChainTokenPriceUsd, getPushDeadline, isKnownTerminal, markTerminal, prunePushDeadlines, refreshPushDeadlines } from "./push-deadline.ts";
 import type { PushDeadline } from "./push-deadline.ts";
 import type { PriceUnit } from "./multi-asset.ts";
 import { pushGenerationKey } from "./auth-mark-pusher.ts";
@@ -1072,8 +1072,8 @@ export function getCrossClusterCircuitBreakerState(
     // a deliberate fail-OPEN, because withholding here would brick pushes on a market the keeper
     // has never read, which is a worse failure than today's bound. The log line below makes the
     // unseeded case visible rather than silent.
-    const seedE6 = seed ? getOnChainMarkE6(seed.marketAddress, seed.assetIndex) : null;
-    if (seedE6 === null) {
+    const seedUsd = seed ? getOnChainTokenPriceUsd(seed.marketAddress, seed.assetIndex) : null; // per TOKEN: the on-chain mark is per lot
+    if (seedUsd === null) {
       console.warn(
         `[loop] ${label}: circuit breaker starting UNSEEDED (no on-chain mark read yet) — ` +
           `the first push is unbounded (GH#172)`,
@@ -1081,7 +1081,7 @@ export function getCrossClusterCircuitBreakerState(
     }
     state = {
       symbol: label,
-      lastPrice: seedE6 === null ? 0 : priceE6ToUsdNumber(seedE6),
+      lastPrice: seedUsd === null ? 0 : seedUsd,
       circuitBreakerTrips: 0,
       cbTripPrice: 0,
       cbConsecutiveTrips: 0,
