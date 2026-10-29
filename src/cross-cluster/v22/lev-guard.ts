@@ -389,7 +389,8 @@ export class LevGuardKeeper {
    * Returns what happened (tests / logs).
    */
   async pokeOnce(marketAddress: string, label: string, reason: "push" | "pre-allocate"): Promise<PokeResult> {
-    if (!this.d.config.poke) return "disabled";
+    // D19: W1 decides on the STORED NAV index (levLpStopTriggeredV22), which only op 4 / op 5 refresh, so W1 implies POKE.
+    if (!this.d.config.poke && !this.d.config.w1) return "disabled";
     const s = this.m(marketAddress);
     if (s.pokeInflight) return "busy";
     const t = this.now();
@@ -433,7 +434,7 @@ export class LevGuardKeeper {
   async onPushLanded(marketAddress: string, label: string): Promise<void> {
     try {
       const c = this.d.config;
-      if (c.poke) await this.pokeOnce(marketAddress, label, "push");
+      if (c.poke || c.w1) await this.pokeOnce(marketAddress, label, "push"); // D19: W1 implies POKE
       if (c.w1) await this.w1Once(marketAddress, label);
     } catch (err) {
       this.log(`[lev-guard] ${label}: push hook failed: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
