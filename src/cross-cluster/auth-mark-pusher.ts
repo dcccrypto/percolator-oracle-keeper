@@ -834,6 +834,7 @@ export function pruneAuthMarkPusherState(keep: ReadonlySet<string>): void {
   // one reverted Custom(19) on chain (~15/h on the fresh v2.2 devnet, 411 in 30 h, always "ix 1").
   for (const k of [...lastSentObservationSequence.keys()]) if (!keep.has(generationKeyMarket(k))) lastSentObservationSequence.delete(k);
   for (const k of [...lastSentCycle.keys()]) if (!keep.has(generationKeyMarket(k))) lastSentCycle.delete(k);
+  for (const k of [...landedObservationSequence.keys()]) if (!keep.has(generationKeyMarket(k))) landedObservationSequence.delete(k);
   for (const m of [...terminalLogged]) if (!keep.has(m)) terminalLogged.delete(m);
   for (const m of [...soloUntil.keys()]) if (!keep.has(m)) soloUntil.delete(m);
   for (const m of [...landedRevertTimes.keys()]) if (!keep.has(m)) landedRevertTimes.delete(m);
@@ -932,6 +933,12 @@ interface InFlightPush {
   items: Array<{ key: string; market: string; seq: bigint }>;
 }
 const inFlightPushes: InFlightPush[] = [];
+/**
+ * Highest observation_sequence per (market, asset) key seen LANDED OK in one of our push txs (read back by
+ * reconcilePushOutcomes). Evidence, not intent: `lastSentObservationSequence` says what we sent, this says what the
+ * chain accepted from us.
+ */
+const landedObservationSequence = new Map<string, bigint>();
 const MAX_IN_FLIGHT_PUSHES = 64;
 /** Do not ask about a tx until it has had time to land. */
 const PUSH_STATUS_MIN_AGE_MS = 4_000;
@@ -942,9 +949,9 @@ const LATE_DUPLICATE_LOG_EVERY_MS = 60_000;
 /** Observed outcomes of pushes this process sent (read back from chain). */
 export const pushLandingStats = {
   landedOk: 0,
-  /** Custom(19) on a tx whose markets were all already superseded by a higher nonce we sent: benign. */
+  /** Custom(19) at an asset for which a higher nonce of OURS landed OK: we superseded ourselves (benign). */
   lateDuplicateReverts: 0,
-  /** Any other landed revert, including Custom(19) on a nonce nothing superseded: needs a human. */
+  /** Any other landed revert, including Custom(19) that no landed push of ours explains: needs a human. */
   otherReverts: 0,
   /** Never landed (dropped, or unknown after PUSH_STATUS_GIVE_UP_MS). */
   unlanded: 0,
@@ -964,21 +971,43 @@ export function resetPushLandingState(): void {
   soloUntil.clear();
   landedRevertTimes.clear();
   lastSentCycle.clear();
+  landedObservationSequence.clear();
 }
 
 /**
  * Read back what happened to the push txs we sent: one batched
  * `getSignatureStatuses` over the ones old enough to have landed (no RPC at all
  * when there are none). A landed push revert is classified rather than ignored:
- * Custom(19) on markets we have since pushed a higher nonce for is the benign
- * late duplicate described above (counted, summarised once a minute); anything
- * else is logged loudly. Never throws.
+ * Custom(19) at an asset for which one of OUR pushes with a higher nonce landed
+ * OK is the benign late duplicate described above (counted, summarised once a
+ * minute); anything else is logged loudly. Never throws.
+ *
+ * Keepfix2 (2026-10-29, live 4458ecc, tx ozVCGUEU… ix 15): the verdict is taken at
+ * the FAILING asset, on landed evidence. The old rule needed every market in the
+ * tx to have a higher nonce SENT since. A cycle that pushes only some assets (one
+ * whose pool prices were unavailable pushed just cap4's five fixed-price assets)
+ * left the batch's other 14 markets "unsuperseded", so our own reorder -- the
+ * older batch landed in the same slot just after that cycle's cap4 tx -- was
+ * logged as a LANDED REVERT and struck cap4 toward SOLO. Conversely a nonce SENT
+ * is not one that landed: if another pusher advances the nonce, every one of our
+ * pushes for that asset reverts, and the old rule called all but the newest
+ * benign. While a newer push of ours for the failing asset is still unconfirmed,
+ * the verdict waits for it.
  */
 export async function reconcilePushOutcomes(devnetConn: Connection, nowMs: number = Date.now()): Promise<void> {
   try {
     const due = inFlightPushes.filter((f) => nowMs - f.sentAtMs >= PUSH_STATUS_MIN_AGE_MS);
     if (due.length === 0) return;
     const { value } = await devnetConn.getSignatureStatuses(due.map((f) => f.signature));
+    // Pass 1: what landed OK, and which txs this pass settles (status known, or given up on).
+    const settled = new Set<InFlightPush>();
+    due.forEach((f, i) => {
+      const st = value[i];
+      if (st || nowMs - f.sentAtMs >= PUSH_STATUS_GIVE_UP_MS) settled.add(f);
+      if (st && !st.err) {
+        for (const it of f.items) if (it.seq > (landedObservationSequence.get(it.key) ?? 0n)) landedObservationSequence.set(it.key, it.seq);
+      }
+    });
     due.forEach((f, i) => {
       const st = value[i];
       if (!st) {
@@ -988,10 +1017,15 @@ export async function reconcilePushOutcomes(devnetConn: Connection, nowMs: numbe
         pushLandingStats.landedOk++;
       } else {
         const failing = parseFailingPush(st.err, f.items.length);
-        const superseded =
-          failing !== null &&
-          failing.custom === ENGINE_STALE_CUSTOM &&
-          f.items.every((it) => (lastSentObservationSequence.get(it.key) ?? 0n) > it.seq);
+        const item = failing !== null && failing.custom === ENGINE_STALE_CUSTOM ? f.items[failing.position] : undefined;
+        const superseded = item !== undefined && (landedObservationSequence.get(item.key) ?? 0n) > item.seq;
+        if (!superseded && item !== undefined && nowMs - f.sentAtMs < PUSH_STATUS_GIVE_UP_MS) {
+          // A newer push of ours for this asset whose outcome is not known yet may be what superseded it: decide later.
+          const newerPending = inFlightPushes.some(
+            (g) => g !== f && !settled.has(g) && g.items.some((x) => x.key === item.key && x.seq > item.seq),
+          );
+          if (newerPending) return;
+        }
         if (superseded) {
           pushLandingStats.lateDuplicateReverts++;
           lateDuplicatesSinceLog++;
@@ -1010,7 +1044,7 @@ export async function reconcilePushOutcomes(devnetConn: Connection, nowMs: numbe
     if (lateDuplicatesSinceLog > 0 && nowMs - lastLateDuplicateLogMs >= LATE_DUPLICATE_LOG_EVERY_MS) {
       console.log(
         `[push] ${lateDuplicatesSinceLog} landed push tx(s) reverted Custom(19) as late duplicates of already-superseded ` +
-          `pushes (a higher nonce landed first; no price update lost; totals ${JSON.stringify(pushLandingStats)})`,
+          `pushes (a higher nonce of ours for the failing asset landed first; totals ${JSON.stringify(pushLandingStats)})`,
       );
       lateDuplicatesSinceLog = 0;
       lastLateDuplicateLogMs = nowMs;

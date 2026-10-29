@@ -160,7 +160,7 @@ import { createCrankLiveness, crankLivenessOptsFromEnv } from "./crank-liveness.
 import type { CrankLiveness } from "./crank-liveness.ts";
 import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
-import { adlHealth, adlHealthOf, decodeAdlState } from "./adl-state.ts";
+import { adlHealth, adlHealthOf, decodeAdlState, parseAdlFraction } from "./adl-state.ts";
 import type { AdlAssetHealth } from "./adl-state.ts";
 import { isTerminalMarket } from "./market-state.ts";
 import { recordPushDeadline } from "./push-deadline.ts";
@@ -246,6 +246,8 @@ interface CrankMarketState {
   /** Last layout problem logged at error level, and how many reads have hit it since. */
   lastLayoutProblem: string | null;
   layoutProblemReads: number;
+  /** Alerts this market's last successful health evaluation found active (re-reported if a later evaluation throws). */
+  lastActive?: Alert[];
 }
 
 /** What one crank attempt saw — feeds alerting.ts. */
@@ -1947,18 +1949,28 @@ export function v22CrankSample(
     lossStaleCycles: h.lossStaleCycles,
     ...(h.layout ? { layout: h.layout } : {}),
     ...(h.sweep ? { sweep: h.sweep } : {}),
-    ...(h.adl
-      ? {
-          adl: {
-            reduceOnly: h.adl.reduceOnly,
-            aLong: BigInt(h.adl.aLong),
-            aShort: BigInt(h.adl.aShort),
-            oiEffLong: BigInt(h.adl.oiEffLong),
-            oiEffShort: BigInt(h.adl.oiEffShort),
-          },
-        }
-      : {}),
+    ...(h.adl ? { adl: v22AdlState(h.adl) } : {}),
   };
+}
+
+/** Plain unsigned decimal integer string -> bigint, else null (no sign, no fraction, no exponent, no whitespace). */
+function parseUintString(s: string): bigint | null {
+  return /^\d+$/.test(s) ? BigInt(s) : null;
+}
+
+/**
+ * The published ADL record back to the evaluator's bigints. `aLong`/`aShort` are published as decimal fractions of
+ * ADL_ONE (`adlHealth` -> `adlFraction`, "1.000000"), so they are parsed as such, exactly; OI is an integer string.
+ * Any field that does not parse yields null: the ADL state is then UNKNOWN for this sample, which never alerts and
+ * never ends a reduce-only episode (evaluateCrankHealth) -- rather than a throw that takes the whole report down.
+ */
+export function v22AdlState(a: NonNullable<CrankRefreshHealth["adl"]>): AdlState | null {
+  const aLong = parseAdlFraction(a.aLong);
+  const aShort = parseAdlFraction(a.aShort);
+  const oiEffLong = parseUintString(a.oiEffLong);
+  const oiEffShort = parseUintString(a.oiEffShort);
+  if (aLong === null || aShort === null || oiEffLong === null || oiEffShort === null) return null;
+  return { reduceOnly: a.reduceOnly, aLong, aShort, oiEffLong, oiEffShort };
 }
 
 /**
@@ -1981,18 +1993,36 @@ export async function reportCrankHealth(
     // GH#181: a v2.2-owned market has no observation of its own (the sweep delegate owns it and
     // this function's caller returns before `observed` is set), so fall back to the record the
     // v2.2 layer publishes. Without this, evaluateCrankHealth never runs for any v2.2 market.
-    const sample =
-      crankSample(m.label, m.marketAddress, st) ??
-      v22CrankSample(m.label, m.marketAddress, getCrankRefreshHealth(m.marketAddress), Date.now());
-    if (!sample) continue;
-    const ev = evaluateCrankHealth(sample, st.streaks, sink.thresholds);
-    st.streaks = ev.streaks;
-    active.push(...ev.active);
-    records.push(crankHealthRecord(sample));
-    st.obs = null;
+    // Each market is isolated: one market's bad record must not stop the others' alerts, and must not throw out of
+    // here into the crank loop (ledger v22-keepfix-2026-10-29 §4: a BigInt throw here crash-looped every round). A
+    // market whose evaluation throws keeps its previously active alerts, so the error does not fake a RESOLVED.
+    try {
+      const sample =
+        crankSample(m.label, m.marketAddress, st) ??
+        v22CrankSample(m.label, m.marketAddress, getCrankRefreshHealth(m.marketAddress), Date.now());
+      if (!sample) {
+        st.lastActive = undefined;
+        continue;
+      }
+      const ev = evaluateCrankHealth(sample, st.streaks, sink.thresholds);
+      const record = crankHealthRecord(sample);
+      st.streaks = ev.streaks;
+      st.lastActive = ev.active;
+      active.push(...ev.active);
+      records.push(record);
+    } catch (err) {
+      console.error(`[cranker] ${m.label}: crank-health evaluation failed (cranks unaffected) — ${err instanceof Error ? err.message : String(err)}`);
+      active.push(...(st.lastActive ?? []));
+    } finally {
+      st.obs = null;
+    }
   }
   if (cycle % HEALTH_LINE_EVERY_CYCLES === 0 && records.length > 0) {
-    sink.health("crank", { cycle, markets: records });
+    try {
+      sink.health("crank", { cycle, markets: records });
+    } catch (err) {
+      console.error(`[cranker] crank health line failed (cranks unaffected) — ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   await sink.reconcile("crank", active);
   return active;
@@ -2081,7 +2111,13 @@ export async function startRecoveryCrankLoop(
     );
     cycleCount++;
     liveness.beat();
-    await reportCrankHealth(registry, states, cycleCount, sink);
+    // Reporting is not cranking: an error in it is logged and the loop carries on at its own cadence. Before this,
+    // a throw here unwound the loop and the supervisor's backoff cut the crank rate from 6 s to ~60 s.
+    try {
+      await reportCrankHealth(registry, states, cycleCount, sink);
+    } catch (err) {
+      console.error(`[cranker] crank-health report failed (cranks unaffected) — ${err instanceof Error ? err.message : String(err)}`);
+    }
     liveness.beat();
     if (cycleCount % HEALTH_SUMMARY_EVERY_CYCLES === 0) {
       const summary = registry.markets
