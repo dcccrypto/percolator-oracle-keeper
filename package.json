@@ -13,6 +13,7 @@
     "cross-cluster:dry-run": "tsx src/dry-run.ts",
     "cross-cluster:live": "tsx src/cross-cluster.ts",
     "pre-resolve": "tsx src/pre-resolve-drain.ts",
+    "refund-plan": "tsx scripts/refund-plan.ts",
     "rotate-logs": "bash scripts/rotate-keeper-logs.sh"
   },
   "dependencies": {

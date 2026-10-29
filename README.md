@@ -231,6 +231,15 @@ any keeper action (`prefer` counts it, `strict` freezes the LP until it clears, 
 (counted) and `strict` skips the LP that round; the accrue-through-a-counterparty fallback settles that counterparty alone at the new K for the round's duration; the LP's rent is not settled under pairing
 (rent is index-based and timing-invariant). Defence in depth: the engine fix is separate.
 
+### Never-connected rent refund PLAN (D6, dry-run only)
+
+`pnpm refund-plan plan --input never-connected.json [--prior earlier-plan.json] --out plan.json` turns the keeper's never-connected classification (the `v22.lifecycle.markets` health map, or an array of rows) into a refund plan: per market the creator wallet, slab + stake rent components, total lamports, reason, plus batch totals and a `planHash`. Policy: ledger "v22 market lifecycle" 2026-10-25 (decision C) and memo D6; the guard rent is not refunded.
+
+- **Recipient** is the `creator` field on each row (or a top-level `creators` map). The keeper does not know who paid, so the file must carry it from the creator lookup; a row without one is refused, never guessed.
+- **Caps** (lower-only via `--per-market-cap-lamports` / `--batch-cap-lamports`): 0.11 SOL per market, 1 SOL per batch. Over cap, a market not classified never-connected, a bad address, conflicting duplicates, or a market in a `--prior` plan refuses the whole batch (exit 1, no file written). Nothing is truncated.
+- **Approval**: the plan is `status: "UNAPPROVED"`. A human sets `status: "APPROVED"` and fills `approval.{approver,date,planHash}`; `pnpm refund-plan verify --plan plan.json` exits 0 only if the hash matches the contents and the caps hold.
+- **No sending**: the tool has no keys, no transaction building, no network. A test (`src/cross-cluster/v22/refund-plan.test.ts`) greps its source for forbidden APIs. Paying an approved plan is a separate, human-gated mainnet step that is not in this repo.
+
 ### Market lifecycle (plan `v22-market-lifecycle-plan-2026-10-25`, option C)
 
 Tag 39 `ResolveStalePermissionless` is the always-on backstop; the keeper fires it at maturity. The admin resolve (deliberate retirements) is NOT done by the keeper. `KEEPER_V22_STALE_RESOLVE` defaults to `off`: merging or deploying changes nothing until it is set.
