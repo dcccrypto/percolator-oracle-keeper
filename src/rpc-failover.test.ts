@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isTransientRpcError, parseFallbackUrls, preflightOutageDecision, preflightStampSha, GENESIS_HASH } from "./rpc-failover.ts";
+import { isTransientRpcError, parseFallbackUrls, preflightOutageDecision, preflightStampSha, GENESIS_HASH, redactText } from "./rpc-failover.ts";
 
 test("status and error classification", () => {
   assert.ok(isTransientRpcError(new Error("rpc-degraded: all devnet RPC endpoints are down")));
@@ -78,4 +78,10 @@ test("F3: the stamp binds registry + wrapper program id + cluster genesis", () =
   assert.notEqual(base, preflightStampSha(reg, "WRAP2", GENESIS_HASH.devnet), "re-deploy to a new wrapper id must not reuse the stamp");
   assert.notEqual(base, preflightStampSha(reg, "WRAP1", GENESIS_HASH.mainnet), "another cluster must not reuse the stamp");
   assert.notEqual(base, preflightStampSha(Buffer.from('{"markets":[1]}'), "WRAP1", GENESIS_HASH.devnet));
+});
+
+test("keeper#225 follow-up: redactText scrubs a path token in a websocket URL too", () => {
+  const r = redactText("ws closed wss://example.solana-mainnet.quiknode.pro/0123456789abcdef0123456789abcdef/ code 1006");
+  assert.doesNotMatch(r, /0123456789abcdef0123456789abcdef/, r);
+  assert.match(r, /wss:\/\/example\.solana-mainnet\.quiknode\.pro/);
 });

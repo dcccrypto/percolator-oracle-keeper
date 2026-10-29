@@ -510,6 +510,12 @@ describe("item 17 (F-10): error text is redacted; no literal key in dry-run.ts",
     assert.equal(redactErrorText("down: https://api.devnet.solana.com"), "down: https://api.devnet.solana.com");
     assert.equal(redactErrorText("x https://h.io/?api-key=K"), "x https://h.io?***");
   });
+  it("GH#225 follow-up: a websocket URL is redacted like an https one (web3.js derives wss:// from the RPC URL)", () => {
+    const r = redactErrorText("ws error wss://solana-mainnet.g.alchemy.com/v2/SECRETKEY123 closed");
+    assert.doesNotMatch(r, /SECRETKEY123/, `key survived redaction in ${r}`);
+    assert.match(r, /wss:\/\/solana-mainnet\.g\.alchemy\.com\/\*\*\*/);
+    assert.doesNotMatch(redactErrorText("ws://localhost:8900/?api-key=K"), /api-key=K/);
+  });
 
   it("src/dry-run.ts carries no literal Helius key (same removal as #146 on relaunch-live)", () => {
     const src = readFileSync(new URL("../../dry-run.ts", import.meta.url), "utf8");

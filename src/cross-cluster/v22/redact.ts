@@ -14,7 +14,8 @@
 export function redactErrorText(s: string, max = 160): string {
   return s
     .replace(/(api[-_]?key|apikey|token|secret|auth)=[^&\s"')]+/gi, "$1=***")
-    .replace(/https?:\/\/[^\s"')]+/gi, (u) => {
+    // ws(s) too: web3.js derives its websocket endpoint (same host, same path key) from the RPC URL.
+    .replace(/(?:https?|wss?):\/\/[^\s"')]+/gi, (u) => {
       try {
         const url = new URL(u);
         return `${url.protocol}//${url.host}${url.pathname === "/" ? "" : "/***"}${url.search ? "?***" : ""}`;

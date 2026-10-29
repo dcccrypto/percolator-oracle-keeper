@@ -109,7 +109,8 @@ export function redactText(text: string, knownUrls: readonly string[] = []): str
       /* not a URL: nothing further to scrub */
     }
   }
-  out = out.replace(/https?:\/\/[^\s"'<>)]+/gi, (m) => redactUrl(m));
+  // ws(s) too: web3.js derives its websocket endpoint (same host, same path key) from the RPC URL.
+  out = out.replace(/(?:https?|wss?):\/\/[^\s"'<>)]+/gi, (m) => redactUrl(m));
   out = out.replace(/((?:api[-_]?key|apikey|token|secret|key)=)[^&\s"']+/gi, "$1***");
   return out;
 }
