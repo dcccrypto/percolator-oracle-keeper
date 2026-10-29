@@ -355,7 +355,7 @@ export class LifecycleEngine {
 
   // ── Alerts ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-  private alertsFor(all: Tracked[]): { never: Alert[]; warn: Alert[]; matured: Alert[]; interest: Alert[]; unregHeld: Alert[] } {
+  private alertsFor(all: Tracked[]): { never: Alert[]; warn: Alert[]; matured: Alert[]; interest: Alert[]; unregHeld: Alert[]; unregLive: Alert[] } {
     const unregHeld: Alert[] = [];
     const never: Alert[] = [];
     const warn: Alert[] = [];
