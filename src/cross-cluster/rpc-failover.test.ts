@@ -31,6 +31,10 @@ interface Host {
   /** getLatestBlockhash answers with a context slot this far behind the host's own getSlot (2026-10-29 Helius). */
   bhLag?: number;
   callStatus?: number; // HTTP status for real calls only; probes (genesis/slot/block time) succeed
+  /** Chain speed this host reports and (without slotFn) advances at. Default 2.5 (mainnet-like). */
+  rate?: number;
+  /** getLatestBlockhash context slot as a function of the clock (a frozen blockhash: a constant). */
+  bhSlotFn?: (nowMs: number) => number;
 }
 
 /** Scripted transport keyed by URL. Records every (url, method) it sees. */
@@ -42,19 +46,29 @@ function makeNet(hosts: Record<string, Host>, nowMs: () => number = () => 1_000_
     const method = (JSON.parse(String(init?.body)) as { method: string }).method;
     calls.push({ url, method });
     if (!h || h.throwNet) throw new Error(`ECONNRESET ${url}`);
-    if (h.throwOnCall && method !== "getGenesisHash" && method !== "getSlot") throw new Error(`ECONNRESET ${url}`);
+    const probe = method === "getGenesisHash" || method === "getSlot" || method === "getBlockTime" || method === "getRecentPerformanceSamples";
+    if (h.throwOnCall && !probe) throw new Error(`ECONNRESET ${url}`);
+    const rate = h.rate ?? 2.5;
+    const slotNow = () => (h.slotFn ? h.slotFn(nowMs()) : (h.slot ?? 1000) + (h.frozen ? 0 : Math.floor(((nowMs() - 1_000_000) * rate) / 1000)));
+    if (method === "getRecentPerformanceSamples") {
+      if (h.status && h.status !== 200) return new Response(h.body ?? "x", { status: h.status });
+      // five 60 s samples at this host's rate (the chain reports its own speed: no keeper clock involved)
+      const n = Math.round(rate * 60);
+      const result = Array.from({ length: 5 }, (_, i) => ({ slot: slotNow() - i * n, numSlots: n, numTransactions: 1000, samplePeriodSecs: 60 }));
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result }), { status: 200 });
+    }
     if (method === "getBlockTime") {
       if (h.noBlockTime) return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32004, message: "Block not available" } }), { status: 200 });
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: Math.floor(nowMs() / 1000) - (h.blockAgeSec ?? 8) }), { status: 200 });
     }
-    if (h.callStatus && method !== "getGenesisHash" && method !== "getSlot" && method !== "getBlockTime") return new Response("Internal server error", { status: h.callStatus });
-    if (method === "getLatestBlockhash" && h.bhLag !== undefined && (h.status ?? 200) === 200) {
-      const slot = (h.slot ?? 1000) + Math.floor(((nowMs() - 1_000_000) * 2.5) / 1000) - h.bhLag;
+    if (h.callStatus && !probe) return new Response("Internal server error", { status: h.callStatus });
+    if (method === "getLatestBlockhash" && (h.bhLag !== undefined || h.bhSlotFn) && (h.status ?? 200) === 200) {
+      const slot = h.bhSlotFn ? h.bhSlotFn(nowMs()) : slotNow() - (h.bhLag as number);
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { context: { slot }, value: { blockhash: `bh:${url}`, lastValidBlockHeight: slot + 150 } } }), { status: 200 });
     }
     if (method === "getGenesisHash" || method === "getSlot") {
       if (h.status && h.status !== 200) return new Response(h.body ?? "x", { status: h.status });
-      const result = method === "getGenesisHash" ? (h.genesis ?? GENESIS_HASH.devnet) : h.slotFn ? h.slotFn(nowMs()) : (h.slot ?? 1000) + (h.frozen ? 0 : Math.floor(((nowMs() - 1_000_000) * 2.5) / 1000));
+      const result = method === "getGenesisHash" ? (h.genesis ?? GENESIS_HASH.devnet) : slotNow();
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result }), { status: 200 });
     }
     return new Response(h.body ?? JSON.stringify({ jsonrpc: "2.0", id: 1, result: `ok:${url}` }), { status: h.status ?? 200 });
@@ -791,5 +805,227 @@ describe("rpc-failover: HTTP 500 (2026-10-16)", () => {
     assert.equal(f.snapshot().activeIndex, 1);
     assert.equal(f.snapshot().reason, "on-fallback");
     assert.equal(await who(await call(f)), `ok:${F1}`);
+  });
+});
+
+// 2026-10-29 dry run of f6421bd: devnet ran ~4.2 slots/s (236 ms slots; getRecentPerformanceSamples 248-253 per 60 s) but
+// the slot guard assumed 2.5 (x1.15 headroom). With one endpoint in use nothing re-anchored the ceiling, so ~80 s after
+// boot Helius AND public devnet, agreeing with each other, were both "suspect-ahead" -> all-endpoints-down, no pushes.
+// These tests run the DEFAULT configuration (as deployed) against realistic chain speeds and keeper clocks for 15+ min.
+describe("rpc-failover: real chain speeds and keeper clocks (2026-10-29 dry run)", () => {
+  const T0 = 1_000_000;
+  const DEVNET = 4.2;
+  const MAINNET = 2.5;
+  const H = "https://mainnet.helius-rpc.com/?api-key=" + SECRET;
+  const MPUB = "https://api.mainnet-beta.solana.com";
+
+  /** A chain at `rate` slots/s on the CHAIN clock; the keeper reads its own (possibly drifting / stepped) clock. */
+  function sim(opts: {
+    rate: number | ((chainMs: number) => number);
+    cluster?: "devnet" | "mainnet";
+    keeperClock?: (chainMs: number) => number;
+    hosts?: (head: (ms: number) => number) => Record<string, Host>;
+    urls?: string[];
+    extra?: Partial<ConstructorParameters<typeof RpcFailover>[0]>;
+  }) {
+    let chainT = T0;
+    // integrate a possibly time-varying rate (1 s steps) so the head is exact and monotonic
+    const rateAt = typeof opts.rate === "number" ? () => opts.rate as number : opts.rate;
+    const heads: number[] = [500_000_000];
+    const head = (ms: number) => {
+      const s = Math.max(0, Math.floor((ms - T0) / 1000));
+      while (heads.length <= s + 1) heads.push(heads[heads.length - 1] + rateAt(T0 + (heads.length - 1) * 1000));
+      const frac = (ms - T0) / 1000 - s;
+      return Math.floor(heads[s] + (heads[s + 1] - heads[s]) * frac);
+    };
+    const cluster = opts.cluster ?? "devnet";
+    const urls = opts.urls ?? (cluster === "devnet" ? [P, F1] : [H, MPUB]);
+    const curRate = () => rateAt(chainT);
+    const genesis = GENESIS_HASH[cluster];
+    const hosts =
+      opts.hosts?.(head) ??
+      ({
+        [urls[0]]: { slotFn: head, genesis, get rate() { return curRate(); }, get blockAgeSec() { return 20 / curRate(); }, bhSlotFn: (ms: number) => head(ms) - 2 },
+        // the public node trails the paid one by a few slots, as observed
+        [urls[1]]: { slotFn: (ms: number) => head(ms) - 4, genesis, get rate() { return curRate(); }, get blockAgeSec() { return (20 + 4) / curRate(); }, bhSlotFn: (ms: number) => head(ms) - 6 },
+      } as Record<string, Host>);
+    const net = makeNet(hosts, () => chainT);
+    const logs: string[] = [];
+    const clock = opts.keeperClock ?? ((ms: number) => ms);
+    const f = new RpcFailover({ cluster, urls, base: net.base, now: () => clock(chainT), log: (l) => logs.push(l), ...opts.extra });
+    return { f, net, logs, head, urls, tick: (ms: number) => (chainT += ms), now: () => chainT };
+  }
+
+  const bh = (f: RpcFailover, url = P) =>
+    f.fetch(url, { method: "POST", body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getLatestBlockhash", params: [{ commitment: "confirmed" }] }) });
+
+  /** The keeper's traffic shape for `seconds`: a read every second, a blockhash + a send every 2 s. Returns failures. */
+  async function run(s: ReturnType<typeof sim>, seconds: number) {
+    const fails: string[] = [];
+    for (let i = 0; i < seconds; i++) {
+      s.tick(1_000);
+      const r = await call(s.f).then((x) => x.status, (e: Error) => e.message);
+      if (r !== 200) fails.push(`t=${i}s read: ${r}`);
+      if (i % 2 === 0) {
+        const b = await bh(s.f).then((x) => x.status, (e: Error) => e.message);
+        if (b !== 200) fails.push(`t=${i}s blockhash: ${b}`);
+        const w = await call(s.f, "sendTransaction").then((x) => x.status, (e: Error) => e.message);
+        if (w !== 200) fails.push(`t=${i}s send: ${w}`);
+      }
+      const snap = s.f.snapshot();
+      if (snap.status !== "ok") fails.push(`t=${i}s status ${snap.status}/${snap.reason}`);
+    }
+    return fails;
+  }
+
+  it("devnet at 4.2 slots/s, default config, 20 min: every read, blockhash and send is served by the primary; never suspect-ahead", async () => {
+    const s = sim({ rate: DEVNET });
+    const fails = await run(s, 20 * 60);
+    assert.deepEqual(fails.slice(0, 5), [], `${fails.length} failures; logs:\n${s.logs.slice(0, 8).join("\n")}`);
+    assert.ok(!s.logs.some((l) => /suspect-ahead|ALL ENDPOINTS DOWN|USELESS/.test(l)), s.logs.join("\n"));
+    // 20 slots back is 4.8 s old at 4.2 slots/s, not 8 s: an exact keeper clock must measure ~0 skew
+    assert.ok(s.logs.some((l) => /keeper clock vs chain: -?0\.\ds/.test(l)), s.logs.join("\n"));
+    const snap = s.f.snapshot();
+    assert.equal(snap.activeIndex, 0);
+    assert.equal(snap.switches, 0);
+    assert.ok(Math.abs((snap.slotRate.measured as number) - DEVNET) < 0.05, JSON.stringify(snap.slotRate));
+    assert.ok(!s.net.calls.some((c) => c.url === F1 && (c.method === "sendTransaction" || c.method === "getBalance")));
+  });
+
+  it("devnet at 4.2 slots/s with only the primary ever vetted after boot (peer slow to answer): still never suspect-ahead over 30 min", async () => {
+    const s = sim({ rate: DEVNET, extra: { slotCheckIntervalMs: 10_000 } });
+    await call(s.f);
+    // after the boot baseline the fallback is not consulted again unless something fails
+    const before = s.net.calls.filter((c) => c.url === F1).length;
+    const fails = await run(s, 30 * 60);
+    assert.deepEqual(fails.slice(0, 5), [], `${fails.length} failures`);
+    assert.ok(s.net.calls.filter((c) => c.url === F1).length - before <= 4, "steady state does not lean on the public endpoint");
+  });
+
+  it("mainnet at 2.5 slots/s, default config, 20 min: served, measured ~2.5, and the ceiling is as tight as before (2.875/s)", async () => {
+    const s = sim({ rate: MAINNET, cluster: "mainnet" });
+    const fails = await run(s, 20 * 60);
+    assert.deepEqual(fails.slice(0, 5), [], `${fails.length} failures`);
+    const snap = s.f.snapshot();
+    assert.ok(Math.abs((snap.slotRate.measured as number) - MAINNET) < 0.05, JSON.stringify(snap.slotRate));
+    assert.ok(Math.abs(snap.slotRate.ceiling - MAINNET * 1.15) < 0.06, JSON.stringify(snap.slotRate));
+  });
+
+  it("devnet 4.2 slots/s with a drifting keeper clock (+150 ppm, 3 s fast, NTP steps of -2 s and +2 s): served for 20 min", async () => {
+    const step = (ms: number) => (ms - T0 > 300_000 ? -2_000 : 0) + (ms - T0 > 700_000 ? 4_000 : 0);
+    const s = sim({ rate: DEVNET, keeperClock: (ms) => T0 + (ms - T0) * 1.00015 + 3_000 + step(ms) });
+    const fails = await run(s, 20 * 60);
+    assert.deepEqual(fails.slice(0, 5), [], `${fails.length} failures; logs:\n${s.logs.join("\n")}`);
+    assert.ok(!s.logs.some((l) => /suspect-ahead|DISABLED/.test(l)), s.logs.join("\n"));
+  });
+
+  it("a big backward clock step (-90 s) cannot lock out two agreeing endpoints: re-anchored with an [ALERT]", async () => {
+    const s = sim({ rate: DEVNET, keeperClock: (ms) => (ms - T0 > 120_000 ? ms - 90_000 : ms) });
+    const fails = await run(s, 10 * 60);
+    assert.deepEqual(fails, [], s.logs.join("\n"));
+    assert.ok(s.logs.some((l) => /\[ALERT\].*agree.*above the plausibility ceiling.*clock stepped back/.test(l)), s.logs.join("\n"));
+    assert.equal(s.f.snapshot().status, "ok");
+  });
+
+  it("the chain speeds up after the rate was measured (2.5 -> 4.2 -> 6 slots/s): two agreeing endpoints win over the cap, with an [ALERT]", async () => {
+    const s = sim({ rate: (ms) => (ms - T0 < 300_000 ? 2.5 : ms - T0 < 600_000 ? 4.2 : 6) });
+    const fails = await run(s, 15 * 60);
+    assert.deepEqual(fails, [], s.logs.join("\n"));
+    assert.ok(s.logs.some((l) => /\[ALERT\].*agree.*above the plausibility ceiling/.test(l)), s.logs.join("\n"));
+    assert.ok((s.f.snapshot().slotRate.measured as number) > 5.5, JSON.stringify(s.f.snapshot().slotRate));
+    assert.ok(!s.logs.join("\n").includes(SECRET));
+  });
+
+  it("devnet 4.2: a LONE endpoint above the ceiling is still suspect-ahead (its honest peer disagrees); the floor never moves for it", async () => {
+    const s = sim({ rate: DEVNET, extra: { slotCheckIntervalMs: 1_000, primaryRetryMs: 1e9 } });
+    await run(s, 120);
+    s.net.hosts[P] = { status: 429 };
+    s.tick(2_000);
+    await call(s.f); // F1 active
+    const floor0 = s.f.snapshot().floorSlot as number;
+    s.net.hosts[P] = { slotFn: s.head }; // P honest again (not active: primary probe disabled)
+    s.net.hosts[F1] = { slotFn: (ms) => s.head(ms) + 5_000, rate: 400 }; // a liar, and it claims a huge rate too
+    s.tick(2_000);
+    await call(s.f).catch(() => undefined);
+    const snap = s.f.snapshot();
+    assert.equal(snap.endpoints[1].suspectAhead, true);
+    assert.equal(snap.endpoints[1].state, "down");
+    assert.ok((snap.floorSlot as number) < floor0 + 100, `floor ${snap.floorSlot} vs ${floor0}`);
+    assert.ok(snap.slotRate.ceiling < 5, `a liar's rate must not loosen the ceiling: ${JSON.stringify(snap.slotRate)}`);
+  });
+
+  it("devnet 4.2: a rogue sole fallback pacing the ceiling for 1 h gains no more than the 15% headroom of the MEASURED rate", async () => {
+    const s = sim({ rate: DEVNET, extra: { slotCheckIntervalMs: 1, primaryRetryMs: 1, backoffBaseMs: 1, backoffMaxMs: 1 } });
+    await call(s.f);
+    const a0 = s.head(T0);
+    const start = s.now();
+    s.net.hosts[P] = { status: 429 };
+    const rogue = (ms: number) => Math.floor(a0 + ((ms - T0) / 1000) * DEVNET * 1.15 + 100 - 1);
+    s.net.hosts[F1] = { slotFn: rogue, rate: DEVNET };
+    for (let t = 0; t < 3_600; t += 11) {
+      s.tick(11_000);
+      await call(s.f).catch(() => undefined);
+    }
+    const lead = (s.f.snapshot().floorSlot as number) - s.head(s.now());
+    const allowed = ((s.now() - start) / 1000) * DEVNET * 0.15 + 100;
+    assert.ok(lead <= allowed + 5, `lead ${lead} > ${allowed}`);
+  });
+
+  it("devnet 4.2: a FROZEN blockhash on the primary (2026-10-29 Helius) is still refused for 10 min; blockhashes come from the fallback", async () => {
+    const s = sim({
+      rate: DEVNET,
+      hosts: (head) => ({
+        [P]: { slotFn: head, rate: DEVNET, blockAgeSec: 20 / DEVNET, bhSlotFn: () => head(T0) - 50 }, // getSlot current, blockhash context frozen
+        [F1]: { slotFn: (ms) => head(ms) - 4, rate: DEVNET, blockAgeSec: 24 / DEVNET, bhSlotFn: (ms) => head(ms) - 6 },
+      }),
+    });
+    const bhOf = async (r: Response) => ((await r.json()) as { result: { value: { blockhash: string } } }).result.value.blockhash;
+    let fromP = 0;
+    for (let i = 0; i < 600; i++) {
+      s.tick(1_000);
+      assert.equal(await who(await call(s.f)), `ok:${P}`, `read at t=${i}s`);
+      if ((await bhOf(await bh(s.f))) === `bh:${P}`) fromP++;
+    }
+    // the frozen context (50 slots behind at boot) crosses the 75-slot allowance within ~6 s at 4.2 slots/s
+    assert.ok(fromP <= 7, `frozen-blockhash primary served ${fromP} blockhashes`);
+    assert.equal(s.f.snapshot().reason, "stale-blockhash");
+    assert.equal(s.f.snapshot().activeIndex, 0);
+  });
+
+  it("devnet 4.2: a FROZEN slot on the fallback is still rejected as lagging once the primary is gone", async () => {
+    const s = sim({
+      rate: DEVNET,
+      extra: { slotCheckIntervalMs: 1 },
+      hosts: (head) => ({ [P]: { slotFn: head, rate: DEVNET, blockAgeSec: 20 / DEVNET }, [F1]: { slotFn: head, rate: DEVNET, blockAgeSec: 20 / DEVNET } }),
+    });
+    await run(s, 60);
+    const frozenAt = s.head(s.now());
+    s.net.hosts[F1] = { slotFn: () => frozenAt, rate: DEVNET };
+    await run(s, 15); // the primary keeps serving and raising the floor: 63 slots past the frozen fallback (> maxSlotLag)
+    s.net.hosts[P] = { status: 429 };
+    const r = await call(s.f);
+    assert.equal(r.status, 429, "the primary's own 429 is handed back (web3.js retries); the frozen fallback does not serve");
+    assert.match(s.f.snapshot().endpoints[1].lastError ?? "", /lagging: slot \d+ is 6\d behind/);
+    assert.ok(!s.net.calls.some((c) => c.url === F1 && c.method === "getBalance"));
+    await assert.rejects(call(s.f), /rpc-degraded/);
+  });
+
+  it("before any measurement the ceiling uses the bound (default 5 slots/s); RPC_SLOTS_PER_SECOND overrides it", () => {
+    const f = new RpcFailover({ cluster: "devnet", urls: [P, F1], base: makeNet({}).base, log: () => undefined });
+    assert.equal(f.snapshot().slotRate.measured, null);
+    assert.equal(f.snapshot().slotRate.bound, 5);
+    const g = failoverFromEnv("devnet", P, [F1], { RPC_SLOTS_PER_SECOND: "7.5" }, makeNet({}).base) as RpcFailover;
+    assert.equal(g.snapshot().slotRate.bound, 7.5);
+    assert.ok(Math.abs(g.snapshot().slotRate.ceiling - 7.5 * 1.15) < 1e-9);
+  });
+
+  it("a single endpoint's rate report cannot raise the ceiling above the bound (no corroborating peer)", async () => {
+    const s = sim({
+      rate: DEVNET,
+      hosts: (head) => ({ [P]: { slotFn: head, rate: 40 }, [F1]: { slotFn: head, rate: DEVNET } }),
+    });
+    await call(s.f);
+    // P and F1 disagree on the rate by ~10x: not corroborated, so the ceiling is capped at the bound
+    assert.ok(s.f.snapshot().slotRate.ceiling <= 5 * 1.15 + 1e-9, JSON.stringify(s.f.snapshot().slotRate));
   });
 });
