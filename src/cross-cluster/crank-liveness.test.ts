@@ -144,15 +144,27 @@ describe("crank liveness watchdog", () => {
       markets: [{ label, marketAddress: Keypair.generate().publicKey.toBase58(), poolAddress: Keypair.generate().publicKey.toBase58(), dexType: "pumpswap", assetIndex: 0, registeredAt: Date.now() }],
     });
     const good = new AlertSink({ thresholds: DEFAULT_THRESHOLDS, log: () => undefined, logError: () => undefined });
-    const bad = new AlertSink({ thresholds: DEFAULT_THRESHOLDS, log: () => undefined, logError: () => undefined });
-    bad.reconcile = async () => {
-      throw new Error("boom");
-    };
+    // The loop must THROW. A failing alert sink no longer does that (reporting is isolated from the loop, ledger
+    // v22-keepfix2-2026-10-29), so the registry itself throws once the loop is running (boot reads `markets` twice,
+    // the first cycle reads it again before the throw).
+    const badReg = mk("A");
+    const aMarkets = badReg.markets;
+    let reads = 0;
+    Object.defineProperty(badReg, "markets", {
+      get: () => {
+        if (++reads > 3) throw new Error("boom");
+        return aMarkets;
+      },
+    });
     let deadFired = 0;
     let healthyFired = 0;
     let controlFired = 0;
     const A = createCrankLiveness({ intervalMs: 50, intervals: 2, minSilenceMs: 1, onStall: () => deadFired++ });
-    await startRecoveryCrankLoop(quiet, Keypair.generate(), mk("A"), { intervalMs: 50, dryRun: true }, bad, undefined, A).catch(() => undefined);
+    let threw = false;
+    await startRecoveryCrankLoop(quiet, Keypair.generate(), badReg, { intervalMs: 50, dryRun: true }, good, undefined, A).catch(() => {
+      threw = true;
+    });
+    assert.ok(threw, "harness: the first loop must have thrown");
     // Negative control: a watchdog that is armed and never stopped DOES fire in this window, so the harness can see an orphan.
     const C = createCrankLiveness({ intervalMs: 50, intervals: 2, minSilenceMs: 1, onStall: () => controlFired++ });
     const stopC = C.start();

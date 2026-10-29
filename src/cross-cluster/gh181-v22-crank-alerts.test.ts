@@ -101,7 +101,8 @@ describe("GH#181: a v2.2 market's published health record is evaluated, so its a
 
   it("adl-reduce-only fires from the ADL state the v2.2 layer back-fills", async () => {
     const { kinds } = await run(
-      record({ adl: { reduceOnly: true, aLong: "1000000000000000", aShort: "861700000000000", oiEffLong: "27500000", oiEffShort: "27500000" } }),
+      // The published form: aLong/aShort are decimal fractions of ADL_ONE (adlHealth -> adlFraction).
+      record({ adl: { reduceOnly: true, aLong: "1.000000", aShort: "0.861700", oiEffLong: "27500000", oiEffShort: "27500000" } }),
     );
     assert.ok(kinds.includes("adl-reduce-only"), `expected adl-reduce-only; got ${JSON.stringify(kinds)}`);
   });
@@ -152,8 +153,8 @@ describe("GH#181: v22CrankSample, directly", () => {
     );
   });
 
-  it("converts the ADL strings to the bigints the evaluator expects", () => {
-    const s = v22CrankSample("L", MKT, record({ adl: { reduceOnly: true, aLong: "12", aShort: "34", oiEffLong: "56", oiEffShort: "78" } }), NOW);
-    assert.deepEqual(s?.adl, { reduceOnly: true, aLong: 12n, aShort: 34n, oiEffLong: 56n, oiEffShort: 78n });
+  it("converts the published ADL strings (fractions of ADL_ONE; integer OI) to the bigints the evaluator expects", () => {
+    const s = v22CrankSample("L", MKT, record({ adl: { reduceOnly: true, aLong: "1.000000", aShort: "0.861700", oiEffLong: "56", oiEffShort: "78" } }), NOW);
+    assert.deepEqual(s?.adl, { reduceOnly: true, aLong: 1_000_000_000_000_000n, aShort: 861_700_000_000_000n, oiEffLong: 56n, oiEffShort: 78n });
   });
 });

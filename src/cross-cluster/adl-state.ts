@@ -92,6 +92,18 @@ export function adlFraction(a: bigint): string {
   return `${scaled / 1_000_000n}.${(scaled % 1_000_000n).toString().padStart(6, "0")}`;
 }
 
+/**
+ * The exact inverse of the published decimal form: "0.861700" -> 861_700_000_000_000n (units of ADL_ONE). Exact for any
+ * plain decimal with at most 15 fractional digits (ADL_ONE = 1e15). Null for anything else (sign, exponent, empty
+ * parts, > 15 digits) -- never a rounded guess. `BigInt("1.000000")` throws, which crash-looped the recovery-crank
+ * loop on growth 4458ecc (ledger v22-keepfix-2026-10-29 §4).
+ */
+export function parseAdlFraction(s: string): bigint | null {
+  const m = /^(\d+)(?:\.(\d{1,15}))?$/.exec(s);
+  if (!m) return null;
+  return BigInt(m[1]) * ADL_ONE + BigInt((m[2] ?? "").padEnd(15, "0"));
+}
+
 /** The /health shape of an ADL state (refresh-coordination.ts `CrankRefreshHealth.adl`). */
 export function adlHealth(s: AdlState): { reduceOnly: boolean; aLong: string; aShort: string; oiEffLong: string; oiEffShort: string } {
   return { reduceOnly: s.reduceOnly, aLong: adlFraction(s.aLong), aShort: adlFraction(s.aShort), oiEffLong: s.oiEffLong.toString(), oiEffShort: s.oiEffShort.toString() };

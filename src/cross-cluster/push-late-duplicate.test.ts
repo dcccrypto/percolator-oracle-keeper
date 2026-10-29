@@ -31,6 +31,7 @@ import {
   resetPushLandingState,
   pushLandingStats,
   PUSH_SEND_OPTIONS,
+  getSoloMarkets,
 } from "./auth-mark-pusher.ts";
 
 const BLOCKHASH = { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 };
@@ -202,5 +203,80 @@ describe("reconcilePushOutcomes: landed push reverts are classified, not invisib
     const broken = { getSignatureStatuses: async () => { throw new Error("429"); } };
     await assert.doesNotReject(reconcilePushOutcomes(broken as never, Date.now() + 10_000));
     void conn;
+  });
+});
+
+/**
+ * Keepfix2 (2026-10-29): the one LANDED REVERT of the 4458ecc deploy, ozVCGUEU… `[15, Custom(19)]`.
+ * Cycle 188 sent a 15-push batch ending with cap4 asset 0 (seq 269023). Cycle 189 had no pool prices and pushed only
+ * cap4's five fixed-price assets (asset 0 at seq 269024). Both landed in slot 516515644, cycle 189's first, so the batch
+ * reverted at cap4: our own reorder. The batch's other 14 markets had no newer push yet, so the old every-market rule
+ * called it "not a superseded late duplicate" and struck cap4 toward SOLO.
+ */
+describe("keepfix2: a landed Custom(19) is judged at the failing asset, on landed evidence", () => {
+  beforeEach(() => resetPushLandingState());
+
+  const stale = (ix: number) => ({ err: { InstructionError: [ix, { Custom: ENGINE_STALE }] } });
+
+  it("a batch reverted by OUR later partial cycle is a late duplicate, and strikes nobody toward SOLO", async () => {
+    const [a, b, cap4] = markets(3);
+    const c = chain([a, b, cap4]);
+    const keeper = Keypair.generate();
+    for (let round = 0; round < 2; round++) {
+      await pushAuthMarkBatch(c.conn as never, keeper, asPushes([a, b, cap4]), 100n + BigInt(round * 10), BLOCKHASH, false); // full batch
+      await pushAuthMarkBatch(c.conn as never, keeper, asPushes([cap4]), 104n + BigInt(round * 10), BLOCKHASH, false); // partial: cap4 only
+    }
+    const st: Record<string, { err: unknown }> = {};
+    c.sent.forEach((x, i) => (st[x.sig] = i % 2 === 0 ? stale(3) : { err: null })); // each batch reverts at ix 3 = cap4
+    const errors: string[] = [];
+    const orig = console.error;
+    console.error = (...m: unknown[]) => void errors.push(m.join(" "));
+    try {
+      await reconcilePushOutcomes(statusConn(st).conn as never, Date.now() + 10_000);
+    } finally {
+      console.error = orig;
+    }
+    assert.deepEqual(
+      { late: pushLandingStats.lateDuplicateReverts, other: pushLandingStats.otherReverts, ok: pushLandingStats.landedOk },
+      { late: 2, other: 0, ok: 2 },
+    );
+    assert.deepEqual(getSoloMarkets(), [], "our own reorder is not a reason to isolate cap4");
+    assert.ok(!errors.some((e) => e.includes("LANDED REVERT")), errors.join("\n"));
+  });
+
+  it("waits for the newer push's outcome before judging, then calls it a late duplicate", async () => {
+    const [a, cap4] = markets(2);
+    const c = chain([a, cap4]);
+    const keeper = Keypair.generate();
+    await pushAuthMarkBatch(c.conn as never, keeper, asPushes([a, cap4]), 100n, BLOCKHASH, false);
+    await pushAuthMarkBatch(c.conn as never, keeper, asPushes([cap4]), 104n, BLOCKHASH, false);
+    const [s0, s1] = c.sent.map((x) => x.sig);
+    await reconcilePushOutcomes(statusConn({ [s0]: stale(2) }).conn as never, Date.now() + 10_000); // s1 not seen yet
+    assert.deepEqual([pushLandingStats.lateDuplicateReverts, pushLandingStats.otherReverts], [0, 0], "no verdict while the newer push is unknown");
+    await reconcilePushOutcomes(statusConn({ [s0]: stale(2), [s1]: { err: null } }).conn as never, Date.now() + 12_000);
+    assert.deepEqual([pushLandingStats.lateDuplicateReverts, pushLandingStats.otherReverts], [1, 0]);
+  });
+
+  it("someone else advancing the nonce is NOT our late duplicate: every revert is flagged and the market goes SOLO", async () => {
+    // A second pusher on market `a`: each of our pushes for it reverts on chain. We SENT higher nonces every cycle,
+    // but none of them LANDED -- the old rule (nonce sent) called all but the newest benign.
+    const [a, b] = markets(2);
+    const c = chain([a, b]);
+    const keeper = Keypair.generate();
+    await pushAuthMarkBatch(c.conn as never, keeper, asPushes([a, b]), 100n, BLOCKHASH, false);
+    await pushAuthMarkBatch(c.conn as never, keeper, asPushes([a, b]), 104n, BLOCKHASH, false);
+    const [s0, s1] = c.sent.map((x) => x.sig);
+    const orig = console.error;
+    const origWarn = console.warn;
+    console.error = () => undefined;
+    console.warn = () => undefined;
+    try {
+      await reconcilePushOutcomes(statusConn({ [s0]: stale(1), [s1]: stale(1) }).conn as never, Date.now() + 10_000);
+    } finally {
+      console.error = orig;
+      console.warn = origWarn;
+    }
+    assert.deepEqual([pushLandingStats.lateDuplicateReverts, pushLandingStats.otherReverts], [0, 2]);
+    assert.deepEqual(getSoloMarkets(), [a], "two unexplained landed reverts isolate the market (K-7)");
   });
 });
