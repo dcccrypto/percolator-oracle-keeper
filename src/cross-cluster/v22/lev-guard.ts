@@ -20,7 +20,7 @@
  *                              (LpStopNotTriggered = nothing to do). The LP itself is never listed.
  *
  *   KEEPER_LEV_DRY_RUN=1      simulate and log every op 2/3/4/5 of THIS subsystem, send nothing (GH#226). Also honoured:
- *                              the global DRY_RUN / KEEPER_DRY_RUN, and KEEPER_V22_DRY_RUN when KEEPER_V22 is on.
+ *                              the global DRY_RUN / KEEPER_DRY_RUN and KEEPER_V22_DRY_RUN (with KEEPER_V22 off: any value but off/0/false/no, fail-safe).
  *
  * Tunables (all optional): KEEPER_LEV_POKE_MIN_GAP_MS (1500), KEEPER_LEV_HOLDER_INTERVAL_MS (3600000), KEEPER_LEV_W1_BATCH (4),
  * KEEPER_LEV_W1_MAX_TXS (12), KEEPER_LEV_RISK_KEY_PATH (a keypair file; its contents are never logged).
@@ -50,7 +50,7 @@ import { decodeVaultLpState } from "../resolved-portfolio-cleanup.ts";
 import { decodeActiveDepthSource } from "../depth-source.ts";
 import { simulateAndSend } from "./exec.ts";
 import type { ExecConnection, ExecContext, ExecOutcome } from "./exec.ts";
-import { V22FlagError, parseFlag } from "./flags.ts";
+import { FALSE_WORDS, V22FlagError, parseFlag } from "./flags.ts";
 import { redactErrorText } from "./redact.ts";
 import { buildReport, cpmmDumpBps, filterHolders, holderAttemptOrder, knownExcludedOwners, totalsByOwner } from "./lev-guard-math.ts";
 import type { CandidateHolder, OwnerView, TokenAccountView } from "./lev-guard-math.ts";
@@ -133,6 +133,29 @@ export function levGuardConfigFromEnv(env: Env = process.env): LevGuardConfig {
 }
 
 export const levGuardEnabled = (c: LevGuardConfig): boolean => c.poke || c.holderJob || c.w1;
+
+/**
+ * GH#226 follow-up: this subsystem's dry-run decision, FAIL-SAFE. Dry if any switch that dry-ran before says so (global
+ * DRY_RUN / KEEPER_DRY_RUN, `KEEPER_V22_DRY_RUN` with KEEPER_V22 on, `KEEPER_LEV_DRY_RUN`). With KEEPER_V22 off,
+ * `KEEPER_V22_DRY_RUN` is not parsed by the v2.2 flags (N-6), but an operator who set it asked for a dry run: honour any
+ * value except an explicit off/0/false/no, with a warning. Never throws, so a stray value cannot stop the keeper at boot.
+ */
+export function levGuardDryRunDecision(
+  env: Env,
+  globalDryRun: boolean,
+  v22: { enabled: boolean; dryRun: boolean },
+  cfg: LevGuardConfig,
+): { dryRun: boolean; warning: string | null } {
+  if (globalDryRun || v22.dryRun || cfg.dryRun) return { dryRun: true, warning: null };
+  const raw = env.KEEPER_V22_DRY_RUN;
+  if (v22.enabled || raw === undefined || raw.trim() === "") return { dryRun: false, warning: null };
+  if (FALSE_WORDS.includes(raw.trim().toLowerCase())) return { dryRun: false, warning: null };
+  return {
+    dryRun: true,
+    warning:
+      "[lev-guard] WARNING: KEEPER_V22_DRY_RUN is set while KEEPER_V22 is off; the leverage-guard jobs run DRY (fail-safe). Use KEEPER_LEV_DRY_RUN to control this subsystem explicitly.",
+  };
+}
 
 /**
  * Load the risk key. Never logs the file's contents. THROWS (a clear startup error) when the file is group- or world-readable (mode & 0o077 != 0);

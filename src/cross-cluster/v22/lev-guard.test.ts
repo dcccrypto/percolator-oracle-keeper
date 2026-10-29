@@ -42,7 +42,7 @@ import {
   totalsByOwner,
 } from "./lev-guard-math.ts";
 import type { OwnerView, TokenAccountView } from "./lev-guard-math.ts";
-import { LEV_GUARD_DEFAULTS, LevGuardKeeper, KEY_TAG_LEN, keyTagOf, netPosOnAsset, W1_MAX_VICTIMS_PER_TX, levGuardConfigFromEnv, levGuardEnabled, loadRiskKey, w1Victims } from "./lev-guard.ts";
+import { LEV_GUARD_DEFAULTS, LevGuardKeeper, KEY_TAG_LEN, keyTagOf, netPosOnAsset, W1_MAX_VICTIMS_PER_TX, levGuardConfigFromEnv, levGuardEnabled, loadRiskKey, w1Victims, levGuardDryRunDecision } from "./lev-guard.ts";
 import type { LevGuardConfig } from "./lev-guard.ts";
 import { fakeExecConn, key, portfolioBytes, v22MarketBytes, vaultLpStateBytes } from "./test-helpers.ts";
 import { levGuardHealthFields, setLevGuardHealthProvider } from "./health.ts";
@@ -382,6 +382,26 @@ describe("flags", () => {
     // strict like every other KEEPER_LEV_* flag, and it never enables the subsystem by itself
     assert.throws(() => levGuardConfigFromEnv({ KEEPER_LEV_DRY_RUN: "dry" }), V22FlagError);
     assert.equal(levGuardEnabled(levGuardConfigFromEnv({ KEEPER_LEV_DRY_RUN: "1" })), false, "a dry-run flag alone starts no job");
+  });
+  it("GH#226 follow-up: the issue's exact config dry-runs (fail safe), and deciding never throws (N-6 kept)", () => {
+    const decide = (env: Record<string, string>, globalDry = false) =>
+      levGuardDryRunDecision(env, globalDry, v22FlagsFromEnv(env), levGuardConfigFromEnv(env));
+    // KEEPER_V22=off + KEEPER_V22_DRY_RUN=on + KEEPER_LEV_W1=on used to send real op 5 forced reduces
+    const trap = decide({ KEEPER_V22: "off", KEEPER_V22_DRY_RUN: "on", KEEPER_LEV_W1: "1" });
+    assert.equal(trap.dryRun, true, "the operator asked for a dry run: never go live on it");
+    assert.match(trap.warning ?? "", /KEEPER_LEV_DRY_RUN/);
+    // a malformed value with the layer off still does not throw (N-6) and fails SAFE
+    assert.equal(decide({ KEEPER_V22_DRY_RUN: "dry", KEEPER_LEV_W1: "1" }).dryRun, true);
+    // an explicit "off" is honoured, quietly
+    assert.deepEqual(decide({ KEEPER_V22_DRY_RUN: "off", KEEPER_LEV_W1: "1" }), { dryRun: false, warning: null });
+    // unset everywhere: live, as before
+    assert.deepEqual(decide({ KEEPER_LEV_W1: "1" }), { dryRun: false, warning: null });
+    // every switch that dry-ran before still does
+    assert.equal(decide({ KEEPER_LEV_W1: "1" }, true).dryRun, true);
+    assert.equal(decide({ KEEPER_V22: "on", KEEPER_V22_DRY_RUN: "on", KEEPER_LEV_W1: "1" }).dryRun, true);
+    assert.equal(decide({ KEEPER_LEV_DRY_RUN: "1", KEEPER_LEV_W1: "1" }).dryRun, true);
+    // with the layer on, KEEPER_V22_DRY_RUN=off is read strictly by v22 flags and means live
+    assert.deepEqual(decide({ KEEPER_V22: "on", KEEPER_V22_DRY_RUN: "off", KEEPER_LEV_W1: "1" }), { dryRun: false, warning: null });
   });
   it("each flag turns on only its own job; 1 / on / true parse; a typo is a startup error (never a silent default)", () => {
     assert.deepEqual([levGuardConfigFromEnv({ KEEPER_LEV_POKE: "1" }).poke, levGuardConfigFromEnv({ KEEPER_LEV_POKE: "1" }).holderJob, levGuardConfigFromEnv({ KEEPER_LEV_POKE: "1" }).w1], [true, false, false]);

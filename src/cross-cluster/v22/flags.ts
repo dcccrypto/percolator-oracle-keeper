@@ -155,7 +155,7 @@ export class V22FlagError extends Error {
 }
 
 const TRUE_WORDS = ["on", "1", "true", "yes"];
-const FALSE_WORDS = ["off", "0", "false", "no"];
+export const FALSE_WORDS: readonly string[] = ["off", "0", "false", "no"];
 
 /** unset / empty -> `def`; on/1/true/yes -> true; off/0/false/no -> false; anything else THROWS. */
 export function parseFlag(env: Env, key: string, def: boolean): boolean {
