@@ -213,6 +213,7 @@ describe("tag 111 G9", () => {
     const ctx = v22Ctx();
     assert.deepEqual(g9ExtraTail(ctx, false, 2), []);
     assert.equal(g9ExtraTail(ctx, true, 1).length, 0);
+    assert.equal(g9ExtraTail(ctx, true, 3).length, 0, "GH#183: mode 3 (RESTORE-FROM-PNL) is a restore: no oracle tail");
     const t = g9ExtraTail(ctx, true, 0);
     assert.ok(t[0].equals(deriveG9FeedAllowlistV22(ctx.programId)[0]));
     assert.equal(t.length, 1 + ctx.oracleLegFeeds.length);
@@ -254,6 +255,58 @@ describe("tag 111 G9", () => {
     const r4 = await g9Once(execCtx(waiting.conn), ctx, unitsAccount(ctx.market, 4900n), freshG9State(), { ...args, dryRun: false });
     assert.equal(r4.action.kind, "wait");
     assert.equal(waiting.sims.length, 0);
+  });
+});
+
+describe("tag 111 G9 restore: mode 3 first, mode 1 fallback in the same sweep (GH#183)", () => {
+  function unitsWithReceivable(market: PublicKey): Uint8Array {
+    const b = Buffer.alloc(16 + 192);
+    b.writeBigUInt64LE(0x5045_5243_5631_3600n, 0);
+    b.writeUInt16LE(19, 8);
+    b[10] = 13;
+    Buffer.from(market.toBytes()).copy(b, 16);
+    b[16 + 136] = 1;
+    return new Uint8Array(b);
+  }
+  const args = { allowAnyOracleMode: false, mainnetBuild: false, drawCapAtoms: 7n, dryRun: false };
+  it("a clean mode-3 simulation is sent as mode 3 and nothing else is tried", async () => {
+    const ctx = v22Ctx();
+    const f = fakeExecConn();
+    const st = freshG9State();
+    const units = { g9PendingSlot: 0n, backstopReceivableAtoms: 10n };
+    assert.equal(decideG9(ctx, units, BigInt(ctx.readSlot), false, st).kind, "restore");
+    // g9Once decodes the units account itself: write the receivable where the SDK decoder reads it (offset 16 + 80).
+    const acct = unitsWithReceivable(ctx.market);
+    Buffer.from(acct.buffer, acct.byteOffset, acct.byteLength).writeBigUInt64LE(10n, 16 + 80);
+    const r = await g9Once(execCtx(f.conn), ctx, acct, st, args);
+    assert.equal(r.action.kind, "restore");
+    assert.equal(r.outcome?.kind, "sent");
+    assert.equal(f.sentData[0][0][1], 3, "mode byte = 3 (RESTORE-FROM-PNL)");
+    assert.equal(f.sims.length, 1);
+  });
+  it("a refused mode-3 simulation falls back to mode 1 in the same sweep; the refused attempt sends nothing", async () => {
+    const ctx = v22Ctx();
+    const f = fakeExecConn({ simErr: (_tx, i) => (i === 0 ? customAt(0, 116) : null) });
+    const st = freshG9State();
+    const acct = unitsWithReceivable(ctx.market);
+    Buffer.from(acct.buffer, acct.byteOffset, acct.byteLength).writeBigUInt64LE(10n, 16 + 80);
+    const r = await g9Once(execCtx(f.conn), ctx, acct, st, args);
+    assert.equal(r.action.kind, "restore");
+    assert.equal(r.outcome?.kind, "sent");
+    assert.equal(f.sims.length, 2, "mode 3 simulated, refused, then mode 1 simulated");
+    assert.equal(f.sent.length, 1, "only the fallback is sent");
+    assert.equal(f.sentData[0][0][1], 1, "the sent instruction is mode 1 (RESTORE)");
+  });
+  it("both refused: the outcome is the (expected) refusal, nothing is sent", async () => {
+    const ctx = v22Ctx();
+    const f = fakeExecConn({ simErr: () => customAt(0, 116) });
+    const acct = unitsWithReceivable(ctx.market);
+    Buffer.from(acct.buffer, acct.byteOffset, acct.byteLength).writeBigUInt64LE(10n, 16 + 80);
+    const r = await g9Once(execCtx(f.conn), ctx, acct, freshG9State(), args);
+    assert.equal(r.action.kind, "restore");
+    assert.equal(r.outcome?.kind, "refused");
+    assert.equal(f.sent.length, 0);
+    assert.equal(f.sims.length, 2);
   });
 });
 
