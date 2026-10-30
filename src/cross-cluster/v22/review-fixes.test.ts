@@ -475,9 +475,9 @@ describe("item 15 (F-7): Earn exit queue rotates and the scan is filtered by reg
 
 describe("item 17 (F-10): error text is redacted; no literal key in dry-run.ts", () => {
   it("api keys and URL queries never reach /health or the logs", async () => {
-    const t = "fetch failed https://mainnet.helius-rpc.com/?api-key=2a089bfd-SECRET&x=1 (api-key=ABC123)";
+    const t = "fetch failed https://mainnet.helius-rpc.com/?api-key=deadbeef-SECRET&x=1 (api-key=ABC123)";
     const r = redactErrorText(t);
-    assert.doesNotMatch(r, /SECRET|ABC123|2a089bfd/);
+    assert.doesNotMatch(r, /SECRET|ABC123|deadbeef/);
     const f = fakeExecConn();
     (f.conn as unknown as { simulateTransaction: () => Promise<never> }).simulateTransaction = async () => {
       throw new Error(t);
@@ -485,8 +485,8 @@ describe("item 17 (F-10): error text is redacted; no literal key in dry-run.ts",
     const { simulateAndSend } = await import("./exec.ts");
     const out = await simulateAndSend(execCtx(f.conn), [buildObservationCrankIx(key(1), MARKET, LP)], { job: "redact", label: "T", units: 1 });
     assert.equal(out.kind, "failed");
-    if (out.kind === "failed") assert.doesNotMatch(out.error, /SECRET|2a089bfd/);
-    assert.doesNotMatch(allJobCounters().redact.lastError ?? "", /SECRET|2a089bfd/);
+    if (out.kind === "failed") assert.doesNotMatch(out.error, /SECRET|deadbeef/);
+    assert.doesNotMatch(allJobCounters().redact.lastError ?? "", /SECRET|deadbeef/);
     // the loop's layout-problem text path goes through it too (negative control: a plain message survives)
     assert.equal(redactErrorText("layout unknown: length 123"), "layout unknown: length 123");
   });
