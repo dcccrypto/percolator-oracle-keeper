@@ -23,6 +23,10 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { Keypair } from "@solana/web3.js";
 
+// A live-entry boot is a child tsx process that compiles the whole keeper; under a loaded host (parallel suite, CI) it takes well over 5 s.
+// The timeout only bounds a hang (the negative control relies on it), so it is generous.
+const LIVE_ENTRY_TIMEOUT_MS = 30_000;
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const ENTRY = path.join(ROOT, "src", "cross-cluster.ts");
 
@@ -46,7 +50,7 @@ function runLiveEntry(env: Record<string, string>): Promise<EntryResult> {
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
-    }, 5_000);
+    }, LIVE_ENTRY_TIMEOUT_MS);
     child.on("close", (code) => {
       clearTimeout(timer);
       resolve({ code, output, timedOut });

@@ -17,12 +17,16 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { Keypair } from "@solana/web3.js";
 import {
+
   createWalletBalanceState,
   shouldRefreshBalance,
   applyBalanceReading,
   recordBalanceReadFailure,
   formatSol,
 } from "./wallet-balance-guard.ts";
+// A live-entry boot is a child tsx process that compiles the whole keeper; under a loaded host (parallel suite, CI) it takes well over 5 s.
+// The timeout only bounds a hang (the negative control relies on it), so it is generous.
+const LIVE_ENTRY_TIMEOUT_MS = 30_000;
 
 const MIN = 50_000_000; // 0.05 SOL
 
@@ -100,7 +104,7 @@ function runLiveEntry(env: Record<string, string>): Promise<{ code: number | nul
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
-    }, 5_000);
+    }, LIVE_ENTRY_TIMEOUT_MS);
     child.on("close", (code) => {
       clearTimeout(timer);
       resolve({ code, output, timedOut });
