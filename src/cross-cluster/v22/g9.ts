@@ -74,8 +74,12 @@ export function decideG9(
   return { kind: "none", reason: "propose retry spacing" };
 }
 
-export function g9ExtraTail(ctx: V22MarketCtx, mainnetBuild: boolean, mode: 0 | 1 | 2): PublicKey[] {
-  if (!mainnetBuild || mode === BackstopMode.Restore) return [];
+/**
+ * The oracle tail (feed allowlist + leg feeds) belongs to modes 0 and 2 ONLY: the program's R-1/R-7/R-8 oracle gate covers
+ * tag 111 modes 0 and 2 (v16_program.rs:37947). Both restores (1 RESTORE, 3 RESTORE-FROM-PNL) need no feed (GH#183).
+ */
+export function g9ExtraTail(ctx: V22MarketCtx, mainnetBuild: boolean, mode: 0 | 1 | 2 | 3): PublicKey[] {
+  if (!mainnetBuild || mode === BackstopMode.Restore || mode === BackstopMode.RestoreFromPnl) return [];
   return [deriveG9FeedAllowlistV22(ctx.programId)[0], ...ctx.oracleLegFeeds];
 }
 
@@ -97,13 +101,23 @@ export async function g9Once(
   const now = BigInt(ctx.readSlot);
   const action = decideG9(ctx, units, now, p.allowAnyOracleMode, st);
   if (action.kind === "none" || action.kind === "wait") return { action, outcome: null };
-  const mode = action.kind === "propose" ? BackstopMode.Propose : action.kind === "draw" ? BackstopMode.Draw : BackstopMode.Restore;
-  const cap = mode === BackstopMode.Propose ? 0n : p.drawCapAtoms;
-  const ix = buildInsuranceBackstopDrawIxV22(ctx.sdk, exec.keeper.publicKey, mode, cap, g9ExtraTail(ctx, p.mainnetBuild, mode));
   st.lastAttempt.set(`${ctx.marketAddress}|${action.kind}`, now);
   // 114-116 are the G9 / rescue refusals: "not eligible right now" is an expected answer to a propose / draw / restore probe.
   const expected = new Set<number>([114, 115, 116, 21]);
-  const outcome = await simulateAndSend(exec, [ix], { job: `g9-${action.kind}`, label: ctx.label, units: G9_TX_UNITS, dryRun: p.dryRun, expected });
+  const attempt = (mode: 0 | 1 | 2 | 3, job: string): Promise<ExecOutcome> => {
+    const cap = mode === BackstopMode.Propose ? 0n : p.drawCapAtoms;
+    const ix = buildInsuranceBackstopDrawIxV22(ctx.sdk, exec.keeper.publicKey, mode, cap, g9ExtraTail(ctx, p.mainnetBuild, mode));
+    return simulateAndSend(exec, [ix], { job, label: ctx.label, units: G9_TX_UNITS, dryRun: p.dryRun, expected });
+  };
+  if (action.kind === "restore") {
+    // GH#183 / program KEEPER NOTE (W4-4): try mode 3 (RESTORE-FROM-PNL, repays the backstop from the vault LP's source-backed
+    // profit) first. It can REVERT where mode 1 would succeed (the capacity read errors on an inconsistent source ledger), so a
+    // simulation that REFUSES it falls back to mode 1 (capital) in the SAME sweep. Nothing is sent for the refused attempt.
+    const pnl = await attempt(BackstopMode.RestoreFromPnl, "g9-restore-pnl");
+    if (pnl.kind !== "refused") return { action, outcome: pnl };
+    return { action, outcome: await attempt(BackstopMode.Restore, "g9-restore") };
+  }
+  const outcome = await attempt(action.kind === "propose" ? BackstopMode.Propose : BackstopMode.Draw, `g9-${action.kind}`);
   return { action, outcome };
 }
 
