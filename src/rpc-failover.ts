@@ -138,8 +138,12 @@ export function redactText(text: string, knownUrls: readonly string[] = []): str
     }
   }
   // ws(s) too: web3.js derives its websocket endpoint (same host, same path key) from the RPC URL.
-  out = out.replace(/(?:https?|wss?):\/\/[^\s"'<>)]+/gi, (m) => redactUrl(m));
-  out = out.replace(/((?:api[-_]?key|apikey|token|secret|key)=)[^&\s"']+/gi, "$1***");
+  out = out.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>),]+/gi, (m) => redactUrl(m));
+  // A scheme-less `host.tld/<long token>` (some HTTP clients print the target without its scheme).
+  out = out.replace(/\b((?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?)\/[^\s"'<>),]*[A-Za-z0-9_-]{16,}[^\s"'<>),]*/gi, "$1/***");
+  out = out.replace(/\bBearer\s+[A-Za-z0-9._~+\/=-]+/gi, "Bearer ***");
+  out = out.replace(/\b(x-api-key|api-key|authorization|x-auth-token)\s*:\s*[^\s"',;)]+(?:\s+[^\s"',;)]+)?/gi, "$1: ***");
+  out = out.replace(/((?:api[-_]?key|apikey|token|secret|key|password|passwd|pwd)=)[^&\s"']+/gi, "$1***");
   return out;
 }
 
