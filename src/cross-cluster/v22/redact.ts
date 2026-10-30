@@ -13,9 +13,13 @@
  */
 export function redactErrorText(s: string, max = 160): string {
   return s
-    .replace(/(api[-_]?key|apikey|token|secret|auth)=[^&\s"')]+/gi, "$1=***")
-    // ws(s) too: web3.js derives its websocket endpoint (same host, same path key) from the RPC URL.
-    .replace(/(?:https?|wss?):\/\/[^\s"')]+/gi, (u) => {
+    // Header / bearer forms: undici and proxies echo `Authorization: Bearer <t>` / `x-api-key: <k>` in some errors.
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/=-]+/gi, "Bearer ***")
+    .replace(/\b(x-api-key|api-key|authorization|x-auth-token)\s*:\s*[^\s"',;)]+(?:\s+[^\s"',;)]+)?/gi, "$1: ***")
+    .replace(/(api[-_]?key|apikey|token|secret|auth|key|password|passwd|pwd)=[^&\s"')]+/gi, "$1=***")
+    // Any scheme, not just http(s)/ws(s): `postgres://user:pass@host/db` (a DB / pooler URL), `redis://`, `ftp://` carry
+    // credentials the same way. ws(s) too: web3.js derives its websocket endpoint (same host, same path key) from the RPC URL.
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'),]+/gi, (u) => {
       try {
         const url = new URL(u);
         return `${url.protocol}//${url.host}${url.pathname === "/" ? "" : "/***"}${url.search ? "?***" : ""}`;
@@ -23,5 +27,7 @@ export function redactErrorText(s: string, max = 160): string {
         return "<url>";
       }
     })
+    // A scheme-less `host.tld/<long token>` (some HTTP clients print the target without its scheme).
+    .replace(/\b((?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?)\/[^\s"')]*[A-Za-z0-9_-]{16,}[^\s"')]*/gi, "$1/***")
     .slice(0, max);
 }
