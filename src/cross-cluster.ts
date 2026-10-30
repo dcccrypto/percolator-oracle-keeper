@@ -121,6 +121,7 @@ import { fetchMarketPortfolios } from "./cross-cluster/recovery-cranker.ts";
 import { v22FlagsFromEnv, describeV22Flags } from "./cross-cluster/v22/flags.ts";
 import { V22Loop, startV22Loop } from "./cross-cluster/v22/loop.ts";
 import { setLoneLpCrankSuppressor } from "./cross-cluster/v22/delegation.ts";
+import { dryRunDecision } from "./dry-run-switch.ts";
 import { LevGuardKeeper, levGuardConfigFromEnv, levGuardDryRunDecision, levGuardEnabled, loadRiskKey } from "./cross-cluster/v22/lev-guard.ts";
 import { setLevGuardHealthProvider } from "./cross-cluster/v22/health.ts";
 import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
@@ -274,11 +275,10 @@ function loadKeypair(): Keypair {
 // ── Config ─────────────────────────────────────────────────────────────────────
 // KEEPER_DRY_RUN=1 is the Railway cutover switch (same meaning as DRY_RUN=true):
 // a standby keeper boots with it on so two keepers never sign at once.
-const DRY_RUN =
-  process.env.DRY_RUN === "true" ||
-  process.env.KEEPER_DRY_RUN === "1" ||
-  process.env.KEEPER_DRY_RUN === "true" ||
-  process.argv.includes("--dry-run");
+// Fail-safe parse (dry-run-switch.ts): any value but unset/empty/off/0/false/no means DRY.
+const DRY_RUN_DECISION = dryRunDecision(process.env, process.argv);
+for (const w of DRY_RUN_DECISION.warnings) console.warn(w);
+const DRY_RUN = DRY_RUN_DECISION.dryRun;
 
 const CC_INTERVAL_MS = bootPositiveNumberEnv("CC_INTERVAL_MS", 7000);
 

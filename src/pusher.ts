@@ -28,6 +28,7 @@ import { devnetConnectionConfig } from "./rpc-headers.ts";
 import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
 import { failoverFromEnv, parseFallbackUrls } from "./rpc-failover.ts";
 import { markCadenceCheck } from "./cross-cluster/mark-smoother.ts";
+import { dryRunDecision } from "./dry-run-switch.ts";
 import { setHealthExtension, startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { startRegistryReloadLoop } from "./cross-cluster/registry-reload.ts";
 import { getAlertSink } from "./cross-cluster/alerting.ts";
@@ -63,7 +64,9 @@ try {
   fatal(err instanceof Error ? err.message : String(err));
 }
 
-const DRY_RUN = process.env.DRY_RUN === "true" || process.env.KEEPER_DRY_RUN === "1" || process.env.KEEPER_DRY_RUN === "true" || process.argv.includes("--dry-run");
+const DRY_RUN_DECISION = dryRunDecision(process.env, process.argv);
+for (const w of DRY_RUN_DECISION.warnings) console.warn(w);
+const DRY_RUN = DRY_RUN_DECISION.dryRun;
 const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "3000", 10);
 {
   const c = markCadenceCheck(CC_INTERVAL_MS, Number(process.env.CC_MARK_WINDOW_MS ?? 15_000));
