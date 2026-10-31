@@ -4,7 +4,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { Keypair } from "@solana/web3.js";
+import { Keypair, PublicKey } from "@solana/web3.js";
 import {
   DEFAULT_P2B_GATE_CONFIG,
   P2bFeatureGate,
@@ -163,7 +163,7 @@ describe("makeTag103Probe: simulate only, on a BOUND market", () => {
     return { c, probe, markets };
   }
 
-  it("builds a 9-account tag-103 with u128::MAX on the first BOUND market and simulates it (never sends)", async () => {
+  it("builds an 11-account (prog #640) tag-103 with u128::MAX on the first BOUND market and simulates it (never sends)", async () => {
     const w = world(1, { err: ie({ Custom: 100 }) });
     assert.equal(await w.probe(), "supported");
     assert.equal(w.c.sent.length, 0);
@@ -173,7 +173,9 @@ describe("makeTag103Probe: simulate only, on a BOUND market", () => {
     assert.equal(ix.data[0], 103);
     assert.equal(ix.data.length, 17);
     assert.ok(ix.data.subarray(1).every((b) => b === 0xff), "amount = u128::MAX");
-    assert.equal(ix.keys.length, 9);
+    assert.equal(ix.keys.length, 11);
+    assert.ok(ix.keys[10].pubkey.equals(PublicKey.findProgramAddressSync([Buffer.from("lev_guard"), w.markets[1].toBuffer()], PROGRAM)[0]), "[10] = the lev guard");
+    assert.equal(ix.keys[10].isWritable, true);
     assert.ok(ix.keys[1].pubkey.equals(w.markets[1]), "the bound market (index 1), not the unbound index 0");
     assert.ok(ix.keys[0].pubkey.equals(KEEPER.publicKey));
   });

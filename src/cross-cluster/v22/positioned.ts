@@ -1,7 +1,7 @@
 /**
  * cross-cluster/v22/positioned.ts
  *
- * Positioned-portfolio discovery for a v2.2 market (10,603 B portfolios, parsed by the SDK's VERSION-keyed
+ * Positioned-portfolio discovery for a v2.2 market (10,607 B portfolios, parsed by the SDK's VERSION-keyed
  * `parsePortfolioV17`): the positioned set with leg counts (for the 3 + legs weight), the LP, the smallest leg per
  * portfolio (dust candidates), and an optional FLAT anchor portfolio (accrue-only crank target).
  */

@@ -39,7 +39,7 @@ export const CLOSE_PROGRESS_LEN = 184;
 /**
  * Where the close-progress ledger sits in a portfolio of a given wrapper VERSION (v2.2 follow-up to K-3, 2026-10-10).
  *
- * The constants above are the v2.1 (VERSION 18, 9,563 B) numbers. A v2.2 portfolio (VERSION 19) is 10,603 B: 16 legs
+ * The constants above are the v2.1 (VERSION 18, 9,563 B) numbers. A v2.2 portfolio (VERSION 19) is 10,607 B: 16 legs
  * grew 152 -> 217 B (+1,040), so every field after them moves. In the engine struct (release/v22-engine-rem 3ce4cbd1
  * src/v16.rs:26049-26050, same order as 35ddd692) `close_progress` is IMMEDIATELY followed by
  * `resolved_payout_receipt`, and the 184-byte ledger itself is unchanged (max_close_slot @48, residual @168). So the
@@ -81,7 +81,7 @@ export interface CloseProgress {
 
 /**
  * Decode the 184-byte ledger (either the full portfolio account or the slice at the ledger offset). A full account is
- * located by its length: a v2.2 (10,603 B) portfolio reads at 10,225, anything else at the v2.1 offset.
+ * located by its length: a v2.2 (10,607 B) portfolio reads at 10,225, anything else at the v2.1 offset.
  */
 export function decodeCloseProgress(d: Uint8Array, isSlice = false): CloseProgress | null {
   const full = [...LAYOUTS_BY_VERSION.keys()].map(closeLayoutForVersion).find((l) => l !== null && l.accountLen === d.length);
@@ -126,7 +126,7 @@ const PORTFOLIO_MARKET_OFF = 16;
  */
 export function makeSharedCloseScan(ttlMs = 90_000, now: () => number = Date.now) {
   type Snapshot = { at: number; byMarket: Map<string, Array<{ pubkey: PublicKey; data: Uint8Array }>> };
-  // One snapshot per portfolio layout (v2.1 9,563 B / v2.2 10,603 B): still ONE getProgramAccounts per layout in use.
+  // One snapshot per portfolio layout (v2.1 9,563 B / v2.2 10,607 B): still ONE getProgramAccounts per layout in use.
   const cachedBy = new Map<number, Snapshot>();
   const inflightBy = new Map<number, Promise<Snapshot>>();
   return {
@@ -191,7 +191,7 @@ export async function watchBankruptCloses(
     const [mi] = await conn.getMultipleAccountsInfo([market], "confirmed");
     // The valve only exists on LIVE markets (group.header.mode == 0).
     if (!mi || marketMode(new Uint8Array(mi.data)) !== 0) return { kind: "nothing" };
-    // The market's own VERSION picks the portfolio size + ledger offset (v2.2: 10,603 B / 10,225); never a guess.
+    // The market's own VERSION picks the portfolio size + ledger offset (v2.2: 10,607 B / 10,225); never a guess.
     const layout = closeLayoutForMarket(new Uint8Array(mi.data));
     if (!layout) return { kind: "skipped", reason: "market VERSION has no portfolio layout in the pinned SDK" };
     const accs = shared

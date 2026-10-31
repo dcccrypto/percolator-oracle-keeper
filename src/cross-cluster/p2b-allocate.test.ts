@@ -5,7 +5,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair } from "@solana/web3.js";
-import { deriveBondTrancheV22, deriveLpVaultRegistry } from "@percolatorct/sdk";
+import { ComputeBudgetInstruction, PublicKey, SystemProgram } from "@solana/web3.js";
+import { deriveBondTrancheV22, deriveLpBackingLedger, deriveLpVaultRegistry } from "@percolatorct/sdk";
 import { DEFAULT_ALLOCATE_CONFIG, VaultLpAllocator, allocateConfigFromEnv } from "./p2b-allocate.ts";
 import type { AllocateConfig } from "./p2b-allocate.ts";
 import { KEEPER, PROGRAM, fakeConn, patchedMarket, registryBytes, snapshot, vaultLpStateBytes } from "./p2b-test-helpers.ts";
@@ -100,7 +101,7 @@ describe("tag 103: local eligibility costs no RPC", () => {
 });
 
 describe("tag 103: simulate first, send only on a clean simulation", () => {
-  it("clean simulation -> sends ONE tx: [compute budget, tag 103 with u128::MAX and 9 accounts]", async () => {
+  it("clean simulation -> sends ONE tx: [compute budget, tag 103 with u128::MAX and 11 accounts (prog #640)]", async () => {
     const r = rig({ sims: [{ err: null }] });
     const s = boundSnap();
     await firstDue(r, s);
@@ -109,7 +110,7 @@ describe("tag 103: simulate first, send only on a clean simulation", () => {
     const ix = r.c.sent[0].instructions[1];
     assert.equal(ix.data[0], 103);
     assert.ok(ix.data.subarray(1).every((b) => b === 0xff));
-    assert.equal(ix.keys.length, 9);
+    assert.equal(ix.keys.length, 11);
     assert.ok(ix.keys[1].pubkey.equals(s.market));
     assert.ok(ix.keys[4].pubkey.equals(s.vaultLp!.lpPortfolio), "[4] = the vault LP portfolio");
     assert.equal(r.c.count("simulateTransaction"), 1, "simulated exactly once, before the send");
@@ -241,17 +242,18 @@ describe("allocateConfigFromEnv", () => {
 });
 
 describe("tag 103: bond tranche account (EARN-10)", () => {
-  it("market WITHOUT a bond tranche: exactly the 9 accounts, no tranche", async () => {
+  it("market WITHOUT a bond tranche: 11 accounts, a pad at [9] (no tranche), the lev guard at [10]", async () => {
     const r = rig({ sims: [{ err: null }] });
     const s = boundSnap({ bond: false });
     await firstDue(r, s);
     assert.equal(await r.a.runMarket(s), "sent");
     const ix = r.c.sent[0].instructions[1];
-    assert.equal(ix.keys.length, 9);
+    assert.equal(ix.keys.length, 11);
     assert.ok(!ix.keys.some((k) => k.pubkey.equals(deriveBondTrancheV22(PROGRAM, s.market)[0])));
+    assert.ok(ix.keys[9].pubkey.equals(SystemProgram.programId));
   });
 
-  it("market WITH a bond tranche (registry byte 162): 10 accounts, ['bond_tranche', market] read-only at [9]; first 9 unchanged", async () => {
+  it("market WITH a bond tranche (registry byte 162): 11 accounts, ['bond_tranche', market] read-only at [9]; first 9 unchanged", async () => {
     const rPlain = rig({ sims: [{ err: null }] });
     const plain = boundSnap({ bond: false });
     await firstDue(rPlain, plain);
@@ -261,7 +263,7 @@ describe("tag 103: bond tranche account (EARN-10)", () => {
     await firstDue(r, s);
     assert.equal(await r.a.runMarket(s), "sent");
     const ix = r.c.sent[0].instructions[1];
-    assert.equal(ix.keys.length, 10);
+    assert.equal(ix.keys.length, 11);
     const tranche = ix.keys[9];
     assert.ok(tranche.pubkey.equals(deriveBondTrancheV22(PROGRAM, s.market)[0]));
     assert.equal(tranche.isWritable, false);
@@ -279,5 +281,41 @@ describe("tag 103: bond tranche account (EARN-10)", () => {
     await firstDue(r, s);
     assert.equal(await r.a.runMarket(s), "no-room");
     assert.equal(r.c.count("simulateTransaction"), 1);
+  });
+});
+
+describe("tag 103: prog #640 / #636 NAV flow tail and compute budget (exact, written from the handler)", () => {
+  // v16_program.rs handle_vault_lp_allocate @ 780013c8: [0] cranker s w, [1] market w, [2] registry w, [3] vault_lp_state w,
+  // [4] vault LP w, [5] own ledger w, [6] sibling ledger w, [7] ext w, [8] system program, [9] bond tranche (bond market) or
+  // any account, [10] lev guard w (lev_nav_flow_begin(.., 10, 7, ..): REQUIRED on a growth market, else Custom(134)).
+  const pda = (seed: string, m: PublicKey) => PublicKey.findProgramAddressSync([Buffer.from(seed), m.toBuffer()], PROGRAM)[0];
+  for (const bond of [false, true]) {
+    it(`${bond ? "bond" : "no-bond"} market: the exact 11-account list, the guard writable at [10], and a 600k CU limit`, async () => {
+      const r = rig({ sims: [{ err: null }] });
+      const s = boundSnap({ bond });
+      await firstDue(r, s);
+      assert.equal(await r.a.runMarket(s), "sent");
+      const tx = r.c.sent[0];
+      const ix = tx.instructions[1];
+      const reg = deriveLpVaultRegistry(PROGRAM, s.market)[0];
+      const dom = s.registry!.domain;
+      const want = [
+        KEEPER.publicKey, s.market, reg, pda("vault_lp", s.market), s.vaultLp!.lpPortfolio,
+        deriveLpBackingLedger(PROGRAM, s.market, dom)[0], deriveLpBackingLedger(PROGRAM, s.market, dom ^ 1)[0],
+        pda("vault_lp_ext", s.market), SystemProgram.programId,
+        bond ? pda("bond_tranche", s.market) : SystemProgram.programId,
+        pda("lev_guard", s.market),
+      ];
+      assert.deepEqual(ix.keys.map((k) => k.pubkey.toBase58()), want.map((k) => k.toBase58()));
+      assert.deepEqual([ix.keys[7].isWritable, ix.keys[9].isWritable, ix.keys[10].isWritable], [true, false, true]);
+      // the compute budget: explicit and above the 207k worst case measured after #640
+      const cb = tx.instructions[0];
+      assert.equal(ComputeBudgetInstruction.decodeInstructionType(cb), "SetComputeUnitLimit");
+      assert.equal(ComputeBudgetInstruction.decodeSetComputeUnitLimit(cb).units, 600_000);
+    });
+  }
+  it("the default CU is the SDK's NAV flow number for 103 (600k), not the 200k runtime default", () => {
+    assert.equal(DEFAULT_ALLOCATE_CONFIG.computeUnits, 600_000);
+    assert.equal(allocateConfigFromEnv({}, false).computeUnits, 600_000);
   });
 });

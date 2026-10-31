@@ -23,14 +23,16 @@
  *     rent); once it exists the registry flag is set and the tag-78 tail (lp-fee-cranker.ts)
  *     follows automatically on the next fee cycle.
  *
- * Compute: tag 103 runs a full certificate refresh of the vault LP; the SDK says to budget it
- * like tag 77. No tag-103 measurement was published, so the default is the SDK's heaviest
- * vault-LP figure (`RECOMMENDED_CU_P3.tradeCpi` = 600k, worst measured 405k there); override with
- * P2B_ALLOCATE_CU.
+ * Compute: tag 103 runs a full certificate refresh of the vault LP and (prog #640) samples the LP-stop NAV at
+ * the flow: measured 162k -> 207k (PR #640, LiteSVM), devnet ~230k before #640. The default is the SDK's
+ * `NAV_FLOW_COMPUTE_UNITS_V22[103]` = 600k (2.2x of ~275k); override with P2B_ALLOCATE_CU (never below ~300k).
+ *
+ * Accounts (prog #640): 9 base + `[9]` bond tranche (bond market) or a pad + `[10]` the lev guard
+ * `["lev_guard", market]` (w), REQUIRED on a growth market (Custom(134) without it).
  */
 import { ComputeBudgetProgram, Transaction, VersionedTransaction } from "@solana/web3.js";
 import type { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import { RECOMMENDED_CU_P3, buildVaultLpAllocateIxP2b } from "@percolatorct/sdk";
+import { NAV_FLOW_COMPUTE_UNITS_V22, U128_MAX_P2B, buildVaultLpAllocateIxV22 } from "@percolatorct/sdk";
 import type { Alert } from "./alerting.ts";
 import { isLiveMarket } from "./market-state.ts";
 import { isComputeExhaustion, parseInstructionError } from "./positioned-refresh.ts";
@@ -56,7 +58,9 @@ export interface AllocateConfig {
 export const DEFAULT_ALLOCATE_CONFIG: AllocateConfig = {
   intervalMs: 60_000,
   jitter: 0.25,
-  computeUnits: RECOMMENDED_CU_P3.tradeCpi,
+  // prog #640: tag 103 samples the LP-stop NAV at the flow and measured up to 207k CU (above the 200k default);
+  // 600k = NAV_FLOW_COMPUTE_UNITS_V22[103] (devnet ~230k before #640 + 45k, x2.2). Same value as before.
+  computeUnits: NAV_FLOW_COMPUTE_UNITS_V22[103].units,
   maxBackoffMs: 10 * 60_000,
   dryRun: false,
 };
@@ -233,10 +237,12 @@ export class VaultLpAllocator {
 
   private async attempt(snap: VaultMarketSnapshot): Promise<AllocateOutcome> {
     const { conn, keeper, programId } = this.deps;
-    const ix = buildVaultLpAllocateIxP2b(
+    // prog #640 (#636): the v2.2 form carries [9] bond tranche / pad and [10] the lev guard (REQUIRED on a growth market,
+    // else Custom(134)); see the SDK's NAV_FLOW_TAILS_V22.
+    const ix = buildVaultLpAllocateIxV22(
       { programId, market: snap.market, registryDomain: snap.registry!.domain, lpPortfolio: snap.vaultLp!.lpPortfolio },
       keeper.publicKey,
-      undefined,
+      U128_MAX_P2B,
       // EARN-10: on a market whose registry has the bond-tranche flag (byte 162) the program REQUIRES the
       // ["bond_tranche", market] account at [9]; without it tag 103 fails NotEnoughAccountKeys.
       { bondTranche: snap.registryData ? lpVaultRegistryBondFlag(snap.registryData) : false },
