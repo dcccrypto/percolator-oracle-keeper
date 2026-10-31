@@ -221,7 +221,7 @@ interface CrankMarketState {
   positionedFetchedAt: number;
   /** Set when a simulation still ended loss-stale: re-read the positioned set. */
   positionedDirty: boolean;
-  /** Portfolio account length of this market's layout (9,563 B on v2.1; 10,603 B on v2.2 variant B). */
+  /** Portfolio account length of this market's layout (9,563 B on v2.1; 10,607 B on v2.2 variant B). */
   portfolioLen: number;
   /** Last refresh summary logged, so steady-state cycles stay quiet. */
   lastRefreshSummary: string | null;
@@ -435,8 +435,8 @@ export function fetchMarketPortfolios(conn: Connection, market: PublicKey, portf
  *     names the portfolio directly, one read, any layout. Accepted only when that portfolio is a wrapper-owned,
  *     matcher-enabled portfolio of THIS market (same check as the scan below).
  *  2. Fallback: scan the market's portfolios for a matcher-enabled one, once per portfolio length the pinned SDK can
- *     decode (VERSION 18 = 9,563 B, VERSION 19 = 10,603 B). The scan used to filter on the v2.1 length only, so a
- *     v2.2 market (10,603 B portfolios) was never found and never cranked.
+ *     decode (VERSION 18 = 9,563 B, VERSION 19 = 10,607 B). The scan used to filter on the v2.1 length only, so a
+ *     v2.2 market (10,607 B portfolios) was never found and never cranked.
  *
  * Exported for tests.
  */
@@ -1151,7 +1151,7 @@ export function layoutHealthFor(
   const L = detection.layout;
   const accountLen = L.groupOff + L.headerLen + detection.slots * L.slotStride;
   // The portfolio length the SDK parser reads for THIS layout's VERSION (VERSION-keyed since the v2.2 SDK:
-  // 9,563 B for VERSION 18, 10,603 B for VERSION 19). An explicit argument overrides it (tests).
+  // 9,563 B for VERSION 18, 10,607 B for VERSION 19). An explicit argument overrides it (tests).
   // v2.2 variant B is NEVER driven by this legacy path (its [LP crank, refresh xN] sweep settles the LP in every tx, the
   // shape SETTLE_PAIRING exists to avoid). The v2.2 layer takes the market through the sweep delegate BEFORE this
   // verdict is reached; anything that gets here (no KEEPER_V22 / KEEPER_V22_SWEEP) gets the accrual-only crank and a loud

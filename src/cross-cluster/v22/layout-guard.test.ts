@@ -14,13 +14,13 @@ beforeEach(() => resetLayoutGuardMetrics());
 const B = layoutById("v2.2-b");
 
 describe("VERSION-keyed layout guard", () => {
-  it("variant B: every geometry number comes from the SDK LAYOUT_V22 (slot 2,661, leg 217, portfolio 10,603, group 806, VERSION 19)", () => {
-    assert.deepEqual([B.wrapperVersion, B.slotStride, B.portfolioLegLen, B.portfolioAccountLen, B.headerLen, B.groupOff], [19, 2661, 217, 10603, 806, 592]);
+  it("variant B: every geometry number comes from the SDK LAYOUT_V22 (slot 2,661, leg 217, portfolio 10,607, group 806, VERSION 19)", () => {
+    assert.deepEqual([B.wrapperVersion, B.slotStride, B.portfolioLegLen, B.portfolioAccountLen, B.headerLen, B.groupOff], [19, 2661, 217, 10607, 806, 592]);
     assert.deepEqual([B.slotStride, B.portfolioAccountLen, B.portfolioLegLen, B.headerLen], [LAYOUT_V22.assetSlotStride, LAYOUT_V22.portfolio.accountLen, LAYOUT_V22.portfolio.legStride, LAYOUT_V22.marketGroupLen]);
     assert.equal(rowAgreesWithSdk(B), null);
     assert.equal(rowAgreesWithSdk(layoutById("v2.1-legacy")), null);
     assert.equal(rowAgreesWithSdk(layoutById("v2.1-drift")), null);
-    assert.deepEqual([...SDK_PORTFOLIO_LENS].sort((a, b) => a - b), [9563, 10603]);
+    assert.deepEqual([...SDK_PORTFOLIO_LENS].sort((a, b) => a - b), [9563, 10607]);
   });
 
   it("a VERSION 19 account of the variant-B length detects as v2.2-b (not stage A), for 1..14 slots", () => {
@@ -100,7 +100,7 @@ describe("VERSION-keyed layout guard", () => {
     b.writeUInt32LE(1, stageA.groupOff + stageA.header.maxMarketSlots);
     const h = layoutHealthFor(detectLayout(new Uint8Array(b)), null);
     assert.equal(h.kind, "unsupported");
-    assert.match(h.problem ?? "", /10091-byte portfolios.*10603/);
+    assert.match(h.problem ?? "", /10091-byte portfolios.*10607/);
   });
 
   it("the v2.2 loader runs the SDK's FULL guard: bad magic and wrong kind are refused loudly and counted", () => {
@@ -131,8 +131,8 @@ describe("VERSION-keyed layout guard", () => {
   });
 
   it("portfolios: only SDK-parsable lengths are read; an undecodable account of the right length is counted, never guessed", () => {
-    const ok = analysePortfolios([{ pubkey: key(1), data: new Uint8Array(10603) }, { pubkey: key(2), data: new Uint8Array(10091) }, { pubkey: key(3), data: new Uint8Array(9563) }], { lpPortfolio: null, portfolioLen: 10603 });
+    const ok = analysePortfolios([{ pubkey: key(1), data: new Uint8Array(10607) }, { pubkey: key(2), data: new Uint8Array(10091) }, { pubkey: key(3), data: new Uint8Array(9563) }], { lpPortfolio: null, portfolioLen: 10607 });
     assert.equal(ok.all.length, 0);
-    assert.equal(ok.undecodable, 1, "the zeroed 10,603 B account fails the SDK guard; the other lengths are not this market's");
+    assert.equal(ok.undecodable, 1, "the zeroed 10,607 B account fails the SDK guard; the other lengths are not this market's");
   });
 });

@@ -3,7 +3,7 @@
  *
  * Fixtures (`__fixtures__/v22-*.b64`) are public devnet accounts of the fresh v2.2 programs, read 2026-10-10 at slot
  * ~509,453,100: the SOL / JUP / CHILLHOUSE markets (wrapper 6kpg2wi7, 4,059 B, lot_exp 0 / 1 / 4), their vault_lp state
- * PDAs, their stake v5 pools (480 B) and SOL's vault-LP portfolio (10,603 B).
+ * PDAs, their stake v5 pools (480 B) and SOL's vault-LP portfolio (10,607 B).
  *
  *   K-1  PushAuthMark carries price x 10^lot_exp, lot_exp read from the market account.
  *   K-2  VERSION 19 is decoded with ITS geometry (592 / 806 / 2,661 / 1,024), not the v2.1 group length.
@@ -312,10 +312,10 @@ describe("K-3: lpPortfolio derived on chain for registry entries that carry none
     assert.deepEqual(gpaLens, []);
   });
 
-  it("falls back to a scan that includes the VERSION-19 portfolio length (10,603 B)", async () => {
+  it("falls back to a scan that includes the VERSION-19 portfolio length (10,607 B)", async () => {
     const { c, gpaLens } = conn({ scan: true });
     assert.equal((await findLpPortfolio(c as never, sol))?.toBase58(), MARKETS.sol.lp);
-    assert.ok(gpaLens.includes(10_603), `scanned lengths ${gpaLens.join(",")}`);
+    assert.ok(gpaLens.includes(10_607), `scanned lengths ${gpaLens.join(",")}`);
   });
 
   it("NEGATIVE CONTROL: the pre-K-3 scan (v2.1 length 9,563 only) finds nothing for a v2.2 market", async () => {
