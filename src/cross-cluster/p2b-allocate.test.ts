@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { Keypair } from "@solana/web3.js";
 import { ComputeBudgetInstruction, PublicKey, SystemProgram } from "@solana/web3.js";
 import { deriveBondTrancheV22, deriveLpBackingLedger, deriveLpVaultRegistry } from "@percolatorct/sdk";
-import { DEFAULT_ALLOCATE_CONFIG, VaultLpAllocator, allocateConfigFromEnv } from "./p2b-allocate.ts";
+import { DEFAULT_ALLOCATE_CONFIG, P2B_ALLOCATE_CU_MIN, VaultLpAllocator, allocateConfigFromEnv } from "./p2b-allocate.ts";
 import type { AllocateConfig } from "./p2b-allocate.ts";
 import { KEEPER, PROGRAM, fakeConn, patchedMarket, registryBytes, snapshot, vaultLpStateBytes } from "./p2b-test-helpers.ts";
 
@@ -238,6 +238,14 @@ describe("allocateConfigFromEnv", () => {
     assert.deepEqual([c.intervalMs, c.jitter, c.computeUnits, c.dryRun], [90_000, 0.1, 700_000, true]);
     assert.throws(() => allocateConfigFromEnv({ P2B_ALLOCATE_INTERVAL_MS: "5" }, false), /P2B_ALLOCATE_INTERVAL_MS/);
     assert.throws(() => allocateConfigFromEnv({ P2B_ALLOCATE_JITTER_PCT: "95" }, false), /P2B_ALLOCATE_JITTER_PCT/);
+  });
+  it("P2B_ALLOCATE_CU floor is 300k: tag 103 measured 207k (PR #640), ~275k on devnet; a lower override is refused", () => {
+    assert.equal(P2B_ALLOCATE_CU_MIN, 300_000);
+    assert.equal(allocateConfigFromEnv({ P2B_ALLOCATE_CU: "300000" }, false).computeUnits, 300_000);
+    for (const v of ["299999", "250000", "200000", "50000"]) {
+      assert.throws(() => allocateConfigFromEnv({ P2B_ALLOCATE_CU: v }, false), /P2B_ALLOCATE_CU="\d+" must be an integer in \[300000, 1400000\]/, v);
+    }
+    assert.throws(() => allocateConfigFromEnv({ P2B_ALLOCATE_CU: "1400001" }, false), /P2B_ALLOCATE_CU/);
   });
 });
 
