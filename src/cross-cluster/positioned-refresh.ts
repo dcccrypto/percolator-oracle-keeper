@@ -229,9 +229,38 @@ export interface PositionedPortfolio {
  * holds a leg on ANY of them, and its long / short counts are summed over them (matching the summed
  * `stored_pos_count` of `decodeMarketRefreshStateFor`). A single number is the pre-K-6 behaviour.
  */
+/**
+ * Is this portfolio the market's LP? prog #645 (upstream 0c5d4f4f + 0b838425, rc23 2b5dce8a): any non-trade
+ * instruction that changes a portfolio's legs (a refresh clearing a side-reset leg, a liquidation, a wind-down, rent,
+ * a vault-LP draw, ...) bumps its position epoch and CLEARS the matcher capability (ENABLED bit + expiry) of every
+ * matcher that is not the canonical, position-synced one. `matcherEnabled` is therefore no longer a stable "is an LP"
+ * signal: an LP on any other matcher reads `false` after the first such instruction, until it re-enables. (It never
+ * was an identity either: anyone can enable a matcher on their own portfolio, review F-4.)
+ *
+ * The signal, in order:
+ *   1. the market's known LP key (the cranker's `lpPortfolio`: registry seed or the `vault_lp` state) — identity;
+ *   2. without a key, a CONFIGURED matcher (`matcher_program` set) or an enabled one: #645 clears only the ENABLED
+ *      bit and the expiry, never the program / context / delegate, so a cleared LP still reads as one.
+ *
+ * @param pubkey       The portfolio address.
+ * @param parsed       Its decoded matcher fields.
+ * @param lpPortfolio  The market's LP key, when known.
+ * @returns Whether to treat it as the LP (refreshed last, never sent a liquidate crank).
+ */
+export function portfolioIsLp(
+  pubkey: PublicKey,
+  parsed: { matcherEnabled: boolean; matcherProgram: PublicKey },
+  lpPortfolio?: PublicKey | null,
+): boolean {
+  if (lpPortfolio) return pubkey.equals(lpPortfolio);
+  return parsed.matcherEnabled || !parsed.matcherProgram.equals(PublicKey.default);
+}
+
 export function selectPositionedPortfolios(
   accounts: ReadonlyArray<{ pubkey: PublicKey; data: Uint8Array }>,
   assetIndex: number | ReadonlyArray<number> = REFRESH_ASSET_INDEX,
+  /** #645: the market's LP key (identity). Omitted = the configured-matcher fallback of {@link portfolioIsLp}. */
+  lpPortfolio?: PublicKey | null,
 ): PositionedPortfolio[] {
   const onAsset: (a: number) => boolean = typeof assetIndex === "number" ? (a) => a === assetIndex : (a) => assetIndex.includes(a);
   const out: PositionedPortfolio[] = [];
@@ -262,7 +291,7 @@ export function selectPositionedPortfolios(
       }
     }
     if (longLegs + shortLegs === 0) continue;
-    out.push({ pubkey, longLegs, shortLegs, isLp: parsed.matcherEnabled === true, activeLegs, lossWeight, kfEpochSnapLong, kfEpochSnapShort });
+    out.push({ pubkey, longLegs, shortLegs, isLp: portfolioIsLp(pubkey, parsed, lpPortfolio), activeLegs, lossWeight, kfEpochSnapLong, kfEpochSnapShort });
   }
   return out;
 }
@@ -490,10 +519,14 @@ export function soloTxComputeUnits(model: LegCostModel, p: Pick<PositionedPortfo
  * (ANSEM `DcVGSEfZ`, 2026-09-29: capital 0, PnL -88M -> -223M in ~2h while
  * the Earn vault's backing was consumed).
  */
-export function isBankruptPortfolio(data: Uint8Array): boolean {
+export function isBankruptPortfolio(data: Uint8Array, isLp?: boolean): boolean {
   try {
     const p = parsePortfolioV17(data);
-    return p.activeBitmap !== 0n && !p.matcherEnabled && p.capital + p.pnl <= 0n;
+    // #645: the LP is excluded by identity when the caller knows it, else by the configured-matcher fallback
+    // (`portfolioIsLp`), NOT by `matcherEnabled`, which the program now clears on the LP after any out-of-matcher
+    // position change.
+    const lp = isLp ?? (p.matcherEnabled || !p.matcherProgram.equals(PublicKey.default));
+    return p.activeBitmap !== 0n && !lp && p.capital + p.pnl <= 0n;
   } catch {
     return false;
   }

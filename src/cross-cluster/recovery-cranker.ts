@@ -120,6 +120,7 @@ import {
   catchupAllowsRefresh,
   catchupCrankCount,
   isBankruptPortfolio,
+  REFRESH_ASSET_INDEX,
   decodeMarketRefreshState,
   isAssetLossStale,
   marketHasPositions,
@@ -413,6 +414,21 @@ export function isLpVaultPortfolio(data: Uint8Array): boolean {
 }
 
 /**
+ * #645: an exact-length portfolio with a configured matcher (`matcher_program` set) — enabled or not. The program
+ * clears only the ENABLED bit and expiry of a non-position-synced matcher after an out-of-matcher position change;
+ * the program / context stay. Used where the portfolio's identity is already established (the `vault_lp` state).
+ */
+export function isMatcherConfiguredPortfolio(data: Uint8Array): boolean {
+  if (!SDK_PORTFOLIO_LENS.has(data.length)) return false;
+  try {
+    const p = parsePortfolioV17(data);
+    return p.matcherEnabled || !p.matcherProgram.equals(PublicKey.default);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Find a matcher-enabled ("LP vault") portfolio bound to `market`. Returns
  * null if none exists yet (e.g. a brand-new market with no LP vault) — the
  * caller should skip cranking that market until discovery succeeds.
@@ -449,7 +465,9 @@ export async function findLpPortfolio(
     const st = vls && vls.owner.equals(WRAPPER_PROGRAM_ID) ? decodeVaultLpState(new Uint8Array(vls.data)) : null;
     if (st) {
       const pf = await conn.getAccountInfo(st.lpPortfolio, "confirmed");
-      if (pf && pf.owner.equals(WRAPPER_PROGRAM_ID) && portfolioBelongsTo(pf.data, market) && isLpVaultPortfolio(pf.data)) {
+      // #645: the vault_lp state PDA is the identity; the program may have cleared this LP's matcher-ENABLED bit after
+      // an out-of-matcher position change, so a CONFIGURED matcher is enough here.
+      if (pf && pf.owner.equals(WRAPPER_PROGRAM_ID) && portfolioBelongsTo(pf.data, market) && isMatcherConfiguredPortfolio(pf.data)) {
         return st.lpPortfolio;
       }
       console.warn(`[cranker] ${market.toBase58().slice(0, 8)}…: vault_lp state names ${st.lpPortfolio.toBase58()}, which is not a matcher-enabled portfolio of this market — scanning instead`);
@@ -814,7 +832,7 @@ export async function crankOneMarket(
     // re-planned with a second crank so the engine liquidates it this cycle.
     if (!resolved.sim.err && resolved.sim.portfolioData) {
       const bankrupt = [...resolved.sim.portfolioData.entries()]
-        .filter(([, data]) => isBankruptPortfolio(data))
+        .filter(([pk, data]) => isBankruptPortfolio(data, lpIdentityOf(targets, pk)))
         .map(([pk]) => new PublicKey(pk));
       if (bankrupt.length > 0) {
         obs.bankruptFound = bankrupt.length;
@@ -1054,6 +1072,16 @@ export async function crankOneMarket(
   }
 }
 
+/**
+ * #645: the LP verdict of a simulated post-state account, taken from the cycle's positioned entries (identity) when
+ * the account is one of them; `undefined` (= `isBankruptPortfolio`'s configured-matcher fallback) otherwise.
+ * Exported for tests.
+ */
+export function lpIdentityOf(entries: ReadonlyArray<Pick<PositionedPortfolio, "pubkey" | "isLp">>, pk: string): boolean | undefined {
+  const e = entries.find((x) => x.pubkey.toBase58() === pk);
+  return e ? e.isLp : undefined;
+}
+
 /** Re-read the positioned set at most this often while it still matches the market. */
 const POSITIONED_MAX_AGE_MS = 5 * 60_000;
 
@@ -1085,7 +1113,8 @@ async function positionedPortfoliosFor(
   try {
     const accounts = await withRpcRetry(label, () => fetchMarketPortfolios(conn, market, state.portfolioLen));
     // K-6: a leg on ANY observed asset (asset 0 only on a single-asset market).
-    const set = selectPositionedPortfolios(accounts.map((a) => ({ pubkey: a.pubkey, data: a.account.data })), observationAssetsFor(market.toBase58()));
+    // #645: the LP by identity (the market's resolved LP key), not by its matcher-enabled bit.
+    const set = selectPositionedPortfolios(accounts.map((a) => ({ pubkey: a.pubkey, data: a.account.data })), observationAssetsFor(market.toBase58()), state.lpPortfolio);
     const changed =
       cached === null ||
       cached.length !== set.length ||
@@ -1259,8 +1288,12 @@ export function sweepContextFor(
  */
 function learnFromSim(ctx: SweepContext, sim: SimOutcome): SideEpochs | null {
   if (sim.portfolioData && sim.portfolioData.size > 0) {
+    // #645: keep each entry's LP identity; the post-state's matcher-enabled bit may have been cleared by this very crank.
+    const lpKey = ctx.positioned.find((p) => p.isLp)?.pubkey ?? null;
     const fresh = selectPositionedPortfolios(
       [...sim.portfolioData.entries()].map(([pk, data]) => ({ pubkey: new PublicKey(pk), data })),
+      REFRESH_ASSET_INDEX,
+      lpKey,
     );
     refreshPositionedFrom(ctx.positioned, fresh);
   }
@@ -1339,7 +1372,7 @@ export async function runSweepFollowups(
       }
       if (!resolved.sim.err && resolved.sim.portfolioData) {
         const bankrupt = [...resolved.sim.portfolioData.entries()]
-          .filter(([, d]) => isBankruptPortfolio(d))
+          .filter(([pk, d]) => isBankruptPortfolio(d, lpIdentityOf(batch, pk)))
           .map(([pk]) => new PublicKey(pk));
         if (bankrupt.length > 0) {
           out.bankruptFound += bankrupt.length;
@@ -1626,7 +1659,7 @@ export async function refreshOverflow(params: {
       let resolved = await resolveCrankPlan(build, chunk, simulate, onOptional, refreshPruneBudget(chunk.length));
       if (!resolved.sim.err && resolved.sim.portfolioData) {
         const bankrupt = [...resolved.sim.portfolioData.entries()]
-          .filter(([, d]) => isBankruptPortfolio(d))
+          .filter(([pk, d]) => isBankruptPortfolio(d, lpIdentityOf(chunk, pk)))
           .map(([pk]) => new PublicKey(pk));
         if (bankrupt.length > 0) {
           out.bankruptFound += bankrupt.length;
