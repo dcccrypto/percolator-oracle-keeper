@@ -5,8 +5,11 @@
  * no longer lost. Before the burn the admin records a payee (tag 125, PDA `["creator_fee_payee", market, idx u16 LE]`,
  * kind 19) and profile `p4_flags` bit 3 is set. After the burn, tag 90 (`WithdrawCreatorFee`) for that asset is
  * PERMISSIONLESS: any signer may send it, it pays ONLY the payee's canonical associated token account for the vault
- * mint (classic SPL Token; no delegate, no close authority), and it takes the payee record as account [6]. CloseSlab
- * no longer re-books such a pot to the protocol leg: it refuses (71 CloseSlabFeesOutstanding) until the pot is paid.
+ * mint (classic SPL Token; no delegate, no close authority), and it takes the payee record as account [6]. During the
+ * payee's grace CloseSlab does not re-book such a pot: it refuses (71 CloseSlabFeesOutstanding) until the pot is paid.
+ * prog #651 (rc23 bbaa0e7b): once CREATOR_PAYEE_GRACE_SLOTS (7 x 216,000) have passed since the engine's `resolved_slot`
+ * (Clock), CloseSlab (marketauth) re-books an unpaid payee pot to the protocol leg, like a no-payee pot; tag 90 pays the
+ * payee until that re-book, then answers 62. See `payeeGrace` / `payeeWindDownVerdict`.
  *
  * This keeper pays that pot from the pre-resolve drain (before ResolveMarket and before CloseSlab). Everything here
  * is read from the program source at 2b5dce8a (`src/creator_fee_payee_v22.rs`, `handle_withdraw_creator_fee`,
@@ -135,6 +138,54 @@ export function creatorPayoutCap(data: Uint8Array, splVaultBalance: bigint): big
   if (engineVault < cap) cap = engineVault;
   if (splVaultBalance < cap) cap = splVaultBalance;
   return cap;
+}
+
+/** prog #651 `CREATOR_PAYEE_GRACE_SLOTS` (7 x 216,000). */
+export const CREATOR_PAYEE_GRACE_SLOTS = 1_512_000n;
+/**
+ * Engine header `resolved_slot` (u64 LE) on a VERSION 19 market, relative to the market-group header (rustc `offset_of!`
+ * at prog bbaa0e7b / engine 2f05df8c, via the percolator-sdk #440 parity fixture; `mode` is at 674 = LAYOUT_V22.group.mode).
+ * Only VERSION 19 markets can carry a payee (tag 125 exists only on the v2.2 wrapper).
+ */
+export const V22_GROUP_RESOLVED_SLOT_OFF = 675;
+
+export interface PayeeGrace {
+  resolved: boolean;
+  resolvedSlot: bigint;
+  /** First slot at which CloseSlab may re-book an unpaid payee pot (`resolved_slot + GRACE`). */
+  endSlot: bigint;
+  /** `payee_grace_elapsed`: Resolved and `nowSlot >= endSlot`; false without a slot or on a non-VERSION-19 market. */
+  over: boolean;
+}
+
+/** prog #651 `payee_grace_elapsed` read from market bytes. Null on a market layout that cannot carry a payee. */
+export function payeeGrace(data: Uint8Array, nowSlot: bigint | null): PayeeGrace | null {
+  const g = resolveMarketGeometry(data, { parser: "payeeGrace", strictLength: false });
+  if (g.layout.version !== 19) return null;
+  const resolved = data[g.groupOff + g.layout.group.mode] === 1;
+  const resolvedSlot = new DataView(data.buffer, data.byteOffset, data.byteLength).getBigUint64(g.groupOff + V22_GROUP_RESOLVED_SLOT_OFF, true);
+  const endSlot = resolvedSlot + CREATOR_PAYEE_GRACE_SLOTS;
+  const over = nowSlot !== null && endSlot <= 0xffff_ffff_ffff_ffffn && resolved && nowSlot >= endSlot;
+  return { resolved, resolvedSlot, endSlot, over };
+}
+
+/**
+ * The Resolved-market wind-down's verdict on the payee pot (pre-resolve-drain). A claim that keeps failing (e.g. a payee ATA
+ * with a delegate) no longer means "rerun for ever": once the grace is over, CloseSlab re-books the pot itself, so it is
+ * reported as re-bookable and does not block completion. Before the grace a failure still asks for a rerun.
+ */
+export function payeeWindDownVerdict(outcome: PayeeClaimOutcome, grace: PayeeGrace | null, owed: bigint | null): { ok: boolean; line: string } {
+  if (typeof outcome === "string") return { ok: true, line: outcome };
+  if (grace?.over) {
+    return {
+      ok: true,
+      line: `error ${outcome.error}; the payee grace ended at slot ${grace.endSlot}: the unpaid pot${owed !== null ? ` (${owed} atoms)` : ""} is RE-BOOKABLE — CloseSlab (marketauth) re-books it to the protocol leg, then tag 84 claims it and CloseSlab closes`,
+    };
+  }
+  return {
+    ok: false,
+    line: `error ${outcome.error}; rerun (anyone can pay the payee)${grace ? `; if it keeps failing, CloseSlab re-books the pot from slot ${grace.endSlot}` : ""}`,
+  };
 }
 
 /** Payee record PDA `["creator_fee_payee", market, asset_index u16 LE]`. */

@@ -205,3 +205,48 @@ describe("the pre-resolve drain pays the payee by default", () => {
     assert.equal(defaultDeps.payCreator, payCreatorFeeToPayeeOnce);
   });
 });
+
+// ── prog #651: payee grace (7 x 216,000 slots after resolved_slot) ──────────────────────────────
+import { CREATOR_PAYEE_GRACE_SLOTS, V22_GROUP_RESOLVED_SLOT_OFF, payeeGrace, payeeWindDownVerdict } from "./creator-fee-payee.ts";
+
+describe("prog #651: payeeGrace + the Resolved wind-down verdict", () => {
+  const v22 = fx("v22-sol-market-v19");
+  function resolvedAt(slot: bigint, mode = 1): Uint8Array {
+    const b = Buffer.from(v22);
+    const g = resolveMarketGeometry(new Uint8Array(b), { parser: "t", strictLength: false });
+    b[g.groupOff + g.layout.group.mode] = mode;
+    b.writeBigUInt64LE(slot, g.groupOff + V22_GROUP_RESOLVED_SLOT_OFF);
+    return new Uint8Array(b);
+  }
+  it("constants: 1,512,000 slots; resolved_slot right after mode (674) in the VERSION 19 group header", () => {
+    assert.equal(CREATOR_PAYEE_GRACE_SLOTS, 7n * 216_000n);
+    assert.equal(V22_GROUP_RESOLVED_SLOT_OFF, resolveMarketGeometry(new Uint8Array(v22), { parser: "t", strictLength: false }).layout.group.mode + 1);
+  });
+  it("boundary: end - 1 not over, end over; no slot / Live never; a VERSION 18 market has no payee grace (null)", () => {
+    const d = resolvedAt(1_000n);
+    const end = 1_000n + CREATOR_PAYEE_GRACE_SLOTS;
+    assert.equal(payeeGrace(d, end - 1n)!.over, false);
+    assert.equal(payeeGrace(d, end)!.over, true);
+    assert.equal(payeeGrace(d, end)!.endSlot, end);
+    assert.equal(payeeGrace(d, null)!.over, false);
+    assert.equal(payeeGrace(resolvedAt(1_000n, 0), end + 5n)!.over, false);
+    assert.equal(payeeGrace(new Uint8Array(fx("sol-market-v18-fees")), end), null);
+  });
+  it("verdict: success ok; failure inside the grace = rerun (exit 2); failure after the grace = re-bookable, not a blocker", () => {
+    const d = resolvedAt(1_000n);
+    const end = 1_000n + CREATOR_PAYEE_GRACE_SLOTS;
+    assert.deepEqual(payeeWindDownVerdict("paid", payeeGrace(d, end), 5n), { ok: true, line: "paid" });
+    const inside = payeeWindDownVerdict({ error: "Custom(136)" }, payeeGrace(d, end - 1n), 5n);
+    assert.equal(inside.ok, false);
+    assert.match(inside.line, new RegExp(`re-books the pot from slot ${end}`));
+    const after = payeeWindDownVerdict({ error: "Custom(136)" }, payeeGrace(d, end), 5n);
+    assert.equal(after.ok, true);
+    assert.match(after.line, /5 atoms.*RE-BOOKABLE.*tag 84/);
+    assert.equal(payeeWindDownVerdict({ error: "x" }, null, null).ok, false, "unknown grace: rerun");
+  });
+  it("the Resolved CLI path uses the verdict (not a bare 'payee failed = exit 2')", () => {
+    const src = readFileSync(join(here, "..", "pre-resolve-drain.ts"), "utf8");
+    assert.match(src, /const verdict = payeeWindDownVerdict\(payee, grace, owed\);/);
+    assert.match(src, /const complete = w\.complete && verdict\.ok;/);
+  });
+});

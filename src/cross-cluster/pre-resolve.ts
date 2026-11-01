@@ -11,6 +11,12 @@
  * passes `additional_reserved = 0`). Protocol (84) and creator (90) CAN still
  * be claimed while Resolved, but only before CloseSlab.
  *
+ * prog #587 (#644): when asset 0's `asset_admin` was burned AFTER recording a creator-fee payee
+ * (tag 125), tag 90 is permissionless and pays only that payee. The drain pays it here
+ * (`payCreator`, capped at what tag 90 can pay). CloseSlab refuses (71) while that pot is owed,
+ * for the payee's grace; prog #651: 7 days (1,512,000 slots) after resolution CloseSlab re-books
+ * an unpaid payee pot to the protocol leg instead (then tag 84 claims it).
+ *
  * The keeper itself never sends ResolveMarket. This is the gate for whoever
  * does: `scripts/pre-resolve-drain.ts --market <slab>` runs it and exits
  * non-zero while any Live-only leg is still outstanding, so an operator
@@ -141,8 +147,8 @@ export async function drainFeeLegsBeforeResolve(
     if (after.creatorRoute === "Payee") {
       const why = typeof creator === "string" ? creator : `error: ${creator.error}`;
       warnings.push(
-        `creator leg ${after.creatorClaimable} atoms is owed to the recorded payee (tag 90 payee route ${why}); anyone can send it, ` +
-          `and CloseSlab refuses (71) until it is paid — rerun this before CloseSlab`,
+        `creator leg ${after.creatorClaimable} atoms is owed to the recorded payee (tag 90 payee route ${why}); anyone can send it. ` +
+          `After resolution CloseSlab refuses (71) until it is paid, for up to 7 days; then CloseSlab re-books it to the protocol leg (prog #651) — rerun this before CloseSlab`,
       );
     } else if (after.creatorRoute === "Refused") {
       warnings.push(
