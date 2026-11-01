@@ -1286,10 +1286,12 @@ export function sweepContextFor(
  * accrual in that tx bumped them). Returns the new epochs, or null if the market
  * post-state did not decode.
  */
-function learnFromSim(ctx: SweepContext, sim: SimOutcome): SideEpochs | null {
+export function learnFromSim(ctx: SweepContext, sim: SimOutcome): SideEpochs | null {
   if (sim.portfolioData && sim.portfolioData.size > 0) {
     // #645: keep each entry's LP identity; the post-state's matcher-enabled bit may have been cleared by this very crank.
-    const lpKey = ctx.positioned.find((p) => p.isLp)?.pubkey ?? null;
+    // K2 (voff2): a flat LP is not in `positioned`; then no fresh entry may become the LP by the configured-matcher fallback,
+    // so pass a sentinel that matches nothing (the LP itself cannot be a positioned entry in that case).
+    const lpKey = ctx.positioned.find((p) => p.isLp)?.pubkey ?? PublicKey.default;
     const fresh = selectPositionedPortfolios(
       [...sim.portfolioData.entries()].map(([pk, data]) => ({ pubkey: new PublicKey(pk), data })),
       REFRESH_ASSET_INDEX,

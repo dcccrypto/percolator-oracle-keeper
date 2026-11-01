@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { PublicKey } from "@solana/web3.js";
 import { parsePortfolioV17 } from "@percolatorct/sdk";
 import { isBankruptPortfolio, planCrankTx, portfolioIsLp, selectPositionedPortfolios } from "./positioned-refresh.ts";
-import { findLpPortfolio, isMatcherConfiguredPortfolio, lpIdentityOf } from "./recovery-cranker.ts";
+import { findLpPortfolio, isMatcherConfiguredPortfolio, learnFromSim, lpIdentityOf } from "./recovery-cranker.ts";
 import { deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { selectLegHolders } from "./p2b-wind-down.ts";
@@ -142,5 +142,26 @@ describe("#645: findLpPortfolio trusts the vault_lp state's LP even with its ENA
   it("NEGATIVE CONTROL: a PDA-named portfolio that is not this market's matcher portfolio is still refused", async () => {
     const k = conn(fixture("cate-trader-portfolio-v18"));
     assert.equal(await findLpPortfolio(k.c as never, SOL), null);
+  });
+});
+
+describe("voff2 K2: learnFromSim with a flat LP (no positioned LP entry) never promotes a trader to LP", () => {
+  /** A positioned trader that once configured a matcher (program set, ENABLED off): the fallback would call it an LP. */
+  function traderWithConfiguredMatcher(): Buffer {
+    const b = Buffer.from(fixture("cate-trader-portfolio-v18"));
+    const lp = fixture("cate-lp-portfolio-v18");
+    const cfg = lp.length - 128;
+    lp.copy(b, cfg, cfg, cfg + 32); // matcher program only; control stays 0 (not enabled)
+    return b;
+  }
+  it("the post-state entry keeps isLp false", () => {
+    const d = traderWithConfiguredMatcher();
+    assert.equal(parsePortfolioV17(new Uint8Array(d)).matcherEnabled, false);
+    assert.equal(selectPositionedPortfolios([{ pubkey: CATE_TRADER, data: d }])[0]!.isLp, true, "control: the bare fallback would promote it");
+    const positioned = selectPositionedPortfolios([{ pubkey: CATE_TRADER, data: fixture("cate-trader-portfolio-v18") }], 0, CATE_LP);
+    assert.equal(positioned[0]!.isLp, false);
+    const ctx = { positioned, firstBatch: [], epochs: { long: 0n, short: 0n } } as never;
+    learnFromSim(ctx, { err: null, logs: [], marketData: null, portfolioData: new Map([[CATE_TRADER.toBase58(), new Uint8Array(d)]]) } as never);
+    assert.equal((ctx as { positioned: { isLp: boolean }[] }).positioned[0]!.isLp, false);
   });
 });

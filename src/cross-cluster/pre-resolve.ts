@@ -70,7 +70,8 @@ export interface PreResolveDeps {
   payCreator?: typeof payCreatorFeeToPayeeOnce;
 }
 
-const defaultDeps: PreResolveDeps = {
+/** The drain's default senders (exported so a test pins that the payee payout is wired in by default). */
+export const defaultDeps: PreResolveDeps = {
   crankLp: crankLpFeesOnce,
   pushStake: pushStakeFeesOnce,
   inspectTerminal: inspectStakeBoundBudget,

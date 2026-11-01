@@ -112,3 +112,96 @@ describe("buildPayeeClaimIxs", () => {
     assert.equal(Buffer.from(t90.data).toString("hex"), "5a" + "2a" + "00".repeat(15) + "0000" + "0300000000000000");
   });
 });
+
+// ── voff2 K1: never claim more than tag 90 can pay ──────────────────────────────────────────────
+import { resolveMarketGeometry } from "@percolatorct/sdk";
+import { creatorPayoutCap, payCreatorFeeToPayeeOnce } from "./creator-fee-payee.ts";
+import { defaultDeps } from "./pre-resolve.ts";
+
+function put128(b: Buffer, off: number, v: bigint): void { b.writeBigUInt64LE(v & ((1n << 64n) - 1n), off); b.writeBigUInt64LE(v >> 64n, off + 8); }
+/** SOL v18 bytes with the engine pool fields set (insurance, reserved, budgets, engine vault). */
+function withPool(src: Buffer, o: { insurance: bigint; reserved: bigint; budget: bigint; vault: bigint }): Buffer {
+  const b = Buffer.from(src);
+  const g = resolveMarketGeometry(new Uint8Array(b), { parser: "t", strictLength: false });
+  put128(b, g.groupOff + g.layout.group.insurance, o.insurance);
+  put128(b, g.groupOff + g.layout.group.sourceInsuranceCreditReservedTotalAtoms, o.reserved);
+  put128(b, g.groupOff + g.layout.group.insuranceDomainBudgetRemainingTotal, o.budget);
+  put128(b, g.groupOff + g.layout.group.vault, o.vault);
+  return b;
+}
+
+describe("K1: creatorPayoutCap = the unbudgeted pool tag 90 / CloseSlab use, bounded by both vaults", () => {
+  const sol = fx("sol-market-v18-fees");
+  it("insurance - reserved - budget (no rent on a v18 market), then min with the engine and SPL vaults", () => {
+    const m = new Uint8Array(withPool(sol, { insurance: 1_000n, reserved: 100n, budget: 600n, vault: 10_000n }));
+    assert.equal(creatorPayoutCap(m, 10_000n), 300n);
+    assert.equal(creatorPayoutCap(m, 250n), 250n, "SPL vault binds");
+    const lowVault = new Uint8Array(withPool(sol, { insurance: 1_000n, reserved: 100n, budget: 600n, vault: 200n }));
+    assert.equal(creatorPayoutCap(lowVault, 10_000n), 200n, "engine vault binds");
+  });
+  it("saturates at 0 when losses / budgets consumed the pool", () => {
+    assert.equal(creatorPayoutCap(new Uint8Array(withPool(sol, { insurance: 500n, reserved: 100n, budget: 600n, vault: 10_000n })), 10_000n), 0n);
+  });
+});
+
+describe("K1: payCreatorFeeToPayeeOnce claims min(owed, cap); skips without a tx at cap 0", () => {
+  const sol = fx("sol-market-v18-fees");
+  const keeper = Keypair.generate();
+  const payee = Keypair.generate().publicKey;
+  /** Burned admin + bit 3, pot 1,000 (legacy 0), and the given pool. */
+  function market(pool: { insurance: bigint; reserved: bigint; budget: bigint; vault: bigint }): Buffer {
+    return withCreator(withPool(sol, pool), { admin: new Uint8Array(32), p4: P4_FLAG_CREATOR_FEE_PAYEE, pot: 1_000n, legacy: 0n });
+  }
+  function conn(m: Buffer, mk: PublicKey, splVault: bigint) {
+    const calls: string[] = [];
+    let simulated: Buffer | null = null;
+    const mint = parseWrapperConfigV17(new Uint8Array(m)).collateralMint;
+    const vaultToken = deriveMarketVaultAccounts(PROGRAM, mk, mint).vaultToken;
+    const rec = Buffer.alloc(88); rec.writeBigUInt64LE(0x5045_5243_5631_3600n, 0); rec.writeUInt16LE(19, 8); rec[10] = 19;
+    mk.toBuffer().copy(rec, 16); payee.toBuffer().copy(rec, 48); rec[16 + 66] = 1;
+    const tok = Buffer.alloc(165); tok.writeBigUInt64LE(splVault, 64);
+    const c = {
+      async getAccountInfo(pk: PublicKey) {
+        calls.push("get");
+        if (pk.equals(mk)) return { data: m, owner: PROGRAM };
+        if (pk.equals(deriveCreatorFeePayee(PROGRAM, mk, 0)[0])) return { data: rec, owner: PROGRAM };
+        if (pk.equals(vaultToken)) return { data: tok, owner: new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA") };
+        return null;
+      },
+      async getLatestBlockhash() { calls.push("bh"); return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 }; },
+      async simulateTransaction(tx: { message: { compiledInstructions: Array<{ data: Uint8Array }> } }) {
+        calls.push("sim");
+        const ix = tx.message.compiledInstructions.find((i) => i.data[0] === 90 && i.data.length === 27);
+        simulated = ix ? Buffer.from(ix.data) : null;
+        return { value: { err: null, logs: [] } };
+      },
+      async sendRawTransaction() { calls.push("send"); return "sig"; },
+    };
+    return { c: c as never, calls, simulated: () => simulated };
+  }
+  const MK = Keypair.generate().publicKey;
+  it("partly consumed pool: tag 90 asks for the cap (300), not the pot (1,000)", async () => {
+    const k = conn(market({ insurance: 1_000n, reserved: 100n, budget: 600n, vault: 10_000n }), MK, 10_000n);
+    const out = await payCreatorFeeToPayeeOnce(k.c, keeper, MK.toBase58(), true, undefined, PROGRAM);
+    assert.equal(out, "skipped", JSON.stringify(out)); // dry run
+    const d = k.simulated();
+    assert.ok(d, "tag 90 simulated");
+    assert.equal(d.readBigUInt64LE(1), 300n);
+  });
+  it("pool large enough: the whole pot (1,000)", async () => {
+    const k = conn(market({ insurance: 1_000_000n, reserved: 0n, budget: 0n, vault: 1_000_000n }), MK, 1_000_000n);
+    await payCreatorFeeToPayeeOnce(k.c, keeper, MK.toBase58(), true, undefined, PROGRAM);
+    assert.equal(k.simulated()!.readBigUInt64LE(1), 1_000n);
+  });
+  it("pool 0: 'no-surplus', no simulation, no send (no spam)", async () => {
+    const k = conn(market({ insurance: 500n, reserved: 100n, budget: 600n, vault: 10_000n }), MK, 10_000n);
+    assert.equal(await payCreatorFeeToPayeeOnce(k.c, keeper, MK.toBase58(), false, undefined, PROGRAM), "no-surplus");
+    assert.ok(!k.calls.includes("sim") && !k.calls.includes("send") && !k.calls.includes("bh"), k.calls.join());
+  });
+});
+
+describe("the pre-resolve drain pays the payee by default", () => {
+  it("defaultDeps.payCreator is payCreatorFeeToPayeeOnce", () => {
+    assert.equal(defaultDeps.payCreator, payCreatorFeeToPayeeOnce);
+  });
+});

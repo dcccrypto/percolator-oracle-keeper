@@ -35,6 +35,7 @@ import {
   parseAssetControlSequencesV17,
   parseAssetOracleProfileV17,
   parseWrapperConfigV17,
+  resolveMarketGeometry,
 } from "@percolatorct/sdk";
 import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { assetSlotOffset, selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
@@ -94,6 +95,46 @@ export function readCreatorFeeState(data: Uint8Array): CreatorFeeState | null {
     authorityEpoch: parseAssetControlSequencesV17(data, slot).authorityEpoch,
     collateralMint: cfg.collateralMint,
   };
+}
+
+const u128At = (d: Uint8Array, o: number): bigint => {
+  const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
+  return v.getBigUint64(o, true) | (v.getBigUint64(o + 8, true) << 64n);
+};
+
+/**
+ * K1 (voff2): the most tag 90 can pay right now. Tag 90 is an EXACT debit through the engine's
+ * `withdraw_insurance_surplus_not_atomic` (engine 2f05df8c v16.rs ~13412 / ~13363), which refuses unless
+ *   amount <= insurance - source_insurance_credit_reserved_total - rent_unrouted_total - insurance_domain_budget_remaining_total
+ *   amount <= header.vault
+ * and the handler then requires the SPL vault balance (`require_token_balance`). This is the same unbudgeted pool CloseSlab
+ * (`handle_close_slab` ~25915) compares the owed legs against, so after paying `min(owed, cap)` the rest is unbacked and
+ * CloseSlab no longer refuses 71 for it. Saturating, like the program.
+ *
+ * @param data              Market bytes.
+ * @param splVaultBalance   The market vault token account's amount.
+ * @returns The cap in atoms (0 = nothing payable now).
+ */
+export function creatorPayoutCap(data: Uint8Array, splVaultBalance: bigint): bigint {
+  const g = resolveMarketGeometry(data, { parser: "creatorPayoutCap", strictLength: false });
+  const L = g.layout;
+  const G = g.groupOff;
+  const sat = (a: bigint, b: bigint): bigint => (a > b ? a - b : 0n);
+  const maxSlots = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(G + L.group.config + L.group.maxMarketSlotsInConfig, true);
+  let rent = 0n;
+  if (L.bandRent) {
+    const n = Math.min(maxSlots, g.slotCount);
+    for (let i = 0; i < n; i++) rent += u128At(data, g.engineOff(i) + L.bandRent.assetState.rentUnroutedAtoms);
+  }
+  const pool = sat(
+    sat(sat(u128At(data, G + L.group.insurance), u128At(data, G + L.group.sourceInsuranceCreditReservedTotalAtoms)), rent),
+    u128At(data, G + L.group.insuranceDomainBudgetRemainingTotal),
+  );
+  let cap = pool;
+  const engineVault = u128At(data, G + L.group.vault);
+  if (engineVault < cap) cap = engineVault;
+  if (splVaultBalance < cap) cap = splVaultBalance;
+  return cap;
 }
 
 /** Payee record PDA `["creator_fee_payee", market, asset_index u16 LE]`. */
@@ -158,6 +199,8 @@ export function buildPayeeClaimIxs(p: {
 export type PayeeClaimOutcome =
   | "paid"
   | "not-needed"
+  /** K1: a pot is owed but the unbudgeted insurance pool / vault is 0: nothing payable (CloseSlab does not refuse for it). */
+  | "no-surplus"
   | "skipped"
   | { error: string };
 
@@ -190,11 +233,18 @@ export async function payCreatorFeeToPayeeOnce(
     if (!rec || !rec.owner.equals(programId)) return { error: `payee record ${record.toBase58()} missing although p4 bit 3 is set` };
     const payee = decodePayeeRecord(new Uint8Array(rec.data), market, 0);
     if (!payee) return { error: `payee record ${record.toBase58()} does not decode (the program would refuse it with ${CREATOR_FEE_PAYEE_INVALID})` };
+    // K1: never ask for more than tag 90 can pay (else it fails every run and CloseSlab stays refused).
+    const vaultToken = deriveMarketVaultAccounts(programId, market, s.collateralMint).vaultToken;
+    const vInfo = await conn.getAccountInfo(vaultToken, "confirmed");
+    const splVault = vInfo && vInfo.data.length >= 72 ? Buffer.from(vInfo.data).readBigUInt64LE(64) : 0n;
+    const cap = creatorPayoutCap(new Uint8Array(info.data), splVault);
+    const amount = s.owed < cap ? s.owed : cap;
+    if (amount === 0n) return "no-surplus";
     const tx = new Transaction();
     tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT }));
     for (const ix of buildPayeeClaimIxs({
       programId, market, caller: keeper.publicKey, assetIndex: 0, payee, collateralMint: s.collateralMint,
-      amount: s.owed, authorityEpoch: s.authorityEpoch,
+      amount, authorityEpoch: s.authorityEpoch,
     })) tx.add(ix);
     const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash;
@@ -204,14 +254,14 @@ export async function payCreatorFeeToPayeeOnce(
     if (dryRun) {
       const sim = await conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), { sigVerify: false, commitment: "confirmed" });
       if (sim.value.err) return { error: describeProgramError("tag 90 (payee) simulation", sim.value.err) };
-      console.log(`[creator-payee] [DRY-RUN] tag 90 ${s.owed} atoms -> ${payee.toBase58()} (${marketAddress.slice(0, 8)}…)`);
+      console.log(`[creator-payee] [DRY-RUN] tag 90 ${amount} of ${s.owed} atoms -> ${payee.toBase58()} (${marketAddress.slice(0, 8)}…)`);
       return "skipped";
     }
     const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries: 2 });
     const c = await confirmBySignature(conn, sig, blockhash, lastValidBlockHeight, confirmOpts);
     if (c.status === "failed") return { error: `${describeProgramError("tag 90 (payee) landed but failed on chain:", c.err)} sig=${sig.slice(0, 16)}…` };
     if (c.status === "not-landed") return { error: `not landed (retry): ${c.reason} sig=${sig.slice(0, 16)}…` };
-    console.log(`[creator-payee] paid ${s.owed} atoms -> ${payee.toBase58()} (${marketAddress.slice(0, 8)}…) sig=${sig.slice(0, 16)}…`);
+    console.log(`[creator-payee] paid ${amount} of ${s.owed} atoms -> ${payee.toBase58()} (${marketAddress.slice(0, 8)}…) sig=${sig.slice(0, 16)}…`);
     return "paid";
   } catch (err) {
     return { error: describeProgramError("tag 90 (payee)", err, 120) };
