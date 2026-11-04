@@ -11,6 +11,7 @@ import { WRAPPER_PROGRAM_ID } from "../src/program-ids.ts";
 import { loadV22Market } from "../src/cross-cluster/v22/market.ts";
 import { freshStakeCommitTargetState, stakeCommitTargetOnce, commitDueSlot } from "../src/cross-cluster/v22/stake-commit-target.ts";
 import { STAKE_PROGRAM_ID } from "../src/program-ids.ts";
+import { parseSecretKeyJson } from "../src/env-utils.ts";
 import { decodeStakePoolV5, deriveStakePool } from "@percolatorct/sdk";
 
 const [marketArg, keyFile, ...flags] = process.argv.slice(2);
@@ -23,7 +24,7 @@ async function retryingFetch(url: Parameters<typeof fetch>[0], init?: Parameters
   return fetch(url, init);
 }
 const conn = new Connection(process.env.RPC_URL ?? "https://api.devnet.solana.com", { commitment: "confirmed", fetch: retryingFetch as never, disableRetryOnRateLimit: true });
-const keeper = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(keyFile, "utf8"))));
+const keeper = Keypair.fromSecretKey(parseSecretKeyJson(fs.readFileSync(keyFile, "utf8"), `keypair file ${keyFile}`));
 const st = freshStakeCommitTargetState();
 const log = (l: string) => console.log(`${new Date().toISOString()} ${l}`);
 for (;;) {
