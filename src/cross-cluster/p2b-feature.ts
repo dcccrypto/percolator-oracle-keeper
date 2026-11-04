@@ -44,6 +44,7 @@ import { decodeVaultLpState, deriveVaultLpState } from "./resolved-portfolio-cle
 import { parseInstructionError } from "./positioned-refresh.ts";
 import { parseLpVaultRegistry } from "@percolatorct/sdk";
 import { addKeeperPriorityFee } from "./priority-fee.ts";
+import { lpVaultRegistryBondFlag } from "./v22/market.ts";
 
 export type P2bMode = "auto" | "on" | "off";
 export type P2bProbeResult = "supported" | "unsupported" | "unknown" | "no-candidate";
@@ -236,6 +237,10 @@ export function makeTag103Probe(deps: {
       const ix = buildVaultLpAllocateIxP2b(
         { programId: deps.programId, market: pubs[i], registryDomain: domain, lpPortfolio: state.lpPortfolio },
         deps.keeper.publicKey,
+        undefined,
+        // same accounts as the allocator: a bond-flagged market requires the tranche at [9]; without it the simulation
+        // fails with a non-Custom error ("unknown"), and the gate stays off for every market
+        { bondTranche: lpVaultRegistryBondFlag(new Uint8Array(reg.data)) },
       );
       const tx = new Transaction();
       tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: RECOMMENDED_CU_P3.tradeCpi }));
