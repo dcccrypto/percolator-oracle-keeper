@@ -173,6 +173,7 @@ The keeper sends none of tags 74, 120, 121 or 122 and reads no G9 allowlist acco
 | `KEEPER_V22_ACCRUE_ANCHORS` | none | `market:flatPortfolio,...` accrue-only crank targets (else discovered) |
 | `KEEPER_V22_HOLDING_RENT` / `_RENT_CADENCE_SLOTS` | off / 9000 | tag 106 on rent markets |
 | `KEEPER_V22_DUST_SWEEP` | off | tag 118 (own flag; keep off on a wrapper without the bilateral fix) |
+| `KEEPER_V22_ADL_WIND_DOWN` | off | tag 104 on close-only v2.2 assets (own flag; any market, not only band): arms the episode, then force-closes the A < 1 side's legs at the mark once the program reports the bound expired. The v2.1 P2b runner never runs on v2.2 (see v22/adl-wind-down.ts) |
 | `KEEPER_V22_G9` | off | tag 111 propose -> 9,000 slots -> draw, restore |
 | `KEEPER_V22_G9_DRY_RUN` | **on** | G9 logs only until set to `off` |
 | `KEEPER_V22_G9_ALLOW_ANY_ORACLE_MODE` | off | skip the Hybrid-only gate (devnet testing) |
