@@ -17,6 +17,11 @@
  *                                account measured at or below maintenance after the simulated refresh; simulate first, fall back to the plain refresh
  *   KEEPER_V22_LIQUIDATE_PAD_BPS  plan-time pad over maintenance, in bps of notional (default 500): accounts within it weigh more in the round plan
  *   KEEPER_V22_LIQUIDATE_MAX_PER_TX  most liquidation cranks one sweep tx carries (default 4; the 1.4M CU and 1,232 B limits bound it further)
+ *   KEEPER_V22_LIQUIDATE_MATCH_VAULT_LP  bigtest F2 (DEFAULT OFF): append the market's BOUND vault-LP portfolio as the last account of the
+ *                                refresh + liquidation cranks of every flagged account, so the wrapper matches a clean liquidation against
+ *                                the vault LP instead of ADL-scaling its side (no reduce-only latch, error 120). NEEDS a wrapper built
+ *                                from percolator-prog feat/v22-wrap-liq-adl-latch: the deployed wrapper reads that account as the
+ *                                cranker-reward slot and refuses the tx (the simulation then falls back to the plain refresh).
  *   KEEPER_V22_HOLDING_RENT       tag 106 settle on rent markets
  *   KEEPER_V22_RENT_CADENCE_SLOTS slots between rent settles of one portfolio (default 9000, about one hour)
  *   KEEPER_V22_DUST_SWEEP         tag 118 (OFF by default, own flag; band markets only)
@@ -123,6 +128,8 @@ export interface V22Flags {
   liquidate: boolean;
   liquidatePadBps: number;
   liquidateMaxPerTx: number;
+  /** bigtest F2: the bound vault LP rides on the flagged accounts' refresh + liquidation cranks (needs the wrapper feature). */
+  liquidateMatchVaultLp: boolean;
   pairing: PairingMode;
   holdingRent: boolean;
   rentCadenceSlots: number;
@@ -243,7 +250,7 @@ const U64_MAX = (1n << 64n) - 1n;
 
 /** Every v2.2 flag at its default (OFF; G9 dry-run ON; the lone LP crank ON = today). */
 export const V22_FLAG_DEFAULTS: V22Flags = {
-  enabled: false, dryRun: false, tickMs: 20_000, feeCrankBond: false, sweep: false, liquidate: false, liquidatePadBps: 500, liquidateMaxPerTx: 4, pairing: "prefer", holdingRent: false,
+  enabled: false, dryRun: false, tickMs: 20_000, feeCrankBond: false, sweep: false, liquidate: false, liquidatePadBps: 500, liquidateMaxPerTx: 4, liquidateMatchVaultLp: false, pairing: "prefer", holdingRent: false,
   rentCadenceSlots: 9_000, dustSweep: false, g9: false, g9DryRun: true, g9AllowAnyOracleMode: false, g9DrawCapAtoms: U64_MAX,
   stakeSync: false, stakeSyncIntervalMs: 60_000, stakeCommitTarget: false, earnExit: false, loneLpCrank: true, mainnetBuild: false, lpMaxUnsettledMs: 300_000, lifecycle: LIFECYCLE_DEFAULTS,
 };
@@ -279,6 +286,7 @@ export function v22FlagsFromEnv(env: Env = process.env): V22Flags {
     liquidate: parseFlag(env, "KEEPER_V22_LIQUIDATE", false),
     liquidatePadBps: posInt(env, "KEEPER_V22_LIQUIDATE_PAD_BPS", 500),
     liquidateMaxPerTx: posInt(env, "KEEPER_V22_LIQUIDATE_MAX_PER_TX", 4),
+    liquidateMatchVaultLp: parseFlag(env, "KEEPER_V22_LIQUIDATE_MATCH_VAULT_LP", false),
     pairing,
     holdingRent: parseFlag(env, "KEEPER_V22_HOLDING_RENT", false),
     rentCadenceSlots: posInt(env, "KEEPER_V22_RENT_CADENCE_SLOTS", 9_000),
@@ -310,6 +318,7 @@ export function describeV22Flags(f: V22Flags): Record<string, string | number | 
     liquidate: f.liquidate,
     liquidatePadBps: f.liquidatePadBps,
     liquidateMaxPerTx: f.liquidateMaxPerTx,
+    liquidateMatchVaultLp: f.liquidateMatchVaultLp,
     settlePairing: f.pairing,
     holdingRent: f.holdingRent,
     rentCadenceSlots: f.rentCadenceSlots,
