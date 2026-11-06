@@ -22,7 +22,7 @@ import fs from "fs";
 import { loadRegistryForProgramSet } from "./cross-cluster/registry.ts";
 import { registryRowProblems } from "./cross-cluster/multi-asset.ts";
 import { PROGRAM_IDS_RESOLVED, describeProgramIds } from "./program-ids.ts";
-import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
+import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv, parseSecretKeyJson } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { devnetConnectionConfig } from "./rpc-headers.ts";
 import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
@@ -74,10 +74,10 @@ const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "3000", 10);
 }
 
 function loadKeypair(): Keypair {
-  if (process.env.KEEPER_KEYPAIR) return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(process.env.KEEPER_KEYPAIR) as number[]));
+  if (process.env.KEEPER_KEYPAIR) return Keypair.fromSecretKey(parseSecretKeyJson(process.env.KEEPER_KEYPAIR, "KEEPER_KEYPAIR"));
   const p = process.env.KEEPER_KEYPAIR_PATH ?? `${process.env.HOME}/.config/solana/percolator-v17-devnet.json`;
   if (!fs.existsSync(p)) fatal(`keeper keypair not found at ${p}. Set KEEPER_KEYPAIR_PATH or KEEPER_KEYPAIR.`);
-  return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(p, "utf8")) as number[]));
+  return Keypair.fromSecretKey(parseSecretKeyJson(fs.readFileSync(p, "utf8"), `keypair file ${p}`));
 }
 
 const keeper = loadKeypair();
