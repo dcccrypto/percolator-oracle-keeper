@@ -619,7 +619,17 @@ export class V22Loop {
           gapBackoff: r.gapBackoff,
           rent,
           protective,
-          liq: f.liquidate ? { layout: ctx.layout, slots: ctx.slots, params: readMarginParams(ctx.data, ctx.layout, ctx.slots), padBps: f.liquidatePadBps, maxPerTx: f.liquidateMaxPerTx } : undefined,
+          liq: f.liquidate
+            ? {
+                layout: ctx.layout,
+                slots: ctx.slots,
+                params: readMarginParams(ctx.data, ctx.layout, ctx.slots),
+                padBps: f.liquidatePadBps,
+                maxPerTx: f.liquidateMaxPerTx,
+                // bigtest F2: only a REGISTRY-BOUND vault LP that is also this round's LP (the wrapper identifies it by key).
+                vaultLpCounterparty: vaultLpCounterpartyFor(f.liquidateMatchVaultLp, ctx.bound, ctx.lpPortfolio, positioned.lp.pubkey),
+              }
+            : undefined,
         },
         roundCfg,
       );
@@ -981,4 +991,14 @@ export function livenessRepairsFor(ctx: Pick<V22MarketCtx, "data" | "readSlot" |
     }
   }
   return out;
+}
+
+/**
+ * bigtest F2: the vault-LP counterparty for a market's liquidation cranks, or null (today's tx shape). Only when the flag is on,
+ * the LP-vault registry says a vault LP is BOUND, and the vault_lp_state's LP is the round's LP: the wrapper treats only the
+ * bound vault-LP key as a counterparty, and any other program-owned trailing portfolio as the cranker-reward slot.
+ */
+export function vaultLpCounterpartyFor(flag: boolean, bound: boolean, stateLp: PublicKey | null, roundLp: PublicKey): PublicKey | null {
+  if (!flag || !bound || !stateLp) return null;
+  return stateLp.equals(roundLp) ? stateLp : null;
 }

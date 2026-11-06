@@ -34,7 +34,7 @@ import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import type { MarketLayout } from "../market-layout.ts";
 import {
   DEFAULT_LIQ_EXACT_PAD_BPS, DEFAULT_LIQ_MAX_PER_TX, DEFAULT_LIQ_PAD_BPS, atOrBelowMaintenance, estimateBaseCu, fitLiquidations,
-  MIN_PROGRESS_BPS, markLiquidationCandidates, marginOf, readMarginParams, fitToPacket, liquidationMadeNoProgress, noteLiquidationLanded,
+  MIN_PROGRESS_BPS, markLiquidationCandidates, marginOf, readMarginParams, fitToPacket, liquidationMadeNoProgress, noteLiquidationLanded, MATCH_VAULT_LP_EXTRA_CU,
 } from "./liquidation.ts";
 import type { FlaggedAccount, MarginParams } from "./liquidation.ts";
 import { holdPushes as realHold, releasePushes as realRelease } from "../refresh-coordination.ts";
@@ -225,6 +225,8 @@ export interface LiqRoundInput {
   padBps?: number;
   exactPadBps?: number;
   maxPerTx?: number;
+  /** bigtest F2 (KEEPER_V22_LIQUIDATE_MATCH_VAULT_LP): the market's BOUND vault-LP portfolio; null / absent = today's tx shape. */
+  vaultLpCounterparty?: PublicKey | null;
 }
 
 /** One liquidation-crank attempt, for the `[liq]` log line, /health and the tests. */
@@ -275,6 +277,11 @@ export interface BuildTxArgs {
    * only on a second crank on the account in the SAME tx. A key that is neither refreshed nor the accrue target is ignored.
    */
   liquidate?: ReadonlySet<string>;
+  /**
+   * bigtest F2 (KEEPER_V22_LIQUIDATE_MATCH_VAULT_LP): the market's bound vault-LP portfolio, appended to the refresh and the
+   * liquidation crank of every key in `liquidate` (never to the accrue / observation crank, never to the LP's own crank).
+   */
+  vaultLpCounterparty?: PublicKey | null;
 }
 
 /** What each instruction of a sweep tx is (the simulation reports a refusal by instruction index). */
@@ -291,7 +298,7 @@ export function buildSweepTxSlots(owner: PublicKey, market: PublicKey, tx: Build
   if (tx.accrue !== "none" && tx.accrueTarget) {
     const k = tx.accrueTarget.toBase58();
     slots.push({ ix: buildObservationCrankIx(owner, market, tx.accrueTarget, tx.oracleAccounts ?? []), kind: "accrue", key: k });
-    if (tx.accrue === "counterparty" && liq.has(k)) slots.push({ ix: buildRefreshCrankIx(owner, market, tx.accrueTarget), kind: "liq", key: k });
+    if (tx.accrue === "counterparty" && liq.has(k)) slots.push({ ix: buildRefreshCrankIx(owner, market, tx.accrueTarget, tx.vaultLpCounterparty), kind: "liq", key: k });
   }
   // A hint-less crank is valid ONLY in the same tx/slot as an observing crank. In a LATER slot it answers Custom(22) for a STALE
   // portfolio (Hybrid: no report this slot; price-managed: a pending move / funding, v16_program.rs ~:14104 / ~:14146), the same
@@ -304,8 +311,11 @@ export function buildSweepTxSlots(owner: PublicKey, market: PublicKey, tx: Build
     const k = p.pubkey.toBase58();
     const observe = firstObserves && first;
     first = false;
-    slots.push({ ix: observe ? buildObservationCrankIx(owner, market, p.pubkey, tx.oracleAccounts ?? []) : buildRefreshCrankIx(owner, market, p.pubkey), kind: "refresh", key: k });
-    if (liq.has(k)) slots.push({ ix: buildRefreshCrankIx(owner, market, p.pubkey), kind: "liq", key: k });
+    // bigtest F2: the wrapper's F1 follow-on can liquidate inside the refresh itself, so a flagged account's refresh carries the
+    // vault LP too (an observing first crank does not: its oracle tail stays exactly as before).
+    const lpTail = liq.has(k) ? tx.vaultLpCounterparty : null;
+    slots.push({ ix: observe ? buildObservationCrankIx(owner, market, p.pubkey, tx.oracleAccounts ?? []) : buildRefreshCrankIx(owner, market, p.pubkey, lpTail), kind: "refresh", key: k });
+    if (liq.has(k)) slots.push({ ix: buildRefreshCrankIx(owner, market, p.pubkey, tx.vaultLpCounterparty), kind: "liq", key: k });
   }
   for (const t of tx.tail ?? []) slots.push({ ix: t, kind: "tail", key: null });
   return slots;
@@ -340,6 +350,8 @@ export interface LiqTxOptions {
   candidates: ReadonlyMap<string, PositionedPortfolio>;
   exactPadBps: number;
   maxPerTx: number;
+  /** bigtest F2: the bound vault LP for the liquidation cranks (null / absent = today's shape). */
+  vaultLpCounterparty?: PublicKey | null;
 }
 
 export interface RunTxOptions {
@@ -415,7 +427,7 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
   });
   for (let attempt = 0; attempt <= budget; attempt++) {
     const hasAccrue = accrue !== "none" && target !== null;
-    const plainArgs: BuildTxArgs = { accrue, accrueTarget: target, refresh, oracleAccounts: o.oracleAccounts, tail: o.tail };
+    const plainArgs: BuildTxArgs = { accrue, accrueTarget: target, refresh, oracleAccounts: o.oracleAccounts, tail: o.tail, vaultLpCounterparty: liqCfg?.vaultLpCounterparty ?? null };
     activeSlots = buildSweepTxSlots(owner, ctx.market, plainArgs);
     const ixs = activeSlots.map((sl) => sl.ix);
     chosen = new Map();
@@ -457,7 +469,12 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
       });
       if (flagged.length === 0) return null;
       // a refresh-only tx accrues too: its first crank observes (buildSweepTxSlots), so the accrue cost replaces that refresh's
-      const fit = fitLiquidations({ flagged, baseCu: estimateBaseCu(accrue !== "none" || refresh.length > 0, accrue === "none" ? refresh.slice(1) : refresh) + (accrue === "counterparty" ? 114_000 : 0), maxPerTx: liqCfg.maxPerTx });
+      const fit = fitLiquidations({
+        flagged,
+        baseCu: estimateBaseCu(accrue !== "none" || refresh.length > 0, accrue === "none" ? refresh.slice(1) : refresh) + (accrue === "counterparty" ? 114_000 : 0),
+        maxPerTx: liqCfg.maxPerTx,
+        extraCuPerLiquidation: liqCfg.vaultLpCounterparty ? MATCH_VAULT_LP_EXTRA_CU : 0,
+      });
       for (const d of fit.deferred) {
         pairingStats.liqDeferred++;
         liqNote(d.account.portfolio.pubkey.toBase58(), "deferred", null, `at or below maintenance (${d.account.ratioBps} bps of notional) but not added to this tx: ${d.why}`);
@@ -867,7 +884,7 @@ export async function runSettleRound(
     const [phase1, phase2] = plan.phases.length > 1 ? [plan.phases[0], plan.phases[1]] : [plan.phases[0] ?? [], [] as number[]];
     const liqTx: LiqTxOptions | undefined =
       input.liq && stageA.candidates.size > 0
-        ? { layout: input.liq.layout, slots: input.liq.slots, candidates: stageA.candidates, exactPadBps: input.liq.exactPadBps ?? DEFAULT_LIQ_EXACT_PAD_BPS, maxPerTx: input.liq.maxPerTx ?? DEFAULT_LIQ_MAX_PER_TX }
+        ? { layout: input.liq.layout, slots: input.liq.slots, candidates: stageA.candidates, exactPadBps: input.liq.exactPadBps ?? DEFAULT_LIQ_EXACT_PAD_BPS, maxPerTx: input.liq.maxPerTx ?? DEFAULT_LIQ_MAX_PER_TX, vaultLpCounterparty: input.liq.vaultLpCounterparty ?? null }
         : undefined;
     const runOpts = (isLp: boolean): RunTxOptions => ({
       liq: liqTx,

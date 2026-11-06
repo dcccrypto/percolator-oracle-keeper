@@ -304,13 +304,22 @@ export function buildObservationCrankIx(
   return buildPermissionlessCrankIx(owner, market, portfolio, true, oracleAccounts);
 }
 
-/** No-observation crank: refreshes a stale portfolio from committed state. */
+/**
+ * No-observation crank: refreshes a stale portfolio from committed state.
+ *
+ * bigtest F2: `vaultLpCounterparty` (the market's BOUND vault-LP portfolio) is appended writable as the LAST account; a
+ * wrapper with feat/v22-wrap-liq-adl-latch then matches a clean liquidation of `portfolio` against the vault LP instead of
+ * ADL-scaling its side. Omit it for the vault LP itself and on a wrapper without the feature.
+ */
 export function buildRefreshCrankIx(
   owner: PublicKey,
   market: PublicKey,
   portfolio: PublicKey,
+  vaultLpCounterparty?: PublicKey | null,
 ): TransactionInstruction {
-  return buildPermissionlessCrankIx(owner, market, portfolio, false);
+  const ix = buildPermissionlessCrankIx(owner, market, portfolio, false);
+  if (vaultLpCounterparty && !vaultLpCounterparty.equals(portfolio)) ix.keys.push({ pubkey: vaultLpCounterparty, isSigner: false, isWritable: true });
+  return ix;
 }
 
 function buildPermissionlessCrankIx(

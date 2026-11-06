@@ -36,6 +36,14 @@ export const V22_MARGIN_CFG_OFF = { minNonzeroMmReq: 38, maintenanceMarginBps: 8
 /** Offsets relative to the engine slot base: `a_long`, `a_short` (u128 each) of AssetStateV16Account; `effective_price` is in market-layout. */
 export const V22_ASSET_A_OFF = { aLong: 49, aShort: 65, rawTarget: 17 } as const;
 
+/**
+ * bigtest F2: extra compute of a liquidation crank matched against the vault LP (the engine also refreshes, certifies and
+ * audit-scans the LP). Measured in LiteSVM (percolator-prog feat/v22-wrap-liq-adl-latch, tests/p3_vault_lp.rs, 1-leg LP):
+ * 576,669 CU matched vs 447,524 unilateral = +129,145. Reserved with a margin; a MULTI-LEG vault LP costs more (its refresh
+ * settles every leg) and is not measured yet, so the simulation stays the authority.
+ */
+export const MATCH_VAULT_LP_EXTRA_CU = 150_000;
+
 /** Most liquidation cranks one sweep tx carries (the 1.4M CU and 1,232 B limits bound it further). */
 export const DEFAULT_LIQ_MAX_PER_TX = 4;
 /** A liquidation crank must cut the account's notional by at least this many bps of it (0.5%) or it is a dust action and is not sent. */
@@ -219,6 +227,8 @@ export interface FitInput {
   baseCu: number;
   maxPerTx: number;
   maxCu?: number;
+  /** bigtest F2: extra CU reserved per liquidation crank when it carries the vault-LP counterparty ({@link MATCH_VAULT_LP_EXTRA_CU}). */
+  extraCuPerLiquidation?: number;
 }
 export interface FitResult {
   chosen: FlaggedAccount[];
@@ -234,7 +244,7 @@ export function fitLiquidations(i: FitInput): FitResult {
   const deferred: FitResult["deferred"] = [];
   let cu = i.baseCu;
   for (const f of order) {
-    const add = V22_LEG_COST.liquidateCu(f.portfolio, LIQUIDATE_CRANK_CU);
+    const add = V22_LEG_COST.liquidateCu(f.portfolio, LIQUIDATE_CRANK_CU) + (i.extraCuPerLiquidation ?? 0);
     if (chosen.length >= i.maxPerTx) deferred.push({ account: f, why: "max-per-tx" });
     else if (cu + add > cap) deferred.push({ account: f, why: "compute" });
     else {
