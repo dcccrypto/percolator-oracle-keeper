@@ -89,8 +89,8 @@ type Sim = { err: unknown; logs?: string[] };
  * progress before the close is fully advanced. A chunk simulation returns the watched
  * portfolio's post-state: a new value per landed chunk, then unchanged (= no progress).
  */
-function cconn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, reply: (tags: number[]) => Sim, opts: { ataExists?: boolean; vaultLp?: { state: Buffer; registry: Buffer }; nftRecords?: Array<{ pubkey: PublicKey; data: Buffer }>; chunks?: number } = {}) {
-  const calls = { sims: [] as number[][], sent: [] as number[][], simKeys: [] as string[][], sentTag8: [] as Buffer[], chunkSends: 0 };
+function cconn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, reply: (tags: number[], keys: string[]) => Sim, opts: { ataExists?: boolean; vaultLp?: { state: Buffer; registry: Buffer }; nftRecords?: Array<{ pubkey: PublicKey; data: Buffer }>; chunks?: number; postOf?: (address: string) => Buffer | undefined } = {}) {
+  const calls = { sims: [] as number[][], sent: [] as number[][], simKeys: [] as string[][], sentKeys: [] as string[][], sentTag8: [] as Buffer[], chunkSends: 0 };
   const totalChunks = opts.chunks ?? 1;
   const isChunk = (t: number[]) => (t.includes(30) && !t.includes(8)) || t.includes(101);
   const tagsOf = (tx: VersionedTransaction): number[] =>
@@ -118,15 +118,16 @@ function cconn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, reply: (t
     async simulateTransaction(tx: VersionedTransaction, o?: { accounts?: { addresses: string[] } }) {
       const t = tagsOf(tx); calls.sims.push(t);
       calls.simKeys.push(tx.message.staticAccountKeys.map((k) => k.toBase58()));
-      const r = reply(t);
+      const r = reply(t, tx.message.staticAccountKeys.map((k) => k.toBase58()));
       const accounts = o?.accounts
-        ? o.accounts.addresses.map(() => ({ data: [Buffer.alloc(64, Math.min(calls.chunkSends + 1, totalChunks)).toString("base64"), "base64"] }))
+        ? o.accounts.addresses.map((a) => ({ data: [(opts.postOf?.(a) ?? Buffer.alloc(64, Math.min(calls.chunkSends + 1, totalChunks))).toString("base64"), "base64"] }))
         : undefined;
       return { context: { slot: 1 }, value: { err: r.err, logs: r.logs ?? [], accounts } };
     },
     async sendRawTransaction(raw: Buffer) {
       const tx = VersionedTransaction.deserialize(raw);
       calls.sent.push(tagsOf(tx));
+      calls.sentKeys.push(tx.message.staticAccountKeys.map((k) => k.toBase58()));
       if (isChunk(tagsOf(tx))) calls.chunkSends++;
       for (const ix of tx.message.compiledInstructions) if (ix.data[0] === 8 && ix.data.length === 25) calls.sentTag8.push(Buffer.from(ix.data));
       return "5ig1111111111111111111111111111111111111111111111111111111111111"; },
@@ -137,9 +138,9 @@ function cconn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, reply: (t
 }
 const PF = (k?: PublicKey) => k ?? Keypair.generate().publicKey;
 /** Probe = a lone tag 8 (first sim). P3 answers it with an engine error on a non-empty portfolio. */
-const p3 = (rest: (tags: number[]) => Sim) => {
+const p3 = (rest: (tags: number[], keys: string[]) => Sim) => {
   let n = 0;
-  return (t: number[]): Sim => (n++ === 0 ? { err: { InstructionError: [1, { Custom: 61 }] } } : rest(t));
+  return (t: number[], keys: string[]): Sim => (n++ === 0 ? { err: { InstructionError: [1, { Custom: 61 }] } } : rest(t, keys));
 };
 
 describe("wire and accounts, checked against b2b2559e", () => {
@@ -607,5 +608,147 @@ describe("C-7: chunked resolved closes (CloseResolved / tag 101 advance one chun
     const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CUCFG, new CleanupState(), AFTER_GRACE);
     assert.deepEqual(c.calls.sent, [[-1, 101], [101], [101], [1011], [8]]);
     assert.equal(r.closed, 1);
+  });
+});
+
+describe("per-cycle bound: the vault LP and every trader get a turn", () => {
+  type P = { pubkey: PublicKey; data: Buffer };
+  const R21: Sim = { err: { InstructionError: [1, { Custom: 21 }] } };
+  const OK: Sim = { err: null };
+  const reg = deriveLpVaultRegistry(WRAPPER, SOL)[0];
+  const escrow = nftEscrowAuthority(NFT);
+  const traders = (n: number): P[] => Array.from({ length: n }, () => ({ pubkey: PF(), data: withOwner(Keypair.generate().publicKey) }));
+  const keysOf = (ps: P[]) => new Set(ps.map((p) => p.pubkey.toBase58()));
+  const overBound = (r: { remaining: Array<{ portfolio: string; reason: string }> }) =>
+    new Set(r.remaining.filter((x) => /per-cycle bound/.test(x.reason)).map((x) => x.portfolio));
+  const b58sort = (ps: P[]) => [...ps].sort((x, y) => (x.pubkey.toBase58() < y.pubkey.toBase58() ? -1 : 1));
+  /** Runs `n` cycles on one CleanupState. A portfolio missing from `remaining` was closed and leaves the next scan. */
+  async function runCycles(
+    n: number, start: P[], reply: (t: number[], keys: string[], sent: number[][]) => Sim,
+    opts: Parameters<typeof cconn>[2] = {}, st = new CleanupState(), market = SOL,
+  ) {
+    let pfs = [...start];
+    const out: Array<{ r: Awaited<ReturnType<typeof cleanupResolvedPortfolios>>; calls: ReturnType<typeof cconn>["calls"] }> = [];
+    for (let k = 0; k < n; k++) {
+      const c = cconn(pfs, (t, keys) => reply(t, keys, c.calls.sent), opts);
+      const r = await cleanupResolvedPortfolios(c.conn, KEEPER, market, MINT, false, CUCFG, st, IN_GRACE);
+      out.push({ r, calls: c.calls });
+      const left = new Set(r.remaining.map((x) => x.portfolio));
+      pfs = pfs.filter((p) => left.has(p.pubkey.toBase58()));
+    }
+    return out;
+  }
+  const lpOf = () => {
+    const lp = PF();
+    return { lp, pf: { pubkey: lp, data: withOwner(reg) }, opts: { vaultLp: { state: vaultLpStateBuf(reg, lp, WALLET), registry: registryBuf() } } };
+  };
+  /** The vault LP settles on 101 and closes on tag 8 once a 101 has landed; `stuck` portfolios are refused everything. */
+  const lpCloses = (lp: PublicKey, stuck: Set<string>, other: (t: number[], keys: string[]) => Sim = () => OK) =>
+    (t: number[], keys: string[], sent: number[][]): Sim => {
+      if (keys.some((k) => stuck.has(k))) return R21;
+      if (keys.includes(lp.toBase58())) return t.length === 1 && t[0] === 8 && !sent.some((s) => s.includes(101)) ? R21 : OK;
+      return other(t, keys);
+    };
+
+  for (const n of [8, 20]) {
+    it(`the vault LP is attempted (tag 101) behind ${n} portfolios refused every cycle; only the non-LP excess is over the bound`, async () => {
+      const { lp, pf, opts } = lpOf();
+      const [{ r, calls }] = await runCycles(1, [pf, ...traders(n)], () => R21, opts);
+      assert.ok(!overBound(r).has(lp.toBase58()));
+      assert.ok(calls.sims.some((t) => t.includes(101)), "the vault LP's 101 was simulated");
+      assert.equal(overBound(r).size, n - 8);
+    });
+  }
+
+  it("12 traders refused every cycle: each is attempted within 2 cycles, and at most 8 per cycle", async () => {
+    const ts = traders(12);
+    const [c1, c2] = (await runCycles(2, ts, () => R21)).map((x) => overBound(x.r));
+    assert.equal(c1.size, 4);
+    assert.equal(c2.size, 4);
+    for (const t of ts) assert.ok(!(c1.has(t.pubkey.toBase58()) && c2.has(t.pubkey.toBase58())), "over the bound two cycles running");
+  });
+
+  const stuckKinds: Record<string, () => P[]> = {
+    "refused every cycle, one with an open receipt": () => traders(8).map((p, i) => {
+      if (i === 0) { p.data[RESOLVED_RECEIPT_OFF + 64] = 1; p.data[RESOLVED_RECEIPT_OFF + 65] = 0; }
+      return p;
+    }),
+    "NFT-escrowed with a claim, holder-only, no send": () => Array.from({ length: 8 }, () => ({ pubkey: PF(), data: withOwner(escrow) })),
+    "empty NFT-escrowed inside the grace period, no send": () => Array.from({ length: 8 }, () => ({ pubkey: PF(), data: emptyPortfolio(escrow) })),
+  };
+  for (const [kind, make] of Object.entries(stuckKinds)) {
+    it(`the vault LP behind 8 stuck portfolios (${kind}) gets 101 -> 101(1) -> tag 8 and closes in the first cycle`, async () => {
+      const { lp, pf, opts } = lpOf();
+      const stuck = make();
+      const [{ r, calls }] = await runCycles(1, [pf, ...stuck], lpCloses(lp, keysOf(stuck)), opts);
+      assert.deepEqual(r.vaultLpClosed, [lp.toBase58()], JSON.stringify(r.remaining.find((x) => x.portfolio === lp.toBase58())));
+      assert.equal(overBound(r).size, 0);
+      if (kind.startsWith("refused")) assert.ok(calls.sims.some((t) => t.includes(46)), "the receipt revisit runs once the vault LP is closed");
+    });
+  }
+
+  it("the vault LP behind 8 winners whose CloseResolved makes no progress (account unchanged) closes in the first cycle", async () => {
+    const { lp, pf, opts } = lpOf();
+    const winners = traders(8);
+    const w = keysOf(winners);
+    const data = new Map(winners.map((p) => [p.pubkey.toBase58(), p.data]));
+    const [{ r, calls }] = await runCycles(1, [pf, ...winners],
+      lpCloses(lp, new Set(), (t, keys) => (keys.some((k) => w.has(k)) && t.length === 1 && t[0] === 30 ? OK : R21)),
+      { ...opts, postOf: (a) => data.get(a) });
+    assert.deepEqual(r.vaultLpClosed, [lp.toBase58()]);
+    assert.ok(!calls.sentKeys.some((ks) => ks.some((k) => w.has(k))), "a winner that makes no progress sends nothing");
+  });
+
+  it("the vault LP behind 8 winners whose account changes on every call (they send every cycle) closes in the first cycle", async () => {
+    const { lp, pf, opts } = lpOf();
+    const winners = traders(8);
+    const w = keysOf(winners);
+    const [{ r, calls }] = await runCycles(1, [pf, ...winners],
+      lpCloses(lp, new Set(), (t, keys) => (keys.some((k) => w.has(k)) && t.length === 1 && t[0] === 30 ? OK : R21)),
+      { ...opts, postOf: (a) => (w.has(a) ? Keypair.generate().publicKey.toBuffer() : undefined) });
+    assert.deepEqual(r.vaultLpClosed, [lp.toBase58()]);
+    assert.ok(calls.sentKeys.some((ks) => ks.some((k) => w.has(k))), "the winners did send");
+  });
+
+  it("20 closable traders are all closed within 3 cycles; the vault LP is tried every cycle; at most 8 trader sends per cycle", async () => {
+    const { lp, pf, opts } = lpOf();
+    const ts = traders(20);
+    const tk = keysOf(ts);
+    const cycles = await runCycles(3, [pf, ...ts], (_t, keys) => (keys.includes(lp.toBase58()) ? R21 : OK), opts);
+    assert.equal(cycles.reduce((s, c) => s + c.r.closed, 0), 20);
+    for (const c of cycles) {
+      assert.ok(c.calls.sims.some((t) => t.includes(101)), "the vault LP was tried this cycle");
+      assert.ok(c.calls.sentKeys.filter((ks) => ks.some((k) => tk.has(k))).length <= 8);
+    }
+  });
+
+  it("2 closable traders sorted last by pubkey, behind 16 refused every cycle, are closed within 3 cycles", async () => {
+    const all = b58sort(traders(18));
+    const stuck = all.slice(0, 16);
+    const sk = keysOf(stuck);
+    const cycles = await runCycles(3, [...stuck, ...all.slice(16)], (_t, keys) => (keys.some((k) => sk.has(k)) ? R21 : OK));
+    assert.equal(cycles.reduce((s, c) => s + c.r.closed, 0), 2);
+  });
+
+  it("a mixed market lists every holder-only escrowed portfolio in waitingOnHolder every cycle (stable alert kind)", async () => {
+    const { pf, opts } = lpOf();
+    const held = Array.from({ length: 3 }, () => ({ pubkey: PF(), data: withOwner(escrow) }));
+    const cycles = await runCycles(4, [pf, ...traders(12), ...held], () => R21, opts);
+    for (const c of cycles) assert.deepEqual(new Set(c.r.waitingOnHolder.map((w) => w.portfolio)), keysOf(held));
+  });
+
+  it("two markets on one CleanupState keep separate cursors", async () => {
+    const all = b58sort(traders(24));
+    const a = all.filter((_, i) => i % 2 === 0);
+    const b = all.filter((_, i) => i % 2 === 1);
+    const other = Keypair.generate().publicKey;
+    const st = new CleanupState();
+    const seq: Array<[P[], PublicKey]> = [[a, SOL], [b, other], [a, SOL], [b, other]];
+    const got: Array<Set<string>> = [];
+    for (const [ps, m] of seq) got.push(overBound((await runCycles(1, ps, () => R21, {}, st, m))[0].r));
+    assert.deepEqual(got[0], keysOf(a.slice(8)));
+    assert.deepEqual(got[1], keysOf(b.slice(8)));
+    assert.deepEqual(got[2], keysOf(a.slice(4, 8)));
+    assert.deepEqual(got[3], keysOf(b.slice(4, 8)));
   });
 });
