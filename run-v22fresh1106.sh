@@ -53,6 +53,8 @@ export KEEPER_ALLOW_PROGRAM_ID_OVERRIDE=1
 # the keeper's id table names 5NGgnU2j "v2.1" (those ids were reserved for v2.1 and never deployed until 2026-11-06); the switch only
 # selects that id set + a registry tagged "v21". The v2.2 behaviour is the KEEPER_V22_* flags below.
 export KEEPER_DEVNET_V21=1
+# GH#163: the SOL/USD reference is judged on symbol "SOL/USDC" only; WSOL-quoted pools need it. Pin it explicitly too (SOL/USDC DLMM).
+export SOL_USD_REFERENCE_POOL="${SOL_USD_REFERENCE_POOL:-5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6}"
 export PERCOLATOR_SDK_ALLOW_PROGRAM_OVERRIDE=1   # the SDK has its own env allowlist (WRAPPER/STAKE/NFT/MATCHER)
 export KEEPER_KEYPAIR_PATH="$HOME/.config/solana/percolator-v17-devnet.json"   # FbTbDeGW... (shared with the live keeper)
 
@@ -78,9 +80,9 @@ export KEEPER_V22_TICK_MS="${KEEPER_V22_TICK_MS:-20000}"
 # G8 depth push (44-byte PushAuthMark). ON 2026-10-14 after post-upgrade checks passed; set KEEPER_PUSH_DEPTH=off to revert.
 export KEEPER_PUSH_DEPTH="${KEEPER_PUSH_DEPTH:-on}"
 # off by default: rent, dust, G9, earn-exit (not part of a first bring-up)
-# bigtest F2 latch fix: stays OFF for the fresh launch (Khubair 2026-11-06) until a later go.
-export KEEPER_V22_LIQUIDATE_MATCH_VAULT_LP=off
-export KEEPER_V22_ADL_WIND_DOWN=off
+# bigtest F2 latch fix: ON for the fresh set (Khubair GO 2026-11-06 06:23 GMT). The old :18797 keeper keeps it off.
+export KEEPER_V22_LIQUIDATE_MATCH_VAULT_LP=on
+export KEEPER_V22_ADL_WIND_DOWN=on
 export KEEPER_V22_TICK_INGEST=off
 
 if [[ "$MODE" == "dry" ]]; then
