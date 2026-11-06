@@ -171,11 +171,14 @@ export function recordPushDeadline(marketAddress: string, data: Uint8Array, read
 //
 // Seeding the baseline from chain restores the bound without adding a second price feed: the value
 // cached here is what was last PUBLISHED for the asset, i.e. the "stale but TRUSTED" reading
-// `mark-smoother.ts` already prefers over an unconfirmed one. `raw_oracle_target_price` rather than
-// `effective_price` because the former is the pushed target and the latter lags it by the engine's
-// per-slot step cap, which would make the baseline drift conservative-but-wrong after a gap.
+// `mark-smoother.ts` already prefers over an unconfirmed one. That is the asset oracle profile's
+// `oracle_target_price_e6`: PushAuthMark writes only the profile, and the engine's
+// `raw_oracle_target_price` is copied from it only by the next accrual crank, so after a crank stall
+// the engine field is an OLDER mark (and `effective_price` lags further, by the per-slot step cap).
+// Same order as the wrapper's own `lev_target_price`: the profile target, else the engine target
+// while the profile holds 0. Never `effective_price`.
 
-/** `market` or `market:assetIndex` -> that asset's `raw_oracle_target_price` (e6) at the last read. */
+/** `market` or `market:assetIndex` -> that asset's last pushed mark (e6, per lot) at the last read. */
 // The mark is PER LOT (token price x 10^lot_exp, auth-mark-pusher.ts K-1); `lotExp` rides with it so the breaker can be seeded in per-TOKEN units.
 const marksByUnit = new Map<string, { mark: bigint; lotExp: number }>();
 
@@ -198,12 +201,12 @@ export function recordOnChainMarks(marketAddress: string, data: Uint8Array): voi
       const lifecycle = data[base + det.layout.asset.lifecycle];
       // Only a tradable asset has a mark worth trusting as a baseline.
       if (lifecycle !== LIFECYCLE_ACTIVE && lifecycle !== LIFECYCLE_DRAIN_ONLY) continue;
-      const mark = u64(data, base + det.layout.asset.rawOracleTargetPrice);
-      if (mark <= 0n) continue;
       // lot_exp of this asset: without it the per-lot mark cannot be compared with the breaker's per-token price (a lot_exp > 0 market would trip on every restart).
-      const lotExp = parsePushAuthMarkGenerationFields(data, i)?.lotExp;
-      if (lotExp === undefined) continue; // unknown unit: leave unseeded (fail-open, logged by the breaker)
-      marksByUnit.set(markUnitKey(marketAddress, i), { mark, lotExp });
+      const fields = parsePushAuthMarkGenerationFields(data, i);
+      if (fields === null) continue; // unknown unit: leave unseeded (fail-open, logged by the breaker)
+      const mark = fields.pushedMarkE6 > 0n ? fields.pushedMarkE6 : u64(data, base + det.layout.asset.rawOracleTargetPrice);
+      if (mark <= 0n) continue;
+      marksByUnit.set(markUnitKey(marketAddress, i), { mark, lotExp: fields.lotExp });
     }
   } catch {
     // leave unseeded
