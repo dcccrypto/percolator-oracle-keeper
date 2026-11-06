@@ -77,7 +77,8 @@ async function main(): Promise<void> {
     fail(`registry file ${REGISTRY_PATH} does not exist`);
   }
   const reg = JSON.parse(fs.readFileSync(REGISTRY_PATH, "utf8")) as { programSet?: string; markets?: Entry[] };
-  if (reg.programSet !== undefined && reg.programSet !== "v1") fail(`registry programSet=${reg.programSet}; this keeper runs the explicit-ID (untagged/"v1") mode`);
+  const wantSet = process.env.KEEPER_DEVNET_V21 === "1" ? "v21" : "v1";
+  if ((reg.programSet ?? "v1") !== wantSet) fail(`registry programSet=${reg.programSet ?? "untagged"}; this keeper runs program set ${wantSet} (KEEPER_DEVNET_V21=${process.env.KEEPER_DEVNET_V21 ?? "unset"})`);
   const markets = reg.markets ?? [];
   if (markets.length === 0) {
     if (process.env.PREFLIGHT_ALLOW_EMPTY === "1") { console.log("[preflight] ok (registry empty; allowed for dry-run)"); return; }
