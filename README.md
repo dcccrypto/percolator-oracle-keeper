@@ -169,10 +169,12 @@ The keeper sends none of tags 74, 120, 121 or 122 and reads no G9 allowlist acco
 | `KEEPER_V22_LIQUIDATE` | off | F1: a liquidation crank (second no-observation crank) in the same sweep tx as the refresh of every account measured at or below maintenance after the simulated refresh. Simulates first; a crank the engine refuses (22 = nothing to liquidate) is dropped and the plain refresh goes out. Needs `KEEPER_V22_SWEEP`. Log lines start `[liq]` |
 | `KEEPER_V22_LIQUIDATE_PAD_BPS` | 500 | plan-time pad over maintenance (bps of notional): accounts within it weigh more in the round plan |
 | `KEEPER_V22_LIQUIDATE_MAX_PER_TX` | 4 | most liquidation cranks per sweep tx |
+| `KEEPER_V22_LIQUIDATE_MATCH_VAULT_LP` | off | bigtest F2: append the market's BOUND vault-LP portfolio to the refresh + liquidation cranks of every flagged account, so the wrapper matches a clean liquidation against the vault LP instead of ADL-scaling its side (no reduce-only latch, 120). Only on a market whose registry is bound and whose vault_lp_state LP is the round's LP. **Needs a wrapper built from `feat/v22-wrap-liq-adl-latch`**: the deployed wrapper refuses the extra account (the simulation then falls back to the plain refresh) |
 | `KEEPER_V22_SETTLE_PAIRING` | prefer | `off` / `prefer` / `strict`; acts only with the sweep on. See `v22/settle-pairing.ts` |
 | `KEEPER_V22_ACCRUE_ANCHORS` | none | `market:flatPortfolio,...` accrue-only crank targets (else discovered) |
 | `KEEPER_V22_HOLDING_RENT` / `_RENT_CADENCE_SLOTS` | off / 9000 | tag 106 on rent markets |
 | `KEEPER_V22_DUST_SWEEP` | off | tag 118 (own flag; keep off on a wrapper without the bilateral fix) |
+| `KEEPER_V22_ADL_WIND_DOWN` | off | tag 104 on close-only v2.2 assets (own flag; any market, not only band): arms the episode, then force-closes the A < 1 side's legs at the mark once the program reports the bound expired. The v2.1 P2b runner never runs on v2.2 (see v22/adl-wind-down.ts) |
 | `KEEPER_V22_G9` | off | tag 111 propose -> 9,000 slots -> draw, restore |
 | `KEEPER_V22_G9_DRY_RUN` | **on** | G9 logs only until set to `off` |
 | `KEEPER_V22_G9_ALLOW_ANY_ORACLE_MODE` | off | skip the Hybrid-only gate (devnet testing) |

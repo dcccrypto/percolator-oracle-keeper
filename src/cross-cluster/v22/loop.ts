@@ -50,6 +50,7 @@ import { crankBondFee } from "./fee-bond.ts";
 import { freshRentState, markRentSettled, planRentSettles, settleRentOnce } from "./rent.ts";
 import { buildSettleHoldingRentIxV22 } from "@percolatorct/sdk";
 import { freshDustState, sweepDustOnce } from "./dust.ts";
+import { freshWindDownV22State, windDownV22Once } from "./adl-wind-down.ts";
 import { freshG9State, g9Once } from "./g9.ts";
 import { freshStakeSyncState, stakeSyncOnce } from "./stake-sync.ts";
 import { freshStakeCommitTargetState, stakeCommitTargetOnce } from "./stake-commit-target.ts";
@@ -107,6 +108,9 @@ export interface V22LoopDeps {
 interface MarketRuntime {
   rent: ReturnType<typeof freshRentState>;
   dust: ReturnType<typeof freshDustState>;
+  windDown: ReturnType<typeof freshWindDownV22State>;
+  /** Last tag-104 turn, for /health (null = never acted). */
+  lastWindDown: string | null;
   g9: ReturnType<typeof freshG9State>;
   stake: ReturnType<typeof freshStakeSyncState>;
   commitTarget: ReturnType<typeof freshStakeCommitTargetState>;
@@ -406,6 +410,8 @@ export class V22Loop {
       r = {
         rent: freshRentState(),
         dust: freshDustState(),
+        windDown: freshWindDownV22State(),
+        lastWindDown: null,
         g9: freshG9State(),
         stake: freshStakeSyncState(),
         commitTarget: freshStakeCommitTargetState(),
@@ -613,7 +619,17 @@ export class V22Loop {
           gapBackoff: r.gapBackoff,
           rent,
           protective,
-          liq: f.liquidate ? { layout: ctx.layout, slots: ctx.slots, params: readMarginParams(ctx.data, ctx.layout, ctx.slots), padBps: f.liquidatePadBps, maxPerTx: f.liquidateMaxPerTx } : undefined,
+          liq: f.liquidate
+            ? {
+                layout: ctx.layout,
+                slots: ctx.slots,
+                params: readMarginParams(ctx.data, ctx.layout, ctx.slots),
+                padBps: f.liquidatePadBps,
+                maxPerTx: f.liquidateMaxPerTx,
+                // bigtest F2: only a REGISTRY-BOUND vault LP that is also this round's LP (the wrapper identifies it by key).
+                vaultLpCounterparty: vaultLpCounterpartyFor(f.liquidateMatchVaultLp, ctx.bound, ctx.lpPortfolio, positioned.lp.pubkey),
+              }
+            : undefined,
         },
         roundCfg,
       );
@@ -840,6 +856,11 @@ export class V22Loop {
         if (f.dustSweep && ctx.isBand && positioned) {
           await sweepDustOnce(exec, ctx, positioned, r.dust);
         }
+        // Tag 104 on ANY v2.2 market (not only band): a latched side (A < 1) otherwise stays close-only forever.
+        if (f.adlWindDown && terminalKindOf(ctx.data) === null) {
+          const res = await windDownV22Once(ctx, r.windDown, { exec, log: this.log });
+          if (res.length > 0) r.lastWindDown = res.map((x) => `a${x.assetIndex}:${x.action.kind}${x.action.kind === "refused" ? `(${x.action.name})` : x.action.kind === "waiting" ? `(until ${x.action.eligibleAtSlot})` : x.action.kind === "skipped" ? `(${x.action.reason})` : ""}`).join(" ");
+        }
         if (f.g9) {
           const unitsInfo = await this.d.conn.getAccountInfo(deriveInsuranceUnitsV22(this.d.programId, ctx.market)[0], "processed");
           const g = await g9Once(exec, ctx, unitsInfo ? new Uint8Array(unitsInfo.data) : null, r.g9, { dryRun: f.g9DryRun, allowAnyOracleMode: f.g9AllowAnyOracleMode, mainnetBuild: this.d.mainnetBuild === true, drawCapAtoms: f.g9DrawCapAtoms });
@@ -920,6 +941,7 @@ export class V22Loop {
         ...(r.lastRound ? { lastRound: r.lastRound } : {}),
         ...(r.lastFee ? { fee78: r.lastFee } : {}),
         ...(r.lastG9 ? { g9: r.lastG9 } : {}),
+        ...(r.lastWindDown ? { adlWindDown: r.lastWindDown } : {}),
         ...(r.lastStake ? { stakeSync: r.lastStake } : {}),
         ...(r.lastCommitTarget ? { stakeCommitTarget: r.lastCommitTarget } : {}),
         ...(r.lastEarn ? { earnExit: r.lastEarn } : {}),
@@ -969,4 +991,14 @@ export function livenessRepairsFor(ctx: Pick<V22MarketCtx, "data" | "readSlot" |
     }
   }
   return out;
+}
+
+/**
+ * bigtest F2: the vault-LP counterparty for a market's liquidation cranks, or null (today's tx shape). Only when the flag is on,
+ * the LP-vault registry says a vault LP is BOUND, and the vault_lp_state's LP is the round's LP: the wrapper treats only the
+ * bound vault-LP key as a counterparty, and any other program-owned trailing portfolio as the cranker-reward slot.
+ */
+export function vaultLpCounterpartyFor(flag: boolean, bound: boolean, stateLp: PublicKey | null, roundLp: PublicKey): PublicKey | null {
+  if (!flag || !bound || !stateLp) return null;
+  return stateLp.equals(roundLp) ? stateLp : null;
 }
