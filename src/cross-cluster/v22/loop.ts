@@ -30,7 +30,7 @@ import { setCrankRefreshHealth } from "../refresh-coordination.ts";
 import { LOSS_STALE_ALERT_CYCLES } from "../recovery-cranker.ts";
 import { describeV22Flags, pairingActive } from "./flags.ts";
 import type { V22Flags } from "./flags.ts";
-import { allJobCounters } from "./exec.ts";
+import { allJobCounters, execFailure } from "./exec.ts";
 import type { ExecContext } from "./exec.ts";
 import { crankOracleAccounts, loadV22Market } from "./market.ts";
 import type { V22MarketCtx, V22MarketLoad } from "./market.ts";
@@ -47,6 +47,10 @@ import type { GapBackoff, RentPlanInput as RoundInputRent, RoundResult, SweepDep
 import { redactErrorText } from "./redact.ts";
 import { isKnownV22Market, loneLpCrankSuppressed, markV22Market, portfolioWeight, weightBudgetFor } from "./settle-pairing.ts";
 import { crankBondFee } from "./fee-bond.ts";
+import type { BondFeeResult } from "./fee-bond.ts";
+import type { StakeSyncResult } from "./stake-sync.ts";
+import { FEE_JOB_FAILURE_ALERT_AFTER } from "../fee-jobs.ts";
+import { clipKeepingCode } from "../fee-error.ts";
 import { freshRentState, markRentSettled, planRentSettles, settleRentOnce } from "./rent.ts";
 import { buildSettleHoldingRentIxV22 } from "@percolatorct/sdk";
 import { freshDustState, sweepDustOnce } from "./dust.ts";
@@ -166,6 +170,27 @@ interface MarketRuntime {
 /** #174: depth-capacity alerts (scopes `:warn` / `:critical`). */
 export const DEPTH_CAPACITY_ALERT_SCOPE = "v22-depth-capacity";
 
+/**
+ * Bond fee crank (78) and stake sync (stake 31) runs that fail FEE_JOB_FAILURE_ALERT_AFTER times in a row on one market: a
+ * `fee-job-failed` warn, as the legacy fee loop raises (fee-jobs.ts), subject `<job> <market label>`.
+ */
+export const V22_JOB_ALERT_SCOPE = "v22-jobs";
+
+/** One run's verdict: the failure, null when healthy (resets the streak), undefined when it says neither (keeps it). Pure. */
+export function bondFeeVerdict(r: BondFeeResult): string | null | undefined {
+  if (r.kind === "refused") return execFailure(r.outcome);
+  if (r.kind === "failed") return r.error;
+  // after-round / fee-only: a refusal of 78 is reported as a deferral; an expected (band) refusal is not a failure, a hold is neither
+  if (r.kind === "deferred") return r.outcome ? execFailure(r.outcome) : undefined;
+  return null; // sent (landed), dry-run, nothing to crank (38), skipped (the market is not a bond fee market)
+}
+
+export function stakeSyncVerdict(s: StakeSyncResult): string | null | undefined {
+  if (s.kind === "refused" || s.kind === "failed") return execFailure(s.outcome) ?? s.kind;
+  if (s.kind === "sent" || s.kind === "dry-run" || s.kind === "quiet") return null;
+  return undefined; // interval / no pool, backoff, waiting (21), diverged (44)
+}
+
 const POSITIONED_TTL_MS = 10_000;
 /** Margin on a simulated one-crank catch-up cost when sizing the catch-up tx (per-crank cost varies a few % with state). */
 const CATCHUP_MEASURED_MARGIN = 1.08;
@@ -184,6 +209,8 @@ export class V22Loop {
   private lastCatchupAtMs = Number.NEGATIVE_INFINITY;
   /** Market lifecycle: dead-market classifier, permissionless stale resolve (default OFF), warn-band fee forcing (default OFF). */
   private readonly lifecycle: LifecycleEngine | null;
+  /** `job|market` -> consecutive failed runs. A healthy run deletes it; a tick in which the job did not run keeps it. */
+  private readonly jobFails = new Map<string, { job: string; market: string; label: string; n: number; last: string }>();
 
   constructor(private readonly d: V22LoopDeps) {
     this.log = d.log ?? ((s) => console.log(s));
@@ -401,6 +428,27 @@ export class V22Loop {
       await sink.reconcile(`${LP_CERT_ALERT_SCOPE}:critical`, critical);
     } catch (err) {
       this.log(`[v22][lp-cert] alert delivery failed: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+    }
+  }
+
+  private noteJob(job: string, m: { marketAddress: string; label: string }, verdict: string | null | undefined): void {
+    const k = `${job}|${m.marketAddress}`;
+    if (verdict === null) this.jobFails.delete(k);
+    else if (verdict !== undefined) this.jobFails.set(k, { job, market: m.marketAddress, label: m.label, n: (this.jobFails.get(k)?.n ?? 0) + 1, last: verdict });
+  }
+
+  /** Reconcile the job-failure alerts once per tick (an empty set resolves them); a market that left the registry drops its streaks. */
+  private async reconcileJobFailures(): Promise<void> {
+    const live = new Set(this.d.markets().map((m) => m.marketAddress));
+    const active: Alert[] = [];
+    for (const [k, f] of this.jobFails) {
+      if (!live.has(f.market)) this.jobFails.delete(k);
+      else if (f.n >= FEE_JOB_FAILURE_ALERT_AFTER) active.push({ kind: "fee-job-failed", severity: "warn", subject: `${f.job} ${f.label}`, message: `v2.2 ${f.job} failed ${f.n}x consecutively: ${clipKeepingCode(redactErrorText(f.last, 400), 160)}`, data: { job: f.job, market: f.market, streak: f.n } });
+    }
+    try {
+      await (this.d.alertSink ?? getAlertSink()).reconcile(V22_JOB_ALERT_SCOPE, active);
+    } catch (err) {
+      this.log(`[v22][jobs] alert delivery failed: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
     }
   }
 
@@ -686,6 +734,7 @@ export class V22Loop {
         r.lastFeeAtMs = this.now();
         const fee = await crankBondFee(this.sweepDeps(), ctx, positioned, { mode: this.d.flags.pairing, weightBudget: weightBudgetFor(), afterRound: true });
         r.lastFee = fee.kind === "skipped" ? `skipped: ${fee.reason}` : `after-round ${fee.kind}`;
+        this.noteJob("fee-78", ctx, bondFeeVerdict(fee));
       }
       return true;
     } catch (err) {
@@ -847,6 +896,7 @@ export class V22Loop {
           r.lastFeeAtMs = this.now();
           const res = await crankBondFee(this.sweepDeps(), ctx, positioned, { mode: pairing, weightBudget: weightBudgetFor() });
           r.lastFee = res.kind === "skipped" ? `skipped: ${res.reason}` : res.kind;
+          this.noteJob("fee-78", ctx, bondFeeVerdict(res));
         }
         // With the sweep + pairing on, rent settles ride the round (tag 106 in place of the refresh); this is the sweep-off path.
         if (f.holdingRent && ctx.isRent && positioned && !pairingActive(f)) {
@@ -870,6 +920,7 @@ export class V22Loop {
           const poolInfo = await this.d.conn.getAccountInfo(deriveStakePool(ctx.market, STAKE_PROGRAM_ID)[0], "processed");
           const s = await stakeSyncOnce(exec, ctx, poolInfo ? new Uint8Array(poolInfo.data) : null, r.stake, { intervalMs: f.stakeSyncIntervalMs, nowMs: this.now() });
           r.lastStake = s.kind;
+          this.noteJob("stake-sync", ctx, stakeSyncVerdict(s));
           if (s.kind === "diverged") this.log(`[v22][stake-sync] ${ctx.label}: InsuranceReadingsDiverged(44): backing off ${r.stake.diverged} time(s), no retry until the backoff ends`);
         }
         if (f.stakeCommitTarget) {
@@ -892,6 +943,7 @@ export class V22Loop {
     await this.reconcileLpCert();
     await this.reconcileAdlD1();
     await this.reconcileDepthCapacity();
+    await this.reconcileJobFailures();
     try {
       await this.lifecycle?.endTick();
     } catch (err) {

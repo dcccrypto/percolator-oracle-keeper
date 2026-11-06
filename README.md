@@ -266,7 +266,7 @@ Booked / draw log parsing (`p3_senior_draw*`) accepts both the v2.1 and the v2.2
 
 Anchor: `node --import tsx/esm src/v22-create-anchor.ts <market>` (operator tool, never run by the keeper) creates the keeper's own flat portfolio at the layout's exact length; it needs `KEEPER_V22_CREATE_ANCHOR=on`, is dry-run unless `KEEPER_V22_CREATE_ANCHOR_DRY_RUN=off`, and refuses (before simulating or sending) unless the market account is owned by the configured wrapper program and has a supported wrapper VERSION. The `KEEPER_V22_ACCRUE_ANCHORS` override must pass the same keeper-owned / flat check as discovery.
 
-Every v2.2 send is simulated first (`v22/exec.ts`); refusals are logged by name (`PriceBandPinned(104)`, `InsuranceReadingsDiverged(44)`); band states 104/111/112/113 are expected, counted, never alerted.
+Every v2.2 send is simulated first (`v22/exec.ts`); refusals are logged by name (`PriceBandPinned(104)`, `InsuranceReadingsDiverged(44)`); band states 104/111/112/113 are expected, counted, never alerted. A bond fee crank (`fee-78`) or stake sync (`stake-sync`) run that fails (unexpected refusal, transport error, landed failed, not landed) 3 runs in a row on one market raises a `fee-job-failed` warn (scope `v22-jobs`, subject `<job> <market label>`), resolved by the next healthy run; quiet / expected codes, backoffs and waits never count.
 
 ### Leverage guard (wrapper tag 124) — `KEEPER_LEV_*`, all default OFF
 
