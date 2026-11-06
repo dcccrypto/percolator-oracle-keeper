@@ -16,8 +16,12 @@
  * On a market that is already Resolved (or a CloseSlab tombstone) it runs the
  * post-resolve wind-down instead (stake F-9): tag 29 with the insurance budget,
  * then tag 29 with amount 0 (book third-party tag-41 pushes, sweep a stray).
- *   0  wind-down complete (no stake-bound budget left unbooked)
- *   2  budget still unbooked (cooldown, pre-F-9 stake, or a failure) — rerun later
+ * It also pays asset 0's creator pot to its recorded payee when the admin was burned after
+ * recording one (prog #587, permissionless tag 90): CloseSlab refuses (71) until that is paid.
+ *   0  wind-down complete (no stake-bound budget left unbooked, no payee pot left unpaid)
+ *   2  budget still unbooked (cooldown, pre-F-9 stake, or a failure), or the payee pot is
+ *      still unpaid inside its grace — rerun later. After the grace (prog #651, 7 days past
+ *      resolution) an unpaid payee pot is reported as re-bookable by CloseSlab, not as a blocker.
  *
  * Env: DEVNET_RPC_URL (required), DEVNET_RPC_ORIGIN (optional Origin header),
  * KEEPER_KEYPAIR_PATH / KEEPER_KEYPAIR (any funded signer — both cranks are
@@ -27,6 +31,7 @@ import { failoverFromEnv, parseFallbackUrls } from "./rpc-failover.ts";
 import { Connection, Keypair } from "@solana/web3.js";
 import fs from "fs";
 import { drainFeeLegsBeforeResolve, windDownAfterResolve } from "./cross-cluster/pre-resolve.ts";
+import { payCreatorFeeToPayeeOnce, payeeGrace, payeeWindDownVerdict, readCreatorFeeState } from "./cross-cluster/creator-fee-payee.ts";
 import { decodeTerminalState, terminalInsuranceConfigFromEnv } from "./cross-cluster/terminal-insurance.ts";
 import { PublicKey } from "@solana/web3.js";
 import { stakeFeeConfigFromEnv } from "./cross-cluster/stake-fee-pusher.ts";
@@ -67,15 +72,25 @@ async function main(): Promise<number> {
     console.log(`[wind-down] market is ${w.state}; stake-bound=${w.stakeBound} budget=${w.budget ?? "?"} tag29=${w.support ?? "n/a"}`);
     for (const s of w.steps) console.log(`[wind-down] tag 29(amount=${s.amount}): ${s.outcome} — ${s.detail}`);
     console.log(`[wind-down] outcome ${w.outcome}`);
-    console.log(`[wind-down] ${w.complete ? "COMPLETE" : "NOT complete — rerun later"}`);
-    return w.complete ? 0 : 2;
+    const payee = ts.kind === "resolved" ? await payCreatorFeeToPayeeOnce(conn, keeper, market, dryRun) : "skipped";
+    // prog #651: after the payee grace a failing claim is reported as re-bookable (CloseSlab takes it), not "rerun for ever".
+    const slot = typeof payee === "string" ? null : await conn.getSlot("confirmed").then((x) => BigInt(x), () => null);
+    const fresh = typeof payee === "string" ? null : await conn.getAccountInfo(new PublicKey(market), "confirmed");
+    const grace = fresh ? payeeGrace(new Uint8Array(fresh.data), slot) : null;
+    const owed = fresh ? (readCreatorFeeState(new Uint8Array(fresh.data))?.owed ?? null) : null;
+    const verdict = payeeWindDownVerdict(payee, grace, owed);
+    console.log(`[wind-down] creator payee (tag 90): ${verdict.line}`);
+    const complete = w.complete && verdict.ok;
+    console.log(`[wind-down] ${complete ? "COMPLETE" : "NOT complete — rerun later"}`);
+    return complete ? 0 : 2;
   }
   const r = await drainFeeLegsBeforeResolve(conn, keeper, market, dryRun, stakeFeeConfigFromEnv(process.env), undefined, undefined, tcfg);
   const fmt = (l: typeof r.before) =>
-    `protocol=${l.protocolOwed} lp=${l.lpOwed} stake=${l.stakeOwed} creator=${l.creatorClaimable ?? "?"}`;
+    `protocol=${l.protocolOwed} lp=${l.lpOwed} stake=${l.stakeOwed} creator=${l.creatorClaimable ?? "?"} (${l.creatorRoute ?? "?"})`;
   console.log(`[pre-resolve] before: ${fmt(r.before)}`);
   console.log(`[pre-resolve] tag 78: ${typeof r.lp === "string" ? r.lp : `error ${r.lp.error}`}`);
   console.log(`[pre-resolve] tag 87+12: ${JSON.stringify(r.stake)}`);
+  console.log(`[pre-resolve] tag 90 (creator payee): ${typeof r.creator === "string" ? r.creator : `error ${r.creator.error}`}`);
   console.log(`[pre-resolve] after:  ${fmt(r.after)}`);
   for (const w of r.warnings) console.warn(`[pre-resolve][warn] ${w}`);
   for (const b of r.blockers) console.error(`[pre-resolve][BLOCKER] ${b}`);
