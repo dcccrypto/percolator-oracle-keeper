@@ -1,6 +1,6 @@
 /**
  * K-10 (2026-10-12): the resolved-market cleanup scanned 9,563-byte (v2.1) portfolios only, so a Resolved v2.2 market
- * (VERSION 19, 10,603 B portfolios) was never wound down. CODEC DJM81s8h… is the live case: Resolved since slot
+ * (VERSION 19, 10,607 B portfolios) was never wound down. CODEC DJM81s8h… is the live case: Resolved since slot
  * 509,455,455 with 3 materialized portfolios (vault LP 1,000.43 USDC, two users 100.00 and 498.97 USDC).
  *
  * Fixtures: the real CODEC market and its 3 portfolios, read from devnet 2026-10-12. The fake RPC applies the
@@ -75,11 +75,11 @@ const run = async (marketBytes: Buffer) => {
 };
 
 describe("K-10: resolved-market cleanup on a v2.2 market (real CODEC bytes)", () => {
-  it("the fixtures: CODEC is Resolved with 3 materialized portfolios; the 3 portfolios are 10,603 B, flat, no receipt", () => {
+  it("the fixtures: CODEC is Resolved with 3 materialized portfolios; the 3 portfolios are 10,607 B, flat, no receipt", () => {
     const t = decodeTerminalState(new Uint8Array(MARKET));
     assert.deepEqual([t?.kind, t?.kind === "resolved" && t.materializedPortfolios, t?.kind === "resolved" && t.resolvedSlot], ["resolved", 3n, 509_455_455n]);
     const caps = PFS.map((p) => {
-      assert.equal(p.data.length, 10_603);
+      assert.equal(p.data.length, 10_607);
       const d = new Uint8Array(p.data);
       const pf = parsePortfolioV17(d);
       assert.equal(pf.legs.filter((l) => l.active).length, 0);
@@ -90,8 +90,8 @@ describe("K-10: resolved-market cleanup on a v2.2 market (real CODEC bytes)", ()
     assert.deepEqual(caps, [1_000_430_000n, 100_000_000n, 498_969_766n]);
   });
 
-  it("portfolio scan length follows the market VERSION: v2.2 -> 10,603; v2.1 -> 9,563; unreadable -> 9,563", () => {
-    assert.equal(portfolioLenForMarketData(new Uint8Array(MARKET)), 10_603);
+  it("portfolio scan length follows the market VERSION: v2.2 -> 10,607; v2.1 -> 9,563; unreadable -> 9,563", () => {
+    assert.equal(portfolioLenForMarketData(new Uint8Array(MARKET)), 10_607);
     assert.equal(portfolioLenForMarketData(new Uint8Array(fx("sol-market-v18-fees"))), 9_563);
     assert.equal(portfolioLenForMarketData(null), 9_563);
   });
@@ -102,9 +102,9 @@ describe("K-10: resolved-market cleanup on a v2.2 market (real CODEC bytes)", ()
     assert.throws(() => portfolioLenForMarketData(d), /VERSION 20 has no portfolio layout/);
   });
 
-  it("dry-run cleanup on CODEC scans 10,603 B, finds the 3 portfolios and simulates their closes", async () => {
+  it("dry-run cleanup on CODEC scans 10,607 B, finds the 3 portfolios and simulates their closes", async () => {
     const r = await run(MARKET);
-    assert.deepEqual([...new Set(r.scans)], [10_603]);
+    assert.deepEqual([...new Set(r.scans)], [10_607]);
     assert.ok(r.sims.length > 0, "the cleanup simulated at least one wrapper instruction");
     const tags = new Set(r.sims.flat());
     assert.ok(tags.has(30) || tags.has(8) || tags.has(101), `wrapper tags simulated: ${[...tags].join(",")}`);

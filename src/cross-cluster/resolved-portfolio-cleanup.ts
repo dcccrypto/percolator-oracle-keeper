@@ -470,7 +470,7 @@ function why(err: unknown, logs: string[] | null, ixIndex: Record<number, string
 /**
  * K-10: the portfolio account length of `market`'s program version, for the discovery scans below.
  *
- * Both scans filtered on the v2.1 length (9,563 B), so on a v2.2 market (VERSION 19, 10,603 B portfolios) they found
+ * Both scans filtered on the v2.1 length (9,563 B), so on a v2.2 market (VERSION 19, 10,607 B portfolios) they found
  * nothing and a Resolved v2.2 market was never wound down. The length now comes from the market account's own header
  * VERSION through the SDK layout table (the same table `parsePortfolioV17` / `decodeResolvedPayoutReceiptP3` already
  * resolve every portfolio with, so the receipt offset 9,369 / 10,409 needs no change here). The header survives a

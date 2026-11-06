@@ -269,7 +269,7 @@ describe("N-5: anchor refusal falls back; the override passes the same check; th
     const keeper = key(42);
     const lp = key(50);
     const mk = (n: number, owner: PublicKey, o: Partial<Parameters<typeof portfolioBytes>[0]> = {}) => ({ pubkey: key(n), data: portfolioBytes({ owner, ...o } as Parameters<typeof portfolioBytes>[0]) });
-    const base = { lpPortfolio: lp, portfolioLen: 10603, keeperOwner: keeper };
+    const base = { lpPortfolio: lp, portfolioLen: 10607, keeperOwner: keeper };
     const own = mk(60, keeper);
     assert.ok(analysePortfolios([own], { ...base, anchorOverride: own.pubkey }).flatAnchor?.equals(own.pubkey));
     const userFlat = mk(61, key(43));
@@ -292,7 +292,7 @@ describe("N-5: anchor refusal falls back; the override passes the same check; th
     // SystemProgram.createAccount data: u32 ix(0) + u64 lamports + u64 space + 32 owner
     const space = Number(ixs[0].data.readBigUInt64LE(12));
     assert.equal(space, LAYOUT_V22.portfolio.accountLen);
-    assert.equal(space, 10603);
+    assert.equal(space, 10607);
     assert.ok(new PublicKey(ixs[0].data.subarray(20, 52)).equals(WRAPPER_PROGRAM_ID));
     assert.equal(ixs[1].data[0], 1);
     assert.deepEqual(ixs[1].keys.map((k) => k.pubkey.toBase58()), [keeper.toBase58(), MARKET.toBase58(), anchor.toBase58()]);
@@ -303,7 +303,7 @@ describe("N-5: anchor refusal falls back; the override passes the same check; th
     const dry = await createKeeperAnchor(execCtx(f.conn), withMarket(f.conn),  { market: MARKET, programId: WRAPPER_PROGRAM_ID, dryRun: true });
     assert.equal(dry.outcome.kind, "dry-run");
     assert.equal(f.sent.length, 0);
-    assert.equal(dry.lamports, 10603 * 7000);
+    assert.equal(dry.lamports, 10607 * 7000);
     // NEGATIVE CONTROL: armed (dryRun false) it does send, after a clean simulation, with the new account as a signer
     const g = fakeExecConn();
     const live = await createKeeperAnchor(execCtx(g.conn), withMarket(g.conn), { market: MARKET, programId: WRAPPER_PROGRAM_ID, dryRun: false });

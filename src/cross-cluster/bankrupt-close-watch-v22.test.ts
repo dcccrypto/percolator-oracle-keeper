@@ -1,7 +1,7 @@
 /**
  * Bankrupt-close watch on v2.2 (VERSION 19) portfolios — follow-up to K-3 (2026-10-10).
  * The watch used to query 9,563-byte portfolios at the v2.1 ledger offset 9,185 only, so it saw nothing on v2.2
- * (10,603 B, ledger at 10,225). The fake RPC below applies dataSize / memcmp / dataSlice HONESTLY, so a wrong size or
+ * (10,607 B, ledger at 10,225). The fake RPC below applies dataSize / memcmp / dataSlice HONESTLY, so a wrong size or
  * offset returns nothing, exactly as the real node would.
  *
  * Run with: node --import tsx/esm --test src/cross-cluster/bankrupt-close-watch-v22.test.ts
@@ -65,16 +65,16 @@ function honestConn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, nowS
 }
 
 describe("bankrupt-close watch: v2.2 portfolio layout", () => {
-  it("ledger offset = SDK resolvedPayoutReceiptOff - 184: v2.1 9,185 (the source-verified constant), v2.2 10,225 / 10,603 B", () => {
+  it("ledger offset = SDK resolvedPayoutReceiptOff - 184: v2.1 9,185 (the source-verified constant), v2.2 10,225 / 10,607 B", () => {
     assert.deepEqual(closeLayoutForVersion(18), CLOSE_LAYOUT_V21);
-    assert.deepEqual(closeLayoutForVersion(19), { version: 19, accountLen: 10_603, closeOff: V22_OFF });
-    assert.deepEqual(closeLayoutForMarket(MARKET), { version: 19, accountLen: 10_603, closeOff: V22_OFF });
+    assert.deepEqual(closeLayoutForVersion(19), { version: 19, accountLen: 10_607, closeOff: V22_OFF });
+    assert.deepEqual(closeLayoutForMarket(MARKET), { version: 19, accountLen: 10_607, closeOff: V22_OFF });
   });
   it("NEGATIVE CONTROL: an unknown VERSION has no layout (skipped, never guessed)", () => {
     assert.equal(closeLayoutForVersion(20), null);
   });
   it("the real v2.2 LP portfolio decodes an idle ledger at 10,225 (all zero), and a close written there decodes", () => {
-    assert.equal(LP.length, 10_603);
+    assert.equal(LP.length, 10_607);
     assert.ok(LP.subarray(V22_OFF, V22_OFF + CLOSE_PROGRESS_LEN).every((x) => x === 0));
     assert.equal(decodeCloseProgress(new Uint8Array(LP))!.active, false);
     const c = decodeCloseProgress(new Uint8Array(withClose(V22_OFF)))!;
@@ -86,12 +86,12 @@ describe("bankrupt-close watch: v2.2 portfolio layout", () => {
     const o = await watchBankruptCloses(a.conn as never, SOL.toBase58(), CFG) as { kind: string; severity?: string };
     assert.equal(o.kind, "blocked");
     assert.equal(o.severity, "critical");
-    assert.equal(a.calls[0].filters[0].dataSize, 10_603);
+    assert.equal(a.calls[0].filters[0].dataSize, 10_607);
     const b = honestConn([pf], MAX - 100n);
     const o2 = await watchBankruptCloses(b.conn as never, SOL.toBase58(), CFG, makeSharedCloseScan()) as { kind: string; severity?: string };
     assert.deepEqual([o2.kind, o2.severity], ["blocked", "warn"]);
     assert.equal(b.calls.length, 1);
-    assert.equal(b.calls[0].filters[0].dataSize, 10_603);
+    assert.equal(b.calls[0].filters[0].dataSize, 10_607);
   });
   it("NEGATIVE CONTROL: the v2.1 query (9,563 B, offset 9,185) finds nothing on the same v2.2 portfolio", async () => {
     const pf = { pubkey: Keypair.generate().publicKey, data: withClose(V22_OFF) };

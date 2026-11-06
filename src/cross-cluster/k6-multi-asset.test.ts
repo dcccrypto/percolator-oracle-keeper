@@ -305,11 +305,11 @@ describe("K-6 refresh: state and selection over every asset (real 2xhs bytes)", 
   });
 
   it("v2.2 sweep set (analysePortfolios): LP + taker counterparty over every asset; the flat portfolio is not positioned", () => {
-    const r = analysePortfolios(portfolios, { assetIndices: [0, 1, 2, 3, 4], lpPortfolio: new PublicKey(LP), portfolioLen: 10_603 });
+    const r = analysePortfolios(portfolios, { assetIndices: [0, 1, 2, 3, 4], lpPortfolio: new PublicKey(LP), portfolioLen: 10_607 });
     assert.equal(r.lp?.pubkey.toBase58(), LP);
     assert.equal(r.lp?.shortLegs, 4);
     assert.deepEqual(r.counterparties.map((c) => [c.pubkey.toBase58(), c.longLegs]), [[TAKER, 4]]);
-    const only4 = analysePortfolios(portfolios, { assetIndices: [4], lpPortfolio: new PublicKey(LP), portfolioLen: 10_603 });
+    const only4 = analysePortfolios(portfolios, { assetIndices: [4], lpPortfolio: new PublicKey(LP), portfolioLen: 10_607 });
     assert.deepEqual(only4.counterparties, []);
   });
 });
