@@ -8,6 +8,7 @@ import { Keypair, PublicKey } from "@solana/web3.js";
 import { drainFeeLegsBeforeResolve } from "./pre-resolve.ts";
 import type { PreResolveConnection, PreResolveDeps } from "./pre-resolve.ts";
 import { readFeeLegs } from "./fee-legs.ts";
+import { assetSlotOffset, selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fx = (n: string) => Buffer.from(readFileSync(join(here, "__fixtures__", `${n}.b64`), "utf8").trim(), "base64");
@@ -109,5 +110,82 @@ describe("drainFeeLegsBeforeResolve (SOL real bytes: lp 13,690,922 / stake 4,563
     const r = await drainFeeLegsBeforeResolve(k.c, Keypair.generate(), SOL, true, CFG, undefined, deps);
     assert.equal(k.reads(), 1, "no after-read in dry-run");
     assert.equal(r.safeToResolve, false);
+  });
+});
+
+/** prog #587 (#644): asset 0's creator pot under a burned admin with a recorded payee is paid (tag 90) in the drain. */
+describe("drainFeeLegsBeforeResolve: creator-fee payee (prog #587)", () => {
+  const sol = fx("sol-market-v18-fees");
+  /** asset 0: admin / p4 byte / pot; the legacy pot is zeroed so `owed` is exactly `pot`. */
+  function creator(src: Buffer, admin: Uint8Array, p4: number, pot: bigint): Buffer {
+    const b = drained(src, { lp: true, stake: true });
+    const g = selectMarketGroupOffset(new Uint8Array(b));
+    assert.ok(g.ok);
+    const slot = assetSlotOffset(g, 0);
+    b.set(admin, slot + 368);
+    b[slot + 20] = p4;
+    b.writeBigUInt64LE(pot, slot + 400);
+    b.writeBigUInt64LE(0n, 16 + 568);
+    return b;
+  }
+  const BURNED = new Uint8Array(32);
+  const LIVE = new Uint8Array(32).fill(4);
+  const deps = (calls: string[], paid: "paid" | { error: string } = "paid"): PreResolveDeps => ({
+    crankLp: async () => "cranked",
+    pushStake: async () => ({ kind: "done", detail: "ok" }),
+    payCreator: async () => { calls.push("90"); return paid; },
+  });
+
+  it("fixture sanity: the patched bytes read as the intended route and pot", () => {
+    assert.equal(readFeeLegs(new Uint8Array(creator(sol, BURNED, 8, 33n))).creatorRoute, "Payee");
+    assert.equal(readFeeLegs(new Uint8Array(creator(sol, BURNED, 8, 33n))).creatorClaimable, 33n);
+    assert.equal(readFeeLegs(new Uint8Array(creator(sol, BURNED, 0, 33n))).creatorRoute, "Refused");
+    assert.equal(readFeeLegs(new Uint8Array(creator(sol, LIVE, 8, 33n))).creatorRoute, "AdminSigned");
+  });
+
+  it("burned admin + payee: the drain sends tag 90 to the payee; once paid, no creator warning", async () => {
+    const calls: string[] = [];
+    const before = creator(sol, BURNED, 8, 33n);
+    const after = creator(sol, BURNED, 8, 0n);
+    const r = await drainFeeLegsBeforeResolve(conn(before, after).c, Keypair.generate(), SOL, false, CFG, undefined, deps(calls));
+    assert.deepEqual(calls, ["90"]);
+    assert.equal(r.creator, "paid");
+    assert.equal(r.warnings.filter((w) => /creator/.test(w)).length, 0, JSON.stringify(r.warnings));
+    assert.equal(r.safeToResolve, true);
+  });
+
+  it("burned admin + payee, send failed: the warning says the payee is owed and CloseSlab refuses 71 (not 'burned')", async () => {
+    const calls: string[] = [];
+    const before = creator(sol, BURNED, 8, 33n);
+    const r = await drainFeeLegsBeforeResolve(conn(before, before).c, Keypair.generate(), SOL, false, CFG, undefined, deps(calls, { error: "Custom(102)" }));
+    assert.deepEqual(calls, ["90"]);
+    const w = r.warnings.find((x) => /creator/.test(x)) ?? "";
+    assert.match(w, /owed to the recorded payee.*Custom\(102\).*refuses \(71\)/);
+    assert.doesNotMatch(w, /burned there/);
+  });
+
+  it("live admin: nothing is sent; the admin must claim, CloseSlab refuses 71", async () => {
+    const calls: string[] = [];
+    const before = creator(sol, LIVE, 8, 33n);
+    const r = await drainFeeLegsBeforeResolve(conn(before, before).c, Keypair.generate(), SOL, false, CFG, undefined, deps(calls));
+    assert.deepEqual(calls, []);
+    assert.equal(r.creator, "not-needed");
+    assert.match(r.warnings.find((x) => /creator/.test(x)) ?? "", /live asset_admin must claim it with tag 90.*refuses 71/);
+  });
+
+  it("burned admin, no payee: nothing is sent; CloseSlab re-books it to the protocol leg", async () => {
+    const calls: string[] = [];
+    const before = creator(sol, BURNED, 0, 33n);
+    const r = await drainFeeLegsBeforeResolve(conn(before, before).c, Keypair.generate(), SOL, false, CFG, undefined, deps(calls));
+    assert.deepEqual(calls, []);
+    assert.match(r.warnings.find((x) => /creator/.test(x)) ?? "", /no claimant.*re-books it to the protocol leg/);
+  });
+
+  it("burned admin + payee but a zero pot: nothing is sent", async () => {
+    const calls: string[] = [];
+    const before = creator(sol, BURNED, 8, 0n);
+    const r = await drainFeeLegsBeforeResolve(conn(before, before).c, Keypair.generate(), SOL, false, CFG, undefined, deps(calls));
+    assert.deepEqual(calls, []);
+    assert.equal(r.creator, "not-needed");
   });
 });
