@@ -5,6 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair } from "@solana/web3.js";
+import { deriveBondTrancheV22 } from "@percolatorct/sdk";
 import {
   DEFAULT_P2B_GATE_CONFIG,
   P2bFeatureGate,
@@ -151,11 +152,11 @@ describe("p2bGateConfigFromEnv", () => {
 
 describe("makeTag103Probe: simulate only, on a BOUND market", () => {
   const mk = () => Keypair.generate().publicKey;
-  function world(boundIdx: number | null, sim: { err: unknown } | null) {
+  function world(boundIdx: number | null, sim: { err: unknown } | null, bond = false) {
     const markets = [mk(), mk(), mk()];
     const accounts = new Map<string, Uint8Array>();
     markets.forEach((m, i) => {
-      accounts.set(deriveLpVaultRegistry(PROGRAM, m)[0].toBase58(), registryBytes({ bound: i === boundIdx }));
+      accounts.set(deriveLpVaultRegistry(PROGRAM, m)[0].toBase58(), registryBytes({ bound: i === boundIdx, bond: bond && i === boundIdx }));
       accounts.set(deriveVaultLpState(PROGRAM, m).toBase58(), vaultLpStateBytes({ lp: mk() }));
     });
     const c = fakeConn({ accounts, sims: sim ? [{ err: sim.err }] : undefined });
@@ -176,6 +177,16 @@ describe("makeTag103Probe: simulate only, on a BOUND market", () => {
     assert.equal(ix.keys.length, 9);
     assert.ok(ix.keys[1].pubkey.equals(w.markets[1]), "the bound market (index 1), not the unbound index 0");
     assert.ok(ix.keys[0].pubkey.equals(KEEPER.publicKey));
+  });
+
+  it("a bond-flagged bound market: the tranche read-only at [9], as the allocator sends it", async () => {
+    const w = world(1, { err: ie({ Custom: 100 }) }, true);
+    assert.equal(await w.probe(), "supported");
+    const ix = w.c.simulated[0].instructions[1];
+    assert.equal(ix.keys.length, 10);
+    assert.ok(ix.keys[9].pubkey.equals(deriveBondTrancheV22(PROGRAM, w.markets[1])[0]));
+    assert.equal(ix.keys[9].isWritable, false);
+    assert.equal(ix.keys[9].isSigner, false);
   });
 
   it("InvalidInstructionData from the simulation -> unsupported", async () => {
