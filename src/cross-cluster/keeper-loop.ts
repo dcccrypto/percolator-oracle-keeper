@@ -111,6 +111,8 @@ export interface LoopConfig {
    * Fire-and-forget: never awaited by the push cycle.
    */
   onPushLanded?: (marketAddress: string, priceE6: bigint, label: string) => void;
+  /** Called once, right before the first push cycle: every boot-time parse (incl. startKeeperLoop's depth-flag parse) has passed. */
+  onStarted?: () => void;
   /**
    * P3 senior backing exhausted (p3-exhausted-resolve.ts): true = do not push this market,
    * so `last_good_oracle_slot` stops advancing and the tag 39 stale window can run.
@@ -2009,6 +2011,7 @@ export async function startKeeperLoop(
     console.log(`[keeper] depth-push jitter: interval drawn from [${config.intervalMs - Math.floor((config.intervalMs * depthJitterPct) / 100)}, ${config.intervalMs}]ms (SEC-RC L-3)`);
   }
 
+  config.onStarted?.();
   // Main loop
   while (!stopping) {
     const cycleStart = Date.now();
