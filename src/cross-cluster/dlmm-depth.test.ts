@@ -210,6 +210,12 @@ describe("computeDlmmDepth, synthetic uniform liquidity vs closed form / brute f
   });
 });
 
+/** [bid, ask] USD e6 at the capture slots; independently recomputed by the PR #262 reviewer (exact integer bin walk). */
+const PINNED: Record<string, [bigint, bigint]> = {
+  "sol-usdc.json": [277_415_463_261n, 405_111_879_296n],
+  "pengu.json": [8_348_663_275n, 9_342_004_749n],
+};
+
 describe("computeDlmmDepth on captured MAINNET pools", () => {
   const load = (f: string) => {
     const fx = JSON.parse(readFileSync(new URL(`./__fixtures__/dlmm/${f}`, import.meta.url), "utf8"));
@@ -253,6 +259,8 @@ describe("computeDlmmDepth on captured MAINNET pools", () => {
       assert.ok(Math.abs(Number(r.depth.bidQuoteAtoms) - bid) / Math.max(bid, 1) < 1e-6, `bid ${r.depth.bidQuoteAtoms} vs ${bid}`);
       assert.ok(r.depth.bidUsdE6 > 0n && r.depth.askUsdE6 > 0n);
       assert.equal(r.depth.minUsdE6, r.depth.bidUsdE6 < r.depth.askUsdE6 ? r.depth.bidUsdE6 : r.depth.askUsdE6);
+      const pin = PINNED[file];
+      assert.deepEqual([r.depth.bidUsdE6, r.depth.askUsdE6], pin, `pinned e6 figures for ${label}`);
       console.log(`[fixture ${label} slot ${slot}] activeId=${r.depth.activeId} binStep=${r.depth.binStep} spot=${r.depth.spotQuotePerBaseE6} bid=$${Number(r.depth.bidUsdE6) / 1e6} ask=$${Number(r.depth.askUsdE6) / 1e6} min=$${Number(r.depth.minUsdE6) / 1e6} arrays=${r.depth.binArrays}`);
     });
   }

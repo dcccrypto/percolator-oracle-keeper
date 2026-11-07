@@ -275,6 +275,8 @@ export function recordLandedPush(
 }
 
 interface LoopState {
+  /** KEEPER_DEPTH_OBSERVE_DLMM, parsed ONCE at startup (a typo refuses the start; the cycle never re-parses it). */
+  dlmmObserve: boolean;
   startedAt: number;
   lastCycleAt: number | null;
   cycleCount: number;
@@ -1337,7 +1339,7 @@ async function runCycle(
   // Bigtest Medium #6, OBSERVE-ONLY (KEEPER_DEPTH_OBSERVE_DLMM, default OFF): +-2% DLMM depth into /health. Fire-and-forget, after
   // the price read; it never feeds `resolvePushDepth` or any push byte. Flag off = this returns before any RPC.
   startDlmmDepthObservation(
-    dlmmDepthObserveEnabled(),
+    state.dlmmObserve,
     dlmmDepthObserver,
     mainnetConn,
     units,
@@ -1954,6 +1956,7 @@ export async function startKeeperLoop(
 
   // Initialise per-market stats
   const state: LoopState = {
+    dlmmObserve: false,
     startedAt: Date.now(),
     lastCycleAt: null,
     cycleCount: 0,
@@ -2020,6 +2023,7 @@ export async function startKeeperLoop(
 
   // Both depth flags are read every cycle; parsing them here first makes a typo refuse the start, not fail each cycle.
   pushDepthOnchainEnabled();
+  state.dlmmObserve = dlmmDepthObserveEnabled(); // observe-only; invalid value throws HERE, before any cycle
   const depthJitterPct = depthPushJitterPct(pushDepthEnabled());
   if (depthJitterPct > 0) {
     console.log(`[keeper] depth-push jitter: interval drawn from [${config.intervalMs - Math.floor((config.intervalMs * depthJitterPct) / 100)}, ${config.intervalMs}]ms (SEC-RC L-3)`);

@@ -144,3 +144,23 @@ describe("observe-only: push bytes are unchanged", () => {
     assert.equal(binArrayAddress(POOL, -87).toBase58(), fx.binArrays[2].address);
   });
 });
+
+describe("M-1: a bad KEEPER_DEPTH_OBSERVE_DLMM refuses the START, never a per-cycle throw", () => {
+  const src = readFileSync(new URL("./keeper-loop.ts", import.meta.url), "utf8");
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+  it("the flag is parsed in startup (before the main loop), once", () => {
+    const calls = code.match(/dlmmDepthObserveEnabled\(\)/g) ?? [];
+    assert.equal(calls.length, 1);
+    assert.ok(code.indexOf("dlmmDepthObserveEnabled()") < code.indexOf("while (!stopping)"), "must be parsed before the main loop");
+  });
+  it("runCycle does not re-parse it (it reads the value parsed at startup)", () => {
+    const start = code.indexOf("async function runCycle(");
+    const end = code.indexOf("\nasync function ", start + 10);
+    const body = code.slice(start, end > start ? end : undefined);
+    assert.ok(body.includes("startDlmmDepthObservation("));
+    assert.ok(!body.includes("dlmmDepthObserveEnabled"));
+  });
+  it("an invalid value throws from the parser (so the startup call refuses the start)", () => {
+    for (const v of ["disabled", "2", "enabled"]) assert.throws(() => dlmmDepthObserveEnabled({ KEEPER_DEPTH_OBSERVE_DLMM: v }));
+  });
+});

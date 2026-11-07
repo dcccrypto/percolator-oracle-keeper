@@ -11,7 +11,13 @@
  *                    bin_step_seed[2] 73 | pair_type u8 75 | active_id i32 @76 | bin_step u16 @80 | status u8 82 | ... |
  *                    token_x_mint @88 | token_y_mint @120 (X = base, Y = QUOTE; the same offsets the SDK's parseDexPool uses)
  *   BinArray (10136 B): disc [0..8) | index i64 @8 | version u8 @16 | pad[7] | lb_pair pubkey @24 | bins[70] @56
- *   Bin (144 B):     amount_x u64 @0 | amount_y u64 @8 | price u128 @16 (Q64.64, Y atoms per X atom) | liquidity_supply u128 @32 | ...
+ *   Bin (144 B, v0.12): amount_x u64 @0 | amount_y u64 @8 | price u128 @16 (Q64.64, Y atoms per X atom) | liquidity_supply u128 @32 |
+ *                    fulfilled_order_amount_x/y, limit_order_fee_ask/bid_side (u64 x4) @48 | fee_amount_x/y_per_token_stored u128 x2 @80 |
+ *                    open_order_amount u64 @112 | total_processing_order_amount u64 @120 | processed_order_remaining_amount u64 @128 |
+ *                    order_age u32 @136 | limit_order_ask_side u8 @140 | pad[3]
+ *                    LIMIT-ORDER LIQUIDITY IS EXCLUDED: only amount_x / amount_y (the AMM liquidity) is counted, not open_order_amount
+ *                    or processed_order_remaining_amount. The SDK's swappable amount includes limit orders, so this UNDERSTATES depth
+ *                    (conservative; ~$54 ask / ~$351 bid on the SOL fixture). Revisit if this ever stops being observe-only.
  *   PDA:             ["bin_array", lb_pair, index i64 LE] under the DLMM program; index = floor(bin_id / 70) (toward -inf).
  *   bin price:       (1 + bin_step/10000)^bin_id.  A bin above the active id holds only X, below only Y, the active bin both.
  *
