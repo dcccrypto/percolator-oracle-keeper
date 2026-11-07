@@ -60,6 +60,7 @@ import { DEADLINE_FRESH_MS, getOnChainTokenPriceUsd, getPushDeadline, isKnownTer
 import type { PushDeadline } from "./push-deadline.ts";
 import type { PriceUnit } from "./multi-asset.ts";
 import { pushGenerationKey } from "./auth-mark-pusher.ts";
+import { dlmmDepthObserveEnabled, dlmmDepthObserver, startDlmmDepthObservation } from "./dlmm-depth-observe.ts";
 
 /** Round 2: pins re-read every KEEPER_DEPTH_SRC_REFRESH_MS (default 5 min). */
 const depthSourceCache = new DepthSourceCache(Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) > 0 ? Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) : 5 * 60_000);
@@ -714,6 +715,7 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
         lastError: terminalStatus ? null : stat.lastErrorMsg,
         depthE6: stat.lastDepthE6 === null ? null : stat.lastDepthE6.toString(),
         depthSource: stat.lastDepthSource,
+        ...(dlmmDepthObserver.get(stat.key) ? { dlmmDepthObserved: dlmmDepthObserver.get(stat.key) } : {}),
         ...(stat.depthAbsentSince !== null ? { depthAbsentFor: `${Math.floor((nowMs - stat.depthAbsentSince) / 1000)}s` } : {}),
         ...crankHealthFields(getCrankRefreshHealth(addr)),
       };
@@ -1332,6 +1334,20 @@ async function runCycle(
   // SEC-RC L-3: attest the MIN of this read and the recent pre/post-push reads, so liquidity added just before a push
   // and pulled just after it is not what gets attested. Empty (and untouched) when depth pushes are off.
   const attestReservesUsdE6 = pushDepthOn ? conservativeReserves(depthWindow, quoteReservesUsdE6, Date.now()) : quoteReservesUsdE6;
+  // Bigtest Medium #6, OBSERVE-ONLY (KEEPER_DEPTH_OBSERVE_DLMM, default OFF): +-2% DLMM depth into /health. Fire-and-forget, after
+  // the price read; it never feeds `resolvePushDepth` or any push byte. Flag off = this returns before any RPC.
+  startDlmmDepthObservation(
+    dlmmDepthObserveEnabled(),
+    dlmmDepthObserver,
+    mainnetConn,
+    units,
+    (pool) => decimalsCache.get(pool),
+    (() => {
+      const solUnit = units.find((u) => u.source === "pool" && isSolUsdEntry({ dexType: u.dexType as DexType, label: u.label, symbol: u.symbol }));
+      return solUnit ? prices.get(solUnit.poolAddress) : undefined;
+    })(),
+    Date.now(),
+  );
   /** market key -> pool, for the pushes that carry a keeper-attested depth (the post-push re-read set). */
   const attestedDepthPools = new Map<string, string>();
 
