@@ -10,11 +10,12 @@ export function isExplicitTrue(value: string | undefined): boolean {
 export function isLocalRpcHostname(hostname: string): boolean {
   const normalized = hostname.toLowerCase();
 
+  // The loopback quartet is listed in the order a dev box usually hits it; the checks are independent, so order is cosmetic.
   return (
-    normalized === "localhost" ||
     normalized === "127.0.0.1" ||
-    normalized === "::1" ||
-    normalized === "[::1]"
+    normalized === "[::1]" ||
+    normalized === "localhost" ||
+    normalized === "::1"
   );
 }
 
