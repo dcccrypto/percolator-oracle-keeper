@@ -25,6 +25,41 @@ import { PublicKey, type Connection } from "@solana/web3.js";
 import { saveRegistry } from "./registry.ts";
 import { fetchActiveMarkets, type FetchActiveConfig } from "./db-markets.ts";
 import type { Registry, MarketEntry, DexType } from "./registry.ts";
+import { isStablecoinMint, STABLECOIN_MINTS } from "./stablecoin-mints.ts";
+
+/**
+ * Stablecoin-underlying admission refusal (R6). Gated by KEEPER_V22_REFUSE_STABLECOIN_UNDERLYINGS=1,
+ * default OFF, so merging this changes nothing until the flag is set.
+ *
+ * Applies ONLY to NEW admissions (the `idx === -1` branch of reconcileMarkets). A market already in
+ * the registry is never evicted, never stops being cranked/priced, and still receives binding updates;
+ * if its underlying is a stablecoin we only log a warning (once per market).
+ *
+ * The underlying is the Supabase `mainnet_ca` carried on the entry as `mainnetCa`. That value is already
+ * bound to the pool's base/quote mint by price-reader's checkMintBinding on every price read, so the pool
+ * base mint is not re-fetched here (the keeper's RPC connection is devnet; pools live on mainnet).
+ *
+ * FAIL-OPEN: no `mainnetCa` on the row, or any unexpected error while evaluating it, means the market is
+ * NOT refused. An unidentifiable underlying must never block admission (or throw out of the poll).
+ */
+export function refuseStablecoinUnderlyingsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.KEEPER_V22_REFUSE_STABLECOIN_UNDERLYINGS === "1";
+}
+
+/** Returns a refusal reason if `entry`'s underlying is a listed USD stablecoin, else null. Never throws. */
+export function stablecoinRefusalReason(entry: MarketEntry): string | null {
+  try {
+    const ca = entry.mainnetCa;
+    if (isStablecoinMint(ca)) {
+      return `underlying mainnet_ca ${ca} is the USD stablecoin ${STABLECOIN_MINTS.get(ca as string)}`;
+    }
+    return null;
+  } catch {
+    return null; // fail-open
+  }
+}
+
+const warnedTrackedStable = new Set<string>();
 
 const VALID_DEX_TYPES: ReadonlySet<string> = new Set([
   "raydium-clmm",
@@ -165,6 +200,8 @@ export function reconcileMarkets(
   desired: readonly MarketEntry[],
   absences: Map<string, number>,
   threshold: number = ABSENCE_THRESHOLD,
+  /** When true, NEW markets with a stablecoin underlying are not admitted (existing ones are untouched). */
+  refuseStablecoinUnderlyings: boolean = false,
 ): { added: string[]; removed: string[]; updated: string[] } {
   const desiredByAddr = new Map(desired.map((m) => [m.marketAddress, m]));
   const added: string[] = [];
@@ -174,8 +211,21 @@ export function reconcileMarkets(
   for (const [addr, entry] of desiredByAddr) {
     // Present this cycle — any accumulated absence is stale.
     absences.delete(addr);
+    if (refuseStablecoinUnderlyings && !warnedTrackedStable.has(addr)) {
+      const idxT = registry.markets.findIndex((m) => m.marketAddress === addr);
+      const why = idxT === -1 ? null : stablecoinRefusalReason(entry);
+      if (why) {
+        warnedTrackedStable.add(addr);
+        console.warn(`[register-poll] ${addr.slice(0, 8)}… already tracked — KEEPING it (refusal is new-admission only): ${why}`);
+      }
+    }
     const idx = registry.markets.findIndex((m) => m.marketAddress === addr);
     if (idx === -1) {
+      const refusal = refuseStablecoinUnderlyings ? stablecoinRefusalReason(entry) : null;
+      if (refusal) {
+        console.warn(`[register-poll] REFUSING to admit ${addr.slice(0, 8)}… — ${refusal}`);
+        continue;
+      }
       registry.markets.push(entry);
       added.push(addr);
     } else if (entryDiffers(registry.markets[idx], entry)) {
@@ -335,7 +385,13 @@ async function runPollOnce(registry: Registry, config: RegisterPollConfig): Prom
     }
   }
 
-  const { added, removed, updated } = reconcileMarkets(registry, admitted, absenceCounts, ABSENCE_THRESHOLD);
+  const { added, removed, updated } = reconcileMarkets(
+    registry,
+    admitted,
+    absenceCounts,
+    ABSENCE_THRESHOLD,
+    refuseStablecoinUnderlyingsEnabled(),
+  );
 
   for (const a of added) console.log(`[register-poll] added ${a}`);
   for (const r of removed) console.log(`[register-poll] retired ${r} (absent from ${ABSENCE_THRESHOLD} consecutive queries)`);
