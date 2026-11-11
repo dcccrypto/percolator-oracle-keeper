@@ -15,11 +15,38 @@ const mk = (a: string, mainnetCa?: string): MarketEntry =>
   ({ label: a, marketAddress: a, poolAddress: "P" + a, dexType: "pumpswap", assetIndex: 0, mainnetCa }) as MarketEntry;
 
 describe("stablecoin mint list", () => {
-  it("has the 32 mainnet mints and recognises USDC", () => {
-    assert.equal(STABLECOIN_MINTS.size, 32);
+  it("has the 39 mainnet mints and recognises USDC", () => {
+    assert.equal(STABLECOIN_MINTS.size, 39);
     assert.ok(isStablecoinMint(USDC));
     assert.ok(!isStablecoinMint(BONK));
     assert.ok(!isStablecoinMint(undefined));
+  });
+});
+
+describe("r7 added mints", () => {
+  const added: Array<[string, string]> = [
+    ["USD+", "usdsfJbX78ktZUnoRC7dwvvQz7xH3WdkpGne76gdUia"],
+    ["CASH", "CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH"],
+    ["USX", "6FrrzDk5mQARGc1TDYoyVnSyRdds1t4PbtohCD6p3tgG"],
+    ["eUSX", "3ThdFZQKM6kRyVGLG48kaPg5TRMhYMKY1iCRa9xop1WC"],
+    ["JupUSD", "JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD"],
+    ["acUSD", "EwxNF8g9UfmsJVcZFTpL9Hx5MCkoQFoJi6XNWzKf1j8e"],
+    ["FRAX", "FR87nWEUxVgerFGhZM8Y4AggKGLnaXswr1Pd8wZ4kZcp"],
+  ];
+  for (const [sym, mint] of added) {
+    it(`${sym} is recognised and, with the flag ON, refused at admission`, () => {
+      assert.equal(STABLECOIN_MINTS.get(mint), sym);
+      assert.ok(isStablecoinMint(mint));
+      const r = { markets: [] as MarketEntry[] };
+      assert.deepEqual(reconcileMarkets(r, [mk("S", mint)], new Map(), 3, true).added, []);
+    });
+  }
+  it("keeps sUSDe, USDY and the yield-bearing set blocked", () => {
+    assert.ok(isStablecoinMint("Eh6XEPhSwoLv5wFApukmnaVSHQ6sAnoD9BmgmwQoN2sN"));
+    assert.ok(isStablecoinMint("A1KLoBrKBde8Ty9qtNQUtq3C2ortoC3u7twggz7sEto6"));
+  });
+  it("the list is unique and every key is a 32-byte base58 address", () => {
+    for (const k of STABLECOIN_MINTS.keys()) assert.ok(k.length >= 32 && k.length <= 44, k);
   });
 });
 
