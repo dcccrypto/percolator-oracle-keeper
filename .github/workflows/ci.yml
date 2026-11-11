@@ -5,9 +5,9 @@ name: keeper-ci
 
 on:
   push:
-    branches: [feat/v22-keeper-growth]
+    branches: [feat/v22-keeper-growth, ops/v22-fresh-keeper-1106]
   pull_request:
-    branches: [feat/v22-keeper-growth]
+    branches: [feat/v22-keeper-growth, ops/v22-fresh-keeper-1106]
 
 permissions:
   contents: read
