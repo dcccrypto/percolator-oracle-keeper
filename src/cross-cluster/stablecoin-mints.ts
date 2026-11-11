@@ -1,10 +1,11 @@
 /**
  * USD stablecoin mints (Solana mainnet-beta) that must not be admitted as a v2.2 market UNDERLYING.
  *
- * SOURCE OF TRUTH: percolator-launch app/lib/v22/stablecoin-mints.ts. This is a copy of its 39 mainnet
- * entries (32 from 2026-11-10 + 7 added 2026-11-11 with percolator-launch #3798); when that list
- * changes, update this file in lockstep.
- * Policy: USD-pegged stablecoins incl. bridged (Portal/Allbridge) and yield-bearing USD (sUSDe, USDY);
+ * SOURCE OF TRUTH: percolator-launch app/lib/v22/stablecoin-mints.ts. This is a copy of its 41 mainnet
+ * entries (32 from 2026-11-10 + 7 added 2026-11-11 with percolator-launch #3798 + 2 added in r8: Solayer sUSD, Maple syrupUSDC); when that
+ * list changes, update this file in lockstep. The keeper has NO ticker/name rule: it is mint-only, so BOLD / USX / CASH are only ever blocked
+ * by their verified mint (USX, CASH are listed; Liquity BOLD has no Solana mint).
+ * Policy: USD-pegged stablecoins incl. bridged (Portal/Allbridge) and yield-bearing USD (sUSDe, USDY, sUSD, syrupUSDC);
  * EURC and non-USD fiat stables excluded.
  */
 export const STABLECOIN_MINTS: ReadonlyMap<string, string> = new Map<string, string>([
@@ -49,6 +50,9 @@ export const STABLECOIN_MINTS: ReadonlyMap<string, string> = new Map<string, str
   ["JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD", "JupUSD"], // CG jupusd; JUP stable; Metaplex JupUSD
   ["EwxNF8g9UfmsJVcZFTpL9Hx5MCkoQFoJi6XNWzKf1j8e", "acUSD"], // SLTL acUSD (Allbridge, Celo cUSD); mint account verified on-chain
   ["FR87nWEUxVgerFGhZM8Y4AggKGLnaXswr1Pd8wZ4kZcp", "FRAX"], // SLTL FRAX (Portal); Metaplex Frax (Wormhole) / FRAX
+  // Added 2026-11-11 (r8). getAccountInfo on the Solana public RPC + issuer docs page + Jupiter (verified, yb) + CoinGecko platforms.solana.
+  ["susdabGDNbhrnCa6ncrYo81u4s9GM8ecK2UwMyZiq4X", "sUSD"], // ISSUER docs.solayer.org (sUSD Token Info); CG solayer-usd; JUP verified yb; Token-2022 metadata Solayer USD / sUSD
+  ["AvZZF1YaZDziPY2RCK4oJrRVrbN3mTD9NL24hPeaZeUj", "syrupUSDC"], // ISSUER docs.maple.finance crosschain (Solana token); CG syrupusdc; JUP verified yb
 ]);
 
 export function isStablecoinMint(mint: string | null | undefined): boolean {

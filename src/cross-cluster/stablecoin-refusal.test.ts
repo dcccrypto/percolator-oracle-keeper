@@ -16,8 +16,8 @@ const mk = (a: string, mainnetCa?: string): MarketEntry =>
   ({ label: a, marketAddress: a, poolAddress: "P" + a, dexType: "pumpswap", assetIndex: 0, mainnetCa }) as MarketEntry;
 
 describe("stablecoin mint list", () => {
-  it("has the 39 mainnet mints and recognises USDC", () => {
-    assert.equal(STABLECOIN_MINTS.size, 39);
+  it("has the 41 mainnet mints and recognises USDC", () => {
+    assert.equal(STABLECOIN_MINTS.size, 41);
     assert.ok(isStablecoinMint(USDC));
     assert.ok(!isStablecoinMint(BONK));
     assert.ok(!isStablecoinMint(undefined));
@@ -105,5 +105,23 @@ describe("reconcileMarkets stablecoin refusal", () => {
     const r = { markets: [] as MarketEntry[] };
     const out = reconcileMarkets(r, [mk("S", USDC), mk("N", BONK)], new Map(), 3, true);
     assert.deepEqual(out.added, ["N"]);
+  });
+});
+
+describe("r8: sUSD, syrupUSDC added; mint-only means BOLD / USX / CASH tickers are not blocked", () => {
+  it("sUSD and syrupUSDC are recognised and refused at register-poll admission", () => {
+    for (const [sym, mint] of [["sUSD", "susdabGDNbhrnCa6ncrYo81u4s9GM8ecK2UwMyZiq4X"], ["syrupUSDC", "AvZZF1YaZDziPY2RCK4oJrRVrbN3mTD9NL24hPeaZeUj"]] as const) {
+      assert.equal(STABLECOIN_MINTS.get(mint), sym);
+      assert.deepEqual(reconcileMarkets({ markets: [] as MarketEntry[] }, [mk("S", mint)], new Map(), 3, true).added, []);
+    }
+  });
+  it("keeps sUSDe, USDY blocked and the verified USX / CASH mints blocked by mint", () => {
+    for (const m of ["Eh6XEPhSwoLv5wFApukmnaVSHQ6sAnoD9BmgmwQoN2sN", "A1KLoBrKBde8Ty9qtNQUtq3C2ortoC3u7twggz7sEto6", "6FrrzDk5mQARGc1TDYoyVnSyRdds1t4PbtohCD6p3tgG", "CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH"]) assert.ok(isStablecoinMint(m), m);
+  });
+  it("a non-stable mint whose symbol is BOLD / USX / CASH is admitted (the keeper has no ticker rule)", () => {
+    for (const symbol of ["BOLD", "USX", "CASH"]) {
+      const e = { ...mk("M" + symbol, BONK), symbol } as MarketEntry;
+      assert.deepEqual(reconcileMarkets({ markets: [] as MarketEntry[] }, [e], new Map(), 3, true).added, ["M" + symbol]);
+    }
   });
 });

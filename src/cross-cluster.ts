@@ -103,6 +103,7 @@ import type { ConnectionConfig } from "@solana/web3.js";
 import { startRegisterPollLoop, pollOnce } from "./cross-cluster/register-poll.ts";
 import { startRegistrationStream, type RegistrationStream } from "./cross-cluster/registration-stream.ts";
 import { startRegistryReloadLoop } from "./cross-cluster/registry-reload.ts";
+import { warnBootStablecoinRows } from "./cross-cluster/stablecoin-reload-gate.ts";
 import { WRAPPER_PROGRAM_ID } from "./cross-cluster/auth-mark-pusher.ts";
 import { P2bFeatureGate, makeTag103Probe, p2bGateConfigFromEnv, setP2bGate } from "./cross-cluster/p2b-feature.ts";
 import type { P2bGateConfig } from "./cross-cluster/p2b-feature.ts";
@@ -766,9 +767,12 @@ if (SUPABASE_URL && SUPABASE_ANON_KEY) {
 // new registry.json on disk is invisible to a running keeper until restart —
 // and a restart right after a re-seed reintroduces exactly the kind of
 // boot-time gap D5/D1 exist to close.
+// Flag on only: one boot warning per stablecoin row already in the registry (kept, never evicted).
+void warnBootStablecoinRows(registry, mainnetConn);
 void startRegistryReloadLoop(registry, {
   registryPath: REGISTRY_PATH,
   intervalMs: REGISTRY_RELOAD_INTERVAL_MS,
+  mainnetConn,
 }).catch((err) => {
   console.error(
     `[registry-reload] loop crashed (oracle push is unaffected): ${err instanceof Error ? err.message : String(err)}`,
