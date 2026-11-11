@@ -37,15 +37,20 @@
  * latency to one interval with no such platform-dependent failure mode.
  */
 import fs from "fs";
+import type { Connection } from "@solana/web3.js";
 import { assertRegistryProgramSet, loadRegistry, registryProgramSet } from "./registry.ts";
 import type { MarketEntry, Registry } from "./registry.ts";
 import { registryRowProblems } from "./multi-asset.ts";
+import { refuseStablecoinUnderlyingsEnabled } from "./register-poll.ts";
+import { reloadRegistryGated } from "./stablecoin-reload-gate.ts";
 
 export interface RegistryReloadConfig {
   /** Path to registry.json to poll. */
   registryPath: string;
   /** Milliseconds between reload checks (default 15_000). */
   intervalMs?: number;
+  /** Mainnet connection used ONLY by the stablecoin gate (KEEPER_V22_REFUSE_STABLECOIN_UNDERLYINGS=1) to read a new row's pool. */
+  mainnetConn?: Pick<Connection, "getAccountInfo">;
 }
 
 const DEFAULT_RELOAD_INTERVAL_MS = 15_000;
@@ -64,13 +69,10 @@ function sameEntry(a: MarketEntry, b: MarketEntry): boolean {
  *
  * Returns `{ added, removed, updated }` counts (all zero if nothing changed).
  */
-export function reloadRegistryOnce(
-  registry: Registry,
-  registryPath: string,
-): { added: number; removed: number; updated: number } {
+function readValidatedRegistry(registry: Registry, registryPath: string): Registry | null {
   let onDisk: Registry;
   try {
-    if (!fs.existsSync(registryPath)) return { added: 0, removed: 0, updated: 0 };
+    if (!fs.existsSync(registryPath)) return null;
     onDisk = loadRegistry(registryPath);
     if (!Array.isArray(onDisk.markets)) {
       throw new Error("loaded registry has no markets array");
@@ -89,9 +91,31 @@ export function reloadRegistryOnce(
       `[registry-reload] failed to read/parse ${registryPath} — keeping current in-memory registry: ` +
         `${err instanceof Error ? err.message : String(err)}`,
     );
-    return { added: 0, removed: 0, updated: 0 };
+    return null;
   }
+  return onDisk;
+}
 
+export function reloadRegistryOnce(
+  registry: Registry,
+  registryPath: string,
+): { added: number; removed: number; updated: number } {
+  const onDisk = readValidatedRegistry(registry, registryPath);
+  if (!onDisk) return { added: 0, removed: 0, updated: 0 };
+  return applyOnDisk(registry, onDisk, registryPath);
+}
+
+/** Read + validate the file, or null (logged) when it must be skipped. Used by the stablecoin-gated reload (stablecoin-reload-gate.ts). */
+export function readRegistryForReload(registry: Registry, registryPath: string): Registry | null {
+  return readValidatedRegistry(registry, registryPath);
+}
+
+/** Reconcile a validated on-disk registry into `registry` in place. `onDisk.markets` may already exclude refused / held new rows. */
+export function applyOnDisk(
+  registry: Registry,
+  onDisk: Registry,
+  registryPath: string,
+): { added: number; removed: number; updated: number } {
   const onDiskByAddr = new Map(onDisk.markets.map((m) => [m.marketAddress, m]));
   const inMemByAddr = new Map(registry.markets.map((m) => [m.marketAddress, m]));
 
@@ -158,7 +182,8 @@ export async function startRegistryReloadLoop(
   while (!stopping) {
     const cycleStart = Date.now();
     try {
-      reloadRegistryOnce(registry, config.registryPath);
+      if (refuseStablecoinUnderlyingsEnabled()) await reloadRegistryGated(registry, config.registryPath, { conn: config.mainnetConn });
+      else reloadRegistryOnce(registry, config.registryPath);
     } catch (err) {
       // Defense in depth: reloadRegistryOnce already isolates every failure
       // mode internally, but never let an unexpected throw kill this loop.
