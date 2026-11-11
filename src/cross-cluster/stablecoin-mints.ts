@@ -1,11 +1,12 @@
 /**
  * USD stablecoin mints (Solana mainnet-beta) that must not be admitted as a v2.2 market UNDERLYING.
  *
- * SOURCE OF TRUTH: percolator-launch app/lib/v22/stablecoin-mints.ts. This is a copy of its 41 mainnet
- * entries (32 from 2026-11-10 + 7 added 2026-11-11 with percolator-launch #3798 + 2 added in r8: Solayer sUSD, Maple syrupUSDC); when that
+ * SOURCE OF TRUTH: percolator-launch app/lib/v22/stablecoin-mints.ts. This is a copy of its 52 mainnet
+ * entries (32 from 2026-11-10 + 7 added 2026-11-11 with percolator-launch #3798 + 2 added in r8: Solayer sUSD, Maple syrupUSDC + 11 added in the r8 Council
+ * finding: USDu, sUSDu, USDGO, USDP, sUSDai, USDv, DUSD, wYLDS, PST, XO, SOFID); when that
  * list changes, update this file in lockstep. The keeper has NO ticker/name rule: it is mint-only, so BOLD / USX / CASH are only ever blocked
  * by their verified mint (USX, CASH are listed; Liquity BOLD has no Solana mint).
- * Policy: USD-pegged stablecoins incl. bridged (Portal/Allbridge) and yield-bearing USD (sUSDe, USDY, sUSD, syrupUSDC);
+ * Policy: USD-pegged stablecoins incl. bridged (Portal/Allbridge) and yield-bearing USD (sUSDe, USDY, sUSD, syrupUSDC, sUSDu, sUSDai, wYLDS, PST);
  * EURC and non-USD fiat stables excluded.
  */
 export const STABLECOIN_MINTS: ReadonlyMap<string, string> = new Map<string, string>([
@@ -53,6 +54,18 @@ export const STABLECOIN_MINTS: ReadonlyMap<string, string> = new Map<string, str
   // Added 2026-11-11 (r8). getAccountInfo on the Solana public RPC + issuer docs page + Jupiter (verified, yb) + CoinGecko platforms.solana.
   ["susdabGDNbhrnCa6ncrYo81u4s9GM8ecK2UwMyZiq4X", "sUSD"], // ISSUER docs.solayer.org (sUSD Token Info); CG solayer-usd; JUP verified yb; Token-2022 metadata Solayer USD / sUSD
   ["AvZZF1YaZDziPY2RCK4oJrRVrbN3mTD9NL24hPeaZeUj", "syrupUSDC"], // ISSUER docs.maple.finance crosschain (Solana token); CG syrupusdc; JUP verified yb
+  // Added 2026-11-11 (r8 Council finding). getAccountInfo on the Solana public RPC + Jupiter tokens v2 + issuer docs page or CoinGecko platforms.solana (full sources in the launch list).
+  ["9ckR7pPPvyPadACDTzLwK2ZAEeUJ3qGSnzPs8bVaHrSy", "USDu"], // ISSUER docs.unitas.so (General Overview, official token table, Solana); CG usdu; JUP stable (verified); CHAIN Token-2022 metadata USDu / USDu
+  ["9iq5Q33RSiz1WcupHAQKbHBZkpn92UxBG2HfPWAZhMCa", "sUSDu"], // ISSUER docs.unitas.so (General Overview, official token table, Solana); JUP verified; CHAIN Token-2022 metadata Staked USDu / sUSDu
+  ["72puLt71H93Z9CzHuBRTwFpL4TG3WZUhnoCC7p8gxigu", "USDGO"], // CG usdgo; JUP verified; CHAIN Token-2022 metadata USDGO / USDGO; Solflare / Bitget / Solana Compass list it as the official Solana mint
+  ["HVbpJAQGNpkgBaYBZQBR1t7yFdvaYVp2vCQQfKKEN4tM", "USDP"], // ISSUER docs.paxos.com/guides/stablecoin/usdp/mainnet (Solana Mainnet Beta); CG paxos-standard; JUP strict; CHAIN Token-2022 metadata Pax Dollar / USDP
+  ["sUSDai6Y3GxysDEtA9BVcEFTaog6UZpYUVxJiMhAKYE", "sUSDai"], // ISSUER docs.usd.ai Contract Addresses page (Solana table, sUSDai OFT); JUP verified; CHAIN Token-2022 metadata Staked USDai / sUSDai
+  ["USDvUSpnhCr9yBgj3UyVrD239HRUv4RsHwH2FxsWuMk", "USDv"], // CG solomon-usdv; JUP verified; CHAIN Token-2022 metadata USDv / USDv; Solana Compass news on the Sunrise launch names this mint canonical
+  ["DUSDt4AeLZHWYmcXnVGYdgAzjtzU5mXUVnTMdnSzAttM", "DUSD"], // CG standx-dusd; JUP stable (verified); CHAIN Token-2022 metadata DUSD / DUSD
+  ["8fr7WGTVFszfyNWRMXj6fRjZZAnDwmXwEpCrtzmUkdih", "wYLDS"], // CG hastra-wrapped-ylds; JUP stable (verified); CHAIN SPL mint (6 decimals); Phantom / Solana Compass list it as Hastra wYLDS
+  ["59obFNBzyTBGowrkif5uK7ojS58vsuWz3ZCvg6tfZAGw", "PST"], // CG payfi-strategy-token-usdc; JUP verified yb; CHAIN SPL mint (6 decimals)
+  ["xoUSDq85Rjsb6SbUwJyreFgeWQvxdkT7R3c3g7s6p5Y", "XO"], // CG xo-cash; JUP verified; CHAIN Token-2022 metadata XO Cash / XO; Solflare lists it as the official Solana contract
+  ["APhcqtzE73es3KAGiVksZFMLGwJDiAey5qZKUrQHEHfS", "SOFID"], // CG sofiusd platforms.solana; JUP verified; CHAIN Token-2022 metadata SoFiUSD / SOFID; The Block / Decrypt report the Solana launch
 ]);
 
 export function isStablecoinMint(mint: string | null | undefined): boolean {
