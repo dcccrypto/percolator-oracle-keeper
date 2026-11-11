@@ -1,8 +1,9 @@
 /**
  * USD stablecoin mints (Solana mainnet-beta) that must not be admitted as a v2.2 market UNDERLYING.
  *
- * SOURCE OF TRUTH: percolator-launch app/lib/v22/stablecoin-mints.ts. This is a verbatim copy of the
- * 32 mainnet entries (generated 2026-11-10); when that list changes, update this file in lockstep.
+ * SOURCE OF TRUTH: percolator-launch app/lib/v22/stablecoin-mints.ts. This is a copy of its 39 mainnet
+ * entries (32 from 2026-11-10 + 7 added 2026-11-11 with percolator-launch #3798); when that list
+ * changes, update this file in lockstep.
  * Policy: USD-pegged stablecoins incl. bridged (Portal/Allbridge) and yield-bearing USD (sUSDe, USDY);
  * EURC and non-USD fiat stables excluded.
  */
@@ -39,6 +40,15 @@ export const STABLECOIN_MINTS: ReadonlyMap<string, string> = new Map<string, str
   ["DNhZkUaxHXYvpxZ7LNnHtss8sQgdAfd1ZYS1fB7LKWUZ", "apUSDT"],
   ["E77cpQ4VncGmcAXX16LHFFzNBEBb2U7Ar7LBmZNfCgwL", "abUSDT"],
   ["FwEHs3kJEdMa2qZHv7SgzCiFXUQPEycEXksfBkwmS8gj", "aaUSDT"],
+  // Added 2026-11-11 (r7). Verified read-only: Solana public RPC getAccountInfo (SPL / Token-2022 mint) + on-chain metadata name/symbol + an
+  // independent source (CG = CoinGecko platforms.solana, JUP = Jupiter token search verified/stable tag, SLTL = solana-labs token list).
+  ["usdsfJbX78ktZUnoRC7dwvvQz7xH3WdkpGne76gdUia", "USD+"], // CG usd-2; JUP verified; Metaplex USD+
+  ["CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH", "CASH"], // CG cash-4; JUP stable; Token-2022 metadata CASH
+  ["6FrrzDk5mQARGc1TDYoyVnSyRdds1t4PbtohCD6p3tgG", "USX"], // CG usx; JUP stable; Metaplex USX
+  ["3ThdFZQKM6kRyVGLG48kaPg5TRMhYMKY1iCRa9xop1WC", "eUSX"], // CG solstice-eusx; JUP verified (yield-bearing); Metaplex eUSX
+  ["JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD", "JupUSD"], // CG jupusd; JUP stable; Metaplex JupUSD
+  ["EwxNF8g9UfmsJVcZFTpL9Hx5MCkoQFoJi6XNWzKf1j8e", "acUSD"], // SLTL acUSD (Allbridge, Celo cUSD); mint account verified on-chain
+  ["FR87nWEUxVgerFGhZM8Y4AggKGLnaXswr1Pd8wZ4kZcp", "FRAX"], // SLTL FRAX (Portal); Metaplex Frax (Wormhole) / FRAX
 ]);
 
 export function isStablecoinMint(mint: string | null | undefined): boolean {
