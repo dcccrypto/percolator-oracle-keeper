@@ -4,6 +4,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { PublicKey } from "@solana/web3.js";
 import { reconcileMarkets, refuseStablecoinUnderlyingsEnabled } from "./register-poll.ts";
 import { STABLECOIN_MINTS, isStablecoinMint } from "./stablecoin-mints.ts";
 import type { MarketEntry } from "./registry.ts";
@@ -44,9 +45,18 @@ describe("r7 added mints", () => {
   it("keeps sUSDe, USDY and the yield-bearing set blocked", () => {
     assert.ok(isStablecoinMint("Eh6XEPhSwoLv5wFApukmnaVSHQ6sAnoD9BmgmwQoN2sN"));
     assert.ok(isStablecoinMint("A1KLoBrKBde8Ty9qtNQUtq3C2ortoC3u7twggz7sEto6"));
+    assert.ok(isStablecoinMint("usdsfJbX78ktZUnoRC7dwvvQz7xH3WdkpGne76gdUia")); // USD+
+    assert.ok(isStablecoinMint("3ThdFZQKM6kRyVGLG48kaPg5TRMhYMKY1iCRa9xop1WC")); // eUSX
   });
   it("the list is unique and every key is a 32-byte base58 address", () => {
-    for (const k of STABLECOIN_MINTS.keys()) assert.ok(k.length >= 32 && k.length <= 44, k);
+    const seen = new Set<string>();
+    for (const k of STABLECOIN_MINTS.keys()) {
+      const canon = new PublicKey(k).toBase58(); // throws on non-base58
+      assert.equal(new PublicKey(k).toBytes().length, 32, k);
+      assert.equal(canon, k, `non-canonical ${k}`);
+      assert.ok(!seen.has(canon), `duplicate ${k}`);
+      seen.add(canon);
+    }
   });
 });
 

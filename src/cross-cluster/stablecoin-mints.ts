@@ -1,8 +1,9 @@
 /**
  * USD stablecoin mints (Solana mainnet-beta) that must not be admitted as a v2.2 market UNDERLYING.
  *
- * SOURCE OF TRUTH: percolator-launch app/lib/v22/stablecoin-mints.ts. This is a verbatim copy of the
- * 32 mainnet entries (generated 2026-11-10); when that list changes, update this file in lockstep.
+ * SOURCE OF TRUTH: percolator-launch app/lib/v22/stablecoin-mints.ts. This is a copy of its 39 mainnet
+ * entries (32 from 2026-11-10 + 7 added 2026-11-11 with percolator-launch #3798); when that list
+ * changes, update this file in lockstep.
  * Policy: USD-pegged stablecoins incl. bridged (Portal/Allbridge) and yield-bearing USD (sUSDe, USDY);
  * EURC and non-USD fiat stables excluded.
  */
