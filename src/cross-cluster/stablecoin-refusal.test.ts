@@ -16,8 +16,8 @@ const mk = (a: string, mainnetCa?: string): MarketEntry =>
   ({ label: a, marketAddress: a, poolAddress: "P" + a, dexType: "pumpswap", assetIndex: 0, mainnetCa }) as MarketEntry;
 
 describe("stablecoin mint list", () => {
-  it("has the 41 mainnet mints and recognises USDC", () => {
-    assert.equal(STABLECOIN_MINTS.size, 41);
+  it("has the 52 mainnet mints and recognises USDC", () => {
+    assert.equal(STABLECOIN_MINTS.size, 52);
     assert.ok(isStablecoinMint(USDC));
     assert.ok(!isStablecoinMint(BONK));
     assert.ok(!isStablecoinMint(undefined));
@@ -123,5 +123,32 @@ describe("r8: sUSD, syrupUSDC added; mint-only means BOLD / USX / CASH tickers a
       const e = { ...mk("M" + symbol, BONK), symbol } as MarketEntry;
       assert.deepEqual(reconcileMarkets({ markets: [] as MarketEntry[] }, [e], new Map(), 3, true).added, ["M" + symbol]);
     }
+  });
+});
+
+describe("r8 Council finding: USDu and ten other verified USD stables are refused by mint", () => {
+  const ADDED: readonly (readonly [string, string])[] = [
+  ["USDu", "9ckR7pPPvyPadACDTzLwK2ZAEeUJ3qGSnzPs8bVaHrSy"],
+    ["sUSDu", "9iq5Q33RSiz1WcupHAQKbHBZkpn92UxBG2HfPWAZhMCa"],
+    ["USDGO", "72puLt71H93Z9CzHuBRTwFpL4TG3WZUhnoCC7p8gxigu"],
+    ["USDP", "HVbpJAQGNpkgBaYBZQBR1t7yFdvaYVp2vCQQfKKEN4tM"],
+    ["sUSDai", "sUSDai6Y3GxysDEtA9BVcEFTaog6UZpYUVxJiMhAKYE"],
+    ["USDv", "USDvUSpnhCr9yBgj3UyVrD239HRUv4RsHwH2FxsWuMk"],
+    ["DUSD", "DUSDt4AeLZHWYmcXnVGYdgAzjtzU5mXUVnTMdnSzAttM"],
+    ["wYLDS", "8fr7WGTVFszfyNWRMXj6fRjZZAnDwmXwEpCrtzmUkdih"],
+    ["PST", "59obFNBzyTBGowrkif5uK7ojS58vsuWz3ZCvg6tfZAGw"],
+    ["XO", "xoUSDq85Rjsb6SbUwJyreFgeWQvxdkT7R3c3g7s6p5Y"],
+    ["SOFID", "APhcqtzE73es3KAGiVksZFMLGwJDiAey5qZKUrQHEHfS"],
+  ];
+  it("each is recognised and refused at register-poll admission", () => {
+    assert.equal(ADDED.length, 11);
+    for (const [sym, mint] of ADDED) {
+      assert.equal(STABLECOIN_MINTS.get(mint), sym);
+      assert.deepEqual(reconcileMarkets({ markets: [] as MarketEntry[] }, [mk("S", mint)], new Map(), 3, true).added, []);
+    }
+  });
+  it("the keeper list has 52 unique mints and each key is a valid pubkey", () => {
+    assert.equal(STABLECOIN_MINTS.size, 52);
+    for (const k of STABLECOIN_MINTS.keys()) assert.equal(new PublicKey(k).toBase58(), k);
   });
 });
