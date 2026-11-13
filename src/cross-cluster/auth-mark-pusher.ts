@@ -1079,6 +1079,9 @@ export function parseFailingPush(
   return { position, custom };
 }
 
+/** Last time the batch preflight logged that its simulate could not run (rate limit for that warning). */
+let lastPreflightUnavailableLogAt = 0;
+
 export async function pushAuthMarkBatch(
   devnetConn: Connection,
   keeper: Keypair,
@@ -1269,10 +1272,16 @@ export async function pushAuthMarkBatch(
         replaceRecentBlockhash: true,
       });
       simErr = sim.value.err;
-    } catch {
+    } catch (err) {
       // A simulate that cannot even run (RPC hiccup) must not drop the push —
-      // fall through and send, which is the old behaviour.
+      // fall through and send, which is the old behaviour. Logged (at most once a minute) so a preflight that
+      // persistently cannot run (e.g. an RPC that rejects a simulate param) is visible rather than silently off.
       simErr = null;
+      const nowMs = Date.now();
+      if (nowMs - lastPreflightUnavailableLogAt >= 60_000) {
+        lastPreflightUnavailableLogAt = nowMs;
+        console.warn(`[push] preflight simulate could not run (sending unvalidated): ${(err instanceof Error ? err.message : String(err)).slice(0, 160)}`);
+      }
     }
     // BlockhashNotFound is NOT a program revert. On a load-balanced devnet RPC
     // pool (the padre endpoint) the node that runs simulateTransaction often lags

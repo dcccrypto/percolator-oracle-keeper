@@ -65,6 +65,7 @@ describe("push preflight simulates a VersionedTransaction", () => {
     assert.equal(sims.length, 1);
     assert.ok(sims[0].tx instanceof VersionedTransaction, "versioned, so web3.js does not swap the blockhash");
     assert.deepEqual(sims[0].cfg, { sigVerify: false, replaceRecentBlockhash: true });
+    // Documentation only: a plain-object mock never runs web3.js's internal refetch; the instanceof check above is the pin.
     assert.equal(blockhashCalls, 0);
     assert.equal(sent.length, 1);
     const sentIxs = Transaction.from(sent[0]).instructions;
