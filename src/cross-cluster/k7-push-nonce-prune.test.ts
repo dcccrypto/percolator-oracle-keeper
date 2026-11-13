@@ -36,6 +36,7 @@ import {
 import { pruneDeregisteredMarkets } from "./keeper-loop.ts";
 import { nonComputeBudget } from "./test-ix.ts";
 import type { PublicKey } from "@solana/web3.js";
+import { simInstructions } from "./sim-tx-test-helper.ts";
 
 const BLOCKHASH = { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 };
 
@@ -77,9 +78,9 @@ function chain(markets: string[], start = 100n, landedErr: (pos: number) => unkn
       },
     },
     /** Capture the pushes of the tx being sent (keeper builds then simulates, so use simulate for decoding). */
-    capture(conn: { simulateTransaction: (tx: { instructions: IxLike[] }) => Promise<unknown> }) {
-      conn.simulateTransaction = async (tx: { instructions: IxLike[] }) => {
-        const ixs = nonComputeBudget(tx.instructions);
+    capture(conn: { simulateTransaction: (tx: unknown) => Promise<unknown> }) {
+      conn.simulateTransaction = async (tx: unknown) => {
+        const ixs = nonComputeBudget(simInstructions(tx) as unknown as IxLike[]);
         sent.push({ markets: ixs.map((ix) => ix.keys[1].pubkey.toBase58()), seqs: ixs.map(seqOf) });
         return { value: { err: null } };
       };

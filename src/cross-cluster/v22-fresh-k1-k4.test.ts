@@ -51,6 +51,7 @@ import { deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 import { decodeStakePoolAnyVersion, isStakePoolV5 } from "./stake-pool-decode.ts";
 import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { nonComputeBudget } from "./test-ix.ts";
+import { simInstructions } from "./sim-tx-test-helper.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fx = (n: string): Uint8Array => new Uint8Array(Buffer.from(readFileSync(join(here, "__fixtures__", `${n}.b64`), "utf8").trim(), "base64"));
@@ -216,9 +217,9 @@ describe("K-1: per-lot mark scaling", () => {
       async getMultipleAccountsInfo(pks: PublicKey[]) {
         return pks.map((pk) => (accounts[pk.toBase58()] ? { data: Buffer.from(accounts[pk.toBase58()]) } : null));
       },
-      async simulateTransaction(tx: { instructions: Array<{ programId: PublicKey; keys: Array<{ pubkey: PublicKey }>; data: Uint8Array }> }) {
+      async simulateTransaction(tx: unknown) {
         sims.push(
-          nonComputeBudget(tx.instructions).map((ix) => {
+          nonComputeBudget(simInstructions(tx)).map((ix) => {
             const v = new DataView(ix.data.buffer, ix.data.byteOffset, ix.data.byteLength);
             return { market: ix.keys[1].pubkey.toBase58(), mark: v.getBigUint64(19, true), seq: v.getBigUint64(27, true) };
           }),

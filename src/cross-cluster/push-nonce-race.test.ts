@@ -32,6 +32,7 @@ import {
 import { pushAuthMarkBatch, getQuarantinedMarkets } from "./auth-mark-pusher.ts";
 import { nonComputeBudget } from "./test-ix.ts";
 import type { PublicKey } from "@solana/web3.js";
+import { simInstructions } from "./sim-tx-test-helper.ts";
 
 const BLOCKHASH = { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 };
 const PRICE = 1_000_000n;
@@ -98,8 +99,8 @@ function chain(marketsList: string[], start = 100n) {
       onRead?.(reads);
       return pks.map((pk) => ({ data: marketAccount(readView.get(pk.toBase58()) ?? 0n) }));
     },
-    async simulateTransaction(tx: { instructions: IxLike[] }) {
-      const pushes = decodePushes(tx.instructions);
+    async simulateTransaction(tx: unknown) {
+      const pushes = decodePushes(simInstructions(tx) as unknown as IxLike[]);
       simulated.push(pushes);
       return { value: { err: execute(ledger, pushes, false) } };
     },

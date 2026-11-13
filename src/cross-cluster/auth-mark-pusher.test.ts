@@ -77,6 +77,7 @@ import {
 } from "@percolatorct/sdk";
 import { nonComputeBudget } from "./test-ix.ts";
 import type { PublicKey } from "@solana/web3.js";
+import { simInstructions } from "./sim-tx-test-helper.ts";
 
 const BLOCKHASH = { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 };
 
@@ -179,10 +180,8 @@ function fakeConn(
       },
       // The tx carries one ComputeBudget ix then one PushAuthMark ix per market;
       // the market is account index 1 of each push ix (see ACCOUNTS_PUSH_AUTH_MARK).
-      async simulateTransaction(tx: {
-        instructions: Array<{ programId: PublicKey; keys: Array<{ pubkey: { toBase58(): string } }>; data: Uint8Array }>;
-      }) {
-        const pushIxs = nonComputeBudget(tx.instructions);
+      async simulateTransaction(tx: unknown) {
+        const pushIxs = nonComputeBudget(simInstructions(tx));
         const marketsInTx = pushIxs.map((ix) => ix.keys[1].pubkey.toBase58());
         simulated.push(marketsInTx);
         simulatedData.push(pushIxs.map((ix) => ix.data));

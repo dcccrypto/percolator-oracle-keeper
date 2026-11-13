@@ -35,6 +35,7 @@ import {
   Transaction,
   TransactionInstruction,
   ComputeBudgetProgram,
+  VersionedTransaction,
 } from "@solana/web3.js";
 import {
   ACCOUNTS_PUSH_AUTH_MARK,
@@ -1258,7 +1259,15 @@ export async function pushAuthMarkBatch(
     tx.sign(keeper);
     let simErr: unknown = null;
     try {
-      const sim = await devnetConn.simulateTransaction(tx);
+      // PERF (v22-keep-1113): simulate the SAME message as a VersionedTransaction. A legacy Transaction makes web3.js
+      // discard the tx's blockhash and fetch its own (getLatestBlockhash("finalized"), polled until it changes, every
+      // 30 s) before simulating: an extra serial RTT on the push path. `replaceRecentBlockhash` has the RPC use its
+      // latest blockhash instead, which is what the legacy path effectively did, and is why sigVerify stays false (it
+      // was false before: no signers were passed). Same program, accounts, CU limit, CU price and commitment.
+      const sim = await devnetConn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), {
+        sigVerify: false,
+        replaceRecentBlockhash: true,
+      });
       simErr = sim.value.err;
     } catch {
       // A simulate that cannot even run (RPC hiccup) must not drop the push —

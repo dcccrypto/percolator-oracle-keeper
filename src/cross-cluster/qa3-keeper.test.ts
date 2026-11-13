@@ -22,6 +22,7 @@ import { crankHealthFields } from "./keeper-loop.ts";
 import { createMarkSmoother } from "./mark-smoother.ts";
 import { healthFileConfigFromEnv, writeHealthSnapshot } from "./health-file.ts";
 import { meteoraWsolPriceToUsdE12, meteoraWsolPriceToUsdE6 } from "./price-reader.ts";
+import { simInstructions } from "./sim-tx-test-helper.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fx = (n: string) => new Uint8Array(Buffer.from(fs.readFileSync(join(here, "__fixtures__", `${n}.b64`), "utf8").trim(), "base64"));
@@ -76,8 +77,8 @@ describe("per-lot mark from the unrounded per-token price", () => {
       marks,
       conn: {
         async getMultipleAccountsInfo(pks: PublicKey[]) { return pks.map((pk) => (accounts[pk.toBase58()] ? { data: Buffer.from(accounts[pk.toBase58()]) } : null)); },
-        async simulateTransaction(tx: { instructions: Array<{ keys: Array<{ pubkey: PublicKey }>; data: Uint8Array }> }) {
-          for (const ix of tx.instructions.slice(1)) marks.set(ix.keys[1].pubkey.toBase58(), new DataView(ix.data.buffer, ix.data.byteOffset).getBigUint64(19, true));
+        async simulateTransaction(tx: unknown) {
+          for (const ix of simInstructions(tx).slice(1)) marks.set(ix.keys[1].pubkey.toBase58(), new DataView(ix.data.buffer, ix.data.byteOffset).getBigUint64(19, true));
           return { value: { err: null } };
         },
         async sendRawTransaction() { return "sig"; },

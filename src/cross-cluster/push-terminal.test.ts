@@ -14,6 +14,7 @@ import { countPushableMarkets } from "./keeper-loop.ts";
 import { DEFAULT_THRESHOLDS, evaluatePushCycle } from "./alerting.ts";
 import { nonComputeBudget } from "./test-ix.ts";
 import type { PublicKey } from "@solana/web3.js";
+import { simInstructions } from "./sim-tx-test-helper.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SOL_BYTES = Buffer.from(readFileSync(join(here, "__fixtures__", "sol-market-v18-fees.b64"), "utf8").trim(), "base64");
@@ -30,8 +31,8 @@ function conn(data: Map<string, Buffer>) {
     simulated, sent,
     conn: {
       async getMultipleAccountsInfo(pks: Array<{ toBase58(): string }>) { return pks.map((pk) => ({ data: data.get(pk.toBase58())! })); },
-      async simulateTransaction(tx: { instructions: Array<{ programId: PublicKey; keys: Array<{ pubkey: { toBase58(): string } }> }> }) {
-        const ms = nonComputeBudget(tx.instructions).map((ix) => ix.keys[1].pubkey.toBase58());
+      async simulateTransaction(tx: unknown) {
+        const ms = nonComputeBudget(simInstructions(tx)).map((ix) => ix.keys[1].pubkey.toBase58());
         simulated.push(ms);
         return { value: { err: null } };
       },
