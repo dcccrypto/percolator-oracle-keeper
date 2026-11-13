@@ -11,6 +11,12 @@
  * passes `additional_reserved = 0`). Protocol (84) and creator (90) CAN still
  * be claimed while Resolved, but only before CloseSlab.
  *
+ * prog #587 (#644): when asset 0's `asset_admin` was burned AFTER recording a creator-fee payee
+ * (tag 125), tag 90 is permissionless and pays only that payee. The drain pays it here
+ * (`payCreator`, capped at what tag 90 can pay). CloseSlab refuses (71) while that pot is owed,
+ * for the payee's grace; prog #651: 7 days (1,512,000 slots) after resolution CloseSlab re-books
+ * an unpaid payee pot to the protocol leg instead (then tag 84 claims it).
+ *
  * The keeper itself never sends ResolveMarket. This is the gate for whoever
  * does: `scripts/pre-resolve-drain.ts --market <slab>` runs it and exits
  * non-zero while any Live-only leg is still outstanding, so an operator
@@ -26,6 +32,8 @@ import type { StakeFeeConfig, StakeFeeConnection } from "./stake-fee-pusher.ts";
 import type { FeeJobOutcome } from "./fee-jobs.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import { inspectStakeBoundBudget, TerminalInsuranceState, windDownOnce } from "./terminal-insurance.ts";
+import { payCreatorFeeToPayeeOnce } from "./creator-fee-payee.ts";
+import type { PayeeClaimConnection, PayeeClaimOutcome } from "./creator-fee-payee.ts";
 import type { TerminalConnection, TerminalInsuranceConfig, WindDownStep } from "./terminal-insurance.ts";
 
 export interface PreResolveReport {
@@ -34,6 +42,8 @@ export interface PreResolveReport {
   after: FeeLegs;
   lp: "cranked" | "no-fees" | "skipped" | "not-needed" | { error: string };
   stake: FeeJobOutcome | { kind: "not-needed" };
+  /** prog #587: permissionless tag 90 to asset 0's recorded payee (only on the "Payee" route with a non-zero pot). */
+  creator: PayeeClaimOutcome;
   /** Live-only legs still outstanding: lost for good at resolve. */
   blockers: string[];
   /** Claimable after resolve, but burned by CloseSlab if not claimed first. */
@@ -56,15 +66,23 @@ export interface WindDownReport {
   complete: boolean;
 }
 
-export type PreResolveConnection = StakeFeeConnection & TerminalConnection & Pick<Connection, "getAccountInfo">;
+export type PreResolveConnection = StakeFeeConnection & TerminalConnection & Pick<Connection, "getAccountInfo"> & Partial<PayeeClaimConnection>;
 
 export interface PreResolveDeps {
   crankLp: typeof crankLpFeesOnce;
   pushStake: typeof pushStakeFeesOnce;
   inspectTerminal?: typeof inspectStakeBoundBudget;
+  /** prog #587: pays asset 0's creator pot to its recorded payee. Omitted = never sent (the report says so). */
+  payCreator?: typeof payCreatorFeeToPayeeOnce;
 }
 
-const defaultDeps: PreResolveDeps = { crankLp: crankLpFeesOnce, pushStake: pushStakeFeesOnce, inspectTerminal: inspectStakeBoundBudget };
+/** The drain's default senders (exported so a test pins that the payee payout is wired in by default). */
+export const defaultDeps: PreResolveDeps = {
+  crankLp: crankLpFeesOnce,
+  pushStake: pushStakeFeesOnce,
+  inspectTerminal: inspectStakeBoundBudget,
+  payCreator: payCreatorFeeToPayeeOnce,
+};
 
 async function legsOf(conn: PreResolveConnection, market: PublicKey): Promise<FeeLegs> {
   const info = await conn.getAccountInfo(market, "confirmed");
@@ -99,6 +117,14 @@ export async function drainFeeLegsBeforeResolve(
     ? await deps.pushStake(conn, keeper, marketAddress, dryRun, { ...stakeCfg, confirm: confirmOpts ?? stakeCfg.confirm })
     : ({ kind: "not-needed" } as const);
 
+  // prog #587: the payee pot. Permissionless; it blocks CloseSlab (71) until paid, so pay it now.
+  const creator: PayeeClaimOutcome =
+    before.creatorRoute === "Payee" && before.creatorClaimable !== null && before.creatorClaimable > 0n
+      ? deps.payCreator
+        ? await deps.payCreator(conn as PayeeClaimConnection, keeper, marketAddress, dryRun, confirmOpts)
+        : { error: "no payee sender configured" }
+      : "not-needed";
+
   const after = dryRun ? before : await legsOf(conn, market);
 
   const blockers: string[] = [];
@@ -118,7 +144,22 @@ export async function drainFeeLegsBeforeResolve(
     warnings.push(`protocol leg ${after.protocolOwed} atoms: claim with tag 84 before CloseSlab (it is burned there)`);
   }
   if (after.creatorClaimable !== null && after.creatorClaimable > 0n) {
-    warnings.push(`creator leg ${after.creatorClaimable} atoms: claim with tag 90 before CloseSlab (it is burned there)`);
+    if (after.creatorRoute === "Payee") {
+      const why = typeof creator === "string" ? creator : `error: ${creator.error}`;
+      warnings.push(
+        `creator leg ${after.creatorClaimable} atoms is owed to the recorded payee (tag 90 payee route ${why}); anyone can send it. ` +
+          `After resolution CloseSlab refuses (71) until it is paid, for up to 7 days; then CloseSlab re-books it to the protocol leg (prog #651) — rerun this before CloseSlab`,
+      );
+    } else if (after.creatorRoute === "Refused") {
+      warnings.push(
+        `creator leg ${after.creatorClaimable} atoms has no claimant (asset_admin burned, no payee recorded): CloseSlab re-books it ` +
+          `to the protocol leg — claim that with tag 84 afterwards`,
+      );
+    } else {
+      warnings.push(
+        `creator leg ${after.creatorClaimable} atoms: the live asset_admin must claim it with tag 90 before CloseSlab (CloseSlab refuses 71 while it is owed)`,
+      );
+    }
   }
   if (after.creatorClaimable === null) {
     warnings.push("creator leg unreadable (unknown account VERSION) — check it by hand before CloseSlab");
@@ -146,7 +187,7 @@ export async function drainFeeLegsBeforeResolve(
       }
     }
   }
-  return { market: marketAddress, before, after, lp, stake, blockers, warnings, safeToResolve: blockers.length === 0, terminal };
+  return { market: marketAddress, before, after, lp, stake, creator, blockers, warnings, safeToResolve: blockers.length === 0, terminal };
 }
 
 /** Run the post-resolve stake tag-29 wind-down once (the CLI does this on a Resolved/Closed market). */
