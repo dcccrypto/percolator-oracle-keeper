@@ -116,21 +116,23 @@ describe("generation read prefetch", () => {
     assert.equal(r2.dataByAddr.size, 0);
   });
 
-  it("pushAuthMarkBatch with a prefetch: one generation read, and the nonce watermark of a push sent after the prefetch started still applies", async () => {
+  it("pushAuthMarkBatch with a prefetch: one generation read, and a push sent AFTER the prefetch was read is still never re-proposed (nonce watermark)", async () => {
     resetTerminalPushLogForTests();
     const ms = fakeMarkets(3);
     const c = conn(ms);
     const kp = Keypair.generate();
-    // cycle 1 pushes (reserves its nonces locally)
+    // cycle 2's prefetch is taken FIRST (chain shows the pre-cycle-1 value; the mock chain never advances) ...
+    const pre = startGenerationRead(c.conn as never, ms.map((m) => m.addr));
+    await pre;
+    // ... THEN cycle 1 sends (reserving its nonces locally)
     const first = await pushAuthMarkBatch(c.conn as never, kp, ms.map(push), 100n, BLOCKHASH, false, { cycle: 1 });
     assert.equal(first.pushedMarkets.length, 3);
     const seq1 = await fetchPushAuthMarkGenerationFields(c.conn as never, ms.map(push), new Set());
-    // cycle 2: prefetch taken (chain still shows the pre-cycle-1 value), then pushed
+    // cycle 2 pushes from the older prefetch: it must still propose above what cycle 1 sent
     const before = c.reads.length;
-    const pre = startGenerationRead(c.conn as never, ms.map((m) => m.addr));
     const second = await pushAuthMarkBatch(c.conn as never, kp, ms.map(push), 101n, BLOCKHASH, false, { cycle: 2, generationRead: pre });
     assert.equal(second.pushedMarkets.length, 3);
-    assert.equal(c.reads.length - before, 1, "the prefetch is the only generation read of cycle 2");
+    assert.equal(c.reads.length - before, 0, "cycle 2 does no generation read of its own: the prefetch is used");
     const seq2 = await fetchPushAuthMarkGenerationFields(c.conn as never, ms.map(push), new Set());
     for (const m of ms) {
       const k = `${m.addr}:0`;
