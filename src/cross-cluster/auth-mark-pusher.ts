@@ -724,14 +724,27 @@ const inactiveLogged = new Set<string>();
  * treat that as "skip this push this cycle" (see
  * {@link parsePushAuthMarkGenerationFields}'s doc comment), never guess.
  */
-export async function fetchPushAuthMarkGenerationFields(
-  devnetConn: Connection,
-  pushes: AuthMarkPushInput[],
-  terminal: Set<string>,
-  /** K-6: multi-asset pushes whose asset is not Active / DrainOnly (skipped, by generation key). */
-  inactive?: Set<string>,
-): Promise<Map<string, { marketId: bigint; observationSequence: bigint; lotExp: number }>> {
-  const uniqueAddrs = [...new Set(pushes.map((p) => p.marketAddress))];
+/** The raw slab bytes behind {@link fetchPushAuthMarkGenerationFields}, by market address. */
+export interface GenerationAccountsRead {
+  /** Every address this read asked for. */
+  requested: ReadonlySet<string>;
+  /** Addresses whose account was returned (absent: the account does not exist, or its chunk failed). */
+  dataByAddr: ReadonlyMap<string, Uint8Array>;
+  /** Addresses whose chunk failed (RPC error), as opposed to an account that does not exist. */
+  failed: ReadonlySet<string>;
+  failedChunks: number;
+  totalChunks: number;
+}
+
+/**
+ * The RPC half of the generation read: one chunked `getMultipleAccountsInfo` at "processed" for `addrs`.
+ * Never throws for an RPC failure (a failed chunk only marks its addresses `failed`), exactly as before.
+ */
+export async function readGenerationAccounts(
+  devnetConn: Pick<Connection, "getMultipleAccountsInfo">,
+  addrs: readonly string[],
+): Promise<GenerationAccountsRead> {
+  const uniqueAddrs = [...new Set(addrs)];
   // "processed", not "confirmed" (#Custom19, 2026-09-28): the watermark this
   // reads is advanced ONLY by this keeper's own pushes, which land ~1-3 slots
   // before they are confirmed. A confirmed read routinely misses the previous
@@ -741,17 +754,56 @@ export async function fetchPushAuthMarkGenerationFields(
   // markets absent from the result (the caller already skips an absent market this cycle with a
   // warning) and never fails the other chunks' markets — one flaky chunk must not stop every price.
   const read = await getMultipleAccountsInfoChunked(devnetConn, uniqueAddrs.map((a) => new PublicKey(a)), "processed");
-  if (read.failedChunks > 0) {
-    console.warn(
-      `[push] generation read: ${read.failedChunks}/${read.totalChunks} chunk(s) failed — ` +
-        `${read.failedKeys} market(s) skipped this cycle (will retry next cycle)`,
-    );
-  }
   const dataByAddr = new Map<string, Uint8Array>();
+  const failed = new Set<string>();
   uniqueAddrs.forEach((addr, i) => {
     const info = read.infos[i];
     if (info) dataByAddr.set(addr, new Uint8Array(info.data));
+    else if (info === undefined) failed.add(addr); // undefined = its chunk failed; null = no such account
   });
+  return { requested: new Set(uniqueAddrs), dataByAddr, failed, failedChunks: read.failedChunks, totalChunks: read.totalChunks };
+}
+
+/**
+ * PERF (v22-keep-1113): start the pusher's generation-account read for `marketAddresses` (keeper-loop.ts runCycle step 1b).
+ * Returns undefined when there is nothing to read. The promise's rejection is marked handled so a cycle that returns
+ * early never surfaces it as an unhandledRejection; it still rejects where the pusher awaits it.
+ */
+export function startGenerationRead(
+  devnetConn: Pick<Connection, "getMultipleAccountsInfo">,
+  marketAddresses: readonly string[],
+): Promise<GenerationAccountsRead> | undefined {
+  if (marketAddresses.length === 0) return undefined;
+  const p = Promise.resolve().then(() => readGenerationAccounts(devnetConn, marketAddresses));
+  p.catch(() => undefined);
+  return p;
+}
+
+export async function fetchPushAuthMarkGenerationFields(
+  devnetConn: Connection,
+  pushes: AuthMarkPushInput[],
+  terminal: Set<string>,
+  /** K-6: multi-asset pushes whose asset is not Active / DrainOnly (skipped, by generation key). */
+  inactive?: Set<string>,
+  /**
+   * PERF (v22-keep-1113): the raw account read of THIS cycle, started by the caller at the top of the cycle
+   * (readGenerationAccounts) so it overlaps the mainnet price read. Used only if it covers every market in `pushes`;
+   * otherwise the read below runs exactly as before. Parsing (terminal / inactive / nonce watermark) always runs here.
+   */
+  prefetched?: Promise<GenerationAccountsRead>,
+): Promise<Map<string, { marketId: bigint; observationSequence: bigint; lotExp: number }>> {
+  const uniqueAddrs = [...new Set(pushes.map((p) => p.marketAddress))];
+  let read = prefetched ? await prefetched : undefined;
+  if (!read || uniqueAddrs.some((a) => !read!.requested.has(a))) read = await readGenerationAccounts(devnetConn, uniqueAddrs);
+  // Failures counted over THIS call's markets only (a prefetch may cover a market that is not pushed this cycle).
+  const failedHere = uniqueAddrs.filter((a) => read!.failed.has(a)).length;
+  if (failedHere > 0) {
+    console.warn(
+      `[push] generation read: ${read.failedChunks}/${read.totalChunks} chunk(s) failed — ` +
+        `${failedHere} market(s) skipped this cycle (will retry next cycle)`,
+    );
+  }
+  const dataByAddr = read.dataByAddr;
 
   const result = new Map<string, { marketId: bigint; observationSequence: bigint; lotExp: number }>();
   for (const p of pushes) {
@@ -1086,7 +1138,11 @@ export async function pushAuthMarkBatch(
   blockhash: { blockhash: string; lastValidBlockHeight: number },
   dryRun: boolean,
   /** S3-B4: the caller's cycle number; pushes of a cycle older than one that already sent for the same asset are dropped. */
-  opts: { cycle?: number } = {},
+  opts: {
+    cycle?: number;
+    /** PERF (v22-keep-1113): this cycle's generation-account read, started early by the caller (see fetchPushAuthMarkGenerationFields). */
+    generationRead?: Promise<GenerationAccountsRead>;
+  } = {},
 ): Promise<{
   pushed: boolean;
   signature?: string;
@@ -1143,7 +1199,7 @@ export async function pushAuthMarkBatch(
   // would make every push after the first one revert.
   const terminal = new Set<string>();
   const inactive = new Set<string>();
-  const generationFields = await fetchPushAuthMarkGenerationFields(devnetConn, eligible, terminal, inactive);
+  const generationFields = await fetchPushAuthMarkGenerationFields(devnetConn, eligible, terminal, inactive, opts.generationRead);
   for (const k of inactive) {
     if (!inactiveLogged.has(k)) {
       inactiveLogged.add(k);
