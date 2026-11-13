@@ -35,6 +35,7 @@ import {
   Transaction,
   TransactionInstruction,
   ComputeBudgetProgram,
+  VersionedTransaction,
 } from "@solana/web3.js";
 import {
   ACCOUNTS_PUSH_AUTH_MARK,
@@ -1130,6 +1131,9 @@ export function parseFailingPush(
   return { position, custom };
 }
 
+/** Last time the batch preflight logged that its simulate could not run (rate limit for that warning). */
+let lastPreflightUnavailableLogAt = 0;
+
 export async function pushAuthMarkBatch(
   devnetConn: Connection,
   keeper: Keypair,
@@ -1314,12 +1318,26 @@ export async function pushAuthMarkBatch(
     tx.sign(keeper);
     let simErr: unknown = null;
     try {
-      const sim = await devnetConn.simulateTransaction(tx);
+      // PERF (v22-keep-1113): simulate the SAME message as a VersionedTransaction. A legacy Transaction makes web3.js
+      // discard the tx's blockhash and fetch its own (getLatestBlockhash("finalized"), polled until it changes, every
+      // 30 s) before simulating: an extra serial RTT on the push path. `replaceRecentBlockhash` has the RPC use its
+      // latest blockhash instead, which is what the legacy path effectively did, and is why sigVerify stays false (it
+      // was false before: no signers were passed). Same program, accounts, CU limit, CU price and commitment.
+      const sim = await devnetConn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), {
+        sigVerify: false,
+        replaceRecentBlockhash: true,
+      });
       simErr = sim.value.err;
-    } catch {
+    } catch (err) {
       // A simulate that cannot even run (RPC hiccup) must not drop the push —
-      // fall through and send, which is the old behaviour.
+      // fall through and send, which is the old behaviour. Logged (at most once a minute) so a preflight that
+      // persistently cannot run (e.g. an RPC that rejects a simulate param) is visible rather than silently off.
       simErr = null;
+      const nowMs = Date.now();
+      if (nowMs - lastPreflightUnavailableLogAt >= 60_000) {
+        lastPreflightUnavailableLogAt = nowMs;
+        console.warn(`[push] preflight simulate could not run (sending unvalidated): ${(err instanceof Error ? err.message : String(err)).slice(0, 160)}`);
+      }
     }
     // BlockhashNotFound is NOT a program revert. On a load-balanced devnet RPC
     // pool (the padre endpoint) the node that runs simulateTransaction often lags
