@@ -17,7 +17,7 @@
  *   Suitable for Railway / Render health checks.
  */
 import http from "http";
-import { Connection, Keypair } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { lifecycleLedger } from "./v22/lifecycle-ledger.ts";
 import type { DexType, Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
@@ -1228,6 +1228,47 @@ export function cloneCircuitBreakerState(state: CircuitBreakerState): CircuitBre
  * confirmation. ~3 RPC calls per cycle (was ~25), so the on-chain AuthMark can
  * refresh near per-slot. Price source is unchanged — the mainnet DEX pools.
  */
+/** The devnet reads a push cycle needs before it can sign, started early (see startPreSendReads). */
+export interface PreSendReads {
+  /** `getSlot("processed")`: the slot stamped on this cycle's pushes. */
+  slot: Promise<number>;
+  /** The process-wide cached blockhash (blockhash-cache.ts, 15 s). */
+  blockhash: Promise<{ blockhash: string; lastValidBlockHeight: number }>;
+  /** The wallet-balance read (#71), only when one is due; `nowMs` is the time the due-check was made. */
+  balance: { nowMs: number; lamports: Promise<number> } | null;
+}
+
+/**
+ * PERF (v22-keep-1113): start the devnet reads the push step needs — the processed slot, the cached blockhash and a
+ * due wallet-balance read — at the START of the cycle, so they run concurrently with the mainnet pool-price read
+ * instead of one after another behind it. None of them depends on the prices. Same calls, same commitments, same
+ * due-rule for the balance; the cycle still awaits each one at the point it used to read it, with the same error
+ * handling, so the wallet guard still decides after prices are computed and before anything is signed.
+ *
+ * A prefetch whose cycle returns early (pool read failed, nothing to push) is simply dropped; its rejection is marked
+ * handled here so it can never surface as an unhandledRejection, and it still throws where it is awaited.
+ */
+export function startPreSendReads(
+  conn: Pick<Connection, "getSlot" | "getBalance" | "getLatestBlockhash" | "rpcEndpoint">,
+  payer: PublicKey,
+  wallet: WalletBalanceState,
+  balanceCheckIntervalMs: number,
+  nowMs: number = Date.now(),
+): PreSendReads {
+  const handled = <T>(p: Promise<T>): Promise<T> => {
+    p.catch(() => undefined);
+    return p;
+  };
+  const call = <T>(f: () => Promise<T>): Promise<T> => handled(Promise.resolve().then(f));
+  return {
+    slot: call(() => conn.getSlot("processed")),
+    blockhash: call(() => getCachedBlockhash(conn, "processed")),
+    balance: shouldRefreshBalance(wallet, nowMs, balanceCheckIntervalMs)
+      ? { nowMs, lamports: call(() => conn.getBalance(payer, "confirmed")) }
+      : null,
+  };
+}
+
 async function runCycle(
   mainnetConn: Connection,
   devnetConn: Connection,
@@ -1288,6 +1329,9 @@ async function runCycle(
       }),
     );
   }
+
+  // ── 1b. Start the devnet reads the push step needs, concurrently with the price read (see startPreSendReads) ──
+  const preSend = startPreSendReads(devnetConn, keeper.publicKey, state.wallet, config.balanceCheckIntervalMs);
 
   // ── 2. Read ALL pool prices in ONE getMultipleAccounts (DEX-pool source) ────
   let prices: Map<string, bigint>;
@@ -1530,10 +1574,10 @@ async function runCycle(
   if (pushes.length === 0) return;
 
   // ── 4. One slot + one (cached) blockhash for the whole batch ────────────────
-  const nowSlot = BigInt(await devnetConn.getSlot("processed"));
-  const now = Date.now();
+  // Both were started in step 1b, alongside the price read; awaited here exactly where they used to be read.
+  const nowSlot = BigInt(await preSend.slot);
   // Shared with the cranker (blockhash-cache.ts): one fetch per 15 s for the whole process.
-  const cachedBlockhash = await getCachedBlockhash(devnetConn, "processed");
+  const cachedBlockhash = await preSend.blockhash;
 
   // ── 4b. Wallet-balance guard (#71) ──────────────────────────────────────────
   // A keeper that cannot pay produces reverting transactions, not fresh marks.
@@ -1541,10 +1585,12 @@ async function runCycle(
   // of the balance on transactions that fail. Checked here — after prices are
   // computed, before anything is signed — so a low wallet costs no RPC writes.
   {
-    const nowMs = Date.now();
-    if (shouldRefreshBalance(state.wallet, nowMs, config.balanceCheckIntervalMs)) {
+    // The read itself was started in step 1b when it was due (same rule: shouldRefreshBalance); the verdict is taken
+    // here, after prices are computed and before anything is signed, as before.
+    if (preSend.balance) {
+      const nowMs = preSend.balance.nowMs;
       try {
-        const lamports = await devnetConn.getBalance(keeper.publicKey, "confirmed");
+        const lamports = await preSend.balance.lamports;
         const transition = applyBalanceReading(
           state.wallet,
           lamports,
