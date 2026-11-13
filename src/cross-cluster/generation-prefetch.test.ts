@@ -74,7 +74,7 @@ describe("generation read prefetch", () => {
     const fresh = conn(ms);
     const want = await fetchPushAuthMarkGenerationFields(fresh.conn as never, ms.map(push), new Set());
     const c = conn(ms);
-    const pre = readGenerationAccounts(c.conn, ms.map((m) => m.addr));
+    const pre = readGenerationAccounts(c.conn as never, ms.map((m) => m.addr));
     const got = await fetchPushAuthMarkGenerationFields(c.conn as never, ms.map(push), new Set(), undefined, pre);
     assert.equal(c.reads.length, 1, "no second read");
     assert.deepEqual([...got.keys()].sort(), [...want.keys()].sort());
@@ -84,7 +84,7 @@ describe("generation read prefetch", () => {
   it("a prefetch that does not cover a pushed market falls back to a fresh read of the pushed set", async () => {
     const ms = fakeMarkets(4);
     const c = conn(ms);
-    const pre = readGenerationAccounts(c.conn, ms.slice(0, 3).map((m) => m.addr));
+    const pre = readGenerationAccounts(c.conn as never, ms.slice(0, 3).map((m) => m.addr));
     const got = await fetchPushAuthMarkGenerationFields(c.conn as never, ms.map(push), new Set(), undefined, pre);
     assert.equal(c.reads.length, 2);
     assert.deepEqual(new Set(c.reads[1]), new Set(ms.map((m) => m.addr)));
@@ -94,7 +94,7 @@ describe("generation read prefetch", () => {
   it("the prefetch may cover MORE markets than are pushed; only the pushed ones are returned / classified", async () => {
     const ms = fakeMarkets(5);
     const c = conn(ms);
-    const pre = readGenerationAccounts(c.conn, ms.map((m) => m.addr));
+    const pre = readGenerationAccounts(c.conn as never, ms.map((m) => m.addr));
     const terminal = new Set<string>();
     const got = await fetchPushAuthMarkGenerationFields(c.conn as never, ms.slice(0, 2).map(push), terminal, undefined, pre);
     assert.deepEqual([...got.keys()].sort(), ms.slice(0, 2).map((m) => `${m.addr}:0`).sort());
@@ -105,13 +105,13 @@ describe("generation read prefetch", () => {
   it("failed chunk: the pushed markets are skipped (never guessed); a missing account is not counted as failed", async () => {
     const ms = fakeMarkets(3);
     const c = conn(ms, { fail: true });
-    const read = await readGenerationAccounts(c.conn, ms.map((m) => m.addr));
+    const read = await readGenerationAccounts(c.conn as never, ms.map((m) => m.addr));
     assert.equal(read.failed.size, 3);
     assert.equal(read.failedChunks, 1);
     const got = await fetchPushAuthMarkGenerationFields(c.conn as never, ms.map(push), new Set(), undefined, Promise.resolve(read));
     assert.equal(got.size, 0);
     const missing = conn([]);
-    const r2 = await readGenerationAccounts(missing.conn, [ms[0].addr]);
+    const r2 = await readGenerationAccounts(missing.conn as never, [ms[0].addr]);
     assert.equal(r2.failed.size, 0);
     assert.equal(r2.dataByAddr.size, 0);
   });
@@ -127,7 +127,7 @@ describe("generation read prefetch", () => {
     const seq1 = await fetchPushAuthMarkGenerationFields(c.conn as never, ms.map(push), new Set());
     // cycle 2: prefetch taken (chain still shows the pre-cycle-1 value), then pushed
     const before = c.reads.length;
-    const pre = startGenerationRead(c.conn, ms.map((m) => m.addr));
+    const pre = startGenerationRead(c.conn as never, ms.map((m) => m.addr));
     const second = await pushAuthMarkBatch(c.conn as never, kp, ms.map(push), 101n, BLOCKHASH, false, { cycle: 2, generationRead: pre });
     assert.equal(second.pushedMarkets.length, 3);
     assert.equal(c.reads.length - before, 1, "the prefetch is the only generation read of cycle 2");
@@ -139,12 +139,12 @@ describe("generation read prefetch", () => {
   });
 
   it("startGenerationRead: nothing to read -> undefined; a rejection never becomes an unhandledRejection", async () => {
-    assert.equal(startGenerationRead(conn([]).conn, []), undefined);
+    assert.equal(startGenerationRead(conn([]).conn as never, []), undefined);
     const unhandled: unknown[] = [];
     const on = (e: unknown) => unhandled.push(e);
     process.on("unhandledRejection", on);
     try {
-      const bad = startGenerationRead(conn([]).conn, ["not-a-base58-key!"]);
+      const bad = startGenerationRead(conn([]).conn as never, ["not-a-base58-key!"]);
       assert.ok(bad);
       await new Promise((r) => setTimeout(r, 30));
       assert.deepEqual(unhandled, []);
