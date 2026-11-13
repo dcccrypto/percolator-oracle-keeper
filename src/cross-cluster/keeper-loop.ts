@@ -1238,6 +1238,9 @@ export interface PreSendReads {
   balance: { nowMs: number; lamports: Promise<number> } | null;
 }
 
+/** True while the last cycle reached the push step; gates the step-0 prefetch (see runCycle). One loop per process. */
+let preSendWarm = true;
+
 /**
  * PERF (v22-keep-1113): start the devnet reads the push step needs — the processed slot, the cached blockhash and a
  * due wallet-balance read — at the START of the cycle, so they run concurrently with the mainnet pool-price read
@@ -1297,7 +1300,11 @@ async function runCycle(
 
   // ── 0. Start the devnet reads the push step needs (slot, blockhash, a due balance read) now, so they run concurrently
   // with the authority check and the mainnet price read below (see startPreSendReads) ─────────────────────────────
-  const preSend = startPreSendReads(devnetConn, keeper.publicKey, state.wallet, config.balanceCheckIntervalMs);
+  // Only when the previous cycle reached the push step (steady state: 99.7 % of live cycles). After a cycle that returned
+  // early (pool read failed, nothing to push, wallet low) the reads are made at step 4 as before, so a no-push streak
+  // costs no extra RPC calls and a due balance read is not repeated every cycle.
+  const preSend = preSendWarm ? startPreSendReads(devnetConn, keeper.publicKey, state.wallet, config.balanceCheckIntervalMs) : null;
+  preSendWarm = false;
 
   // ── 1. Oracle-authority check (only pushable markets go in a batch) ─────────
   // "One-time" per 30-minute window — see maybeResetAuthorityLatches. K-6: per unit (each asset has its own profile).
@@ -1575,10 +1582,12 @@ async function runCycle(
   if (pushes.length === 0) return;
 
   // ── 4. One slot + one (cached) blockhash for the whole batch ────────────────
-  // Both were started in step 0, alongside the price read; awaited here exactly where they used to be read.
-  const nowSlot = BigInt(await preSend.slot);
+  // Started in step 0 alongside the price read (or here, after an early-return cycle); awaited where they used to be read.
+  preSendWarm = true;
+  const reads = preSend ?? startPreSendReads(devnetConn, keeper.publicKey, state.wallet, config.balanceCheckIntervalMs);
+  const nowSlot = BigInt(await reads.slot);
   // Shared with the cranker (blockhash-cache.ts): one fetch per 15 s for the whole process.
-  const cachedBlockhash = await preSend.blockhash;
+  const cachedBlockhash = await reads.blockhash;
 
   // ── 4b. Wallet-balance guard (#71) ──────────────────────────────────────────
   // A keeper that cannot pay produces reverting transactions, not fresh marks.
@@ -1588,10 +1597,10 @@ async function runCycle(
   {
     // The read itself was started in step 0 when it was due (same rule: shouldRefreshBalance); the verdict is taken
     // here, after prices are computed and before anything is signed, as before.
-    if (preSend.balance) {
-      const nowMs = preSend.balance.nowMs;
+    if (reads.balance) {
+      const nowMs = reads.balance.nowMs;
       try {
-        const lamports = await preSend.balance.lamports;
+        const lamports = await reads.balance.lamports;
         const transition = applyBalanceReading(
           state.wallet,
           lamports,

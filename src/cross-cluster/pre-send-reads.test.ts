@@ -45,17 +45,16 @@ describe("startPreSendReads", () => {
   it("starts the slot, blockhash and due balance reads at once, with the old commitments", async () => {
     const { conn, calls } = fakeConn("http://pre-send-1", { delayMs: 50 });
     const wallet = createWalletBalanceState(); // lastCheckAt 0 -> due
-    const t = Date.now();
     const r = startPreSendReads(conn, payer, wallet, 60_000, 1_000_000);
+    // concurrent: after a few microtask turns (no read has resolved yet: each takes 50 ms) all three are in flight
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    assert.equal(calls.length, 3, "all reads started before any resolved");
     const [slot, bh, lamports] = await Promise.all([r.slot, r.blockhash, r.balance!.lamports]);
-    const elapsed = Date.now() - t;
     assert.equal(slot, 123);
     assert.deepEqual(bh, { blockhash: "bh", lastValidBlockHeight: 9 });
     assert.equal(lamports, 5_000_000_000);
     assert.equal(r.balance!.nowMs, 1_000_000);
     assert.deepEqual(calls.map((c) => [c.method, c.arg]).sort(), [["getBalance", "confirmed"], ["getLatestBlockhash", "processed"], ["getSlot", "processed"]]);
-    // concurrent: three 50 ms reads finish in well under the 150 ms a serial chain needs
-    assert.ok(elapsed < 130, `reads ran serially (${elapsed} ms)`);
     invalidateBlockhash(conn);
   });
 
