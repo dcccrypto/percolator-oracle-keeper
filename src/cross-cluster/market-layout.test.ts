@@ -412,14 +412,14 @@ describe("v2.2 portfolios vs the SDK parser (gap reported, not hand-rolled)", ()
     return b;
   };
 
-  it("the SDK parser is VERSION-keyed: 9563 B at VERSION 18, 10603 B at VERSION 19; stage A (10091 B) is unsupported", () => {
+  it("the SDK parser is VERSION-keyed: 9563 B at VERSION 18, 10607 B at VERSION 19; stage A (10091 B) is unsupported", () => {
     assert.equal(V17_PORTFOLIO_ACCOUNT_LEN, 9563);
     const det = detectLayout(v22Market());
     const h = layoutHealthFor(det, { storedPosLong: 9n, storedPosShort: 9n });
     assert.equal(h.kind, "unsupported");
     assert.equal(h.id, "v2.2-drift");
     assert.equal(h.provisional, true);
-    assert.match(h.problem ?? "", /10091-byte portfolios \(leg 185 B\).*parsePortfolioV17.*10603/);
+    assert.match(h.problem ?? "", /10091-byte portfolios \(leg 185 B\).*parsePortfolioV17.*10607/);
     // once the SDK parser handles the v2.2 portfolio the same market is fully supported
     assert.equal(layoutHealthFor(det, null, 10091).kind, "ok");
     // and the v2.1 layouts are supported by today's SDK

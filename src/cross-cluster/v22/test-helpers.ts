@@ -186,7 +186,7 @@ export function refusePortfolio(portfolio: PublicKey, code: number, firstOnly = 
   };
 }
 
-/** A parsable 10,603 B variant-B portfolio (SDK VERSION 19 guard): owner, capital, pnl, legs on asset 0. */
+/** A parsable variant-B portfolio (SDK VERSION 19 guard; 10,607 B / engine disc 20 since engine #299): owner, capital, pnl, legs on asset 0. */
 export function portfolioBytes(o: { owner: PublicKey; capital?: bigint; pnl?: bigint; legs?: Array<{ side: 0 | 1; basis: bigint; assetIndex?: number }>; matcher?: boolean }): Uint8Array {
   const G = LAYOUT_V22.portfolio;
   const b = Buffer.alloc(G.accountLen);
@@ -194,7 +194,7 @@ export function portfolioBytes(o: { owner: PublicKey; capital?: bigint; pnl?: bi
   b.writeUInt16LE(19, 8);
   b[10] = 2;
   b.writeUInt16LE(1, 112);
-  b.writeUInt16LE(19, 114);
+  b.writeUInt16LE(LAYOUT_V22.engineDiscriminator, 114); // engine V16_LAYOUT_DISCRIMINATOR (20 since engine #299)
   Buffer.from(o.owner.toBytes()).copy(b, 116);
   const w128 = (off: number, v: bigint) => {
     const u = BigInt.asUintN(128, v);

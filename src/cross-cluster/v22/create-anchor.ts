@@ -8,7 +8,7 @@
  *   KEEPER_V22_CREATE_ANCHOR=on          required (default off: the script refuses to do anything)
  *   KEEPER_V22_CREATE_ANCHOR_DRY_RUN     default ON: simulate and print; real send only with an explicit "off"
  *
- * The tx is a TOP-LEVEL `SystemProgram.createAccount` of EXACTLY the layout's portfolio length (10,603 B on variant B; the
+ * The tx is a TOP-LEVEL `SystemProgram.createAccount` of EXACTLY the layout's portfolio length (10,607 B on variant B; the
  * wrapper cannot realloc past 10,240 B, so any other length fails) followed by InitPortfolio (tag 1) with the keeper as
  * owner. The new account's keypair signs. It costs about 0.074 SOL of refundable rent. UNVERIFIED without a live v2.2
  * market: that InitPortfolio takes exactly [owner, market, portfolio] on the v2.2 program. The keeper discovers the

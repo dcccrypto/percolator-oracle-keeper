@@ -37,7 +37,7 @@ import {
   VersionedTransaction,
 } from "@solana/web3.js";
 import type { Connection, Keypair } from "@solana/web3.js";
-import { RECOMMENDED_CU_P3, buildVaultLpAllocateIxP2b, deriveLpVaultRegistry } from "@percolatorct/sdk";
+import { NAV_FLOW_COMPUTE_UNITS_V22, U128_MAX_P2B, buildVaultLpAllocateIxV22, deriveLpVaultRegistry } from "@percolatorct/sdk";
 import type { MarketEntry } from "./registry.ts";
 import { lpVaultRegistryBound } from "./registry-flags.ts";
 import { decodeVaultLpState, deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
@@ -233,12 +233,14 @@ export function makeTag103Probe(deps: {
       }
       const state = decodeVaultLpState(new Uint8Array(st.data));
       if (!bound || !state) continue;
-      const ix = buildVaultLpAllocateIxP2b(
+      // the v2.2 (#640) shape the allocator sends: [9] pad / bond tranche, [10] lev guard
+      const ix = buildVaultLpAllocateIxV22(
         { programId: deps.programId, market: pubs[i], registryDomain: domain, lpPortfolio: state.lpPortfolio },
         deps.keeper.publicKey,
+        U128_MAX_P2B,
       );
       const tx = new Transaction();
-      tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: RECOMMENDED_CU_P3.tradeCpi }));
+      tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: NAV_FLOW_COMPUTE_UNITS_V22[103].units }));
       tx.add(ix);
       const { blockhash } = await deps.conn.getLatestBlockhash("confirmed");
       tx.recentBlockhash = blockhash;
