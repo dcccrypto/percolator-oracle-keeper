@@ -59,7 +59,7 @@ import { getMarketAccrual, laggingAssets, multiAssetKey, priceUnitsOfRegistry, p
 import { DEADLINE_FRESH_MS, getOnChainTokenPriceUsd, getPushDeadline, isKnownTerminal, markTerminal, prunePushDeadlines, refreshPushDeadlines } from "./push-deadline.ts";
 import type { PushDeadline } from "./push-deadline.ts";
 import type { PriceUnit } from "./multi-asset.ts";
-import { pushGenerationKey } from "./auth-mark-pusher.ts";
+import { pushGenerationKey, readGenerationAccounts, type GenerationAccountsRead } from "./auth-mark-pusher.ts";
 
 /** Round 2: pins re-read every KEEPER_DEPTH_SRC_REFRESH_MS (default 5 min). */
 const depthSourceCache = new DepthSourceCache(Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) > 0 ? Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) : 5 * 60_000);
@@ -1228,6 +1228,21 @@ export function cloneCircuitBreakerState(state: CircuitBreakerState): CircuitBre
  * confirmation. ~3 RPC calls per cycle (was ~25), so the on-chain AuthMark can
  * refresh near per-slot. Price source is unchanged — the mainnet DEX pools.
  */
+/**
+ * PERF (v22-keep-1113): start the pusher's generation-account read for `marketAddresses` (see runCycle step 1b).
+ * Returns undefined when there is nothing to read. The promise's rejection is marked handled so a cycle that returns
+ * early never surfaces it as an unhandledRejection; it still rejects where the pusher awaits it.
+ */
+export function startGenerationRead(
+  devnetConn: Pick<Connection, "getMultipleAccountsInfo">,
+  marketAddresses: readonly string[],
+): Promise<GenerationAccountsRead> | undefined {
+  if (marketAddresses.length === 0) return undefined;
+  const p = Promise.resolve().then(() => readGenerationAccounts(devnetConn, marketAddresses));
+  p.catch(() => undefined);
+  return p;
+}
+
 async function runCycle(
   mainnetConn: Connection,
   devnetConn: Connection,
@@ -1288,6 +1303,13 @@ async function runCycle(
       }),
     );
   }
+
+  // ── 1b. PERF (v22-keep-1113): start this cycle's generation read (market_id / observation_sequence slab bytes, the
+  // pusher's one devnet getMultipleAccounts) now, so it overlaps the mainnet price read instead of following it. It is
+  // still read fresh in THIS cycle (never cached across cycles); the pusher parses it, applies the local nonce
+  // watermark and classifies terminal / inactive exactly as before, and falls back to its own read if a pushed market is
+  // not covered. Read for the pushable units only (the authority check above has run).
+  const generationRead = startGenerationRead(devnetConn, units.filter((u) => !notPushable.has(u.key)).map((u) => u.marketAddress));
 
   // ── 2. Read ALL pool prices in ONE getMultipleAccounts (DEX-pool source) ────
   let prices: Map<string, bigint>;
@@ -1582,7 +1604,7 @@ async function runCycle(
   // ── 5. One batched PushAuthMark tx, fire-and-forget ─────────────────────────
   try {
     state.cycleAttempted = pushes.length; // adjusted below for terminal markets
-    const res = await pushAuthMarkBatch(devnetConn, keeper, pushes, nowSlot, cachedBlockhash, config.dryRun, { cycle });
+    const res = await pushAuthMarkBatch(devnetConn, keeper, pushes, nowSlot, cachedBlockhash, config.dryRun, { cycle, generationRead });
     state.cycleAttempted = pushes.length - (res.terminalMarkets?.length ?? 0);
     state.cyclePushed = config.dryRun ? state.cycleAttempted : res.signature ? res.pushedMarkets.length : 0;
     const stamp = Date.now();
