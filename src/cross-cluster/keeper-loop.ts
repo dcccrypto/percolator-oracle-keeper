@@ -1295,6 +1295,10 @@ async function runCycle(
     }
   }
 
+  // ── 0. Start the devnet reads the push step needs (slot, blockhash, a due balance read) now, so they run concurrently
+  // with the authority check and the mainnet price read below (see startPreSendReads) ─────────────────────────────
+  const preSend = startPreSendReads(devnetConn, keeper.publicKey, state.wallet, config.balanceCheckIntervalMs);
+
   // ── 1. Oracle-authority check (only pushable markets go in a batch) ─────────
   // "One-time" per 30-minute window — see maybeResetAuthorityLatches. K-6: per unit (each asset has its own profile).
   maybeResetAuthorityLatches();
@@ -1329,9 +1333,6 @@ async function runCycle(
       }),
     );
   }
-
-  // ── 1b. Start the devnet reads the push step needs, concurrently with the price read (see startPreSendReads) ──
-  const preSend = startPreSendReads(devnetConn, keeper.publicKey, state.wallet, config.balanceCheckIntervalMs);
 
   // ── 2. Read ALL pool prices in ONE getMultipleAccounts (DEX-pool source) ────
   let prices: Map<string, bigint>;
@@ -1574,7 +1575,7 @@ async function runCycle(
   if (pushes.length === 0) return;
 
   // ── 4. One slot + one (cached) blockhash for the whole batch ────────────────
-  // Both were started in step 1b, alongside the price read; awaited here exactly where they used to be read.
+  // Both were started in step 0, alongside the price read; awaited here exactly where they used to be read.
   const nowSlot = BigInt(await preSend.slot);
   // Shared with the cranker (blockhash-cache.ts): one fetch per 15 s for the whole process.
   const cachedBlockhash = await preSend.blockhash;
@@ -1585,7 +1586,7 @@ async function runCycle(
   // of the balance on transactions that fail. Checked here — after prices are
   // computed, before anything is signed — so a low wallet costs no RPC writes.
   {
-    // The read itself was started in step 1b when it was due (same rule: shouldRefreshBalance); the verdict is taken
+    // The read itself was started in step 0 when it was due (same rule: shouldRefreshBalance); the verdict is taken
     // here, after prices are computed and before anything is signed, as before.
     if (preSend.balance) {
       const nowMs = preSend.balance.nowMs;
