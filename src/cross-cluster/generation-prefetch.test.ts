@@ -21,8 +21,8 @@ import {
   pushAuthMarkBatch,
   readGenerationAccounts,
   resetTerminalPushLogForTests,
+  startGenerationRead,
 } from "./auth-mark-pusher.ts";
-import { startGenerationRead } from "./keeper-loop.ts";
 import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));

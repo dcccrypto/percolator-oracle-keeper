@@ -59,7 +59,7 @@ import { getMarketAccrual, laggingAssets, multiAssetKey, priceUnitsOfRegistry, p
 import { DEADLINE_FRESH_MS, getOnChainTokenPriceUsd, getPushDeadline, isKnownTerminal, markTerminal, prunePushDeadlines, refreshPushDeadlines } from "./push-deadline.ts";
 import type { PushDeadline } from "./push-deadline.ts";
 import type { PriceUnit } from "./multi-asset.ts";
-import { pushGenerationKey, readGenerationAccounts, type GenerationAccountsRead } from "./auth-mark-pusher.ts";
+import { pushGenerationKey, startGenerationRead } from "./auth-mark-pusher.ts";
 
 /** Round 2: pins re-read every KEEPER_DEPTH_SRC_REFRESH_MS (default 5 min). */
 const depthSourceCache = new DepthSourceCache(Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) > 0 ? Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) : 5 * 60_000);
@@ -1228,21 +1228,6 @@ export function cloneCircuitBreakerState(state: CircuitBreakerState): CircuitBre
  * confirmation. ~3 RPC calls per cycle (was ~25), so the on-chain AuthMark can
  * refresh near per-slot. Price source is unchanged — the mainnet DEX pools.
  */
-/**
- * PERF (v22-keep-1113): start the pusher's generation-account read for `marketAddresses` (see runCycle step 1b).
- * Returns undefined when there is nothing to read. The promise's rejection is marked handled so a cycle that returns
- * early never surfaces it as an unhandledRejection; it still rejects where the pusher awaits it.
- */
-export function startGenerationRead(
-  devnetConn: Pick<Connection, "getMultipleAccountsInfo">,
-  marketAddresses: readonly string[],
-): Promise<GenerationAccountsRead> | undefined {
-  if (marketAddresses.length === 0) return undefined;
-  const p = Promise.resolve().then(() => readGenerationAccounts(devnetConn, marketAddresses));
-  p.catch(() => undefined);
-  return p;
-}
-
 async function runCycle(
   mainnetConn: Connection,
   devnetConn: Connection,

@@ -764,6 +764,21 @@ export async function readGenerationAccounts(
   return { requested: new Set(uniqueAddrs), dataByAddr, failed, failedChunks: read.failedChunks, totalChunks: read.totalChunks };
 }
 
+/**
+ * PERF (v22-keep-1113): start the pusher's generation-account read for `marketAddresses` (keeper-loop.ts runCycle step 1b).
+ * Returns undefined when there is nothing to read. The promise's rejection is marked handled so a cycle that returns
+ * early never surfaces it as an unhandledRejection; it still rejects where the pusher awaits it.
+ */
+export function startGenerationRead(
+  devnetConn: Pick<Connection, "getMultipleAccountsInfo">,
+  marketAddresses: readonly string[],
+): Promise<GenerationAccountsRead> | undefined {
+  if (marketAddresses.length === 0) return undefined;
+  const p = Promise.resolve().then(() => readGenerationAccounts(devnetConn, marketAddresses));
+  p.catch(() => undefined);
+  return p;
+}
+
 export async function fetchPushAuthMarkGenerationFields(
   devnetConn: Connection,
   pushes: AuthMarkPushInput[],
