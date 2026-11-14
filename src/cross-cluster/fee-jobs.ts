@@ -231,6 +231,9 @@ export async function startFeeJobLoop(
               (waiting.length ? ` — waiting: ${waiting.map((w) => `${w.label}: ${clipKeepingCode(w.reason, 100)}`).join(" | ")}` : ""),
           );
         }
+        // Each sink call is isolated: a throw in one must not skip the next or lose events.
+        const sinkErr = (_what: string, e: unknown) =>
+          console.error(`[${job.name}] sweep error — ${e instanceof Error ? e.message.slice(0, 160) : String(e)}`);
         try {
           sink.health(`fee-jobs:${job.name}`, {
             cycle,
@@ -239,10 +242,12 @@ export async function startFeeJobLoop(
             waitingMarkets: waiting.map((w) => w.label),
             failedMarkets: r.failed.map((f) => f.label),
           });
+        } catch (e) { sinkErr("health", e); }
+        try {
           await sink.reconcile(`fee-jobs:${job.name}`, trackers.get(job.name)!.alertsFor(r));
-        } finally {
-          // One-shot events must go out even if health/reconcile threw (the catch below logs it).
-          for (const e of r.events) await sink.fire(`fee-jobs:${job.name}:events`, e);
+        } catch (e) { sinkErr("reconcile", e); }
+        for (const e of r.events) {
+          try { await sink.fire(`fee-jobs:${job.name}:events`, e); } catch (err) { sinkErr("fire", err); }
         }
       } catch (err) {
         console.error(`[${job.name}] sweep error — ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`);
