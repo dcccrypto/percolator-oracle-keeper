@@ -163,9 +163,9 @@ describe("startFeeJobLoop", () => {
 
     assert.equal(errors.length, 1);
     assert.match(errors[0], /\[lp-fee\] sweep error — health sink exploded/);
-    // The next cycle ran normally and reached reconcile (which stopped the loop).
+    // reconcile still ran in the same cycle as the health throw (and stopped the loop).
     assert.equal(t.reconciled.length, 1);
-    assert.equal(t.health.length, 1);
+    assert.equal(t.health.length, 0);
   });
 
   it("stringifies a non-Error throw from the sink", async () => {
