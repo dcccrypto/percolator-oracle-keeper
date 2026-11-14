@@ -133,6 +133,17 @@ function bump(job: string, o: ExecOutcome, now: () => number): void {
   }
 }
 
+/**
+ * The failure an outcome reports (a transport error, an unexpected refusal, a tx that landed failed or never landed), or null
+ * (landed, dry-run, expected refusal, held).
+ */
+export function execFailure(o: ExecOutcome): string | null {
+  if (o.kind === "failed") return o.error;
+  if (o.kind === "refused") return o.expected ? null : `refused ${o.name}`;
+  if (o.kind === "sent" && o.landed !== "landed") return o.landed === "failed" ? `landed but failed on chain (code ${o.failCode ?? "none"})` : "not landed";
+  return null;
+}
+
 function buildTx(keeper: Keypair, ixs: readonly TransactionInstruction[], o: ExecOptions, blockhash: string): Transaction {
   const tx = new Transaction();
   // Heap frame first, as computeBudgetPrelude does (the wrapper needs the 128 KiB heap on every tx).
