@@ -274,7 +274,7 @@ export function recordLandedPush(
   stat.noPushCycles = 0;
 }
 
-interface LoopState {
+export interface LoopState {
   /** KEEPER_DEPTH_OBSERVE_DLMM, parsed ONCE at startup (a typo refuses the start; the cycle never re-parses it). */
   dlmmObserve: boolean;
   startedAt: number;
@@ -1232,7 +1232,7 @@ export function cloneCircuitBreakerState(state: CircuitBreakerState): CircuitBre
  * confirmation. ~3 RPC calls per cycle (was ~25), so the on-chain AuthMark can
  * refresh near per-slot. Price source is unchanged — the mainnet DEX pools.
  */
-async function runCycle(
+export async function runCycle(
   mainnetConn: Connection,
   devnetConn: Connection,
   keeper: Keypair,
