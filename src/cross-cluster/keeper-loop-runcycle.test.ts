@@ -308,6 +308,23 @@ describe("runCycle", () => {
     }
   });
 
+  it("a confirmed market keeps pushing when the periodic re-read fails", async () => {
+    mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    try {
+      const registry = freshRegistry();
+      const state = freshState(registry);
+      const dev = fakeDevnet();
+      await cycle(registry, state, baseConfig, dev);
+      assert.equal(knobs.sent, 1);
+      mock.timers.tick(31 * 60_000); // past the 30 min latch reset
+      knobs.failAccountInfo = true;
+      await cycle(registry, state, baseConfig, dev);
+      assert.equal(knobs.sent, 2, "last known good authority still pushes");
+    } finally {
+      mock.timers.reset();
+    }
+  });
+
   it("skip: a market whose oracle authority is not the keeper is not pushed", async () => {
     const registry = freshRegistry();
     const state = freshState(registry);

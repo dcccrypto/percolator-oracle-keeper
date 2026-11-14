@@ -859,6 +859,9 @@ const AUTHORITY_RECHECK_MS = 30 * 60_000;
  */
 const AUTHORITY_RETRY_MS = parseCrossClusterPositiveNumberEnv("KEEPER_AUTHORITY_RETRY_MIN", 1) * 60_000;
 const authorityRetryAt = new Map<string, number>();
+/** Last SUCCESSFUL read said oracle_authority == keeper. Survives the periodic latch reset, so a failed re-read of a
+ *  previously confirmed market keeps it pushing; only a read showing a different authority removes it. */
+const authorityConfirmed = new Set<string>();
 let lastAuthorityRecheckAt = Date.now();
 function maybeResetAuthorityLatches(): void {
   if (Date.now() - lastAuthorityRecheckAt < AUTHORITY_RECHECK_MS) return;
@@ -1294,6 +1297,8 @@ export async function runCycle(
         authorityRetryAt.delete(m.key);
         // Only a SUCCESSFULLY READ, genuinely different authority is permanent.
         const ok = auth !== null && auth.equals(keeper.publicKey);
+        if (ok) authorityConfirmed.add(m.key);
+        else authorityConfirmed.delete(m.key);
         if (!ok) {
           notPushable.add(m.key);
           const s = state.stats.get(m.key)!;
@@ -1387,7 +1392,7 @@ export async function runCycle(
   for (const entry of units) {
     if (notPushable.has(entry.key)) continue;
     // Authority not confirmed (read failed, retry pending): do not push. lastErrorMsg already says why.
-    if (!authorityChecked.has(entry.key)) continue;
+    if (!authorityConfirmed.has(entry.key)) continue;
     // R3.24 (b): a terminal market (Resolved / closed / Recovery) is never smoothed, breaker-checked or pushed again,
     // and it stays terminal (resolution is one-way). It used to be re-discovered by the PUSHER every cycle, so a cycle
     // in which the smoother or the breaker held it back dropped it from the terminal set and it alerted as no-push.
@@ -1805,6 +1810,7 @@ export function pruneDeregisteredMarkets(
   // Module-level per-market maps: authority latches, breaker state, nonce / quarantine / terminal-log.
   for (const m of [...authorityChecked]) if (!keepKeys.has(m)) authorityChecked.delete(m);
   for (const m of [...notPushable]) if (!keepKeys.has(m)) notPushable.delete(m);
+  for (const m of [...authorityConfirmed]) if (!keepKeys.has(m)) authorityConfirmed.delete(m);
   for (const m of [...authorityRetryAt.keys()]) if (!keepKeys.has(m)) authorityRetryAt.delete(m);
   for (const m of [...crossClusterCircuitBreakerStates.keys()]) if (!keepKeys.has(m)) crossClusterCircuitBreakerStates.delete(m);
   pruneAuthMarkPusherState(keep);
