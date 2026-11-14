@@ -62,8 +62,8 @@ describe("N-1: only a program Custom code is a 'hard' refusal; compute exhaustio
     assert.equal(r.lpSettled, true);
     assert.equal(pairingStats.unpairedLpSettles, 1);
   });
-  it("other no-code errors (blockhash / account in use / RPC) also defer instead of blaming", async () => {
-    for (const err of [{ InstructionError: [4, "AccountInUse"] }, "BlockhashNotFound", { InstructionError: [3, "ProgramFailedToComplete"] }]) {
+  it("other no-code errors (account in use / RPC) also defer instead of blaming", async () => {
+    for (const err of [{ InstructionError: [4, "AccountInUse"] }, { InstructionError: [3, "ProgramFailedToComplete"] }]) {
       resetPairingStats();
       const quarantine = new Map<string, bigint>();
       const f = fakeExecConn({ simErr: (_d, n) => (n === 0 ? err : null) });
@@ -71,6 +71,21 @@ describe("N-1: only a program Custom code is a 'hard' refusal; compute exhaustio
       assert.equal(quarantine.size, 0, JSON.stringify(err));
       assert.equal(r.lpSettled, false, JSON.stringify(err));
     }
+  });
+  it("a one-shot BlockhashNotFound is retried once and may settle; a persistent one still defers and blames nobody", async () => {
+    const quarantine = new Map<string, bigint>();
+    const f = fakeExecConn({ simErr: (_d, n) => (n === 0 ? "BlockhashNotFound" : null) });
+    const r = await runSettleRound(deps(f.conn), { market: MARKET, label: "T" }, { lp: LP, counterparties: cps(6), nowSlot: 100, quarantine }, DEFAULT_SWEEP_ROUND_CONFIG);
+    assert.equal(quarantine.size, 0);
+    assert.equal(pairingStats.hardRefusals, 0);
+    assert.equal(r.lpSettled, true, "the retry simulation was clean, so the round may settle");
+    resetPairingStats();
+    const q2 = new Map<string, bigint>();
+    const g = fakeExecConn({ simErr: () => "BlockhashNotFound" });
+    const r2 = await runSettleRound(deps(g.conn), { market: MARKET, label: "T" }, { lp: LP, counterparties: cps(6), nowSlot: 100, quarantine: q2 }, DEFAULT_SWEEP_ROUND_CONFIG);
+    assert.equal(q2.size, 0);
+    assert.equal(pairingStats.hardRefusals, 0);
+    assert.equal(r2.lpSettled, false, "a persistent BlockhashNotFound still does not settle the LP or quarantine anyone");
   });
   it("quarantine is capped per round unless each code is distinct, and a longer cool-down needs a REPEAT of the same code", async () => {
     // three portfolios refused with the SAME code in one round: only two are quarantined
