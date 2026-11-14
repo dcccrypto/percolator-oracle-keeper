@@ -181,18 +181,33 @@ describe("startFeeJobLoop", () => {
   });
 
   it("paces cycles by the interval minus the sweep time, never below one second", async () => {
-    const job: FeeJob = { name: "lp-fee", async run() { return { kind: "nothing" }; } };
-    const t = makeSink(2);
-    let p!: Promise<void>;
-    p = startFeeJobLoop([job], ctx, registry, { intervalMs: 5000 }, t.sink);
-    await new Promise((r) => setImmediate(r));
-    assert.equal(t.reconciled.length, 1, "first cycle ran");
-    mock.timers.tick(4000);
-    await new Promise((r) => setImmediate(r));
-    assert.equal(t.reconciled.length, 1, "interval (5s) has not elapsed after 4s");
-    mock.timers.tick(1000);
-    await new Promise((r) => setImmediate(r));
-    assert.equal(t.reconciled.length, 2, "second cycle after the full interval");
+    mock.timers.reset();
+    mock.timers.enable({ apis: ["setTimeout", "Date"] });
+    // Sweep durations (mock-clock ms) per cycle: instant, 4500 (leaves 500 -> floored to 1000), 0.
+    const sweepMs = [0, 4500, 0];
+    let n = 0;
+    const job: FeeJob = {
+      name: "lp-fee",
+      async run(_c, m) { if (m.marketAddress === "MA") mock.timers.tick(sweepMs[n++] ?? 0); return { kind: "nothing" }; },
+    };
+    const t = makeSink(3);
+    const p = startFeeJobLoop([job], ctx, registry, { intervalMs: 5000 }, t.sink);
+    const flush = () => new Promise((r) => setImmediate(r));
+    await flush();
+    assert.equal(t.reconciled.length, 1, "cycle 0 ran at once");
+    mock.timers.tick(4999);
+    await flush();
+    assert.equal(t.reconciled.length, 1, "full interval (sweep took 0ms) not yet elapsed");
+    mock.timers.tick(1);
+    await flush();
+    assert.equal(t.reconciled.length, 2, "cycle 1 after 5000ms");
+    // Cycle 1's sweep took 4500ms; only 500 remain, but the wait is floored at 1000.
+    mock.timers.tick(999);
+    await flush();
+    assert.equal(t.reconciled.length, 2, "floor: still waiting at 999ms");
+    mock.timers.tick(1);
+    await flush();
+    assert.equal(t.reconciled.length, 3, "cycle 2 after the 1000ms floor");
     await drive(p);
   });
 });
