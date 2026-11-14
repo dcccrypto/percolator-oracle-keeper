@@ -325,7 +325,7 @@ describe("runCycle", () => {
     assert.equal(state.cyclePushed, 0);
   });
 
-  it("onPushLanded is not fired for multi-asset assets, and a throwing hook cannot break the cycle", async () => {
+  it("onPushLanded is never fired for a multi-asset asset", async () => {
     const registry = freshRegistry();
     const state = freshState(registry);
     let fired = 0;
@@ -333,7 +333,6 @@ describe("runCycle", () => {
       ...baseConfig,
       onPushLanded: () => {
         fired++;
-        throw new Error("hook boom");
       },
     });
     assert.equal(fired, 0);
@@ -352,7 +351,7 @@ describe("makeHealthHandler", () => {
     assert.equal(code, 404);
   });
 
-  it("serves the same body on / as on /health", () => {
+  it("serves / like /health (200 with a markets board)", () => {
     const registry = freshRegistry();
     const state = freshState(registry);
     let code = 0;
@@ -391,7 +390,7 @@ describe("makeHealthHandler", () => {
     state.startedAt = Date.now() - 60 * 60_000;
     const { code, body } = health(state, registry);
     assert.equal(code, 200, "a 5xx would restart-loop the keeper");
-    assert.notEqual(body?.status, "ok");
+    assert.equal(body?.status, "stalled-pricing");
   });
 
   it("stale: repeated batch read failures are named in the body", () => {
@@ -403,7 +402,7 @@ describe("makeHealthHandler", () => {
     const { body } = health(state, registry);
     assert.equal(body?.consecutiveBatchReadFailures, 9);
     assert.equal(body?.lastBatchReadError, "pool rpc down");
-    assert.notEqual(body?.status, "ok");
+    assert.equal(body?.status, "stalled-pricing");
   });
 
   it("a terminal market reads resolved/terminal, not a stale error", () => {
@@ -415,6 +414,7 @@ describe("makeHealthHandler", () => {
     const body = health(state, registry).body!;
     const row = (body.markets as Record<string, Record<string, unknown>>)[addr];
     assert.equal(row.terminal, true);
+    for (const a of row.assets as Array<Record<string, unknown>>) assert.equal(a.lastError, null, "a terminal market never shows an old error");
   });
 
   it("a deregistered market leaves the board after a cycle", async () => {

@@ -626,7 +626,7 @@ export function multiAssetMarketHealth(
       totalPushes: stat.totalPushes,
       totalErrors: stat.totalErrors,
       authorityMismatch: stat.authorityMismatch,
-      lastError: stat.lastErrorMsg,
+      lastError: ctx.terminal ? null : stat.lastErrorMsg, // same as a single-asset row: a terminal market shows no stale error
       accrualLagSlots: lag ? lag.lagSlots : null,
       assetLossStale: lag ? lag.lossStale : null,
     };
