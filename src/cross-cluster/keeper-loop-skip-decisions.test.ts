@@ -93,7 +93,7 @@ describe("withheldFromPush", () => {
 
 describe("recordMultiAssetPushOutcome", () => {
   const mk = () => {
-    const p = { key: `${M1}:1`, marketAddress: M1, assetIndex: 1 };
+    const p = { key: "a1-stat-key", marketAddress: M1, assetIndex: 1 };
     const stat = newMarketStat({ label: "a1", marketAddress: M1, key: p.key, multi: true, assetIndex: 1 });
     const state = { stats: new Map([[p.key, stat]]), landedThisCycle: new Set<string>() };
     return { p, stat, state };
@@ -122,7 +122,10 @@ describe("recordMultiAssetPushOutcome", () => {
   });
   it("pushed key with a signature lands", () => {
     const { p, stat, state } = mk();
+    stat.noPushCycles = 3;
     assert.equal(recordMultiAssetPushOutcome(state, p, { pushedKeys: [genKey], signature: "sig" }, { dryRun: false, stamp: 9 }), "landed");
+    assert.equal(stat.noPushCycles, 0);
+    assert.equal(stat.lastPushAt, 9);
     assert.equal(stat.totalPushes, 1);
     assert.equal(stat.lastSig, "sig");
     assert.ok(state.landedThisCycle.has(p.key));
@@ -137,6 +140,8 @@ describe("recordMultiAssetPushOutcome", () => {
     const { p, stat, state } = mk();
     assert.equal(recordMultiAssetPushOutcome(state, p, { pushedKeys: [], signature: "sig" }, { dryRun: false, stamp: 1 }), "dropped");
     assert.equal(stat.totalPushes, 0);
+    assert.equal(stat.totalErrors, 1);
+    assert.match(stat.lastErrorMsg ?? "", /dropped from batch/);
   });
 });
 
@@ -144,8 +149,11 @@ describe("noPush streaks and pushable counts", () => {
   it("advanceNoPushStreaks bumps only markets that did not land, by stat key", () => {
     const a = newMarketStat({ label: "a", marketAddress: M1 });
     const b = newMarketStat({ label: "b", marketAddress: M2, key: `${M2}:1`, multi: true, assetIndex: 1 });
-    advanceNoPushStreaks([a, b], new Set([M1]));
+    // M2 (b's market address) is in the set but b's stat key is not: b must still be bumped.
+    advanceNoPushStreaks([a, b], new Set([M1, M2]));
     assert.equal(a.noPushCycles, 0);
+    assert.equal(b.noPushCycles, 1);
+    advanceNoPushStreaks([b], new Set([`${M2}:1`]));
     assert.equal(b.noPushCycles, 1);
   });
   it("countPushableMarkets excludes terminal markets", () => {
@@ -172,6 +180,9 @@ describe("price staleness trackers", () => {
     assert.equal(s.depthAbsentSince, 20);
     noteDepthAttempt(s, true, true, 40);
     assert.equal(s.depthAbsentSince, null);
+    noteDepthAttempt(s, true, false, 50);
+    noteDepthAttempt(s, false, false, 60);
+    assert.equal(s.depthAbsentSince, null);
   });
   it("fixedPushFor only accepts a positive fixed price on a fixed unit", () => {
     assert.equal(fixedPushFor({ source: "fixed", fixedPriceE6: 5n }), 5n);
@@ -187,7 +198,7 @@ describe("deadlineBypass", () => {
     assert.deepEqual(deadlineBypass(dl({}), 9n), { priceE6: 9n, reason: "band pin" });
   });
   it("falls back to a generic reason", () => {
-    assert.equal(deadlineBypass(dl({ urgentReason: undefined }), 9n)?.reason, "a fail-closed deadline is close");
+    assert.equal(deadlineBypass(dl({ urgentReason: null }), 9n)?.reason, "a fail-closed deadline is close");
   });
   it("keeps withholding with no deadline, terminal, not urgent, or no usable median", () => {
     assert.equal(deadlineBypass(undefined, 9n), null);
