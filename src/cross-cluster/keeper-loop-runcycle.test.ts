@@ -6,7 +6,7 @@
  * mark, and the rest of the path (authority check, blockhash, wallet guard, batch push, per-market bookkeeping) is
  * the production code.
  */
-import { beforeEach, describe, it } from "node:test";
+import { beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair } from "@solana/web3.js";
 import { readFileSync } from "node:fs";
@@ -246,27 +246,66 @@ describe("runCycle", () => {
     assert.equal(knobs.sent, 0);
   });
 
-  it("authority RPC error: not latched as unpushable, the check is retried next cycle", async () => {
-    const registry = freshRegistry();
-    const state = freshState(registry);
-    const dev = fakeDevnet();
-    let reads = 0;
-    const inner = dev.getAccountInfo;
-    dev.getAccountInfo = async () => {
-      reads++;
-      return inner();
-    };
-    knobs.failAccountInfo = true;
-    await cycle(registry, state, baseConfig, dev);
-    const s = state.stats.get(`${registry.markets[0].marketAddress}#0`)!;
-    assert.equal(s.authorityMismatch, false);
-    assert.equal(reads, 1);
-    knobs.failAccountInfo = false;
-    await cycle(registry, state, baseConfig, dev);
-    assert.equal(reads, 2, "the unreadable authority was asked for again");
-    assert.equal(s.authorityMismatch, false);
-    assert.equal(s.totalPushes, 2, "an unchecked market is still pushed while its authority read keeps failing");
-    assert.equal(s.lastErrorMsg, null);
+  it("authority RPC error: not latched as unpushable, not pushed, and re-read once the retry interval passes", async () => {
+    mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    try {
+      const registry = freshRegistry();
+      const state = freshState(registry);
+      const dev = fakeDevnet();
+      let reads = 0;
+      const inner = dev.getAccountInfo;
+      dev.getAccountInfo = async () => {
+        reads++;
+        return inner();
+      };
+      knobs.failAccountInfo = true;
+      await cycle(registry, state, baseConfig, dev);
+      const s = state.stats.get(`${registry.markets[0].marketAddress}#0`)!;
+      assert.equal(s.authorityMismatch, false);
+      assert.equal(reads, 1);
+      knobs.failAccountInfo = false;
+      await cycle(registry, state, baseConfig, dev);
+      assert.equal(reads, 1, "no re-read inside the retry interval");
+      assert.equal(s.totalPushes, 0, "an unconfirmed market is not pushed");
+      mock.timers.tick(60_000);
+      await cycle(registry, state, baseConfig, dev);
+      assert.equal(reads, 2, "the unreadable authority was asked for again after the interval");
+      assert.equal(s.authorityMismatch, false);
+      assert.equal(s.totalPushes, 1);
+      assert.equal(s.lastErrorMsg, null);
+    } finally {
+      mock.timers.reset();
+    }
+  });
+
+  it("unconfirmed authority: no pushes while the read keeps failing, resumes on the first retry after it confirms", async () => {
+    mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    try {
+      const registry = freshRegistry();
+      const state = freshState(registry);
+      const dev = fakeDevnet();
+      const s = () => state.stats.get(`${registry.markets[0].marketAddress}#0`)!;
+      knobs.failAccountInfo = true;
+      for (let i = 0; i < 5; i++) {
+        await cycle(registry, state, baseConfig, dev);
+        mock.timers.tick(1000); // one tick, still inside the retry interval
+      }
+      assert.equal(knobs.sent, 0, "0 pushes per tick while unconfirmed");
+      assert.equal(s().authorityMismatch, false, "unreadable is not a mismatch");
+      assert.match(s().lastErrorMsg ?? "", /authority check failed/);
+      // The authority now reads fine, but the retry is not due yet: still no push.
+      knobs.failAccountInfo = false;
+      await cycle(registry, state, baseConfig, dev);
+      assert.equal(knobs.sent, 0);
+      // After the retry interval the read is repeated, confirms, and the same cycle pushes.
+      mock.timers.tick(60_000);
+      await cycle(registry, state, baseConfig, dev);
+      assert.equal(knobs.sent, 1, "resumed on the first cycle after the retry interval");
+      assert.equal(s().totalPushes, 1);
+      assert.equal(s().lastErrorMsg, null);
+    } finally {
+      mock.timers.reset();
+    }
   });
 
   it("skip: a market whose oracle authority is not the keeper is not pushed", async () => {

@@ -851,6 +851,14 @@ const notPushable = new Set<string>();
  * market per half hour.
  */
 const AUTHORITY_RECHECK_MS = 30 * 60_000;
+/**
+ * A market whose authority read FAILED is unconfirmed: it is not pushed (a push without a confirmed
+ * oracle_authority == keeper can only revert the whole atomic batch) and the read is retried no more often than
+ * this. KEEPER_AUTHORITY_RETRY_MIN, minutes, default 1 — long enough not to hammer a rate-limited RPC, short
+ * enough that a blip costs about one push window.
+ */
+const AUTHORITY_RETRY_MS = parseCrossClusterPositiveNumberEnv("KEEPER_AUTHORITY_RETRY_MIN", 1) * 60_000;
+const authorityRetryAt = new Map<string, number>();
 let lastAuthorityRecheckAt = Date.now();
 function maybeResetAuthorityLatches(): void {
   if (Date.now() - lastAuthorityRecheckAt < AUTHORITY_RECHECK_MS) return;
@@ -863,6 +871,7 @@ function maybeResetAuthorityLatches(): void {
   }
   authorityChecked.clear();
   notPushable.clear();
+  authorityRetryAt.clear();
 }
 
 /**
@@ -1261,7 +1270,8 @@ export async function runCycle(
   // ── 1. Oracle-authority check (only pushable markets go in a batch) ─────────
   // "One-time" per 30-minute window — see maybeResetAuthorityLatches. K-6: per unit (each asset has its own profile).
   maybeResetAuthorityLatches();
-  const unchecked = units.filter((m) => !authorityChecked.has(m.key));
+  const authNow = Date.now();
+  const unchecked = units.filter((m) => !authorityChecked.has(m.key) && (authorityRetryAt.get(m.key) ?? 0) <= authNow);
   if (unchecked.length > 0) {
     await Promise.all(
       unchecked.map(async (m) => {
@@ -1270,16 +1280,18 @@ export async function runCycle(
           auth = await fetchOracleAuthority(devnetConn, m.marketAddress, m.assetIndex);
         } catch (err) {
           // COULD NOT READ (RPC blip) — do NOT mark checked, do NOT blacklist.
-          // Leaving it unchecked means we retry on the next cycle. Previously a
+          // Leaving it unchecked means we retry after AUTHORITY_RETRY_MS, and the market is not pushed until then. Previously a
           // transient null here latched the market into `notPushable` FOREVER
           // (the set is module-level and never cleared), so a single rate-limit
           // burst at boot could take markets offline permanently while /health
           // still reported "ok".
+          authorityRetryAt.set(m.key, authNow + AUTHORITY_RETRY_MS);
           const s = state.stats.get(m.key)!;
           s.lastErrorMsg = `authority check failed (will retry): ${(err instanceof Error ? err.message : String(err)).slice(0, 80)}`;
           return;
         }
         authorityChecked.add(m.key);
+        authorityRetryAt.delete(m.key);
         // Only a SUCCESSFULLY READ, genuinely different authority is permanent.
         const ok = auth !== null && auth.equals(keeper.publicKey);
         if (!ok) {
@@ -1374,6 +1386,8 @@ export async function runCycle(
   samplePoolsForCycle(units, (m) => isTerminalForPush(state, m), prices, pricesE12, { e6: markSmoother, e12: markSmootherE12 }, smoothNowMs, smoothedThisCycle, smoothedE12ThisCycle, primedPools);
   for (const entry of units) {
     if (notPushable.has(entry.key)) continue;
+    // Authority not confirmed (read failed, retry pending): do not push. lastErrorMsg already says why.
+    if (!authorityChecked.has(entry.key)) continue;
     // R3.24 (b): a terminal market (Resolved / closed / Recovery) is never smoothed, breaker-checked or pushed again,
     // and it stays terminal (resolution is one-way). It used to be re-discovered by the PUSHER every cycle, so a cycle
     // in which the smoother or the breaker held it back dropped it from the terminal set and it alerted as no-push.
@@ -1791,6 +1805,7 @@ export function pruneDeregisteredMarkets(
   // Module-level per-market maps: authority latches, breaker state, nonce / quarantine / terminal-log.
   for (const m of [...authorityChecked]) if (!keepKeys.has(m)) authorityChecked.delete(m);
   for (const m of [...notPushable]) if (!keepKeys.has(m)) notPushable.delete(m);
+  for (const m of [...authorityRetryAt.keys()]) if (!keepKeys.has(m)) authorityRetryAt.delete(m);
   for (const m of [...crossClusterCircuitBreakerStates.keys()]) if (!keepKeys.has(m)) crossClusterCircuitBreakerStates.delete(m);
   pruneAuthMarkPusherState(keep);
   pruneMarketAccrual(keep);
