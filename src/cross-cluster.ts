@@ -127,6 +127,8 @@ import { setLevGuardHealthProvider } from "./cross-cluster/v22/health.ts";
 import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
 import { failoverFromEnv, parseFallbackUrls } from "./rpc-failover.ts";
 import { readHealth, recordLaunch, restartConfig } from "./restart-escalation.ts";
+import { pushDepthOnchainEnabled } from "./cross-cluster/depth-source.ts";
+import { healthFileConfigFromEnv } from "./cross-cluster/health-file.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -143,8 +145,18 @@ process.on("unhandledRejection", (reason) => {
     `[keeper][unhandledRejection] ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`,
   );
 });
+// Boot latch: until the push loop starts (startKeeperLoop's onStarted below), an uncaught error is a failed boot, not a
+// runtime fault. A throw later in this module's evaluation reaches this handler, and so does a rejection of the
+// top-level await on startKeeperLoop before its first cycle. Logging and staying up would end the boot with exit 0, or
+// leave the background loops running with no push loop, so it exits 1 instead. After boot it only logs, as above.
+// Unhandled rejections stay log-only, before and after boot.
+let booted = false;
 process.on("uncaughtException", (err) => {
   console.error(`[keeper][uncaughtException] ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+  if (!booted) {
+    console.error("[fatal] boot failed (error above); exiting 1");
+    process.exit(1);
+  }
 });
 
 // ── RPC endpoints ─────────────────────────────────────────────────────────────
@@ -203,10 +215,11 @@ if (!DEVNET_RPC) {
 // round to zero and silently disable the guard, which was #71's original report.
 //
 // Wrapped in try/catch and exiting explicitly, matching the `[fatal]` pattern the
-// RPC checks above use. A bare throw here would NOT be fatal: the
-// `uncaughtException` handler at the top of this file logs and returns, which
-// suppresses Node's non-zero exit, so a misconfigured keeper would report success
-// to its supervisor and simply never push. Config errors must exit 1.
+// RPC checks above use. A bare throw here would also exit 1 (the boot latch in the
+// `uncaughtException` handler above treats any throw before the push loop starts
+// as a failed boot), but with a full stack instead of one `[fatal]` line. Parsing
+// here is still required: a value parsed only later is refused after the boot
+// crank and the background loops have already run. Config errors must exit 1.
 let MIN_KEEPER_BALANCE_LAMPORTS: number;
 let BALANCE_CHECK_INTERVAL_MS: number;
 let STAKE_FEE_CONFIG: StakeFeeConfig;
@@ -246,6 +259,11 @@ try {
   P2B_HEDGED_THRESHOLDS = hedgedLockoutThresholdsFromEnv(process.env);
   P2B_EARN_GAP_CONFIG = earnGapConfigFromEnv(process.env);
   P2B_LOOP_CONFIG = p2bLoopConfigFromEnv(process.env, MIN_KEEPER_BALANCE_LAMPORTS, BALANCE_CHECK_INTERVAL_MS);
+  // startKeeperLoop reads these again after the boot crank and every background loop have started: parse them here so a
+  // typo refuses the boot before anything runs (#215/#216). pushDepthOnchainEnabled parses KEEPER_PUSH_DEPTH_ONCHAIN and
+  // KEEPER_PUSH_DEPTH; healthFileConfigFromEnv parses KEEPER_HEALTH_FILE / KEEPER_HEALTH_FILE_MS.
+  pushDepthOnchainEnabled(process.env);
+  healthFileConfigFromEnv(process.env);
 } catch (err) {
   console.error(`[fatal] ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
@@ -807,4 +825,7 @@ await startKeeperLoop(mainnetConn, devnetConn, keeper, registry, {
   cycleTimeoutMs: CC_CYCLE_TIMEOUT_MS,
   minKeeperBalanceLamports: MIN_KEEPER_BALANCE_LAMPORTS,
   balanceCheckIntervalMs: BALANCE_CHECK_INTERVAL_MS,
+  onStarted: () => {
+    booted = true;
+  },
 });
