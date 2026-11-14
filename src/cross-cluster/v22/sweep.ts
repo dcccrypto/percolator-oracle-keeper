@@ -45,6 +45,7 @@ import type { ExecContext, ExecOptions, ExecOutcome } from "./exec.ts";
 import { DEFAULT_MAX_GAP_SLOTS, DEFAULT_MAX_TXS_PER_ROUND, DEFAULT_WEIGHT_BUDGET, legAwareTxUnits, planSettleRound } from "./settle-pairing.ts";
 import type { PlannedTx, RoundPlan } from "./settle-pairing.ts";
 import type { PairingMode } from "./flags.ts";
+import { BLOCKHASH_MAX_AGE_MS } from "../blockhash-cache.ts";
 
 const NON_PROGRESS = 22;
 export const SWEEP_TX_UNITS = 1_400_000;
@@ -807,6 +808,34 @@ function logMergedSkip(deps: SweepDeps, market: string, label: string, why: stri
 }
 
 /**
+ * One `getLatestBlockhash` per round instead of one per simulated / sent tx. Concurrent phase-1 txs share the in-flight request;
+ * a failed fetch is not kept; a held value expires after BLOCKHASH_MAX_AGE_MS (well inside the 60-90 s validity). Each tx of a round
+ * carries different instructions, so sharing the blockhash cannot produce a duplicate signature.
+ */
+export function withRoundBlockhash(deps: SweepDeps, now: () => number = Date.now): SweepDeps {
+  const conn = deps.exec.conn;
+  let held: { p: Promise<Awaited<ReturnType<typeof conn.getLatestBlockhash>>>; at: number } | null = null;
+  const proxied = new Proxy(conn, {
+    get(t, prop) {
+      if (prop !== "getLatestBlockhash") {
+        const v = Reflect.get(t, prop, t);
+        return typeof v === "function" ? v.bind(t) : v;
+      }
+      return (...a: Parameters<typeof conn.getLatestBlockhash>) => {
+        if (held && now() - held.at <= BLOCKHASH_MAX_AGE_MS) return held.p;
+        const entry = { p: t.getLatestBlockhash(...a), at: now() };
+        held = entry;
+        entry.p.catch(() => {
+          if (held === entry) held = null;
+        });
+        return entry.p;
+      };
+    },
+  });
+  return { ...deps, exec: { ...deps.exec, conn: proxied } };
+}
+
+/**
  * Plan and execute one round for one market. `counterparties` excludes the LP. Never throws.
  */
 export async function runSettleRound(
@@ -815,6 +844,7 @@ export async function runSettleRound(
   input: RoundInput,
   cfg: SweepRoundConfig = DEFAULT_SWEEP_ROUND_CONFIG,
 ): Promise<RoundResult> {
+  deps = withRoundBlockhash(deps);
   const hold = deps.hold ?? realHold;
   const release = deps.release ?? realRelease;
   const nowSlot = BigInt(input.nowSlot ?? 0);
