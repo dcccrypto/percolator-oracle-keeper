@@ -45,6 +45,7 @@ import type { ExecContext, ExecOptions, ExecOutcome } from "./exec.ts";
 import { DEFAULT_MAX_GAP_SLOTS, DEFAULT_MAX_TXS_PER_ROUND, DEFAULT_WEIGHT_BUDGET, legAwareTxUnits, planSettleRound } from "./settle-pairing.ts";
 import type { PlannedTx, RoundPlan } from "./settle-pairing.ts";
 import type { PairingMode } from "./flags.ts";
+import { BLOCKHASH_MAX_AGE_MS } from "../blockhash-cache.ts";
 
 const NON_PROGRESS = 22;
 export const SWEEP_TX_UNITS = 1_400_000;
@@ -807,6 +808,45 @@ function logMergedSkip(deps: SweepDeps, market: string, label: string, why: stri
 }
 
 /**
+ * One `getLatestBlockhash` per round instead of one per simulated / sent tx. Concurrent phase-1 txs share the in-flight request;
+ * a failed fetch is not kept; a held value expires after BLOCKHASH_MAX_AGE_MS (well inside the 60-90 s validity). Each tx of a round
+ * carries different instructions, so sharing the blockhash cannot produce a duplicate signature.
+ */
+export function withRoundBlockhash(deps: SweepDeps, now: () => number = Date.now): SweepDeps {
+  const conn = deps.exec.conn;
+  type Bh = Awaited<ReturnType<typeof conn.getLatestBlockhash>>;
+  const held = new Map<string, { p: Promise<Bh>; at: number }>();
+  const proxied = new Proxy(conn, {
+    get(t, prop) {
+      if (prop === "getLatestBlockhash") {
+        return (...a: Parameters<typeof conn.getLatestBlockhash>) => {
+          const ck = JSON.stringify(a[0] ?? null);
+          const h = held.get(ck);
+          if (h && now() - h.at <= BLOCKHASH_MAX_AGE_MS) return h.p;
+          const entry = { p: t.getLatestBlockhash(...a), at: now() };
+          held.set(ck, entry);
+          entry.p.catch(() => {
+            if (held.get(ck) === entry) held.delete(ck);
+          });
+          return entry.p;
+        };
+      }
+      if (prop === "simulateTransaction") {
+        // an unknown blockhash poisons every later tx of the round: drop the held one so the next call refetches
+        return async (...a: Parameters<typeof conn.simulateTransaction>) => {
+          const r = await t.simulateTransaction(...a);
+          if (r.value.err === "BlockhashNotFound") held.clear();
+          return r;
+        };
+      }
+      const v = Reflect.get(t, prop, t);
+      return typeof v === "function" ? v.bind(t) : v;
+    },
+  });
+  return { ...deps, exec: { ...deps.exec, conn: proxied } };
+}
+
+/**
  * Plan and execute one round for one market. `counterparties` excludes the LP. Never throws.
  */
 export async function runSettleRound(
@@ -815,6 +855,7 @@ export async function runSettleRound(
   input: RoundInput,
   cfg: SweepRoundConfig = DEFAULT_SWEEP_ROUND_CONFIG,
 ): Promise<RoundResult> {
+  deps = withRoundBlockhash(deps);
   const hold = deps.hold ?? realHold;
   const release = deps.release ?? realRelease;
   const nowSlot = BigInt(input.nowSlot ?? 0);
