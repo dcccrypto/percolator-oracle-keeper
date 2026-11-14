@@ -249,10 +249,14 @@ function readU64LE(data: Uint8Array, off: number): bigint {
 // Returns null on any parse failure (bad magic/version, unrecognized VERSION,
 // or a buffer too short for this asset's slot) — callers must skip this push
 // this cycle, never guess a value.
+//
+// `pushedMarkE6` rides along for the circuit breaker's cold-start seed: the
+// profile's `oracle_target_price_e6`, the last mark PushAuthMark wrote (per lot).
+// It is read inside the length check below and never makes this return null.
 export function parsePushAuthMarkGenerationFields(
   data: Uint8Array,
   assetIndex: number,
-): { marketId: bigint; observationSequence: bigint; lotExp: number } | null {
+): { marketId: bigint; observationSequence: bigint; lotExp: number; pushedMarkE6: bigint } | null {
   const groupOffResult = selectMarketGroupOffset(data);
   if (!groupOffResult.ok) return null;
   const profileOff = assetSlotOffset(groupOffResult, assetIndex);
@@ -263,10 +267,12 @@ export function parsePushAuthMarkGenerationFields(
 
   const lotExp = readMarketLotExp(data, groupOffResult.version, profileOff);
   if (lotExp === null) return null;
+  // Inside the wrapper slot, so covered by the engineAssetOff + 8 check above.
+  const pushedMarkE6 = readU64LE(data, profileOff + PROFILE_ORACLE_TARGET_PRICE_OFF);
 
   try {
     const seqs = parseAssetControlSequencesV17(data, profileOff);
-    return { marketId, observationSequence: seqs.oracleObservation + 1n, lotExp };
+    return { marketId, observationSequence: seqs.oracleObservation + 1n, lotExp, pushedMarkE6 };
   } catch {
     return null;
   }
@@ -287,6 +293,8 @@ export const LOT_EXP_MAX = 15;
 export const MAX_ORACLE_PRICE_E6 = 1_000_000_000_000n;
 /** Profile byte holding lot_exp (`_padding0[0]`), relative to the asset's wrapper slot / oracle profile. */
 export const PROFILE_LOT_EXP_OFF = 19;
+/** Profile byte offset of `oracle_target_price_e6` (SDK `parseAssetOracleProfileV17`, b + 200), relative to the asset's oracle profile. */
+export const PROFILE_ORACLE_TARGET_PRICE_OFF = 200;
 
 /**
  * lot_exp of the asset whose profile starts at `profileOff`. 0 on VERSION < 19 (the byte is padding there, always zero
