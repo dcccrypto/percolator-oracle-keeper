@@ -74,7 +74,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { DEFAULT_REGISTRY_FILE, loadRegistryForProgramSet } from "./cross-cluster/registry.ts";
 import { bindObservationRegistry, registryRowProblems } from "./cross-cluster/multi-asset.ts";
-import { bootPositiveNumberEnv, parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
+import { bootPositiveNumberEnv, defaultOnSwitch, parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { MIN_POOL_LIQUIDITY_USD_E6 } from "./cross-cluster/price-reader.ts";
@@ -308,19 +308,19 @@ const CC_CYCLE_TIMEOUT_MS = bootPositiveNumberEnv("CC_CYCLE_TIMEOUT_MS", 10000);
 // asset.slot_last from drifting far enough behind the live slot to trip
 // EngineLockActive on risk-increasing trades). Defaults to on; set
 // CRANK_ENABLED=false to disable (e.g. for a read-only / dry-run deploy).
-const CRANK_ENABLED = process.env.CRANK_ENABLED !== "false";
+const CRANK_ENABLED = defaultOnSwitch(process.env, "CRANK_ENABLED");
 const CRANK_INTERVAL_MS = bootPositiveNumberEnv("CRANK_INTERVAL_MS", 20000);
 // LP_FEE_CRANK_ENABLED=false to disable. 200s by default: fee distribution is not
 // latency-sensitive (it only moves already-accrued atoms into the vault), and a
 // market with no LP depositors costs no transaction at all.
-const LP_FEE_CRANK_ENABLED = process.env.LP_FEE_CRANK_ENABLED !== "false";
+const LP_FEE_CRANK_ENABLED = defaultOnSwitch(process.env, "LP_FEE_CRANK_ENABLED");
 const LP_FEE_CRANK_INTERVAL_MS = bootPositiveNumberEnv("LP_FEE_CRANK_INTERVAL_MS", 200000);
 // Stake-fee push (tag 87 -> stake AccrueFees, fee-flow audit F2/F3). Shares the
 // fee-job loop and its interval with the LP-fee crank.
-const STAKE_FEE_PUSH_ENABLED = process.env.STAKE_FEE_PUSH_ENABLED !== "false";
+const STAKE_FEE_PUSH_ENABLED = defaultOnSwitch(process.env, "STAKE_FEE_PUSH_ENABLED");
 // Post-resolve wind-down for stake-bound markets (stake F-9 tag 29). A no-op
 // until the deployed stake program supports tag 29 (probed, cached 1 h).
-const TERMINAL_INSURANCE_ENABLED = process.env.TERMINAL_INSURANCE_ENABLED !== "false";
+const TERMINAL_INSURANCE_ENABLED = defaultOnSwitch(process.env, "TERMINAL_INSURANCE_ENABLED");
 
 // Registration-poll loop — outbound poll of the Vercel-hosted playground registered-
 // markets blob, so markets created through the create-market wizard after this keeper
@@ -581,9 +581,9 @@ if (CRANK_ENABLED) {
 // P3 senior draw (d119eebd): crank each bound market's vault LP after every landed mark
 // move, so its deficit is drawn from the vault's pots (junior, then Earn seniors) BEFORE
 // the engine can liquidate it. Markets without a vault-LP state are a cached no-op.
-const P3_EXHAUSTED_WITHHOLD_PUSHES = process.env.P3_EXHAUSTED_WITHHOLD_PUSHES !== "false";
+const P3_EXHAUSTED_WITHHOLD_PUSHES = defaultOnSwitch(process.env, "P3_EXHAUSTED_WITHHOLD_PUSHES");
 const vaultLpCranker =
-  process.env.VAULT_LP_MARK_CRANK_ENABLED === "false" || DRY_RUN
+  !defaultOnSwitch(process.env, "VAULT_LP_MARK_CRANK_ENABLED") || DRY_RUN
     ? null
     : new VaultLpCranker(devnetConn, keeper, ALERT_SINK, {
         wrapperProgramId: CFG_WRAPPER_PROGRAM_ID,
@@ -611,12 +611,12 @@ const vaultLpCranker =
   if (loserForceClose) feeJobs.push(makeResolvedLoserForceCloseJob(loserForceClose));
   if (TERMINAL_INSURANCE_ENABLED) feeJobs.push(makeTerminalInsuranceJob(TERMINAL_CONFIG));
   // Read-only: alerts when a bound vault's seniors are done but the junior's tag 102 has not run.
-  if (process.env.JUNIOR_WATCH_ENABLED !== "false") feeJobs.push(makeJuniorWatchJob(JUNIOR_WATCH_CONFIG));
+  if (defaultOnSwitch(process.env, "JUNIOR_WATCH_ENABLED")) feeJobs.push(makeJuniorWatchJob(JUNIOR_WATCH_CONFIG));
   // Read-only: warn / critical when a Live market's bankrupt close nears / passes max_close_slot with residual.
-  if (process.env.BANKRUPT_CLOSE_WATCH_ENABLED !== "false") feeJobs.push(makeBankruptCloseWatchJob(BANKRUPT_CLOSE_CONFIG));
+  if (defaultOnSwitch(process.env, "BANKRUPT_CLOSE_WATCH_ENABLED")) feeJobs.push(makeBankruptCloseWatchJob(BANKRUPT_CLOSE_CONFIG));
   // P3 senior backing exhausted: critical alert with the tag 39 window, push withholding,
   // and tag 39 sent by the keeper once the stale window has matured.
-  if (process.env.P3_EXHAUSTED_RESOLVE_ENABLED !== "false") {
+  if (defaultOnSwitch(process.env, "P3_EXHAUSTED_RESOLVE_ENABLED")) {
     feeJobs.push(
       makeExhaustedResolveJob({
         wrapperProgramId: CFG_WRAPPER_PROGRAM_ID,

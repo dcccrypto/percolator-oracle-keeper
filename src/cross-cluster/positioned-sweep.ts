@@ -44,6 +44,7 @@ import type { CrankPlan, PlannedCrank, PositionedPortfolio } from "./positioned-
 import { KF_DRIFT_FIELDS, assetSlotsOff, detectLayout, engineSlotBase, layoutById } from "./market-layout.ts";
 import type { MarketLayout, MarketLayoutId } from "./market-layout.ts";
 import { buildLivenessRepairIx } from "./liveness-repair.ts";
+import { defaultOnSwitch } from "../env-utils.ts";
 import type { LivenessRepair } from "./liveness-repair.ts";
 
 // ── Market account decode (every offset comes from market-layout.ts) ─────────
@@ -417,7 +418,7 @@ export function sweepConfigFromEnv(env: Readonly<Record<string, string | undefin
 
 /** KEEPER_SWEEP_ENABLED=false keeps the legacy refresh-everything cycle even on drift-layout markets. */
 export function sweepEnabledFromEnv(env: Readonly<Record<string, string | undefined>> = process.env): boolean {
-  return env.KEEPER_SWEEP_ENABLED !== "false";
+  return defaultOnSwitch(env, "KEEPER_SWEEP_ENABLED");
 }
 
 /** Refreshes that fit one sweep tx beside the accrual (and `extraCu` of other cranks) under MAX_TX_CU. */

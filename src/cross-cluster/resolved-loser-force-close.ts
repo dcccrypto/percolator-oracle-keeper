@@ -58,6 +58,7 @@ import { addKeeperPriorityFee } from "./priority-fee.ts";
 import { S16acGateState, s16acEngineDeployed } from "./s16ac-engine-gate.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
 import { WRAPPER_PROGRAM_ID, NFT_PROGRAM_ID } from "../program-ids.ts";
+import { defaultOnSwitch } from "../env-utils.ts";
 
 /** Wrapper EngineLockActive: the S1-6 (c) wait when a resolved close is refused on a Resolved market. */
 export const WRAPPER_ERR_ENGINE_LOCK_ACTIVE = 21;
@@ -84,7 +85,7 @@ export interface LoserForceCloseConfig {
 }
 
 export function loserForceCloseConfigFromEnv(env: Readonly<Record<string, string | undefined>>): LoserForceCloseConfig | null {
-  if (env.RESOLVED_LOSER_FORCE_CLOSE_ENABLED === "false") return null;
+  if (!defaultOnSwitch(env, "RESOLVED_LOSER_FORCE_CLOSE_ENABLED")) return null;
   return {
     wrapperProgramId: WRAPPER_PROGRAM_ID,
     nftProgramId: NFT_PROGRAM_ID,
