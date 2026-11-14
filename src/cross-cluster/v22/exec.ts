@@ -23,6 +23,16 @@ import { redactErrorText } from "./redact.ts";
 /** Compute-budget instructions buildTx puts in front of the caller's list (heap frame + unit limit). */
 export const COMPUTE_IX_COUNT = 2;
 
+/** Simulation / RPC error that means the tx's recent blockhash is unknown to the cluster. */
+export function isBlockhashNotFound(err: unknown): boolean {
+  return err === "BlockhashNotFound";
+}
+
+/** confirmBySignature "not-landed" reason that means the blockhash can no longer land. */
+export function isConfirmBlockhashExpiry(reason: string): boolean {
+  return /block height exceeded|BlockhashNotFound|TransactionExpired/i.test(reason);
+}
+
 export type ExecConnection = Pick<Connection, "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "getBlockHeight" | "getSignatureStatuses">;
 
 export interface ExecContext {
@@ -34,6 +44,11 @@ export interface ExecContext {
   /** Extra signers (a new account being created); the keeper always signs. */
   extraSigners?: ReadonlyArray<Keypair>;
   log?: (line: string) => void;
+  /**
+   * Drop a held per-round blockhash (set by `withRoundBlockhash`). Called after a
+   * send error or a confirmation expiry so later txs in the same round refetch.
+   */
+  invalidateBlockhash?: () => void;
 }
 
 export interface ExecOptions {
@@ -164,7 +179,10 @@ export async function simulateAndSend(
 
   async function run(): Promise<ExecOutcome> {
     try {
-      const { blockhash, lastValidBlockHeight } = await ctx.conn.getLatestBlockhash("confirmed");
+      let { blockhash, lastValidBlockHeight } = await ctx.conn.getLatestBlockhash("confirmed");
+      // At most one blockhash refetch + resimulate per call. The conn proxy cannot retry:
+      // the compiled tx still carries the stale hash, so we rebuild after refetching.
+      let blockhashRetried = false;
       const dry = ctx.dryRun || o.dryRun === true;
       let list: readonly TransactionInstruction[] = ixs;
       const make = (l: readonly TransactionInstruction[]): Transaction => {
@@ -178,9 +196,27 @@ export async function simulateAndSend(
           commitment: "processed",
           ...(withAccounts && o.accounts ? { accounts: { encoding: "base64" as const, addresses: [...o.accounts] } } : {}),
         });
-      let tx = make(list);
-      let sim = await simulate(tx, o.extend !== undefined && o.accounts !== undefined);
+      const refreshBlockhash = async (): Promise<boolean> => {
+        if (blockhashRetried) return false;
+        blockhashRetried = true;
+        ctx.invalidateBlockhash?.();
+        const fresh = await ctx.conn.getLatestBlockhash("confirmed");
+        blockhash = fresh.blockhash;
+        lastValidBlockHeight = fresh.lastValidBlockHeight;
+        return true;
+      };
+      const simulateMaybeRetry = async (l: readonly TransactionInstruction[], withAccounts: boolean): Promise<{ tx: Transaction; sim: Awaited<ReturnType<typeof simulate>> }> => {
+        let tx = make(l);
+        let sim = await simulate(tx, withAccounts);
+        if (isBlockhashNotFound(sim.value.err) && (await refreshBlockhash())) {
+          tx = make(l);
+          sim = await simulate(tx, withAccounts);
+        }
+        return { tx, sim };
+      };
+      let { tx, sim } = await simulateMaybeRetry(list, o.extend !== undefined && o.accounts !== undefined);
       const firstSim = sim;
+      const firstTx = tx;
       if (!sim.value.err && o.extend && o.accounts) {
         let ext: readonly TransactionInstruction[] | null = null;
         try {
@@ -191,8 +227,7 @@ export async function simulateAndSend(
         }
         if (ext && ext.length > 0) {
           list = ext;
-          tx = make(list);
-          sim = await simulate(tx, o.verifyExtended !== undefined);
+          ({ tx, sim } = await simulateMaybeRetry(list, o.verifyExtended !== undefined));
           if (!sim.value.err && o.verifyExtended) {
             let why: string | null = null;
             try {
@@ -203,7 +238,7 @@ export async function simulateAndSend(
             }
             if (why) {
               list = ixs;
-              tx = make(list);
+              tx = firstTx;
               sim = firstSim;
             }
           }
@@ -224,8 +259,15 @@ export async function simulateAndSend(
       }
       const hold = o.beforeSend?.() ?? null;
       if (hold) return { kind: "held", reason: hold };
-      const sig = await ctx.conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
+      let sig: string;
+      try {
+        sig = await ctx.conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
+      } catch (err) {
+        ctx.invalidateBlockhash?.();
+        throw err;
+      }
       const c = await confirmBySignature(ctx.conn, sig, blockhash, lastValidBlockHeight, ctx.confirm);
+      if (c.status === "not-landed" && isConfirmBlockhashExpiry(c.reason)) ctx.invalidateBlockhash?.();
       const landedSlot = c.status === "landed" ? c.slot : null;
       const failCode = c.status === "failed" ? c.code : null;
       return { kind: "sent", signature: sig, landed: c.status, failCode, landedSlot, unitsConsumed: units, logs };
@@ -237,18 +279,27 @@ export async function simulateAndSend(
 
 /** Simulate only (a quote). Never sends, never signs. */
 export async function simulateOnly(
-  ctx: Pick<ExecContext, "conn" | "keeper">,
+  ctx: Pick<ExecContext, "conn" | "keeper" | "invalidateBlockhash">,
   ixs: readonly TransactionInstruction[],
   o: Pick<ExecOptions, "units" | "program">,
   extra?: { accounts?: string[] },
 ): Promise<{ err: unknown; logs: string[]; unitsConsumed: number | null; code: number | null; accounts: Array<{ data: [string, string] } | null> | null }> {
-  const { blockhash } = await ctx.conn.getLatestBlockhash("confirmed");
-  const tx = buildTx(ctx.keeper, ixs, { job: "sim", label: "sim", units: o.units }, blockhash);
-  const sim = await ctx.conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), {
-    sigVerify: false,
-    commitment: "processed",
-    ...(extra?.accounts ? { accounts: { encoding: "base64" as const, addresses: extra.accounts } } : {}),
-  });
+  let { blockhash } = await ctx.conn.getLatestBlockhash("confirmed");
+  const simulate = (hash: string) => {
+    const tx = buildTx(ctx.keeper, ixs, { job: "sim", label: "sim", units: o.units }, hash);
+    return ctx.conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), {
+      sigVerify: false,
+      commitment: "processed",
+      ...(extra?.accounts ? { accounts: { encoding: "base64" as const, addresses: extra.accounts } } : {}),
+    });
+  };
+  let sim = await simulate(blockhash);
+  // Same one-shot BlockhashNotFound retry as simulateAndSend. No second retry.
+  if (isBlockhashNotFound(sim.value.err)) {
+    ctx.invalidateBlockhash?.();
+    blockhash = (await ctx.conn.getLatestBlockhash("confirmed")).blockhash;
+    sim = await simulate(blockhash);
+  }
   const err = sim.value.err;
   return {
     err,

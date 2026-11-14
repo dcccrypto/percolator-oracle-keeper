@@ -809,13 +809,19 @@ function logMergedSkip(deps: SweepDeps, market: string, label: string, why: stri
 
 /**
  * One `getLatestBlockhash` per round instead of one per simulated / sent tx. Concurrent phase-1 txs share the in-flight request;
- * a failed fetch is not kept; a held value expires after BLOCKHASH_MAX_AGE_MS (well inside the 60-90 s validity). Each tx of a round
- * carries different instructions, so sharing the blockhash cannot produce a duplicate signature.
+ * a failed fetch is not kept; a held value expires after BLOCKHASH_MAX_AGE_MS (well inside the 60-90 s validity).
+ * The held value is also dropped on a send error, a confirmation expiry (block height exceeded / BlockhashNotFound /
+ * TransactionExpired), or a simulate `BlockhashNotFound` (exec then refetches, rebuilds the tx, and retries that
+ * simulate once — the proxy itself does not retry, because the compiled tx still carries the stale hash).
+ * Each tx of a round carries different instructions, so sharing the blockhash cannot produce a duplicate signature.
  */
 export function withRoundBlockhash(deps: SweepDeps, now: () => number = Date.now): SweepDeps {
   const conn = deps.exec.conn;
   type Bh = Awaited<ReturnType<typeof conn.getLatestBlockhash>>;
   const held = new Map<string, { p: Promise<Bh>; at: number }>();
+  const clear = (): void => {
+    held.clear();
+  };
   const proxied = new Proxy(conn, {
     get(t, prop) {
       if (prop === "getLatestBlockhash") {
@@ -832,18 +838,29 @@ export function withRoundBlockhash(deps: SweepDeps, now: () => number = Date.now
         };
       }
       if (prop === "simulateTransaction") {
-        // an unknown blockhash poisons every later tx of the round: drop the held one so the next call refetches
+        // an unknown blockhash poisons every later tx of the round: drop the held one so exec can refetch and retry once
         return async (...a: Parameters<typeof conn.simulateTransaction>) => {
           const r = await t.simulateTransaction(...a);
-          if (r.value.err === "BlockhashNotFound") held.clear();
+          if (r.value.err === "BlockhashNotFound") clear();
           return r;
         };
+      }
+      if (prop === "sendRawTransaction") {
+        // async/await so a synchronous throw is also cleared, not only a rejected promise
+        return (async (...a: Parameters<typeof conn.sendRawTransaction>) => {
+          try {
+            return await t.sendRawTransaction(...a);
+          } catch (err) {
+            clear();
+            throw err;
+          }
+        }) as typeof conn.sendRawTransaction;
       }
       const v = Reflect.get(t, prop, t);
       return typeof v === "function" ? v.bind(t) : v;
     },
   });
-  return { ...deps, exec: { ...deps.exec, conn: proxied } };
+  return { ...deps, exec: { ...deps.exec, conn: proxied, invalidateBlockhash: clear } };
 }
 
 /**
