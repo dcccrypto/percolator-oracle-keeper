@@ -239,7 +239,10 @@ export interface FitResult {
 /** Worst first (lowest ratio), then take while count and compute fit. Pure; the size bound is applied by `fitSize`. */
 export function fitLiquidations(i: FitInput): FitResult {
   const cap = (i.maxCu ?? LIQ_TX_MAX_CU) - LIQ_TX_HEADROOM_CU;
-  const order = [...i.flagged].sort((a, b) => (a.ratioBps < b.ratioBps ? -1 : a.ratioBps > b.ratioBps ? 1 : a.portfolio.pubkey.toBase58() < b.portfolio.pubkey.toBase58() ? -1 : 1));
+  const order = i.flagged
+    .map((f) => ({ f, k: f.portfolio.pubkey.toBase58() }))
+    .sort((a, b) => (a.f.ratioBps < b.f.ratioBps ? -1 : a.f.ratioBps > b.f.ratioBps ? 1 : a.k < b.k ? -1 : 1))
+    .map((e) => e.f);
   const chosen: FlaggedAccount[] = [];
   const deferred: FitResult["deferred"] = [];
   let cu = i.baseCu;
