@@ -231,15 +231,19 @@ export async function startFeeJobLoop(
               (waiting.length ? ` — waiting: ${waiting.map((w) => `${w.label}: ${clipKeepingCode(w.reason, 100)}`).join(" | ")}` : ""),
           );
         }
-        sink.health(`fee-jobs:${job.name}`, {
-          cycle,
-          ...summary,
-          blockedMarkets: r.blocked.map((b) => b.label),
-          waitingMarkets: waiting.map((w) => w.label),
-          failedMarkets: r.failed.map((f) => f.label),
-        });
-        await sink.reconcile(`fee-jobs:${job.name}`, trackers.get(job.name)!.alertsFor(r));
-        for (const e of r.events) await sink.fire(`fee-jobs:${job.name}:events`, e);
+        try {
+          sink.health(`fee-jobs:${job.name}`, {
+            cycle,
+            ...summary,
+            blockedMarkets: r.blocked.map((b) => b.label),
+            waitingMarkets: waiting.map((w) => w.label),
+            failedMarkets: r.failed.map((f) => f.label),
+          });
+          await sink.reconcile(`fee-jobs:${job.name}`, trackers.get(job.name)!.alertsFor(r));
+        } finally {
+          // One-shot events must go out even if health/reconcile threw (the catch below logs it).
+          for (const e of r.events) await sink.fire(`fee-jobs:${job.name}:events`, e);
+        }
       } catch (err) {
         console.error(`[${job.name}] sweep error — ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`);
       }
