@@ -11,6 +11,14 @@
  * reached" / 500 / 502-504 / repeated network errors. Because it sits at that seam it covers reads AND sends, and any
  * Connection built with it (the keeper's, the pusher's, the preflight's).
  *
+ * DEADLINE: web3.js passes no AbortSignal, so an endpoint that accepts a request and never answers used to hold it
+ * ~306 s (undici's default) before anything failed over. Each attempt now carries its own deadline (default 20 s, env
+ * `RPC_REQUEST_TIMEOUT_MS`) covering headers and body; a timeout counts as a network error and the next endpoint is
+ * tried. Solana RPC computes a reply before sending headers, so the deadline mainly has to clear server compute
+ * (public devnet, 2026-11-05: slowest call 0.32 s; a 9 MB getProgramAccounts body arrived 0.41 s after its headers).
+ * A body that stalls after headers is cut at the deadline too, but web3.js is reading it by then, so that call fails
+ * instead of failing over.
+ *
  * SAFETY, per endpoint, before it is ever used (and again after each outage):
  *  - cluster: `getGenesisHash` must equal the expected genesis for the cluster. A mismatching endpoint is
  *    REFUSED for the life of the process (a devnet keeper must never push through a mainnet fallback).
@@ -169,6 +177,9 @@ export interface RpcFailoverOptions {
   /** Consecutive network errors / 5xx before an endpoint is marked down. Default 3. */
   networkErrorThreshold?: number;
   probeTimeoutMs?: number; // default 5_000
+  /** Per-attempt deadline (headers AND body) for traffic; on expiry the attempt counts as a network error and the next
+   *  endpoint is tried. Default 20_000 (env `RPC_REQUEST_TIMEOUT_MS`). */
+  requestTimeoutMs?: number;
   /** Upper bound on chain speed (slots/s) until it is measured; also caps an uncorroborated rate report. Default 5. */
   slotsPerSecond?: number;
   /** Re-measure the chain speed at the next agreement of two endpoints once the measurement is this old. Default 600_000. */
@@ -264,6 +275,7 @@ export class RpcFailover {
       | "backoffMaxMs"
       | "networkErrorThreshold"
       | "probeTimeoutMs"
+      | "requestTimeoutMs"
       | "slotsPerSecond"
       | "rateRefreshMs"
       | "pinMs"
@@ -321,6 +333,7 @@ export class RpcFailover {
       backoffMaxMs: opts.backoffMaxMs ?? 300_000,
       networkErrorThreshold: opts.networkErrorThreshold ?? 3,
       probeTimeoutMs: opts.probeTimeoutMs ?? 5_000,
+      requestTimeoutMs: opts.requestTimeoutMs ?? 20_000,
       slotsPerSecond: opts.slotsPerSecond ?? DEFAULT_MAX_SLOTS_PER_SECOND,
       rateRefreshMs: opts.rateRefreshMs ?? 600_000,
       pinMs: opts.pinMs ?? 60_000,
@@ -927,16 +940,22 @@ export class RpcFailover {
       }
       let res: Response;
       try {
-        res = await this.base(ep.url, init);
+        // Never cleared: web3.js reads the body after we return, and the deadline must bound that too (see DEADLINE above).
+        const deadline = AbortSignal.timeout(this.cfg.requestTimeoutMs);
+        res = await this.base(ep.url, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline });
       } catch (e) {
+        if (init?.signal?.aborted) throw e; // the caller cancelled: not an endpoint failure, do not fail over
         lastErr = e;
-        if (++ep.consecutiveFailures >= this.cfg.networkErrorThreshold) {
+        // Requests that hung on one endpoint time out together. Once it is down, the rest must not stretch its cooldown
+        // (10 concurrent failures used to mark it down 8 times: 2 s became 256 s). The re-vet after the cooldown resets the count.
+        if (this.now() >= ep.downUntil && ++ep.consecutiveFailures >= this.cfg.networkErrorThreshold) {
           this.markDown(ep, `${ep.consecutiveFailures} consecutive network errors: ${e instanceof Error ? e.message : String(e)}`);
         }
         continue;
       }
       let body = "";
-      if (res.status === 401 || res.status === 402 || res.status === 403) {
+      // Buffer every error body while its deadline is live: web3.js reads a kept lastRes only after later endpoints are tried.
+      if (res.status >= 400) {
         try {
           body = await res.clone().text();
         } catch {
@@ -1100,6 +1119,7 @@ export function failoverFromEnv(
     backoffMaxMs: envNumber(env.RPC_BACKOFF_MAX_MS, 300_000),
     floorReseedMs: envNumber(env.RPC_FLOOR_RESEED_MS, 300_000),
     allDownAlertMs: envNumber(env.RPC_ALL_DOWN_ALERT_MS, 120_000),
+    requestTimeoutMs: envNumber(env.RPC_REQUEST_TIMEOUT_MS, 20_000),
   });
   registerRpcFailover(cluster, f);
   console.log(`[rpc-failover:${cluster}] ordered endpoints: ${[primaryUrl, ...fallbacks].map(redactUrl).join(" > ")}`);
