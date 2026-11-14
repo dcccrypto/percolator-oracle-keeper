@@ -152,17 +152,14 @@ export interface PlanInput {
 }
 
 function heaviestFirst(xs: ReadonlyArray<PositionedPortfolio>): PositionedPortfolio[] {
-  return [...xs].sort((a, b) => {
-    const wa = portfolioWeight(a);
-    const wb = portfolioWeight(b);
-    if (wa !== wb) return wb - wa;
-    const la = a.lossWeight ?? 0n;
-    const lb = b.lossWeight ?? 0n;
-    if (la !== lb) return la > lb ? -1 : 1;
-    const ka = a.pubkey.toBase58();
-    const kb = b.pubkey.toBase58();
-    return ka < kb ? -1 : ka > kb ? 1 : 0;
+  // Decorate once: base58-encoding a key inside the comparator ran O(n log n) times and dominated the tick.
+  const d = xs.map((p) => ({ p, w: portfolioWeight(p), l: p.lossWeight ?? 0n, k: p.pubkey.toBase58() }));
+  d.sort((a, b) => {
+    if (a.w !== b.w) return b.w - a.w;
+    if (a.l !== b.l) return a.l > b.l ? -1 : 1;
+    return a.k < b.k ? -1 : a.k > b.k ? 1 : 0;
   });
+  return d.map((e) => e.p);
 }
 
 /**
