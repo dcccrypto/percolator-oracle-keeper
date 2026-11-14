@@ -54,6 +54,7 @@ describe("the live entry point refuses a never-pushing cadence", () => {
   it("CC_INTERVAL_MS=4000 with the default 15 s window: exit 1 with a [fatal] line", async () => {
     const env: Record<string, string | undefined> = { ...process.env };
     delete env.CC_MARK_WINDOW_MS; // the DEFAULT 15 s window is what the runbook warns about
+    delete env.KEEPER_DRY_RUN; // an inherited dry-run flag must not change the fatal-exit path
     const r = await new Promise<{ code: number | null; out: string }>((resolve) => {
       const child = spawn(process.execPath, ["--import", "tsx/esm", path.join(ROOT, "src", "cross-cluster.ts")], {
         cwd: ROOT,
@@ -72,7 +73,9 @@ describe("the live entry point refuses a never-pushing cadence", () => {
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.stderr.on("data", (d) => (out += d.toString()));
-      const timer = setTimeout(() => child.kill("SIGKILL"), 20_000);
+      // Cold start of cross-cluster.ts (tsx compile + imports) measured 11-27 s under load ~30; the child
+      // exits by itself on the fatal line, so this is only a hang backstop and can be generous.
+      const timer = setTimeout(() => child.kill("SIGKILL"), 90_000);
       child.on("close", (code) => { clearTimeout(timer); resolve({ code, out }); });
     });
     assert.equal(r.code, 1, r.out.slice(-400));
