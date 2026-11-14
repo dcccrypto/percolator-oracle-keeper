@@ -258,24 +258,23 @@ describe("P2bLoop tick details", () => {
     assert.match(logs.join("\n"), /probe exploded/);
   });
 
-  it("healthFields is {} while unsupported and, once supported, exposes wallet + counters with no hedged rows before the first evaluation", async () => {
+  it("healthFields is {} while unsupported or before the first tick, and once supported exposes wallet + counters with an empty hedged list", async () => {
     const off = build({ gate: "mode-off", markets: [market("A")] });
     await off.loop.tick();
     assert.deepEqual(off.loop.healthFields(), {});
     const on = build({ gate: "supported", markets: [market("A")] });
-    const before = on.loop.healthFields() as { p2b: { hedgedLockout: unknown[]; walletLow: boolean } };
-    assert.deepEqual(before, {});
+    assert.deepEqual(on.loop.healthFields(), {}, "gate not probed yet");
     await on.loop.tick();
     const f = on.loop.healthFields() as { earnVaults: unknown[]; p2b: { hedgedLockout: unknown[]; walletLow: boolean; allocate: unknown; windDown: unknown } };
     assert.deepEqual(f.earnVaults, []);
     assert.equal(f.p2b.walletLow, false);
-    assert.ok(Array.isArray(f.p2b.hedgedLockout));
+    assert.deepEqual(f.p2b.hedgedLockout, []);
     assert.ok(f.p2b.allocate && f.p2b.windDown);
   });
 });
 
 describe("startP2bLoop", () => {
-  it("ticks, then exits cleanly once SIGTERM is delivered (no extra tick after the stop flag), and logs its tick cadence", async () => {
+  it("ticks, then exits cleanly once SIGTERM is delivered (no extra tick after the stop flag), and logs its tick cadence", { timeout: 10_000 }, async () => {
     const before = { int: process.listeners("SIGINT"), term: process.listeners("SIGTERM") };
     const logs: string[] = [];
     const ol = console.log;
@@ -298,7 +297,7 @@ describe("startP2bLoop", () => {
     assert.match(logs[0], /\[p2b\] loop starting: tick=1000ms/);
   });
 
-  it("SIGINT also stops it", async () => {
+  it("SIGINT also stops it", { timeout: 10_000 }, async () => {
     const before = { int: process.listeners("SIGINT"), term: process.listeners("SIGTERM") };
     const ol = console.log;
     console.log = () => undefined;
