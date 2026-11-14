@@ -814,22 +814,33 @@ function logMergedSkip(deps: SweepDeps, market: string, label: string, why: stri
  */
 export function withRoundBlockhash(deps: SweepDeps, now: () => number = Date.now): SweepDeps {
   const conn = deps.exec.conn;
-  let held: { p: Promise<Awaited<ReturnType<typeof conn.getLatestBlockhash>>>; at: number } | null = null;
+  type Bh = Awaited<ReturnType<typeof conn.getLatestBlockhash>>;
+  const held = new Map<string, { p: Promise<Bh>; at: number }>();
   const proxied = new Proxy(conn, {
     get(t, prop) {
-      if (prop !== "getLatestBlockhash") {
-        const v = Reflect.get(t, prop, t);
-        return typeof v === "function" ? v.bind(t) : v;
+      if (prop === "getLatestBlockhash") {
+        return (...a: Parameters<typeof conn.getLatestBlockhash>) => {
+          const ck = JSON.stringify(a[0] ?? null);
+          const h = held.get(ck);
+          if (h && now() - h.at <= BLOCKHASH_MAX_AGE_MS) return h.p;
+          const entry = { p: t.getLatestBlockhash(...a), at: now() };
+          held.set(ck, entry);
+          entry.p.catch(() => {
+            if (held.get(ck) === entry) held.delete(ck);
+          });
+          return entry.p;
+        };
       }
-      return (...a: Parameters<typeof conn.getLatestBlockhash>) => {
-        if (held && now() - held.at <= BLOCKHASH_MAX_AGE_MS) return held.p;
-        const entry = { p: t.getLatestBlockhash(...a), at: now() };
-        held = entry;
-        entry.p.catch(() => {
-          if (held === entry) held = null;
-        });
-        return entry.p;
-      };
+      if (prop === "simulateTransaction") {
+        // an unknown blockhash poisons every later tx of the round: drop the held one so the next call refetches
+        return async (...a: Parameters<typeof conn.simulateTransaction>) => {
+          const r = await t.simulateTransaction(...a);
+          if (r.value.err === "BlockhashNotFound") held.clear();
+          return r;
+        };
+      }
+      const v = Reflect.get(t, prop, t);
+      return typeof v === "function" ? v.bind(t) : v;
     },
   });
   return { ...deps, exec: { ...deps.exec, conn: proxied } };
