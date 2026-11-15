@@ -1106,6 +1106,16 @@ export async function readAllPoolPricesE6(
               /* no e12 this cycle: the per-lot mark falls back to the e6 price */
             }
           }
+        } else if (pricesE12) {
+          // Tiny price (< $0.000001): e6 floors to 0. The pool stays out of `out` (a default-scale market drops it exactly
+          // as before); only the e12 sink carries it, for the keeper's lot_exp > 0 tiny-price path (percolator-prog #711).
+          try {
+            const dec = decimalsCache.get(entry.poolAddress)!;
+            const e12 = computeDexSpotPriceE6("meteora-dlmm", data, undefined, { base: dec.base + 6, quote: dec.quote });
+            if (e12 > 0n) pricesE12.set(entry.poolAddress, e12);
+          } catch {
+            /* no e12 this cycle: dropped as before */
+          }
         }
       } else if (entry.dexType === "pumpswap") {
         const parsed = parseDexPool("pumpswap", pubkeys[i], data);
@@ -1192,6 +1202,10 @@ export async function readAllPoolPricesE6(
               const usdE12 = meteoraWsolPriceToUsdE12(poolData, dec, solPriceE6);
               if (usdE12 > 0n) pricesE12.set(entry.poolAddress, usdE12);
             }
+          } else if (pricesE12) {
+            // Tiny price: e6 is 0, so the pool stays out of `out`; only the e12 sink carries it (lot_exp > 0 path).
+            const usdE12 = meteoraWsolPriceToUsdE12(poolData, dec, solPriceE6);
+            if (usdE12 > 0n) pricesE12.set(entry.poolAddress, usdE12);
           }
         } catch {
           /* skip this pool for this cycle; next cycle retries */
@@ -1307,6 +1321,9 @@ export async function readAllPoolPricesE6(
             );
             if (reserve !== null && reserve > 0n) quoteReservesUsdE6.set(entry.poolAddress, reserve);
           }
+        } else if (priceE12 > 0n) {
+          // Tiny price: e6 is 0, so the pool stays out of `out`; only the e12 sink carries it (lot_exp > 0 path).
+          pricesE12?.set(entry.poolAddress, priceE12);
         }
       } catch {
         // e.g. WSOL-quoted but solPriceE6 unavailable this cycle (SOL/USD read
