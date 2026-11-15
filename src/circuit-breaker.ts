@@ -385,6 +385,9 @@ export function checkCircuitBreaker(
   newPrice: number,
   cfg: CircuitBreakerConfig,
 ): number | null {
+  // A source that is not a positive finite number is not a price. Fail closed before touching any state:
+  // otherwise a sustained NaN/0/negative run reaches the K-3 snap and becomes the baseline.
+  if (!Number.isFinite(newPrice) || !(newPrice > 0)) return null;
   if (state.lastPrice === 0) return newPrice; // First price — always accept.
   const nowMs = (cfg.now ?? Date.now)();
   const baseline = state.lastPrice;
