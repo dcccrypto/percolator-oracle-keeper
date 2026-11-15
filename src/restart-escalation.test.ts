@@ -40,3 +40,16 @@ test("a corrupt file or unwritable path never throws", () => {
   assert.equal(recordLaunch(p, 1, 5, MIN).health.launchesInWindow, 1);
   assert.doesNotThrow(() => recordLaunch("/nonexistent-dir/x.json", 1, 5, MIN));
 });
+
+test("a failed webhook delivery does not burn the alert window; retries are capped", async () => {
+  const { MAX_ALERT_RETRIES, recordAlertFailure } = await import("./restart-escalation.ts");
+  const p = tmp();
+  let t = 0;
+  for (let i = 0; i < 4; i++) recordLaunch(p, (t += MIN), 5, 15 * MIN);
+  assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, true);
+  assert.equal(recordAlertFailure(p), true); // delivery failed -> stamp rolled back
+  assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, true); // retried on next launch
+  for (let i = 0; i < MAX_ALERT_RETRIES - 1; i++) recordAlertFailure(p);
+  // cap reached: stamp stays, a dead endpoint is not retried again this window
+  assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, false);
+});
