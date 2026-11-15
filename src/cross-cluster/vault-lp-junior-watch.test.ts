@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import { deriveLpBackingLedger, deriveLpVaultRegistry } from "@percolatorct/sdk";
-import { ledgerTotalPrincipal, watchJuniorRelease } from "./vault-lp-junior-watch.ts";
+import { juniorWatchConfigFromEnv, ledgerTotalPrincipal, vaultLpSeniorClaim, watchJuniorRelease } from "./vault-lp-junior-watch.ts";
 import { deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 import { FeeJobFailureTracker, runFeeJobSweep } from "./fee-jobs.ts";
 import { makeJuniorWatchJob } from "./vault-lp-junior-watch.ts";
@@ -100,4 +100,82 @@ describe("vault-LP junior-release watch (P3 F-14)", () => {
       assert.equal(streaks.has(MKT.toBase58()), false);
     });
   }
+});
+
+describe("vault-LP junior-release watch: edge branches", () => {
+  const run = (c: unknown, streaks = new Map<string, number>([[MKT.toBase58(), 4]])) =>
+    watchJuniorRelease(c as never, MKT.toBase58(), CFG, streaks).then((o) => ({ o, streaks }));
+
+  it("unparseable market address fails without touching the connection", async () => {
+    const o = await watchJuniorRelease({ getMultipleAccountsInfo: async () => assert.fail("no RPC") } as never, "not-a-pubkey", CFG, new Map());
+    assert.deepEqual(o, { kind: "failed", error: "unparseable market address" });
+  });
+
+  it("a missing account (market / registry / state) is nothing and resets the streak", async () => {
+    const none = { async getMultipleAccountsInfo(keys: PublicKey[]) { return keys.map(() => null); } };
+    const { o, streaks } = await run(none);
+    assert.equal(o.kind, "nothing");
+    assert.equal(streaks.has(MKT.toBase58()), false);
+  });
+
+  it("an undecodable vault-LP state is nothing and resets the streak", async () => {
+    const { o, streaks } = await run(conn(market(), registry(), Buffer.alloc(16 + 256), ledger()));
+    assert.equal(o.kind, "nothing");
+    assert.equal(streaks.has(MKT.toBase58()), false);
+  });
+
+  it("vaultLpSeniorClaim: null on garbage, value on a real state", () => {
+    assert.equal(vaultLpSeniorClaim(new Uint8Array(8)), null);
+    assert.equal(vaultLpSeniorClaim(new Uint8Array(vaultState(1234n))), 1234n);
+  });
+
+  it("ledgerTotalPrincipal: null when too short or wrong account kind", () => {
+    assert.equal(ledgerTotalPrincipal(new Uint8Array(10)), null);
+    const wrong = new Uint8Array(ledger());
+    wrong[10] = 2;
+    assert.equal(ledgerTotalPrincipal(wrong), null);
+  });
+
+  it("missing backing ledger is treated as released (nothing, streak reset)", async () => {
+    const real = conn(market(), registry(), vaultState(0n), ledger());
+    const led = deriveLpBackingLedger(WRAPPER, MKT, 0)[0].toBase58();
+    const c = { async getMultipleAccountsInfo(keys: PublicKey[]) {
+      return keys.length === 1 && keys[0].toBase58() === led ? [null] : real.getMultipleAccountsInfo(keys);
+    } };
+    const { o, streaks } = await run(c);
+    assert.equal(o.kind, "nothing");
+    assert.equal(streaks.has(MKT.toBase58()), false);
+  });
+
+  it("wrong-kind ledger is treated as released", async () => {
+    const bad = ledger(); bad[10] = 2;
+    const { o } = await run(conn(market(), registry(), vaultState(0n), bad));
+    assert.equal(o.kind, "nothing");
+  });
+
+  it("RPC error becomes failed with a truncated message; non-Error throws are stringified", async () => {
+    const long = "x".repeat(300);
+    const a = await run({ async getMultipleAccountsInfo() { throw new Error(long); } });
+    assert.deepEqual(a.o, { kind: "failed", error: `read/decode failed: ${"x".repeat(120)}` });
+    const b = await run({ async getMultipleAccountsInfo() { throw "boom"; } });
+    assert.deepEqual(b.o, { kind: "failed", error: "read/decode failed: boom" });
+  });
+
+  it("makeJuniorWatchJob without a streak map keeps its own state across runs", async () => {
+    const job = makeJuniorWatchJob({ ...CFG, alertCycles: 2 });
+    const ctx = { conn: conn(market(), registry(), vaultState(0n), ledger()) as never, keeper: Keypair.generate(), dryRun: false };
+    const m = { marketAddress: MKT.toBase58(), label: "M" };
+    assert.equal(job.name, "vault-lp-junior-watch");
+    assert.equal((await job.run(ctx, m)).kind, "skipped");
+    assert.equal((await job.run(ctx, m)).kind, "blocked");
+  });
+
+  it("juniorWatchConfigFromEnv: default 3, explicit value, blank, and invalid values", () => {
+    assert.deepEqual(juniorWatchConfigFromEnv({}, WRAPPER), { wrapperProgramId: WRAPPER, alertCycles: 3 });
+    assert.equal(juniorWatchConfigFromEnv({ ALERT_JUNIOR_RELEASE_CYCLES: "   " }, WRAPPER).alertCycles, 3);
+    assert.equal(juniorWatchConfigFromEnv({ ALERT_JUNIOR_RELEASE_CYCLES: "7" }, WRAPPER).alertCycles, 7);
+    for (const bad of ["0", "-1", "1.5", "abc"]) {
+      assert.throws(() => juniorWatchConfigFromEnv({ ALERT_JUNIOR_RELEASE_CYCLES: bad }, WRAPPER), /positive integer/);
+    }
+  });
 });
