@@ -192,6 +192,19 @@ describe("tiny price (e6 == 0, e12 > 0) end to end", () => {
     assert.ok(stat.lastPriceE6 >= 1_000n, `published ${stat.lastPriceE6}`);
   });
 
+  it("a tiny baseline that jumps back above $0.000001 is clamped at e12, not floored up to $0.000001", async () => {
+    const s = setup();
+    await runCycles(s, 6); // baseline $0.0000005
+    const before = rig.sent.length;
+    assert.ok(before >= 1);
+    rig.reserves = { base: 100_000_000_000_000_000n, quote: 130_000_000_000n }; // $0.0000013 (e6 = 1, +160%)
+    await runCycles(s, 8);
+    for (const tx of rig.sent.slice(before)) {
+      assert.equal(containsU64LE(tx, 1_000_000_000n) || containsU64LE(tx, 1_300_000_000n), false, "never the e6-floored $0.000001 mark nor the unclamped $0.0000013");
+    }
+    assert.ok(rig.sent.slice(before).some((tx) => containsU64LE(tx, 650_000_000n)), "the +30% band edge ($0.00000065) lands");
+  });
+
   it("default scale (lot_exp 0): dropped exactly as before - no push, same error, no push built", async () => {
     const s = setup();
     rig.lotExp = 0;

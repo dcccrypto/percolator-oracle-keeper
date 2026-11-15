@@ -1656,12 +1656,20 @@ export async function runCycle(
     // rate-limited to the edge of the cumulative bound). Publish exactly what
     // it accepted — never the smoothed price it was shown — and record that
     // same value as the pending baseline.
-    const publish = acceptedPublishPrice(
-      priceE6,
-      priceUsd,
-      acceptedUsd,
-      currentCircuitBreakerState.lastPrice,
-    );
+    // lot_exp > 0 market whose breaker baseline is sub-$0.000001 (it was priced by the tiny path): a clamp / hold that lands
+    // below $0.000001 must stay at e12. The e6 rounding below would floor it to 0 -> 1 and publish $0.000001 instead.
+    const subMicro =
+      (unitLotExpCache.get(entry.key) ?? 0) > 0 && acceptedUsd !== priceUsd && acceptedUsd < 1e-6
+        ? acceptedPublishE12(smoothedE12 ?? priceE6 * 1_000_000n, priceUsd, acceptedUsd, currentCircuitBreakerState.lastPrice)
+        : null;
+    const publish = subMicro
+      ? { priceE6: subMicro.priceE12 / 1_000_000n, priceUsd: subMicro.priceUsd }
+      : acceptedPublishPrice(
+          priceE6,
+          priceUsd,
+          acceptedUsd,
+          currentCircuitBreakerState.lastPrice,
+        );
     const { commitNow, deferred } = splitBreakerCommit(
       currentCircuitBreakerState,
       candidateCircuitBreakerState,
@@ -1672,7 +1680,8 @@ export async function runCycle(
 
     stat.lastPriceE6 = publish.priceE6;
     // e12 rides along only when the breaker published the smoothed price itself (not a clamp / hold).
-    if (publish.priceE6 !== priceE6) smoothedE12 = null;
+    if (subMicro) smoothedE12 = subMicro.priceE12;
+    else if (publish.priceE6 !== priceE6) smoothedE12 = null;
     // G8: flag off / non-CPMM / reserve unknown -> null -> the exact 35 B bytes of today.
     const depth = resolvePushDepth(pushDepthOn, attestReservesUsdE6.get(entry.poolAddress));
     noteDepthAttempt(stat, pushDepthOn && entry.dexType === "pumpswap", depth !== null, smoothNowMs);
