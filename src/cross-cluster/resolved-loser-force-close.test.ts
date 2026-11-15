@@ -561,6 +561,7 @@ describe("K-COV4: per-pass bounds and refusals", () => {
 describe("K-COV4: owner token account (ATA) creation for a payout", () => {
   // The loser's close is refused until the owner's token account exists; with the idempotent-ATA ix prepended it works.
   const ataWorld = (ataExists: boolean) => {
+    const ataSends = { count: 0 };
     const w = world({ elf: ELF.s16ac, nowSlot: AFTER, loserEscrowedPayout: true });
     (w.conn as { getMultipleAccountsInfo: unknown }).getMultipleAccountsInfo = async (keys: PublicKey[]) =>
       keys.map(() => (ataExists ? { data: Buffer.alloc(165), owner: WRAPPER, lamports: 1, executable: false } : null));
@@ -578,11 +579,12 @@ describe("K-COV4: owner token account (ATA) creation for a payout", () => {
     (w.conn as { sendRawTransaction: unknown }).sendRawTransaction = async (raw: Buffer) => {
       if (Transaction.from(raw).compileMessage().accountKeys.some((k) => k.toBase58() === ATA_PROGRAM)) {
         w.log.sends++;
+        ataSends.count++;
         return PublicKey.unique().toBase58();
       }
       return origSend(raw);
     };
-    return w;
+    return Object.assign(w, { ataSends });
   };
 
   it("a missing owner token account is created (prepended to the first chunk only) and the loser closes", async () => {
@@ -591,6 +593,8 @@ describe("K-COV4: owner token account (ATA) creation for a payout", () => {
     assert.equal(r.outcome, "closed");
     assert.deepEqual(r.closed, [LOSER.toBase58()]);
     assert.equal(r.calls, 1, "the follow-up chunk has no ATA ix and is refused again -> stop");
+    assert.equal(w.ataSends.count, 1, "exactly one sent tx carried the ATA ix");
+    assert.equal(w.log.sends, 1, "no second chunk was sent");
     assert.deepEqual(r.released, [], "the winner still waits");
   });
 
