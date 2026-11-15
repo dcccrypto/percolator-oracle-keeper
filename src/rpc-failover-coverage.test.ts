@@ -18,8 +18,11 @@ import {
  * cross-cluster/rpc-failover.test.ts do not drive. Scripted transport: each URL maps to a handler that may
  * return a Response, or return undefined to get the healthy default for that method.
  */
-const A = "https://a.example.com/?api-key=AAAAAAAAAAAAAAAA";
-const B = "https://b.example.com/?api-key=BBBBBBBBBBBBBBBB";
+const KA = "AAAAAAAAAAAAAAAA";
+const KB = "BBBBBBBBBBBBBBBB";
+const KC = "CCCCCCCCCCCCCCCC";
+const A = `https://a.example.com/?api-key=${KA}`;
+const B = `https://b.example.com/?api-key=${KB}`;
 const T0 = 1_000_000;
 
 type Handler = (method: string, n: number) => Response | Promise<Response> | undefined;
