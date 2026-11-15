@@ -151,6 +151,7 @@ export class P2bLoop {
       summary.snapshots = snaps.size;
       // Markets with no snapshot this tick (failed chunk read): not evaluated, so their alerts must neither resolve nor reset.
       const missing = new Set(refs.filter((r) => !snaps.has(r.marketAddress)).map((r) => r.label));
+      const missingAddrs = new Set(refs.filter((r) => !snaps.has(r.marketAddress)).map((r) => r.marketAddress));
       if (missing.size > 0) {
         console.warn(`[p2b] snapshots ${snaps.size}/${refs.length}: ${missing.size} markets have no snapshot this tick (tags 103/104, hedged-lockout and earn-gap skip them)`);
       }
@@ -184,7 +185,7 @@ export class P2bLoop {
 
       // 4. Earn par-E3 gap
       if (this.deps.earnGap.isDue()) {
-        const alerts = await this.deps.earnGap.run(this.deps.conn, list);
+        const alerts = await this.deps.earnGap.run(this.deps.conn, list, missingAddrs);
         await this.deps.sink.reconcile("p2b:earn-gap", alerts, missing);
         summary.earnEvaluated = true;
       }
