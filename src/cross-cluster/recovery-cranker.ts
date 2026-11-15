@@ -241,6 +241,11 @@ interface CrankMarketState {
   lastOverflowSummary: string | null;
   /** Sweep (drift-layout markets): last visit per portfolio + the current round (positioned-sweep.ts). */
   sweepCursor: SweepCursor;
+  /**
+   * A one-tx sweep's visits waiting on its signature (K-POISON): the tx is not awaited, so its refreshes are recorded
+   * at the start of the next cycle, and only if it landed. A dropped tx leaves its batch due, so it goes out again.
+   */
+  sweepPendingVisit?: PendingSweepVisit | null;
   /** Last sweep summary logged, so steady-state cycles stay quiet. */
   lastSweepSummary: string | null;
   /** Last layout problem logged at error level, and how many reads have hit it since. */
@@ -696,6 +701,7 @@ export async function crankOneMarket(
     // k portfolios per transaction instead of refreshing every positioned portfolio
     // in the accrual's slot. Legacy / unknown layout: sweepCtx stays null and the
     // cycle below is byte-for-byte the previous behaviour.
+    if (state.sweepPendingVisit) await settlePendingSweepVisit(devnetConn, state);
     const sweepCtx = pre && !v22Owned && !layoutHealth.problem ? sweepContextFor(acct.value.data, positionedAll, state, sweepCfg) : null;
     const targets = sweepCtx ? sweepCtx.firstBatch : positionedAll;
 
@@ -915,18 +921,24 @@ export async function crankOneMarket(
     if (sweepCtx) {
       // Visited = refreshed in this tx, or shown not stale by the simulation (Custom(22) prune).
       const visitedThisCycle = new Set<string>(targets.map((t) => t.pubkey.toBase58()));
-      const firstVisited = [
-        ...plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio),
-        ...resolved.pruned.filter((p) => !p.repair && p.code !== null).map((p) => p.pubkey),
-      ];
-      markVisited(state.sweepCursor, firstVisited);
+      // K-POISON: the refreshes count only once this tx LANDED; marking them at send let a dropped or failed tx
+      // advance the cursor, so its batch waited a whole round instead of going out again next cycle.
+      const firstVisit: PendingSweepVisit = {
+        signature,
+        refreshed: plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio),
+        notStale: resolved.pruned.filter((p) => !p.repair && p.code !== null).map((p) => p.pubkey),
+      };
       // Weights / epoch snaps / market epochs after the accrual tx steer the follow-ups' order.
       let epochs: SideEpochs = learnFromSim(sweepCtx, resolved.sim) ?? sweepCtx.epochs;
       let lastMarketData: Uint8Array | null = resolved.sim.marketData;
       let fu: SweepFollowupResult | null = null;
-      if (sweepCtx.pace.txs > 1) {
+      if (sweepCtx.pace.txs <= 1) {
+        // One tx this cycle, not awaited (no added latency): settled at the start of the next cycle.
+        state.sweepPendingVisit = firstVisit;
+      } else {
         // Spread across slots: each follow-up is simulated only after the previous tx landed.
         const mainLanded = await waitLanded(devnetConn, signature);
+        recordSweepVisit(state.sweepCursor, firstVisit, mainLanded === "landed");
         if (mainLanded === "landed") {
           const fuBh = await withRpcRetry(label, () => devnetConn.getLatestBlockhash("processed"));
           const toFuTx = (p: CrankPlan): Transaction => {
@@ -1382,6 +1394,40 @@ export async function runSweepFollowups(
     out.error = `sweep send failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`;
   }
   return out;
+}
+
+/** The first sweep tx's visits: its refreshes (count only if it landed) and the portfolios its simulation showed not stale. */
+export interface PendingSweepVisit {
+  signature: string;
+  refreshed: PublicKey[];
+  notStale: PublicKey[];
+}
+
+/**
+ * Record a sweep tx's visits as ONE batch (one round boundary, as `markVisited` expects). Not landed: only the
+ * simulated not-stale portfolios count; the refreshes stay due and are picked again next cycle.
+ */
+function recordSweepVisit(cursor: SweepCursor, v: PendingSweepVisit, landed: boolean): void {
+  markVisited(cursor, landed ? [...v.refreshed, ...v.notStale] : v.notStale);
+}
+
+/**
+ * Settle the previous cycle's one-tx sweep before this cycle picks its batch. An unknown status (RPC error, or the
+ * status already aged out) counts as not landed: the batch is re-picked, and its simulation prunes (and records) any
+ * portfolio that is in fact no longer stale. Never throws.
+ */
+async function settlePendingSweepVisit(conn: Pick<Connection, "getSignatureStatuses">, state: CrankMarketState): Promise<void> {
+  const v = state.sweepPendingVisit;
+  if (!v) return;
+  state.sweepPendingVisit = null;
+  let landed = false;
+  try {
+    const st = (await conn.getSignatureStatuses([v.signature])).value[0];
+    landed = st != null && !st.err;
+  } catch {
+    landed = false;
+  }
+  recordSweepVisit(state.sweepCursor, v, landed);
 }
 
 function reportSweepOutcome(label: string, state: CrankMarketState, h: SweepHealth, error: string | null): void {

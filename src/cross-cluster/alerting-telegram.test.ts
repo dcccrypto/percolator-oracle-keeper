@@ -92,6 +92,34 @@ describe("alerting: Telegram delivery", () => {
     for (const l of logs) assert.ok(!l.includes(TOKEN) && !l.includes("secret_TOKEN"), `token leaked: ${l}`);
   });
 
+  it("K-POISON: a page that failed to send does not start the 2 h repeat window; the next cooldown re-pages", async () => {
+    let t = 1_000_000;
+    let down = true;
+    const { sink, posts } = sinkWith({ now: () => t, fail: () => (down ? new Error("HTTP 502") : null) });
+    await sink.reconcile("push", [noPush]);
+    await sink.flush();
+    assert.equal(posts.length, 0, "Telegram was down: the page never arrived");
+    down = false;
+    t += DEFAULT_THRESHOLDS.cooldownMs; // still active after the 15-min cooldown, well inside 2 h
+    await sink.reconcile("push", [noPush]);
+    await sink.flush();
+    assert.equal(posts.length, 1, "the critical alert is paged now, not 2 h after a page nobody got");
+    assert.match(String(posts[0]!.body.text), /^\[CRITICAL\] percolator-keeper market-no-push/);
+  });
+
+  it("K-POISON: no RESOLVED page for an alert whose page never arrived", async () => {
+    let t = 1_000_000;
+    let down = true;
+    const { sink, posts } = sinkWith({ now: () => t, fail: () => (down ? new Error("HTTP 502") : null) });
+    await sink.reconcile("push", [noPush]);
+    await sink.flush();
+    down = false;
+    t += 60_000;
+    await sink.reconcile("push", []);
+    await sink.flush();
+    assert.equal(posts.length, 0, "nothing was paged, so nothing is resolved there");
+  });
+
   it("the stale-push conditions it carries: keeper-wide zero pushes and one market not pushed", async () => {
     const { sink, posts } = sinkWith();
     const zero = evaluatePushCycle({ cycle: 50, registered: 70, attempted: 70, pushed: 0 }, DEFAULT_THRESHOLDS.zeroPushCycles - 1, DEFAULT_THRESHOLDS);

@@ -907,6 +907,9 @@ export class AlertSink {
     this.tgChain = this.tgChain
       .then(() => this.opts.post(url, body))
       .catch((err: unknown) => {
+        // A page nobody got must not hold the next one back TELEGRAM_REPEAT_MS, nor be RESOLVED there
+        // (unless a later page of the same alert has claimed the slot since).
+        if (tag === "ALERT" && this.tgLastSent.get(key) === now) this.tgLastSent.delete(key);
         // The token is in the URL: report the failure without the URL and scrub the token from the message.
         const msg = (err instanceof Error ? err.message : String(err)).split(botToken).join("<token>");
         this.opts.logError(`[alerting] telegram delivery failed: ${msg}`);
