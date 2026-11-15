@@ -258,3 +258,84 @@ describe("tiny-price helpers", () => {
     assert.equal(acceptedPublishE12(10n, 1e-11, 1e-20, 1e-11).priceE12, 1n);
   });
 });
+
+describe("K-TINYGAP: tiny pools on the shared per-pool paths", () => {
+  it("(1) a tiny pool feeds the source-frozen clock: unchanged price keeps the start, a move resets it", async () => {
+    const s = setup();
+    await runCycles(s, 6);
+    const stat = s.state.stats.get(s.marketAddress + "#0")!;
+    assert.notEqual(stat.sourceUnchangedSince, null, "recordRawPrice ran for the tiny pool");
+    const since = stat.sourceUnchangedSince;
+    await runCycles(s, 3);
+    assert.equal(stat.sourceUnchangedSince, since, "bit-identical raw price: the frozen clock keeps its start");
+    rig.reserves = { base: 100_000_000_000_000_000n, quote: 55_000_000_000n }; // $0.00000055
+    await runCycles(s, 1);
+    assert.notEqual(stat.sourceUnchangedSince, since, "a moved raw price restarts the clock");
+  });
+
+  it("(2) samplePoolsForCycle samples a tiny pool at e12 only when the caller says it is tiny-eligible", async () => {
+    const { samplePoolsForCycle } = await import("./keeper-loop.ts");
+    const units = [{ marketAddress: "m", poolAddress: "p", source: "pool" as const }];
+    const seen: string[] = [];
+    const sm = (tag: string) => ({ smooth: (_p: string, v: bigint) => { seen.push(`${tag}:${v}`); return v; } });
+    const run = (eligible?: (m: string) => boolean) => {
+      seen.length = 0;
+      const smoothed = new Map<string, bigint | null>(), e12 = new Map<string, bigint | null>(), primed = new Set<string>();
+      samplePoolsForCycle(units, () => false, new Map(), new Map([["p", 500_000n]]), { e6: sm("e6"), e12: sm("e12") }, 1, smoothed, e12, primed, eligible);
+      return { smoothed, e12, primed };
+    };
+    const off = run(); // lot_exp 0 / no predicate: unchanged, the pool is not sampled at all
+    assert.deepEqual(seen, []);
+    assert.equal(off.primed.size, 0);
+    const on = run(() => true);
+    assert.deepEqual(seen, ["e12:500000"], "only the e12 window is fed; the e6 window stays untouched");
+    assert.equal(on.e12.get("p"), 500_000n);
+    assert.equal(on.smoothed.has("p"), false);
+    assert.ok(on.primed.has("p"));
+  });
+
+  it("(3) the vault-LP hook sees a non-zero, moving mark on a tiny market", async () => {
+    const s = setup();
+    const seen: bigint[] = [];
+    const cfg: LoopConfig = { ...config, onPushLanded: (_m, px) => { seen.push(px); } };
+    const log = console.log, warn = console.warn, err = console.error;
+    console.log = console.warn = console.error = () => {};
+    try {
+      for (let i = 0; i < 6; i++) { s.state.cycleCount++; await runCycle(s.mainnet, s.devnet, keeper, s.registry, s.decimals as never, s.state, cfg); mock.timers.tick(5_000); }
+      rig.reserves = { base: 100_000_000_000_000_000n, quote: 55_000_000_000n };
+      for (let i = 0; i < 6; i++) { s.state.cycleCount++; await runCycle(s.mainnet, s.devnet, keeper, s.registry, s.decimals as never, s.state, cfg); mock.timers.tick(5_000); }
+    } finally { console.log = log; console.warn = warn; console.error = err; }
+    assert.ok(seen.length >= 2);
+    assert.ok(seen.every((p) => p > 0n), `hook prices ${seen}`);
+    assert.ok(new Set(seen).size >= 2, "a real move changes what the hook sees");
+  });
+
+  it("(4) a tiny pumpswap pool attests depth when KEEPER_PUSH_DEPTH is on", async () => {
+    process.env.KEEPER_PUSH_DEPTH = "1";
+    try {
+      const s = setup();
+      await runCycles(s, 6);
+      const stat = s.state.stats.get(s.marketAddress + "#0")!;
+      assert.ok(rig.sent.length >= 1);
+      assert.ok(stat.lastDepthE6 !== null && stat.lastDepthE6 > 0n, `depth ${stat.lastDepthE6}`);
+    } finally { delete process.env.KEEPER_PUSH_DEPTH; }
+  });
+
+  it("lot_exp 0 tiny pool: no frozen clock, no hook call, no depth, no e12 sample (unchanged)", async () => {
+    process.env.KEEPER_PUSH_DEPTH = "1";
+    try {
+      const s = setup();
+      rig.lotExp = 0;
+      let hooks = 0;
+      const cfg: LoopConfig = { ...config, onPushLanded: () => { hooks++; } };
+      const log = console.log, warn = console.warn, err = console.error;
+      console.log = console.warn = console.error = () => {};
+      try { for (let i = 0; i < 6; i++) { s.state.cycleCount++; await runCycle(s.mainnet, s.devnet, keeper, s.registry, s.decimals as never, s.state, cfg); mock.timers.tick(5_000); } } finally { console.log = log; console.warn = warn; console.error = err; }
+      const stat = s.state.stats.get(s.marketAddress + "#0")!;
+      assert.equal(stat.sourceUnchangedSince, null);
+      assert.equal(hooks, 0);
+      assert.equal(stat.lastDepthE6, null);
+      assert.equal(rig.sent.length, 0);
+    } finally { delete process.env.KEEPER_PUSH_DEPTH; }
+  });
+});
