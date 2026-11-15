@@ -202,7 +202,7 @@ describe("tiny price (e6 == 0, e12 > 0) end to end", () => {
     assert.equal(stat.totalErrors, 6);
     assert.match(stat.lastErrorMsg ?? "", /no price|zero|below|unreadable|not priced|price/i);
     assert.equal(stat.sourcePriceE6, 0n);
-    assert.equal(rig.multiCalls, 6, "only the tiny-pool lot_exp lookup read the market (one per cycle); no push was built");
+    assert.equal(rig.multiCalls, 1, "one lot_exp read for the unit, cached (lot_exp is immutable); no push was built");
   });
 
   it("default scale (lot_exp 0) with a normal price: e6 payload, and the only market read is the pusher's own", async () => {

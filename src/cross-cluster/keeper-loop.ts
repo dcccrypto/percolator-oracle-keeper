@@ -1169,6 +1169,9 @@ export function acceptedPublishE12(
   return { priceE12: e12, priceUsd: Number(e12) / 1e12 };
 }
 
+/** lot_exp per unit key (immutable on chain), filled lazily by the tiny-price path only. */
+const unitLotExpCache = new Map<string, number>();
+
 /** A pool priced below $0.000001: no e6 price (the reader leaves it out of `prices`) but a positive e12. */
 export function tinyE12Of(prices: ReadonlyMap<string, bigint>, pricesE12: ReadonlyMap<string, bigint>, pool: string): bigint | null {
   const e6 = prices.get(pool);
@@ -1418,16 +1421,22 @@ export async function runCycle(
   // forever, while its siblings' pools were kept primed by other markets. Withholding a push must not starve its window.
   samplePoolsForCycle(units, (m) => isTerminalForPush(state, m), prices, pricesE12, { e6: markSmoother, e12: markSmootherE12 }, smoothNowMs, smoothedThisCycle, smoothedE12ThisCycle, primedPools);
   // Tiny-price pools (e6 == 0, e12 > 0): only a lot_exp > 0 market can carry them (the per-lot mark is representable).
-  // lot_exp is read from the market account ONLY for those units; a default-scale market costs no RPC and drops as before.
+  // lot_exp is immutable on chain, so it is read once per unit and only for such pools: a default-scale market with a
+  // normal price costs no RPC, and a lot_exp 0 one with a tiny price costs one read ever, then drops as before.
   const tinyLotExps = new Map<string, number>();
   {
     const tinyUnits = units.filter((u) => u.source === "pool" && tinyE12Of(prices, pricesE12, u.poolAddress) !== null && !isTerminalForPush(state, u.marketAddress));
-    if (tinyUnits.length > 0) {
+    const unknown = tinyUnits.filter((u) => !unitLotExpCache.has(u.key));
+    if (unknown.length > 0) {
       try {
-        for (const [k, v] of await fetchUnitLotExps(devnetConn, tinyUnits)) if (v > 0) tinyLotExps.set(k, v);
+        for (const [k, v] of await fetchUnitLotExps(devnetConn, unknown)) unitLotExpCache.set(k, v);
       } catch (err) {
         console.warn(`[loop] tiny-price lot_exp read failed (those pools drop this cycle): ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}`);
       }
+    }
+    for (const u of tinyUnits) {
+      const v = unitLotExpCache.get(u.key);
+      if (v !== undefined && v > 0) tinyLotExps.set(u.key, v);
     }
   }
   const tinyPricePush = (
