@@ -1156,4 +1156,29 @@ describe("coverage: fail-safe branches (risk-key parse, guard read errors, hook 
     await assert.doesNotReject(k.onPushLanded(w.market.toBase58(), "T"));
     assert.ok(logs.some((l) => l.includes("push hook failed") && l.includes("push hook boom")));
   });
+
+  it("healthFields reports the flags, risk-key presence, dry-run and the stats, without any key material", async () => {
+    const w = world();
+    const c = levConn({ accounts: w.accounts });
+    const rk = Keypair.generate();
+    const { k } = keeperOf(c.conn, cfg({ poke: true, w1: true }), { dryRun: true, riskKey: rk });
+    const h = k.healthFields();
+    assert.equal(h.poke, true);
+    assert.equal(h.holderJob, false);
+    assert.equal(h.w1, true);
+    assert.equal(h.riskKey, true);
+    assert.equal(h.dryRun, true);
+    assert.deepEqual(h.markets, {});
+    assert.ok(!JSON.stringify(h).includes(rk.publicKey.toBase58()));
+    assert.equal(keeperOf(c.conn, cfg()).k.healthFields().riskKey, false);
+  });
+
+  it("pokeOnce under a global dry-run simulates but sends nothing, and counts dryRun", async () => {
+    const w = world();
+    const c = levConn({ accounts: w.accounts });
+    const { k } = keeperOf(c.conn, cfg({ poke: true }), { dryRun: true });
+    assert.equal(await k.pokeOnce(w.market.toBase58(), "T", "pre-allocate"), "dry-run");
+    assert.equal(k.stats.pokes.dryRun, 1);
+    assert.equal(c.base.sentData.length, 0);
+  });
 });
