@@ -77,7 +77,7 @@ describe("rpc-failover coverage: pure helpers", () => {
     assert.equal(isTransientRpcError({ toString: () => "bad data" }), false);
   });
 
-  it("constructor rejects an empty list and an unusable default base is still callable", () => {
+  it("constructor rejects an empty list and default options construct", () => {
     assert.throws(() => new RpcFailover({ cluster: "devnet", urls: [] }), /at least one endpoint/);
     // default `now` / `log` / `base` are wired (no override): construction alone must not throw
     const f = new RpcFailover({ cluster: "mainnet", urls: [A] });
@@ -110,7 +110,7 @@ describe("rpc-failover coverage: health registry", () => {
 });
 
 describe("rpc-failover coverage: probe transport edges", () => {
-  it("a non-200 probe whose body cannot be read, a JSON-RPC error with and without a message, and a non-Error throw all mark the endpoint down", async () => {
+  it("a non-200 probe whose body cannot be read, a JSON-RPC error with and without a message, and a non-Error throw all surface as a probe failure", async () => {
     const unreadable = new Response("x", { status: 503 });
     unreadable.text = () => Promise.reject(new Error("boom"));
     const { f } = setup({
@@ -119,7 +119,7 @@ describe("rpc-failover coverage: probe transport edges", () => {
     });
     await assert.rejects(call(f), /rpc-degraded/);
     const [a, b] = f.snapshot().endpoints;
-    assert.match(a.lastError ?? "", /HTTP 503/);
+    assert.match(a.lastError ?? "", /HTTP 503$/);
     assert.match(b.lastError ?? "", /rpc error: unknown/);
 
     const s2 = setup({
@@ -145,7 +145,7 @@ describe("rpc-failover coverage: probe transport edges", () => {
     assert.match(b.lastError ?? "", /slot probe returned no slot/);
   });
 
-  it("a 401 on the slot probe is an auth failure (parked, [ALERT]); a 401 on the genesis probe too", async () => {
+  it("a 401 on the slot probe and a 403 on the genesis probe are auth failures (parked, [ALERT])", async () => {
     const { f, logs } = setup({
       [A]: (m) => (m === "getSlot" ? new Response("unauthorized", { status: 401 }) : undefined),
       [B]: (m) => (m === "getGenesisHash" ? new Response("forbidden", { status: 403 }) : undefined),
@@ -155,17 +155,25 @@ describe("rpc-failover coverage: probe transport edges", () => {
     assert.ok(logs.every((l) => !/AAAAAAAAAAAAAAAA|BBBBBBBBBBBBBBBB/.test(l)));
   });
 
-  it("a probe that never answers is aborted by probeTimeoutMs and counted as a network failure", async () => {
-    const { f } = setup(
-      {
-        [A]: (m) => (m === "getGenesisHash" ? new Promise<Response>(() => undefined) : undefined),
-      },
-      { probeTimeoutMs: 20 },
-    );
-    // the stuck probe never resolves, but the abort signal is not honoured by this scripted base:
-    // race it so the test itself cannot hang, and assert the failover did not serve from A.
-    const r = await Promise.race([call(f).then((x) => x.status), new Promise<string>((res) => setTimeout(() => res("pending"), 200))]);
-    assert.ok(r === "pending" || r === 200);
+  it("a probe that never answers is aborted by probeTimeoutMs, counted as a network failure, and the next endpoint serves", async () => {
+    const t = T0;
+    const base: FetchLike = async (input, init) => {
+      const url = String(input);
+      const method = (JSON.parse(String(init?.body)) as { method: string }).method;
+      if (url === A && method === "getGenesisHash") {
+        return new Promise<Response>((_res, rej) => init?.signal?.addEventListener("abort", () => rej(new Error("aborted by timeout"))));
+      }
+      if (method === "getGenesisHash") return json(GENESIS_HASH.devnet);
+      if (method === "getSlot") return json(1000);
+      if (method === "getBlockTime") return json(Math.floor(t / 1000) - 8);
+      if (method === "getRecentPerformanceSamples") return json([{ numSlots: 150, samplePeriodSecs: 60 }]);
+      return json(`ok:${url}`);
+    };
+    const f = new RpcFailover({ cluster: "devnet", urls: [A, B], base, now: () => t, log: () => undefined, probeTimeoutMs: 20 });
+    const r = await call(f);
+    assert.equal(((await r.json()) as { result: string }).result, `ok:${B}`);
+    assert.match(f.snapshot().endpoints[0].lastError ?? "", /network: aborted by timeout/);
+    assert.equal(f.snapshot().endpoints[0].state, "down");
   });
 });
 
@@ -193,7 +201,7 @@ describe("rpc-failover coverage: chain speed measurement edges", () => {
     assert.equal(f.snapshot().slotRate.measured, null);
   });
 
-  it("one endpoint's report alone is capped at the bound; a later disagreeing pair is capped too", async () => {
+  it("one endpoint's report alone is capped at the bound; a disagreeing pair is not corroborated", async () => {
     // A reports 20 slots/s, B reports nothing usable: uncorroborated, capped at slotsPerSecond (5)
     const fast: Handler = (m) => (m === "getRecentPerformanceSamples" ? json([{ numSlots: 1200, samplePeriodSecs: 60 }]) : undefined);
     const none: Handler = (m) => (m === "getRecentPerformanceSamples" ? json("x") : undefined);
@@ -245,7 +253,7 @@ describe("rpc-failover coverage: request-level status handling", () => {
     });
   });
 
-  it("402 with a quota body is a quota stop; 402/403 without one is passed through untouched", async () => {
+  it("402 with a quota body is a quota stop; a 402 without one is passed through untouched", async () => {
     const q = setup({ [A]: (m) => (m === "getBalance" ? new Response("rate limit exceeded", { status: 402 }) : undefined) });
     assert.equal(((await (await call(q.f)).json()) as { result: string }).result, `ok:${B}`);
     assert.equal(q.f.snapshot().endpoints[0].state, "down");
@@ -266,7 +274,7 @@ describe("rpc-failover coverage: request-level status handling", () => {
     assert.ok(logs.some((l) => /AUTH FAILURE/.test(l)));
   });
 
-  it("500 / 502 / 503 / 504 fail over; 501 and 505 do not; the endpoint is only marked down at the threshold", async () => {
+  it("500 / 502 / 503 / 504 are retriable (returned, endpoint marked down at the threshold); 501 and 505 are not", async () => {
     for (const status of [500, 502, 503, 504]) {
       const { f } = setup({ [A]: (m) => (m === "getBalance" ? new Response("e", { status }) : undefined) }, { networkErrorThreshold: 2 }, [A]);
       assert.equal((await call(f)).status, status);
@@ -311,7 +319,7 @@ describe("rpc-failover coverage: blockhash judging", () => {
     }
   });
 
-  it("a stale blockhash is refused with a one-time ALERT, and a fresh one afterwards is logged as recovered (with and without a lag)", async () => {
+  it("a stale blockhash is refused with a one-time ALERT, and a fresh one afterwards is logged as recovered (with its lag)", async () => {
     let stale = true;
     const { f, logs, tick } = setup(
       { [A]: (m) => bh(stale ? 1000 - 500 : 1000)(m) },
@@ -366,6 +374,6 @@ describe("rpc-failover coverage: baseline-less boot and overturn edges", () => {
     aSlot = 100;
     tick(2_000);
     await call(f).catch(() => undefined);
-    assert.match(f.snapshot().endpoints[0].lastError ?? "", /lagging|suspect/);
+    assert.match(f.snapshot().endpoints[0].lastError ?? "", /^lagging:/);
   });
 });
