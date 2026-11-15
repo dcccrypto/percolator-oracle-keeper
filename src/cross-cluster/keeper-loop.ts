@@ -156,6 +156,8 @@ interface MarketStat {
   sourceUnchangedSince: number | null;
   /** The last raw pool price read (E6), for sourceUnchangedSince. */
   lastRawPriceE6: bigint;
+  /** Tiny-price (lot_exp > 0, e6 == 0) twin of lastRawPriceE6, for sourceUnchangedSince only. */
+  lastRawPriceE12: bigint;
   /** G8: the depth_e6 carried by the last landed push (null = that push was the 35 B form, or none yet). */
   lastDepthE6: bigint | null;
   /** G8: where that depth came from (null when lastDepthE6 is null). */
@@ -198,6 +200,7 @@ export function newMarketStat(m: {
     markGap: null,
     sourceUnchangedSince: null,
     lastRawPriceE6: 0n,
+    lastRawPriceE12: 0n,
     lastDepthE6: null,
     lastDepthSource: null,
     depthAbsentSince: null,
@@ -218,6 +221,18 @@ export function recordRawPrice(
   if (stat.sourceUnchangedSince === null || rawPriceE6 !== stat.lastRawPriceE6) {
     stat.sourceUnchangedSince = nowMs;
     stat.lastRawPriceE6 = rawPriceE6;
+  }
+}
+
+/** Tiny-price twin of {@link recordRawPrice}: the same frozen clock, keyed on the raw e12 (the e6 reading is 0). */
+export function recordRawPriceE12(
+  stat: Pick<MarketStat, "sourceUnchangedSince" | "lastRawPriceE12">,
+  rawPriceE12: bigint,
+  nowMs: number,
+): void {
+  if (stat.sourceUnchangedSince === null || rawPriceE12 !== stat.lastRawPriceE12) {
+    stat.sourceUnchangedSince = nowMs;
+    stat.lastRawPriceE12 = rawPriceE12;
   }
 }
 
@@ -977,12 +992,23 @@ export function samplePoolsForCycle(
   smoothed: Map<string, bigint | null>,
   smoothedE12: Map<string, bigint | null>,
   primed: Set<string>,
+  /** Units that carry a sub-$0.000001 price (lot_exp > 0 markets): their pool is sampled at e12 only. Absent = never. */
+  tinyEligible?: (u: Pick<PriceUnit, "marketAddress" | "poolAddress" | "source">) => boolean,
 ): void {
   for (const u of units) {
-    if (u.source !== "pool" || smoothed.has(u.poolAddress)) continue;
+    if (u.source !== "pool" || smoothed.has(u.poolAddress) || smoothedE12.has(u.poolAddress)) continue;
     if (isTerminal(u.marketAddress)) continue;
     const raw = prices.get(u.poolAddress);
-    if (raw === undefined || raw <= 0n) continue;
+    if (raw === undefined || raw <= 0n) {
+      // Tiny price: the e6 reading is absent, only e12 exists. Feed the e12 window alone (the e6 one has nothing to hold).
+      if (tinyEligible?.(u) && tinyE12Of(prices, pricesE12, u.poolAddress) !== null) {
+        const px12 = smoothers.e12.smooth(u.poolAddress, pricesE12.get(u.poolAddress)!, nowMs);
+        smoothedE12.set(u.poolAddress, px12);
+        if (px12 === null) primed.delete(u.poolAddress);
+        else primed.add(u.poolAddress);
+      }
+      continue;
+    }
     const px = smoothers.e6.smooth(u.poolAddress, raw, nowMs);
     smoothed.set(u.poolAddress, px);
     // Same sample, same instant, at e12 (the e6 value x 1e6 when the read produced no e12), so the two windows stay aligned.
@@ -1415,11 +1441,6 @@ export async function runCycle(
   // R3.24: a market whose pool window is still priming would be withheld this cycle. Make sure its fail-closed
   // deadlines (push-deadline.ts) are known before deciding that: one read for all such markets, only while priming.
   await refreshPushDeadlines(devnetConn, deadlineReadsNeeded(units, state.terminalMarkets, primedPools, smoothNowMs));
-  // R3.24: sample EVERY live pool once per cycle, before any per-unit skip. The smoother used to be fed only on the
-  // cycles a unit reached it, so a pool whose only market was push-held most cycles (2xhs asset 2, cbBTC, 2026-10-15:
-  // 25 unheld cycles of 174, i.e. one sample per ~21 s against a 15 s window) never held 3 samples and re-primed
-  // forever, while its siblings' pools were kept primed by other markets. Withholding a push must not starve its window.
-  samplePoolsForCycle(units, (m) => isTerminalForPush(state, m), prices, pricesE12, { e6: markSmoother, e12: markSmootherE12 }, smoothNowMs, smoothedThisCycle, smoothedE12ThisCycle, primedPools);
   // Tiny-price pools (e6 == 0, e12 > 0): only a lot_exp > 0 market can carry them (the per-lot mark is representable).
   // lot_exp is immutable on chain, so it is read once per unit and only for such pools: a default-scale market with a
   // normal price costs no RPC, and a lot_exp 0 one with a tiny price costs one read ever, then drops as before.
@@ -1439,6 +1460,11 @@ export async function runCycle(
       if (v !== undefined && v > 0) tinyLotExps.set(u.key, v);
     }
   }
+  // R3.24: sample EVERY live pool once per cycle, before any per-unit skip. The smoother used to be fed only on the
+  // cycles a unit reached it, so a pool whose only market was push-held most cycles (2xhs asset 2, cbBTC, 2026-10-15:
+  // 25 unheld cycles of 174, i.e. one sample per ~21 s against a 15 s window) never held 3 samples and re-primed
+  // forever, while its siblings' pools were kept primed by other markets. Withholding a push must not starve its window.
+  samplePoolsForCycle(units, (m) => isTerminalForPush(state, m), prices, pricesE12, { e6: markSmoother, e12: markSmootherE12 }, smoothNowMs, smoothedThisCycle, smoothedE12ThisCycle, primedPools, (u) => units.some((x) => x.poolAddress === u.poolAddress && tinyLotExps.has(x.key)));
   const tinyPricePush = (
     entry: (typeof units)[number],
     rawE12: bigint,
@@ -1446,6 +1472,7 @@ export async function runCycle(
     stat: NonNullable<ReturnType<typeof state.stats.get>>,
   ): (typeof pushes)[number] | null => {
     stat.sourcePriceE6 = 0n;
+    recordRawPriceE12(stat, rawE12, nowMs);
     lifecycleLedger.recordSource(entry.marketAddress, true, nowMs);
     let e12 = smoothedE12ThisCycle.get(entry.poolAddress);
     if (e12 === undefined) {
@@ -1493,6 +1520,9 @@ export async function runCycle(
     crossClusterCircuitBreakerStates.set(entry.key, commitNow);
     pendingCircuitBreakerStates.set(entry.key, deferred);
     const priceE6 = publish.priceE12 / 1_000_000n; // 0 unless a clamp lifted it to >= $0.000001
+    const depth = resolvePushDepth(pushDepthOn, attestReservesUsdE6.get(entry.poolAddress));
+    noteDepthAttempt(stat, pushDepthOn && entry.dexType === "pumpswap", depth !== null, nowMs);
+    if (depth) attestedDepthPools.set(entry.key, entry.poolAddress);
     stat.sourcePriceE6 = priceE6;
     stat.lastPriceE6 = priceE6;
     return {
@@ -1502,7 +1532,8 @@ export async function runCycle(
       assetIndex: entry.assetIndex,
       priceE6,
       priceE12: publish.priceE12,
-      depth: null,
+      // Same attestation as the e6 path (pumpswap reserves are read for a tiny pool too); null unless the flag is on.
+      depth,
       ...(pushDepthOnchain ? { dex: depthSourceCache.get(entry.marketAddress) } : {}),
     };
   };
@@ -1816,7 +1847,8 @@ export async function runCycle(
       // vault LP: tag 40 ACTIVATE refuses one), so its assets never fire it.
       for (const p of landedPushes(pushes, res).filter((x) => !x.multi)) {
         try {
-          config.onPushLanded(p.marketAddress, p.priceE6, state.stats.get(p.marketAddress)?.label ?? p.marketAddress);
+          // A tiny mark has priceE6 == 0 (the hook reads 0 as no price / never moving): hand it the e12 instead.
+          config.onPushLanded(p.marketAddress, p.priceE6 === 0n && p.priceE12 !== undefined && p.priceE12 > 0n ? p.priceE12 : p.priceE6, state.stats.get(p.marketAddress)?.label ?? p.marketAddress);
         } catch {
           // never let the vault-LP hook disturb the push loop
         }

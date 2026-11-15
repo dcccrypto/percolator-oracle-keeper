@@ -99,11 +99,16 @@ function conns(poolAddress: string) {
   return { mainnet, devnet };
 }
 
-function setup() {
+function setup(single = false) {
   const poolAddress = Keypair.generate().publicKey.toBase58();
   const marketAddress = Keypair.generate().publicKey.toBase58();
+  const asset = { poolAddress, dexType: "pumpswap", mainnetCa: mint.toBase58(), symbol: "TINY/USD" };
   const registry = {
-    markets: [{ label: "TINY/USD", marketAddress, assetIndex: 0, assets: [{ assetIndex: 0, source: "pool", poolAddress, dexType: "pumpswap", mainnetCa: mint.toBase58(), symbol: "TINY/USD" }] }],
+    markets: [
+      single
+        ? { label: "TINY/USD", marketAddress, assetIndex: 0, ...asset }
+        : { label: "TINY/USD", marketAddress, assetIndex: 0, assets: [{ assetIndex: 0, source: "pool", ...asset }] },
+    ],
   } as unknown as Registry;
   const state: LoopState = {
     dlmmObserve: false,
@@ -294,8 +299,8 @@ describe("K-TINYGAP: tiny pools on the shared per-pool paths", () => {
     assert.ok(on.primed.has("p"));
   });
 
-  it("(3) the vault-LP hook sees a non-zero, moving mark on a tiny market", async () => {
-    const s = setup();
+  it("(3) the vault-LP hook sees a non-zero, moving mark on a tiny single-asset market", async () => {
+    const s = setup(true);
     const seen: bigint[] = [];
     const cfg: LoopConfig = { ...config, onPushLanded: (_m, px) => { seen.push(px); } };
     const log = console.log, warn = console.warn, err = console.error;
@@ -305,7 +310,7 @@ describe("K-TINYGAP: tiny pools on the shared per-pool paths", () => {
       rig.reserves = { base: 100_000_000_000_000_000n, quote: 55_000_000_000n };
       for (let i = 0; i < 6; i++) { s.state.cycleCount++; await runCycle(s.mainnet, s.devnet, keeper, s.registry, s.decimals as never, s.state, cfg); mock.timers.tick(5_000); }
     } finally { console.log = log; console.warn = warn; console.error = err; }
-    assert.ok(seen.length >= 2);
+    assert.ok(seen.length >= 2, `hook calls ${seen}`);
     assert.ok(seen.every((p) => p > 0n), `hook prices ${seen}`);
     assert.ok(new Set(seen).size >= 2, "a real move changes what the hook sees");
   });

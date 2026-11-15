@@ -1324,6 +1324,10 @@ export async function readAllPoolPricesE6(
         } else if (priceE12 > 0n) {
           // Tiny price: e6 is 0, so the pool stays out of `out`; only the e12 sink carries it (lot_exp > 0 path).
           pricesE12?.set(entry.poolAddress, priceE12);
+          if (quoteReservesUsdE6) {
+            const reserve = pumpswapQuoteDepthUsdE6(new Uint8Array(quoteVaultInfo.data), dec.quote, pumpswapCandidates[c].quoteMint, solPriceE6);
+            if (reserve !== null && reserve > 0n) quoteReservesUsdE6.set(entry.poolAddress, reserve);
+          }
         }
       } catch {
         // e.g. WSOL-quoted but solPriceE6 unavailable this cycle (SOL/USD read
