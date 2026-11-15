@@ -78,7 +78,10 @@ interface EngineModel {
   accruedSlot: number;
 }
 
-function driftChain(opts: { insurance: bigint }) {
+/** What happens to the n-th sent tx (1-based): "drop" = never lands (no status), "fail" = lands with an error. */
+type SendFate = "drop" | "fail" | undefined;
+
+function driftChain(opts: { insurance: bigint; fate?: (sendN: number) => SendFate }) {
   const base = fx("percolator-market-v18-relaunch");
   const all = INDEX.map((e) => e.pubkey);
   let slot = Number(decodeMarketRefreshState(base).slotLast) + 2;
@@ -93,7 +96,8 @@ function driftChain(opts: { insurance: bigint }) {
   };
   let sigN = 0;
   const landed = new Set<string>();
-  const sends: { kinds: string[]; heldAtSend: boolean; slot: number }[] = [];
+  const failed = new Set<string>();
+  const sends: { kinds: string[]; refreshed: string[]; heldAtSend: boolean; slot: number }[] = [];
 
   const bytes = (s: EngineModel): Buffer => {
     const b = Buffer.alloc(ASSET_SLOTS_OFF + DRIFT_SLOT_STRIDE);
@@ -180,9 +184,12 @@ function driftChain(opts: { insurance: bigint }) {
       const ixs = wrapperIxs(Transaction.from(raw).compileMessage() as never);
       const r = apply(ixs, slot);
       const kinds = ixs.filter((x) => !x.program.equals(ComputeBudgetProgram.programId)).map((x) => (x.data[9] > 0 ? "obs" : "refresh"));
-      sends.push({ kinds, heldAtSend: isPushHeld(MARKET.toBase58()), slot });
+      const refreshed = ixs.filter((x) => !x.program.equals(ComputeBudgetProgram.programId) && x.data[9] === 0).map((x) => x.keys[2].toBase58());
+      sends.push({ kinds, refreshed, heldAtSend: isPushHeld(MARKET.toBase58()), slot });
       const sig = `sig${++sigN}`;
-      if (!r.err) {
+      const fate = opts.fate?.(sigN);
+      if (fate === "fail") failed.add(sig);
+      else if (!r.err && fate !== "drop") {
         m = r.next;
         landed.add(sig);
       }
@@ -190,7 +197,15 @@ function driftChain(opts: { insurance: bigint }) {
       return sig;
     },
     async getSignatureStatuses(sigs: string[]) {
-      return { value: sigs.map((s) => (landed.has(s) ? { err: null, confirmationStatus: "processed" } : null)) };
+      return {
+        value: sigs.map((s) =>
+          landed.has(s)
+            ? { err: null, confirmationStatus: "processed" }
+            : failed.has(s)
+              ? { err: { InstructionError: [1, { Custom: 19 }] }, confirmationStatus: "processed" }
+              : null,
+        ),
+      };
     },
   };
   return { conn, sends, model: () => m, bytes: () => bytes(m) };
@@ -232,11 +247,15 @@ describe("crankOneMarket on a drift-layout market (continuous sweep)", () => {
     assert.equal(f.lossStale, 0);
     assert.equal(f.sweepCovered, true);
     assert.equal(typeof f.sweepCoverageRatio, "number");
-    assert.equal(st.sweepCursor.visits.size, 10);
+    assert.equal(st.sweepCursor.visits.size, 0, "the one sweep tx is not awaited: its visits wait on its signature");
+    assert.equal(st.sweepPendingVisit?.refreshed.length, 10);
 
     await crankOneMarket(chain.conn as never, KEEPER, ENTRY, st, false);
     assert.equal(chain.sends.length, 2);
-    assert.equal(st.sweepCursor.visits.size, 12, "the 2 left over were taken first in cycle 2");
+    assert.equal(st.sweepCursor.visits.size, 10, "cycle 1's tx landed: its 10 are recorded before cycle 2 picks");
+    const leftOver = INDEX.map((e) => e.pubkey).filter((p) => !chain.sends[0].refreshed.includes(p));
+    assert.equal(leftOver.length, 2);
+    for (const p of leftOver) assert.ok(chain.sends[1].refreshed.includes(p), "the 2 left over were taken first in cycle 2");
     const cycle2 = new Set(chain.sends[1].kinds);
     assert.deepEqual([...cycle2], ["obs", "refresh"]);
     // every portfolio refreshed since the generation began -> it rotated: drift_gen moved to
@@ -278,6 +297,41 @@ describe("crankOneMarket on a drift-layout market (continuous sweep)", () => {
     assert.ok(sample?.sweep);
     const ev = evaluateCrankHealth(sample, freshStreaks(), DEFAULT_THRESHOLDS);
     assert.ok(ev.active.some((a) => a.kind === "loss-stale"));
+  });
+
+  it("K-POISON: a relaxed-pace sweep tx that never lands does not count its refreshes as visited; the next cycle retries them", async () => {
+    const chain = driftChain({ insurance: 10n ** 12n, fate: (n) => (n === 1 ? "drop" : undefined) });
+    const st = freshCrankMarketState();
+    await crankOneMarket(chain.conn as never, KEEPER, ENTRY, st, false);
+    assert.equal(chain.sends.length, 1);
+    assert.equal(chain.model().stale.size, 12, "the tx was dropped: nothing refreshed on chain");
+    await crankOneMarket(chain.conn as never, KEEPER, ENTRY, st, false);
+    assert.equal(chain.sends.length, 2);
+    assert.deepEqual(
+      [...chain.sends[1].refreshed].sort(),
+      [...chain.sends[0].refreshed].sort(),
+      "the dropped batch (still the stalest, heaviest) goes out again instead of waiting for the next round",
+    );
+    assert.equal(chain.model().stale.size, 2, "this time it landed");
+    assert.equal(st.sweepCursor.visits.size, 0, "cycle 1's dropped tx recorded nothing");
+    await crankOneMarket(chain.conn as never, KEEPER, ENTRY, st, false);
+    assert.equal(st.sweepCursor.visits.size, 10, "cycle 2's landed tx is recorded");
+    const leftOver = INDEX.map((e) => e.pubkey).filter((p) => !chain.sends[1].refreshed.includes(p));
+    for (const p of leftOver) assert.ok(chain.sends[2].refreshed.includes(p), "and the 2 left over go out next");
+  });
+
+  it("K-POISON: an urgent-pace accrual tx that fails on chain does not advance the sweep cursor", async () => {
+    const chain = driftChain({ insurance: 0n, fate: (n) => (n === 1 ? "fail" : undefined) });
+    const st = freshCrankMarketState();
+    await crankOneMarket(chain.conn as never, KEEPER, ENTRY, st, false);
+    assert.equal(chain.sends.length, 1, "the follow-ups wait for the accrual, which failed");
+    assert.equal(st.sweepCursor.visits.size, 0, "nothing refreshed: no portfolio is marked visited");
+    await crankOneMarket(chain.conn as never, KEEPER, ENTRY, st, false);
+    assert.deepEqual(
+      [...chain.sends[1].refreshed].sort(),
+      [...chain.sends[0].refreshed].sort(),
+      "the failed batch is retried first",
+    );
   });
 
   it("a legacy-layout account (unconverted fixture) never decodes as drift, so the sweep does not engage", async () => {
