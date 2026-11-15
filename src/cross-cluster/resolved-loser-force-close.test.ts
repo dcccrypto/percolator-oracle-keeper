@@ -28,6 +28,7 @@ import {
   forceCloseWindow,
   LoserForceCloseState,
   makeResolvedLoserForceCloseJob,
+  loserForceCloseConfigFromEnv,
   type LoserForceCloseConfig,
 } from "./resolved-loser-force-close.ts";
 import { classifyS16acElfPrefix, S16acGateState, s16acEngineDeployed } from "./s16ac-engine-gate.ts";
@@ -396,5 +397,274 @@ describe("I-S1 NEGATIVE CONTROLS: behaviour before the upgrade is unchanged", ()
     assert.equal(r.outcome, "no-wait");
     assert.equal(w.log.sends, 0);
     assert.ok(w.holdsClaim(w.state.get(WINNER.toBase58())!));
+  });
+});
+
+// ---- K-COV4: branch coverage for the paths the main suite does not reach ----
+type Sim = (tx: VersionedTransaction, opts: { accounts?: { addresses: string[] } }) => Promise<{ context: unknown; value: { err: unknown; logs: unknown[]; accounts: unknown } }>;
+const ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const hasAtaIx = (tx: VersionedTransaction): boolean => tx.message.staticAccountKeys.some((k) => k.toBase58() === ATA_PROGRAM);
+const simAddr = (o: { accounts?: { addresses: string[] } }): string | undefined => o.accounts?.addresses?.[0];
+const wrapSim = (w: ReturnType<typeof world>, f: (orig: Sim) => Sim): void => {
+  const orig = w.conn.simulateTransaction.bind(w.conn) as unknown as Sim;
+  (w.conn as { simulateTransaction: Sim }).simulateTransaction = f(orig);
+};
+const b64 = (d: Uint8Array) => [Buffer.from(d).toString("base64"), "base64"];
+
+describe("K-COV4: config from env", () => {
+  it("RESOLVED_LOSER_FORCE_CLOSE_ENABLED=false disables; otherwise the bounded defaults", () => {
+    assert.equal(loserForceCloseConfigFromEnv({ RESOLVED_LOSER_FORCE_CLOSE_ENABLED: "false" }), null);
+    const c = loserForceCloseConfigFromEnv({});
+    assert.ok(c);
+    assert.deepEqual([c.maxScanPerCycle, c.maxClosesPerCycle, c.maxChunkCallsPerPortfolio, c.maxAtaCreatesPerCycle, c.gateTtlMs], [32, 8, 16, 4, 600_000]);
+    assert.ok(c.wrapperProgramId && c.nftProgramId);
+  });
+});
+
+describe("K-COV4: early exits and failure", () => {
+  it("a market that is not Resolved (zeroed data) does nothing and clears waitingSeen", async () => {
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    const st = new LoserForceCloseState();
+    st.waitingSeen.add(CODEC.toBase58());
+    const r = await forceCloseResolvedLosers(w.conn as never, Keypair.generate(), CODEC, new Uint8Array(MARKET.length), AFTER, false, CFG(), st);
+    assert.equal(r.outcome, "not-resolved");
+    assert.ok(!st.waitingSeen.has(CODEC.toBase58()));
+    assert.deepEqual([w.log.sims, w.log.sends], [0, 0]);
+  });
+
+  it("no portfolio with a claim left -> no-candidates, nothing sent", async () => {
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    for (const k of [LOSER, WINNER]) {
+      const d = w.state.get(k.toBase58())!;
+      const z = new Uint8Array(d);
+      z.fill(0, capitalOffset(d), capitalOffset(d) + 16);
+      w.state.set(k.toBase58(), z);
+    }
+    const st = new LoserForceCloseState();
+    st.waitingSeen.add(CODEC.toBase58());
+    const r = await run(w, AFTER, st);
+    assert.equal(r.outcome, "no-candidates");
+    assert.ok(!st.waitingSeen.has(CODEC.toBase58()));
+    assert.deepEqual([w.log.sims, w.log.sends], [0, 0]);
+  });
+
+  it("an unexpected RPC error returns outcome failed (never throws) and logs it", async () => {
+    const lines: string[] = [];
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    (w.conn as { getProgramAccounts: unknown }).getProgramAccounts = async () => {
+      throw new Error("rpc down");
+    };
+    const r = await run(w, AFTER, new LoserForceCloseState(), CFG({ log: (l) => lines.push(l) }));
+    assert.equal(r.outcome, "failed");
+    assert.equal(r.detail, "rpc down");
+    assert.ok(lines.some((l) => l.includes('"event":"failed"')));
+    // a non-Error throw is stringified
+    (w.conn as { getProgramAccounts: unknown }).getProgramAccounts = async () => {
+      throw "boom";
+    };
+    assert.equal((await run(w, AFTER)).detail, "boom");
+  });
+});
+
+describe("K-COV4: rotating scan window when candidates exceed maxScanPerCycle", () => {
+  it("scans one portfolio per pass; a waiter seen on a truncated pass keeps the next pass closing the loser", async () => {
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER, chunks: 1 });
+    const st = new LoserForceCloseState();
+    const cfg = CFG({ maxScanPerCycle: 1 });
+    // sorted: LOSER (5vYA…) < WINNER (6UW2…). Pass 1 sees only the loser: closable, but no waiter seen yet -> nothing sent.
+    const r1 = await run(w, AFTER, st, cfg);
+    assert.equal(r1.outcome, "no-wait");
+    assert.equal(w.log.sends, 0);
+    assert.equal(st.cursor.get(CODEC.toBase58()), 1);
+    // Pass 2 sees only the winner: waiting (21), nothing closable in this window.
+    const r2 = await run(w, AFTER, st, cfg);
+    assert.equal(r2.outcome, "nothing-closable");
+    assert.deepEqual(r2.waiting, [WINNER.toBase58()]);
+    assert.ok(st.waitingSeen.has(CODEC.toBase58()));
+    assert.equal(w.log.sends, 0);
+    // Pass 3 wraps to the loser: no waiter in window, but one was seen while truncated -> closes the loser.
+    const r3 = await run(w, AFTER, st, cfg);
+    assert.equal(r3.outcome, "closed");
+    assert.deepEqual(r3.closed, [LOSER.toBase58()]);
+    assert.deepEqual(new Set(w.log.sendTargets), new Set([LOSER.toBase58()]));
+  });
+});
+
+describe("K-COV4: per-pass bounds and refusals", () => {
+  it("maxClosesPerCycle=0 skips the loser as over the bound and sends nothing", async () => {
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    const r = await run(w, AFTER, new LoserForceCloseState(), CFG({ maxClosesPerCycle: 0 }));
+    assert.equal(r.outcome, "nothing-closable");
+    assert.equal(w.log.sends, 0);
+    assert.match(r.skipped.find((s) => s.portfolio === LOSER.toBase58())?.reason ?? "", /0-per-cycle bound/);
+  });
+
+  it("maxChunkCallsPerPortfolio=0 stops on the per-cycle cap without sending", async () => {
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    const r = await run(w, AFTER, new LoserForceCloseState(), CFG({ maxChunkCallsPerPortfolio: 0 }));
+    assert.equal(r.outcome, "nothing-closable");
+    assert.equal(w.log.sends, 0);
+    assert.match(r.skipped.find((s) => s.portfolio === LOSER.toBase58())?.reason ?? "", /per-cycle cap of 0 chunk calls/);
+  });
+
+  it("a CloseResolved that simulates OK but changes nothing is skipped as no-progress, never sent", async () => {
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    wrapSim(w, (orig) => async (tx, o) => {
+      const r = await orig(tx, o);
+      const a = simAddr(o);
+      if (!r.value.err && a === LOSER.toBase58()) return { ...r, value: { ...r.value, accounts: [{ data: b64(w.state.get(a)!) }] } };
+      return r;
+    });
+    const r = await run(w, AFTER);
+    assert.equal(r.outcome, "nothing-closable");
+    assert.equal(w.log.sends, 0);
+    assert.match(r.skipped.find((s) => s.portfolio === LOSER.toBase58())?.reason ?? "", /no progress/);
+  });
+
+  it("a simulation that returns no post-state account is also treated as no progress", async () => {
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    wrapSim(w, (orig) => async (tx, o) => {
+      const r = await orig(tx, o);
+      if (!r.value.err && simAddr(o) === LOSER.toBase58()) return { ...r, value: { ...r.value, accounts: null } };
+      return r;
+    });
+    const r = await run(w, AFTER);
+    assert.equal(r.outcome, "nothing-closable");
+    assert.equal(w.log.sends, 0);
+  });
+
+  it("a non-custom refusal is reported as JSON text", async () => {
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    wrapSim(w, (orig) => async (tx, o) => {
+      const r = await orig(tx, o);
+      if (!r.value.err && simAddr(o) === LOSER.toBase58()) return { ...r, value: { ...r.value, err: "AccountNotFound", accounts: null } };
+      return r;
+    });
+    const r = await run(w, AFTER, new LoserForceCloseState(), CFG({ maxAtaCreatesPerCycle: 0 }));
+    assert.equal(r.outcome, "nothing-closable");
+    assert.match(r.skipped.find((s) => s.portfolio === LOSER.toBase58())?.reason ?? "", /refused: "AccountNotFound"/);
+  });
+
+  it("a tx that does not land stops that portfolio and is not counted as closed", async () => {
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    (w.conn as { getSignatureStatuses: unknown }).getSignatureStatuses = async () => ({ value: [null] });
+    (w.conn as unknown as { getBlockHeight: unknown }).getBlockHeight = async () => 10;
+    const r = await run(w, AFTER);
+    assert.equal(r.outcome, "nothing-closable");
+    assert.deepEqual(r.closed, []);
+    assert.equal(r.calls, 0);
+    assert.equal(w.log.sends, 1);
+    assert.match(r.skipped.find((s) => s.portfolio === LOSER.toBase58())?.reason ?? "", /tx did not land/);
+  });
+});
+
+describe("K-COV4: owner token account (ATA) creation for a payout", () => {
+  // The loser's close is refused until the owner's token account exists; with the idempotent-ATA ix prepended it works.
+  const ataWorld = (ataExists: boolean) => {
+    const ataSends = { count: 0 };
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER, loserEscrowedPayout: true });
+    (w.conn as { getMultipleAccountsInfo: unknown }).getMultipleAccountsInfo = async (keys: PublicKey[]) =>
+      keys.map(() => (ataExists ? { data: Buffer.alloc(165), owner: WRAPPER, lamports: 1, executable: false } : null));
+    wrapSim(w, (orig) => async (tx, o) => {
+      const r = await orig(tx, o);
+      const a = simAddr(o);
+      if (hasAtaIx(tx) && a === LOSER.toBase58()) {
+        const next = new Uint8Array(w.state.get(a)!);
+        next[next.length - 1] ^= 0xff;
+        return { context: { slot: 1 }, value: { err: null, logs: [], accounts: [{ data: b64(next) }] } };
+      }
+      return r;
+    });
+    const origSend = w.conn.sendRawTransaction.bind(w.conn);
+    (w.conn as { sendRawTransaction: unknown }).sendRawTransaction = async (raw: Buffer) => {
+      if (Transaction.from(raw).compileMessage().accountKeys.some((k) => k.toBase58() === ATA_PROGRAM)) {
+        w.log.sends++;
+        ataSends.count++;
+        return PublicKey.unique().toBase58();
+      }
+      return origSend(raw);
+    };
+    return Object.assign(w, { ataSends });
+  };
+
+  it("a missing owner token account is created (prepended to the first chunk only) and the loser closes", async () => {
+    const w = ataWorld(false);
+    const r = await run(w, AFTER);
+    assert.equal(r.outcome, "closed");
+    assert.deepEqual(r.closed, [LOSER.toBase58()]);
+    assert.equal(r.calls, 1, "the follow-up chunk has no ATA ix and is refused again -> stop");
+    assert.equal(w.ataSends.count, 1, "exactly one sent tx carried the ATA ix");
+    assert.equal(w.log.sends, 1, "no second chunk was sent");
+    assert.deepEqual(r.released, [], "the winner still waits");
+  });
+
+  it("with the ATA budget at 0 the keeper does not create it and reports the refusal", async () => {
+    const w = ataWorld(false);
+    const r = await run(w, AFTER, new LoserForceCloseState(), CFG({ maxAtaCreatesPerCycle: 0 }));
+    assert.equal(r.outcome, "nothing-closable");
+    assert.equal(w.log.sends, 0);
+    assert.match(r.skipped.find((s) => s.portfolio === LOSER.toBase58())?.reason ?? "", /Custom\(6\)/);
+  });
+
+  it("an existing owner token account is not re-created: the refusal stands", async () => {
+    const w = ataWorld(true);
+    const r = await run(w, AFTER);
+    assert.equal(r.outcome, "nothing-closable");
+    assert.equal(w.log.sends, 0);
+  });
+});
+
+describe("K-COV4: the fee-job wrapper", () => {
+  const item = (marketAddress: string) => ({ marketAddress, label: "X" });
+  const jobCtx = (w: ReturnType<typeof world>) => ({ conn: w.conn as never, keeper: Keypair.generate(), dryRun: false });
+
+  it("an unparseable market address fails with a clear error", async () => {
+    const job = makeResolvedLoserForceCloseJob(CFG());
+    const r = await job.run(jobCtx(world({ elf: ELF.s16ac, nowSlot: AFTER })), item("not-a-pubkey"));
+    assert.deepEqual(r, { kind: "failed", error: "unparseable market address" });
+  });
+
+  it("a market not owned by the configured wrapper (or missing) is skipped", async () => {
+    const job = makeResolvedLoserForceCloseJob(CFG());
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    (w.conn as { getMultipleAccountsInfo: unknown }).getMultipleAccountsInfo = async () => [{ data: Buffer.from(MARKET), owner: PublicKey.unique(), lamports: 1, executable: false }];
+    assert.equal((await job.run(jobCtx(w), item(CODEC.toBase58()))).kind, "skipped");
+    (w.conn as { getMultipleAccountsInfo: unknown }).getMultipleAccountsInfo = async () => [null];
+    assert.equal((await job.run(jobCtx(w), item(CODEC.toBase58()))).kind, "skipped");
+  });
+
+  it("a market that is not Resolved is nothing (no slot read, no simulation)", async () => {
+    const job = makeResolvedLoserForceCloseJob(CFG());
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    (w.conn as { getMultipleAccountsInfo: unknown }).getMultipleAccountsInfo = async () => [{ data: Buffer.alloc(MARKET.length), owner: WRAPPER, lamports: 1, executable: false }];
+    assert.equal((await job.run(jobCtx(w), item(CODEC.toBase58()))).kind, "nothing");
+    assert.equal(w.log.sims, 0);
+  });
+
+  it("a read failure is reported as failed (Error and non-Error)", async () => {
+    const job = makeResolvedLoserForceCloseJob(CFG());
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    (w.conn as { getMultipleAccountsInfo: unknown }).getMultipleAccountsInfo = async () => {
+      throw new Error("rpc 503");
+    };
+    assert.deepEqual(await job.run(jobCtx(w), item(CODEC.toBase58())), { kind: "failed", error: "read failed: rpc 503" });
+    (w.conn as { getMultipleAccountsInfo: unknown }).getMultipleAccountsInfo = async () => {
+      throw "nope";
+    };
+    assert.deepEqual(await job.run(jobCtx(w), item(CODEC.toBase58())), { kind: "failed", error: "read failed: nope" });
+  });
+
+  it("maps a failed pass to failed and nothing-closable to waiting", async () => {
+    const job = makeResolvedLoserForceCloseJob(CFG());
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    const good = w.conn.getProgramAccounts.bind(w.conn);
+    (w.conn as { getProgramAccounts: unknown }).getProgramAccounts = async () => {
+      throw new Error("gpa failed");
+    };
+    assert.deepEqual(await job.run(jobCtx(w), item(CODEC.toBase58())), { kind: "failed", error: "gpa failed" });
+    (w.conn as { getProgramAccounts: unknown }).getProgramAccounts = good;
+    const stuck = world({ elf: ELF.s16ac, nowSlot: AFTER, loserEscrowedPayout: true });
+    const r = await job.run(jobCtx(stuck), item(CODEC.toBase58()));
+    assert.equal(r.kind, "waiting");
   });
 });
