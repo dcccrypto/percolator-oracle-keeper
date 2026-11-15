@@ -205,6 +205,25 @@ describe("tiny price (e6 == 0, e12 > 0) end to end", () => {
     assert.ok(rig.sent.slice(before).some((tx) => containsU64LE(tx, 650_000_000n)), "the +30% band edge ($0.00000065) lands");
   });
 
+  it("source-frozen clock sees tiny-price changes (normal -> sub-$0.000001 -> moving tiny)", async () => {
+    const s = setup();
+    rig.reserves = NORMAL; rig.lotExp = 8; // $0.002: the e6 path sets the clock
+    await runCycles(s, 3);
+    const stat = s.state.stats.get(s.marketAddress + "#0")!;
+    const e6Since = stat.sourceUnchangedSince;
+    assert.notEqual(e6Since, null);
+    rig.reserves = TINY; // $0.0000005: a different raw reading, so the clock restarts
+    await runCycles(s, 1);
+    const tinySince = stat.sourceUnchangedSince!;
+    assert.ok(tinySince > e6Since!, "dropping under $0.000001 is a source change");
+    assert.equal(stat.lastRawPriceE6, 0n, "the raw e6 read is 0, not the stale $0.002");
+    await runCycles(s, 2); // same tiny price: the clock holds
+    assert.equal(stat.sourceUnchangedSince, tinySince);
+    rig.reserves = { base: TINY.base, quote: 51_000_000_000n }; // $0.00000051: still tiny, but moved
+    await runCycles(s, 1);
+    assert.ok(stat.sourceUnchangedSince! > tinySince, "a moving tiny price is not frozen");
+  });
+
   it("default scale (lot_exp 0): dropped exactly as before - no push, same error, no push built", async () => {
     const s = setup();
     rig.lotExp = 0;

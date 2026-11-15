@@ -156,6 +156,8 @@ interface MarketStat {
   sourceUnchangedSince: number | null;
   /** The last raw pool price read (E6), for sourceUnchangedSince. */
   lastRawPriceE6: bigint;
+  /** The last raw e12 price on the tiny-price path (e6 == 0), for sourceUnchangedSince; null on the e6 path. */
+  lastRawPriceE12: bigint | null;
   /** G8: the depth_e6 carried by the last landed push (null = that push was the 35 B form, or none yet). */
   lastDepthE6: bigint | null;
   /** G8: where that depth came from (null when lastDepthE6 is null). */
@@ -198,6 +200,7 @@ export function newMarketStat(m: {
     markGap: null,
     sourceUnchangedSince: null,
     lastRawPriceE6: 0n,
+    lastRawPriceE12: null,
     lastDepthE6: null,
     lastDepthSource: null,
     depthAbsentSince: null,
@@ -211,13 +214,16 @@ export function newMarketStat(m: {
  * elsewhere (WIF/KMNO marks did not change for 74.8k/19.5k slots on 10-03).
  */
 export function recordRawPrice(
-  stat: Pick<MarketStat, "sourceUnchangedSince" | "lastRawPriceE6">,
+  stat: Pick<MarketStat, "sourceUnchangedSince" | "lastRawPriceE6"> & Partial<Pick<MarketStat, "lastRawPriceE12">>,
   rawPriceE6: bigint,
   nowMs: number,
+  /** Tiny-price path only (e6 == 0): the raw e12 reading, so a moving sub-$0.000001 price is not "frozen". */
+  rawPriceE12: bigint | null = null,
 ): void {
-  if (stat.sourceUnchangedSince === null || rawPriceE6 !== stat.lastRawPriceE6) {
+  if (stat.sourceUnchangedSince === null || rawPriceE6 !== stat.lastRawPriceE6 || rawPriceE12 !== (stat.lastRawPriceE12 ?? null)) {
     stat.sourceUnchangedSince = nowMs;
     stat.lastRawPriceE6 = rawPriceE6;
+    stat.lastRawPriceE12 = rawPriceE12;
   }
 }
 
@@ -1446,6 +1452,7 @@ export async function runCycle(
     stat: NonNullable<ReturnType<typeof state.stats.get>>,
   ): (typeof pushes)[number] | null => {
     stat.sourcePriceE6 = 0n;
+    recordRawPrice(stat, 0n, nowMs, rawE12);
     lifecycleLedger.recordSource(entry.marketAddress, true, nowMs);
     let e12 = smoothedE12ThisCycle.get(entry.poolAddress);
     if (e12 === undefined) {
