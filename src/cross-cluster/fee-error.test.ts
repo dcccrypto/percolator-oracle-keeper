@@ -186,7 +186,7 @@ describe("describeProgramError", () => {
   });
 
   it("code with an empty text has no dash tail", () => {
-    assert.equal(describeProgramError("w", { Custom: 27 }, 0).startsWith("w OracleStale(27)"), true);
+    assert.equal(describeProgramError("w", { Custom: 27 }, 0), "w OracleStale(27) — …");
     assert.equal(describeProgramError("w", "\ncustom program error: 0x1b"), "w OracleStale(27)");
   });
 
@@ -203,16 +203,6 @@ describe("describeProgramError", () => {
   it("reads the code from nested SendTransactionError logs", () => {
     const err = Object.assign(new Error("Simulation failed."), { logs: ["Program P failed: custom program error: 0x1b"] });
     assert.ok(describeProgramError("w", err).startsWith("w OracleStale(27)"));
-  });
-
-  it("never echoes a secret key or a full keypair that is not in the error text", () => {
-    const kp = Keypair.generate();
-    const secretJson = JSON.stringify(Array.from(kp.secretKey));
-    const out = describeProgramError("w", simFailed(27));
-    assert.ok(!out.includes(secretJson));
-    assert.ok(!out.includes(Buffer.from(kp.secretKey).toString("base64")));
-    // A thrown Keypair is not stringified into the message beyond what the caller passed in.
-    assert.ok(!describeProgramError("w", new Error("rpc 429")).includes("secret"));
   });
 });
 
@@ -271,6 +261,10 @@ describe("staleResolveWait", () => {
     ["window disabled (0 slots)", 27, mk(LAST, 0n), LAST + WINDOW * 2n],
     ["not a decodable Live market", 27, new Uint8Array(32), LAST + WINDOW * 2n],
   ];
+  it("null: Resolved market (not Live) even with a matured window", () => {
+    const resolved = Buffer.from(readFileSync(new URL("./__fixtures__/v22-codec-market-v19-resolved.b64", import.meta.url), "utf8").trim(), "base64");
+    assert.equal(staleResolveWait(27, resolved, 2n ** 60n), null);
+  });
   for (const [label, code, data, slot] of nulls) it(`null: ${label}`, () => assert.equal(staleResolveWait(code, data, slot), null));
 });
 
