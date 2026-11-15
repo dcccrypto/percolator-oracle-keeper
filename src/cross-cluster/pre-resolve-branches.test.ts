@@ -59,7 +59,7 @@ describe("drainFeeLegsBeforeResolve: market lookup", () => {
     await assert.rejects(run(noop, conn(sol, null)), /not found/);
   });
   it("rejects an unparseable market address", async () => {
-    await assert.rejects(drainFeeLegsBeforeResolve(conn(empty), Keypair.generate(), "nope", false, STAKE_CFG, undefined, noop));
+    await assert.rejects(drainFeeLegsBeforeResolve(conn(empty), Keypair.generate(), "nope", false, STAKE_CFG, undefined, noop), /Invalid public key/);
   });
 });
 
@@ -133,10 +133,12 @@ describe("F-9 stake-bound terminal budget", () => {
   it("closed state never gets the portfolios warning", async () => {
     const r = await run(withTerminal({ state: { kind: "closed" }, stakeBound: true, budget: 9n, support: "supported" }));
     assert.doesNotMatch(r.warnings.join("|"), /materialized/);
+    assert.equal(r.warnings.length, baseWarn + 1);
   });
   it("null state with a budget skips the portfolios warning", async () => {
     const r = await run(withTerminal({ state: null, stakeBound: true, budget: 9n, support: "supported" }));
     assert.doesNotMatch(r.warnings.join("|"), /materialized/);
+    assert.equal(r.warnings.length, baseWarn + 1);
   });
   it("unsupported -> BLOCKER 'no tag 29 (pre-F-9)'", async () => {
     const r = await run(withTerminal({ state: live(9n, 0n), stakeBound: true, budget: 9n, support: "unsupported" }));
@@ -190,7 +192,8 @@ describe("windDownAfterResolve", () => {
   it("default runner (windDownOnce) is used and never throws on an unreachable market", async () => {
     const c = { getMultipleAccountsInfo: async () => [null, null], getAccountInfo: async () => null } as unknown as PreResolveConnection;
     const r = await windDownAfterResolve(c, Keypair.generate(), SOL, true, TCFG);
-    assert.equal(typeof r.complete, "boolean");
+    assert.equal(r.complete, false);
+    assert.match(r.outcome, /market account not found/);
     assert.equal(r.market, SOL);
   });
 });
