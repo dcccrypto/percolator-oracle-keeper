@@ -88,6 +88,7 @@ export type AlertKind =
   | "p3-senior-draw"
   | "p3-senior-backing-exhausted"
   | "hedged-lockout"
+  | "p2b-snapshot-gap"
   | "earn-par-e3-gap"
   | "pusher-takeover"
   | "band-pin-expiring"
@@ -819,7 +820,7 @@ export class AlertSink {
    * crank cycle). New or cooled-down alerts fire; alerts of this scope that
    * are no longer active fire a single RESOLVED line. Returns what fired.
    */
-  async reconcile(scope: string, active: Alert[]): Promise<Alert[]> {
+  async reconcile(scope: string, active: Alert[], hold?: ReadonlySet<string>): Promise<Alert[]> {
     const now = this.opts.now();
     const fired: Alert[] = [];
     const activeNow = new Set<string>();
@@ -837,6 +838,8 @@ export class AlertSink {
     this.zeroPushesInFlight = false;
     for (const [key, sev] of [...this.activeKeys]) {
       if (!key.startsWith(`${scope}|`) || activeNow.has(key)) continue;
+      // `hold`: subjects whose state could not be read this tick. An unread market is not evidence the condition cleared.
+      if (hold && hold.has(key.split("|")[2] ?? "")) continue;
       this.activeKeys.delete(key);
       this.lastSent.delete(key);
       const [, kind, subject] = key.split("|");
@@ -956,4 +959,15 @@ export function getAlertSink(): AlertSink {
     });
   }
   return shared;
+}
+
+/** P2b: some markets had no snapshot this tick (a chunk read failed), so tags 103/104, hedged-lockout and earn-gap skipped them. */
+export function snapshotGapAlert(markets: number, snapshots: number, droppedChunks: number): Alert {
+  return {
+    kind: "p2b-snapshot-gap",
+    severity: "warn",
+    subject: "p2b",
+    message: `only ${snapshots} of ${markets} markets were read this tick (${droppedChunks} snapshot chunk reads failed): wind-down, allocate, hedged-lockout and earn-gap skipped the rest`,
+    data: { markets, snapshots, droppedChunks },
+  };
 }

@@ -87,7 +87,8 @@ export function windDownHolders(
     let p;
     try {
       p = parsePortfolioV17(data);
-    } catch {
+    } catch (err) {
+      console.warn(`[portfolio-decode] ${pubkey.toBase58()} failed to decode, skipped as a leg holder: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`);
       continue;
     }
     let longLegs = 0;
