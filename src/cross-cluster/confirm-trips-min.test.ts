@@ -20,9 +20,9 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { Keypair } from "@solana/web3.js";
 
-// A live-entry boot is a child tsx process that compiles the whole keeper; under a loaded host (parallel suite, CI) it takes well over 5 s.
+// A live-entry boot is a child tsx process that compiles the whole keeper; under a loaded host (parallel suite, CI) it takes well over 5 s (~20 s on a loaded host, longer under the full suite).
 // The timeout only bounds a hang (the negative control relies on it), so it is generous.
-const LIVE_ENTRY_TIMEOUT_MS = 30_000;
+const LIVE_ENTRY_TIMEOUT_MS = 180_000;
 
 const ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
