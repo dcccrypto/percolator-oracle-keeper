@@ -147,10 +147,11 @@ describe("vault-LP junior-release watch: edge branches", () => {
     assert.equal(streaks.has(MKT.toBase58()), false);
   });
 
-  it("wrong-kind ledger is treated as released", async () => {
+  it("wrong-kind ledger is treated as released (nothing, streak reset)", async () => {
     const bad = ledger(); bad[10] = 2;
-    const { o } = await run(conn(market(), registry(), vaultState(0n), bad));
+    const { o, streaks } = await run(conn(market(), registry(), vaultState(0n), bad));
     assert.equal(o.kind, "nothing");
+    assert.equal(streaks.has(MKT.toBase58()), false);
   });
 
   it("RPC error becomes failed with a truncated message; non-Error throws are stringified", async () => {
