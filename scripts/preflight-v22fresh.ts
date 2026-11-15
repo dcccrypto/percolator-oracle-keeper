@@ -9,7 +9,7 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import fs from "fs";
 import crypto from "crypto";
 import { failoverFromEnv, isTransientRpcError, parseFallbackUrls, preflightOutageDecision, preflightStampSha, redactText, GENESIS_HASH } from "../src/rpc-failover.ts";
-import { alertText, recordLaunch, restartConfig } from "../src/restart-escalation.ts";
+import { alertText, recordAlertFailure, recordLaunch, restartConfig } from "../src/restart-escalation.ts";
 
 const DEVNET_RPC = process.env.DEVNET_RPC_URL ?? "";
 const WRAPPER = process.env.WRAPPER_PROGRAM_ID ?? "";
@@ -32,8 +32,10 @@ async function noteLaunch(): Promise<void> {
   const hook = process.env.KEEPER_ALERT_WEBHOOK_URL?.trim();
   if (alertDue && hook && hook.startsWith("https://")) {
     try {
-      await fetch(hook, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, alert: health }), signal: AbortSignal.timeout(5_000) });
+      const res = await fetch(hook, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, alert: health }), signal: AbortSignal.timeout(5_000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
     } catch (e) {
+      recordAlertFailure(c.path, Date.now()); // not delivered: let the next launch retry (capped)
       console.error(`[preflight] alert webhook failed: ${e instanceof Error ? e.name : "error"}`);
     }
   }
