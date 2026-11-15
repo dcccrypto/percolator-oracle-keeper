@@ -1058,3 +1058,102 @@ describe("W1 (KEEPER_LEV_W1)", () => {
     assert.equal(c.base.sentData.some((d) => hex(d[0]) === "7c05"), false);
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+describe("coverage: fail-safe branches (risk-key parse, guard read errors, hook isolation)", () => {
+  it("loadRiskKey: anything that is not a 64-byte u8 JSON array disables REPORT and logs the path only", () => {
+    const dir = fs.mkdtempSync(join(tmpdir(), "levkey-bad-"));
+    try {
+      const cases: Array<[string, string]> = [
+        ["notjson.json", "{ not json"],
+        ["obj.json", JSON.stringify({ a: 1 })],
+        ["short.json", JSON.stringify(Array.from({ length: 63 }, () => 1))],
+        ["range.json", JSON.stringify(Array.from({ length: 64 }, (_, i) => (i === 5 ? 256 : 1)))],
+        ["frac.json", JSON.stringify(Array.from({ length: 64 }, (_, i) => (i === 5 ? 1.5 : 1)))],
+        ["bad-seed.json", JSON.stringify(Array.from({ length: 64 }, () => 7))], // valid shape, Keypair.fromSecretKey rejects the pubkey half
+      ];
+      for (const [name, body] of cases) {
+        const p = join(dir, name);
+        fs.writeFileSync(p, body, { mode: 0o600 });
+        const logs: string[] = [];
+        assert.equal(loadRiskKey(p, (s) => logs.push(s)), null, name);
+        assert.equal(logs.length, 1, name);
+        assert.ok(logs[0].includes("REPORT disabled") && logs[0].includes(p), name);
+        assert.ok(!/\d+\s*,\s*\d+/.test(logs[0]), `${name}: no key bytes in the log`);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("hasGuard: an unreadable guard PDA is not cached (retried), a confirmed absence is cached until the recheck window", async () => {
+    const w = world({}, { guard: false });
+    let t = 1_000_000;
+    const c = levConn({ accounts: w.accounts });
+    const { k } = keeperOf(c.conn, cfg({ poke: true }), { now: () => t });
+    const real = c.conn.getAccountInfo.bind(c.conn);
+    let boom = true;
+    (c.conn as { getAccountInfo: unknown }).getAccountInfo = async (...a: Parameters<typeof real>) => {
+      if (boom) throw new Error("rpc down");
+      return real(...a);
+    };
+    assert.equal(await k.hasGuard(w.market.toBase58()), false);
+    boom = false;
+    const before = c.reads.getAccountInfo;
+    assert.equal(await k.hasGuard(w.market.toBase58()), false, "read succeeds: absent");
+    assert.equal(c.reads.getAccountInfo, before + 1, "the failed read was not cached");
+    assert.equal(await k.hasGuard(w.market.toBase58()), false);
+    assert.equal(c.reads.getAccountInfo, before + 1, "confirmed absence is cached inside the recheck window");
+  });
+
+  it("pokeOnce: a throw while building/sending is counted as failed, logged redacted, and the inflight flag clears", async () => {
+    const w = world();
+    const c = levConn({ accounts: w.accounts });
+    const { k, logs } = keeperOf(c.conn, cfg({ poke: true }));
+    const realSim = c.conn.simulateTransaction.bind(c.conn);
+    (c.conn as { simulateTransaction: unknown }).simulateTransaction = async () => {
+      throw new Error("sim kaboom");
+    };
+    assert.equal(await k.pokeOnce(w.market.toBase58(), "T", "pre-allocate"), "failed");
+    assert.equal(k.stats.pokes.failed, 1);
+    assert.ok(logs.some((l) => l.includes("[lev-guard][poke] T")));
+    (c.conn as { simulateTransaction: unknown }).simulateTransaction = realSim;
+    assert.equal(await k.pokeOnce(w.market.toBase58(), "T", "pre-allocate"), "sent", "not stuck inflight");
+  });
+
+  it("vaultLpFor: a failed refresh keeps serving the last known vault LP", async () => {
+    const w = world();
+    let t = 1_000_000;
+    const c = levConn({ accounts: w.accounts });
+    const { k } = keeperOf(c.conn, cfg({ poke: true }), { now: () => t });
+    assert.equal(await k.pokeOnce(w.market.toBase58(), "T", "pre-allocate"), "sent");
+    t += 10 * 60 * 60 * 1000; // past any cache TTL
+    (c.conn as { getAccountInfo: unknown }).getAccountInfo = async () => {
+      throw new Error("rpc down");
+    };
+    // guard is cached present; vault-LP refresh throws -> stale key is reused, not "no-vault-lp"
+    const r = await k.pokeOnce(w.market.toBase58(), "T", "pre-allocate");
+    assert.notEqual(r, "no-vault-lp");
+  });
+
+  it("beforeAllocate never throws even when the poke does", async () => {
+    const w = world();
+    const c = levConn({ accounts: w.accounts });
+    const { k } = keeperOf(c.conn, cfg({ poke: true }));
+    (k as unknown as { pokeOnce: () => Promise<never> }).pokeOnce = async () => {
+      throw new Error("boom");
+    };
+    await assert.doesNotReject(k.beforeAllocate(w.market.toBase58(), "T"));
+  });
+
+  it("onPushLanded never throws: a failing step is logged and swallowed", async () => {
+    const w = world();
+    const c = levConn({ accounts: w.accounts });
+    const { k, logs } = keeperOf(c.conn, cfg({ poke: true }));
+    (k as unknown as { pokeOnce: () => Promise<never> }).pokeOnce = async () => {
+      throw new Error("push hook boom");
+    };
+    await assert.doesNotReject(k.onPushLanded(w.market.toBase58(), "T"));
+    assert.ok(logs.some((l) => l.includes("push hook failed") && l.includes("push hook boom")));
+  });
+});
