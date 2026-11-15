@@ -283,7 +283,7 @@ describe("K-TINYGAP: tiny pools on the shared per-pool paths", () => {
     const units = [{ marketAddress: "m", poolAddress: "p", source: "pool" as const }];
     const seen: string[] = [];
     const sm = (tag: string) => ({ smooth: (_p: string, v: bigint) => { seen.push(`${tag}:${v}`); return v; } });
-    const run = (eligible?: (m: string) => boolean) => {
+    const run = (eligible?: (u: { poolAddress: string }) => boolean) => {
       seen.length = 0;
       const smoothed = new Map<string, bigint | null>(), e12 = new Map<string, bigint | null>(), primed = new Set<string>();
       samplePoolsForCycle(units, () => false, new Map(), new Map([["p", 500_000n]]), { e6: sm("e6"), e12: sm("e12") }, 1, smoothed, e12, primed, eligible);

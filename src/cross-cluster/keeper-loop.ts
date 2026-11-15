@@ -109,6 +109,7 @@ export interface LoopConfig {
   /**
    * P3 senior draw (d119eebd): called for every market whose push LANDED, with the
    * pushed mark. The vault-LP cranker cranks a bound market's vault LP on a real move.
+   * `priceE6` is the e12 price when the mark is sub-$0.000001 (priceE6 would be 0); consumers only compare it for change.
    * Fire-and-forget: never awaited by the push cycle.
    */
   onPushLanded?: (marketAddress: string, priceE6: bigint, label: string) => void;
@@ -214,25 +215,27 @@ export function newMarketStat(m: {
  * elsewhere (WIF/KMNO marks did not change for 74.8k/19.5k slots on 10-03).
  */
 export function recordRawPrice(
-  stat: Pick<MarketStat, "sourceUnchangedSince" | "lastRawPriceE6">,
+  stat: Pick<MarketStat, "sourceUnchangedSince" | "lastRawPriceE6" | "lastRawPriceE12">,
   rawPriceE6: bigint,
   nowMs: number,
 ): void {
   if (stat.sourceUnchangedSince === null || rawPriceE6 !== stat.lastRawPriceE6) {
     stat.sourceUnchangedSince = nowMs;
     stat.lastRawPriceE6 = rawPriceE6;
+    stat.lastRawPriceE12 = 0n; // a later return to the same tiny price is a move
   }
 }
 
 /** Tiny-price twin of {@link recordRawPrice}: the same frozen clock, keyed on the raw e12 (the e6 reading is 0). */
 export function recordRawPriceE12(
-  stat: Pick<MarketStat, "sourceUnchangedSince" | "lastRawPriceE12">,
+  stat: Pick<MarketStat, "sourceUnchangedSince" | "lastRawPriceE6" | "lastRawPriceE12">,
   rawPriceE12: bigint,
   nowMs: number,
 ): void {
   if (stat.sourceUnchangedSince === null || rawPriceE12 !== stat.lastRawPriceE12) {
     stat.sourceUnchangedSince = nowMs;
     stat.lastRawPriceE12 = rawPriceE12;
+    stat.lastRawPriceE6 = 0n;
   }
 }
 
