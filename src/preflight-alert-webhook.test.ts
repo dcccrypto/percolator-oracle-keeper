@@ -23,17 +23,16 @@ function runPreflight(status: number): Promise<{ code: number | null; out: strin
     stub,
     [
       `import fs from "node:fs";`,
-      `const real = globalThis.fetch;`,
       `globalThis.fetch = async (input, init) => {`,
       `  if (String(input) === ${JSON.stringify(HOOK)}) {`,
       `    fs.appendFileSync(${JSON.stringify(callsFile)}, "x");`,
       `    return new Response("", { status: ${status} });`,
       `  }`,
-      `  return real(input, init);`,
+      `  throw new Error("unexpected fetch in hermetic preflight test");`,
       `};`,
     ].join("\n"),
   );
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const env: Record<string, string | undefined> = { ...process.env, KEEPER_RESTART_LOG: restartLog, KEEPER_RESTART_ALERT_N: "1", KEEPER_ALERT_WEBHOOK_URL: HOOK };
     // Keep the child hermetic: the refusal must come from the missing RPC env, never a real endpoint.
     delete env.DEVNET_RPC_URL;
@@ -45,10 +44,16 @@ function runPreflight(status: number): Promise<{ code: number | null; out: strin
     c.stdout.on("data", (d) => (out += d));
     c.stderr.on("data", (d) => (out += d));
     c.on("close", (code) => {
-      const rec = JSON.parse(fs.readFileSync(restartLog, "utf8")) as Record<string, unknown>;
-      const calls = fs.existsSync(callsFile) ? fs.readFileSync(callsFile, "utf8").length : 0;
-      fs.rmSync(dir, { recursive: true, force: true });
-      resolve({ code, out, rec, calls });
+      try {
+        if (!fs.existsSync(restartLog)) throw new Error(`child wrote no restart log (exit ${code}):\n${out}`);
+        const rec = JSON.parse(fs.readFileSync(restartLog, "utf8")) as Record<string, unknown>;
+        const calls = fs.existsSync(callsFile) ? fs.readFileSync(callsFile, "utf8").length : 0;
+        resolve({ code, out, rec, calls });
+      } catch (e) {
+        reject(e);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
     });
   });
 }
@@ -70,4 +75,5 @@ test("preflight: a 2xx alert webhook reply keeps the stamp (no retry, no failure
   assert.doesNotMatch(r.out, /alert webhook failed/);
   assert.equal(typeof r.rec.lastAlertAt, "number", JSON.stringify(r.rec));
   assert.equal("alertFails" in r.rec, false, JSON.stringify(r.rec));
+  assert.equal(r.code, 1, r.out); // ran past noteLaunch to the missing-RPC-env refusal
 });
