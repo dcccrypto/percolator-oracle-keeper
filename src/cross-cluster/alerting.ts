@@ -844,6 +844,7 @@ export class AlertSink {
       if (!key.startsWith(`${scope}|`) || activeNow.has(key)) continue;
       this.activeKeys.delete(key);
       this.lastSent.delete(key);
+      this.webhookFails.delete(key);
       const [, kind, subject] = key.split("|");
       await this.deliver("ALERT-RESOLVED", {
         kind: kind as AlertKind,
