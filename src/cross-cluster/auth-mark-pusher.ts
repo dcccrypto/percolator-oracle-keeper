@@ -311,6 +311,12 @@ export function readMarketLotExp(data: Uint8Array, version: number, profileOff: 
  * exact old value `perLotMarkE6(priceE6, lotExp)`; out-of-range still returns null (skip, never clamp).
  */
 export function perLotMarkFromE12(tokenPriceE6: bigint, tokenPriceE12: bigint | undefined, lotExp: number): bigint | null {
+  // Tiny price (< $0.000001): the e6 price floors to 0 but e12 is positive. On a lot-scaled market the per-lot mark
+  // is still representable; use it (tiny-price format, percolator-prog #711). lotExp 0 / no e12 stays a skip.
+  if (tokenPriceE6 === 0n && tokenPriceE12 !== undefined && tokenPriceE12 > 0n && tokenPriceE12 < 1_000_000n && Number.isInteger(lotExp) && lotExp > 0 && lotExp <= LOT_EXP_MAX) {
+    const fine = (tokenPriceE12 * 10n ** BigInt(lotExp) + 500_000n) / 1_000_000n;
+    return fine > 0n && fine <= MAX_ORACLE_PRICE_E6 ? fine : null;
+  }
   const coarse = perLotMarkE6(tokenPriceE6, lotExp);
   if (coarse === null || lotExp === 0 || tokenPriceE12 === undefined || tokenPriceE12 <= 0n) return coarse;
   const unit = 10n ** BigInt(lotExp);
