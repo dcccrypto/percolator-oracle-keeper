@@ -325,7 +325,7 @@ describe("rpc-failover coverage: blockhash judging", () => {
   it("a stale blockhash is refused with a one-time ALERT, and a fresh one afterwards is logged as recovered (with its lag)", async () => {
     let stale = true;
     const { f, logs, tick } = setup(
-      { [A]: (m) => bh(stale ? 1000 - 500 : 1000)(m) },
+      { [A]: (m, n) => bh(stale ? 1000 - 500 : 1000)(m, n) },
       { backoffBaseMs: 1_000 },
     );
     const r = await call(f, "getLatestBlockhash"); // A stale -> B serves
@@ -361,7 +361,7 @@ describe("rpc-failover coverage: baseline-less boot and overturn edges", () => {
       throw new Error("ECONNREFUSED");
     };
     const unk: Handler = (m) => (m === "getBlockTime" ? json("x") : undefined);
-    const s = setup({ [A]: (m) => (m === "getBalance" || m === "sendTransaction" ? new Response("x", { status: 429 }) : dead(m)), [B]: unk });
+    const s = setup({ [A]: (m, n) => (m === "getBalance" || m === "sendTransaction" ? new Response("x", { status: 429 }) : dead(m, n)), [B]: unk });
     await assert.rejects(call(s.f, "sendTransaction"), /rpc-degraded/);
 
     const old: Handler = (m) => (m === "getBlockTime" ? json(1) : undefined);
