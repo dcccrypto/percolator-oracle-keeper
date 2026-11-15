@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assetSlotOffset, selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
-import { acceptedPublishE12, newMarketStat, runCycle, tinyE12Of, resetCrossClusterCircuitBreakerStates } from "./keeper-loop.ts";
+import { acceptedPublishE12, newMarketStat, runCycle, tinyE12Of, resetCrossClusterCircuitBreakerStates, resetUnitLotExpCacheForTests } from "./keeper-loop.ts";
 import type { LoopConfig, LoopState } from "./keeper-loop.ts";
 import { priceUnitsOfRegistry } from "./multi-asset.ts";
 import { PROFILE_LOT_EXP_OFF } from "./auth-mark-pusher.ts";
@@ -201,6 +201,20 @@ describe("tiny price (e6 == 0, e12 > 0) end to end", () => {
     await runCycles(s, 8);
     for (const tx of rig.sent.slice(before)) {
       assert.equal(containsU64LE(tx, 1_000_000_000n) || containsU64LE(tx, 1_300_000_000n), false, "never the e6-floored $0.000001 mark nor the unclamped $0.0000013");
+    }
+    assert.ok(rig.sent.slice(before).some((tx) => containsU64LE(tx, 650_000_000n)), "the +30% band edge ($0.00000065) lands");
+  });
+
+  it("restart with a tiny breaker baseline (empty lot_exp cache) and the pool just above $0.000001: still clamped at e12", async () => {
+    const s = setup();
+    await runCycles(s, 6); // baseline $0.0000005 on the breaker
+    const before = rig.sent.length;
+    assert.ok(before >= 1);
+    resetUnitLotExpCacheForTests(); // restart: the baseline is kept (on-chain seed), the lazily filled lot_exp cache is not
+    rig.reserves = { base: 100_000_000_000_000_000n, quote: 130_000_000_000n }; // $0.0000013 (e6 = 1, +160%)
+    await runCycles(s, 8);
+    for (const tx of rig.sent.slice(before)) {
+      assert.equal(containsU64LE(tx, 1_000_000_000n), false, "never the e6-floored $0.000001 mark (+100% over the baseline)");
     }
     assert.ok(rig.sent.slice(before).some((tx) => containsU64LE(tx, 650_000_000n)), "the +30% band edge ($0.00000065) lands");
   });

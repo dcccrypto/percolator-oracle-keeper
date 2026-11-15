@@ -1177,6 +1177,10 @@ export function acceptedPublishE12(
 
 /** lot_exp per unit key (immutable on chain), filled lazily by the tiny-price path only. */
 const unitLotExpCache = new Map<string, number>();
+/** Test hook: a process restart empties the lazily filled lot_exp cache but not the on-chain breaker seed. */
+export function resetUnitLotExpCacheForTests(): void {
+  unitLotExpCache.clear();
+}
 
 /** A pool priced below $0.000001: no e6 price (the reader leaves it out of `prices`) but a positive e12. */
 export function tinyE12Of(prices: ReadonlyMap<string, bigint>, pricesE12: ReadonlyMap<string, bigint>, pool: string): bigint | null {
@@ -1432,7 +1436,17 @@ export async function runCycle(
   const tinyLotExps = new Map<string, number>();
   {
     const tinyUnits = units.filter((u) => u.source === "pool" && tinyE12Of(prices, pricesE12, u.poolAddress) !== null && !isTerminalForPush(state, u.marketAddress));
-    const unknown = tinyUnits.filter((u) => !unitLotExpCache.has(u.key));
+    // A unit whose breaker baseline is already sub-$0.000001 (seeded from the on-chain mark after a restart, or left by an
+    // earlier tiny push) needs its lot_exp too even when the pool is back above $0.000001 now: an upward clamp toward that
+    // baseline lands under $0.000001 and must stay at e12. Decided from the baseline, not from the lazily filled cache.
+    const baselineTiny = units.filter((u) => {
+      if (u.source !== "pool" || isTerminalForPush(state, u.marketAddress) || tinyUnits.includes(u)) return false;
+      const e6 = prices.get(u.poolAddress);
+      if (e6 === undefined || e6 <= 0n) return false;
+      const b = crossClusterCircuitBreakerStates.get(u.key)?.lastPrice ?? getOnChainTokenPriceUsd(u.marketAddress, u.assetIndex);
+      return b !== null && b !== undefined && b > 0 && b < 1e-6;
+    });
+    const unknown = [...tinyUnits, ...baselineTiny].filter((u) => !unitLotExpCache.has(u.key));
     if (unknown.length > 0) {
       try {
         for (const [k, v] of await fetchUnitLotExps(devnetConn, unknown)) unitLotExpCache.set(k, v);
@@ -1666,7 +1680,8 @@ export async function runCycle(
     // lot_exp > 0 market whose breaker baseline is sub-$0.000001 (it was priced by the tiny path): a clamp / hold that lands
     // below $0.000001 must stay at e12. The e6 rounding below would floor it to 0 -> 1 and publish $0.000001 instead.
     const subMicro =
-      (unitLotExpCache.get(entry.key) ?? 0) > 0 && acceptedUsd !== priceUsd && acceptedUsd < 1e-6
+      (unitLotExpCache.get(entry.key) ?? 0) > 0 && currentCircuitBreakerState.lastPrice > 0 && currentCircuitBreakerState.lastPrice < 1e-6 &&
+      acceptedUsd !== priceUsd && acceptedUsd < 1e-6
         ? acceptedPublishE12(smoothedE12 ?? priceE6 * 1_000_000n, priceUsd, acceptedUsd, currentCircuitBreakerState.lastPrice)
         : null;
     const publish = subMicro
