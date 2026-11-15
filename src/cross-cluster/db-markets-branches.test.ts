@@ -270,11 +270,14 @@ describe("fetchActiveMarkets", () => {
     const conn = fakeConn(() => PUMPSWAP_PROGRAM_ID);
     respond({ body: rows });
     const saved = process.env.KEEPER_MAX_MARKETS_PER_DEPLOYER;
+    const savedTotal = process.env.KEEPER_MAX_MARKETS;
     process.env.KEEPER_MAX_MARKETS_PER_DEPLOYER = "2";
+    delete process.env.KEEPER_MAX_MARKETS;
     try {
       const out = await quiet(() => fetchActiveMarkets(cfg(conn, { caps: undefined })));
       assert.deepEqual(out?.map((e) => e.marketAddress), ["S0", "S1"]);
     } finally {
+      if (savedTotal !== undefined) process.env.KEEPER_MAX_MARKETS = savedTotal;
       if (saved === undefined) delete process.env.KEEPER_MAX_MARKETS_PER_DEPLOYER;
       else process.env.KEEPER_MAX_MARKETS_PER_DEPLOYER = saved;
     }
