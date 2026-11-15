@@ -111,7 +111,7 @@ describe("vault-LP junior-release watch: edge branches", () => {
     assert.deepEqual(o, { kind: "failed", error: "unparseable market address" });
   });
 
-  it("a missing account (market / registry / state) is nothing and resets the streak", async () => {
+  it("all accounts missing (market null) is nothing and resets the streak", async () => {
     const none = { async getMultipleAccountsInfo(keys: PublicKey[]) { return keys.map(() => null); } };
     const { o, streaks } = await run(none);
     assert.equal(o.kind, "nothing");
