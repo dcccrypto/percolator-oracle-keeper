@@ -63,7 +63,7 @@ interface Opts {
   reads?: Array<unknown>;
 }
 function fake(o: Opts) {
-  const c = { sends: 0, sims: 0, reads: 0, signed: [] as Transaction[] };
+  const c = { sends: 0, sims: 0, reads: 0, signed: [] as Transaction[], opts: [] as Array<{ skipPreflight?: boolean } | undefined> };
   const conn = {
     async getMultipleAccountsInfo() {
       const i = c.reads++;
@@ -76,8 +76,9 @@ function fake(o: Opts) {
       return [o.reg === null ? null : { data: o.reg ?? registryBuf() }, o.market ? { data: o.market } : null];
     },
     async getLatestBlockhash() { return { blockhash: BH, lastValidBlockHeight: 1 }; },
-    async sendRawTransaction(raw: Buffer) {
+    async sendRawTransaction(raw: Buffer, opts?: { skipPreflight?: boolean }) {
       c.sends++;
+      c.opts.push(opts);
       c.signed.push(Transaction.from(raw));
       if (o.sendError) throw o.sendError;
       return "sigsigsigsigsigsigsig";
@@ -123,7 +124,7 @@ describe("crankLpFeesOnce — nothing owed / nothing to read", () => {
   });
 
   it("a Resolved market that is not terminal-flat is skipped", async () => {
-    const f = fake({ market: marketBuf({ mode: 1, materialized: 3n }) });
+    const f = fake({ market: marketBuf({ mode: 1, materialized: 3n }), reg: registryBuf({ bound: true }) });
     assert.equal(await crankLpFeesOnce(f.conn, KEEPER, MARKET(), false), "skipped");
     assert.equal(f.c.sends + f.c.sims, 0);
   });
@@ -147,6 +148,8 @@ describe("crankLpFeesOnce — nothing owed / nothing to read", () => {
     const f = fake({ reg: Buffer.alloc(176) });
     assert.equal(await crankLpFeesOnce(f.conn, KEEPER, MARKET(), false), "cranked");
     assert.equal(f.c.sends, 1);
+    const ix = f.c.signed[0].instructions.find((i) => i.programId.equals(WRAPPER_PROGRAM_ID))!;
+    assert.deepEqual([...ix.data], [...buildCrankFeesIx({ keeper: KEEPER.publicKey, market: ix.keys[1].pubkey, registry: ix.keys[2].pubkey, ledger: ix.keys[3].pubkey, siblingLedger: ix.keys[4].pubkey, domainIdx: 0, bound: false, tail: null }).data], "domain 0 fallback encoded");
   });
 
   it("dry-run on a vault with shares never signs or sends", async () => {
@@ -160,7 +163,7 @@ describe("crankLpFeesOnce — failure after the send decision", () => {
   it("a send that throws a generic error is a failure with the code first", async () => {
     const f = fake({ sendError: new Error("custom program error: 0x1c") });
     const r = await crankLpFeesOnce(f.conn, KEEPER, MARKET(), false);
-    assert.ok(typeof r === "object" && !r.waiting && /tag 78/.test(r.error), JSON.stringify(r));
+    assert.ok(typeof r === "object" && !r.waiting && /tag 78/.test(r.error) && /28|0x1c/.test(r.error), JSON.stringify(r));
   });
 
   it("OracleStale (27) with no matured stale window stays a failure, not 'waiting'", async () => {
@@ -309,6 +312,7 @@ describe("crankLpFeesOnce — resolved terminal-flat harvest gate", () => {
     const observe = { seniorDrawLogs: [] as string[] };
     assert.equal(await crankLpFeesOnce(f.conn, KEEPER, MARKET(), false, FAST, observe), "cranked");
     assert.equal(f.c.sends, 1);
+    assert.equal(f.c.opts[0]?.skipPreflight, true);
     assert.deepEqual(observe.seniorDrawLogs, ["p3_senior_draw x"]);
   });
 
@@ -395,35 +399,39 @@ describe("crankLpFeesOnce — P2b ext tail", () => {
 });
 
 describe("crankAllLpFeesOnce / makeLpFeeJob — a failed crank must not look like progress", () => {
-  it("sorts every outcome into its own bucket (cranked/no-fees/skipped/waiting/failed)", async () => {
-    const regs: Array<unknown> = [];
-    const addrs = [MARKET(), MARKET(), MARKET(), MARKET(), MARKET()];
-    const outcomeFor = new Map<string, () => unknown>();
+  it("sorts every outcome of ONE concurrent sweep into its own bucket", async () => {
+    const [mCranked, mNoFees, mSkipped, mWaiting, mFailed] = [MARKET(), MARKET(), MARKET(), MARKET(), MARKET()];
+    const stale = marketBuf({ stale: { slots: 100n, lastGood: 1_000n } });
+    const sendKey = (raw: Buffer): string => Transaction.from(raw).instructions.find((i) => i.programId.equals(WRAPPER_PROGRAM_ID))!.keys[1].pubkey.toBase58();
     const conn = {
       async getMultipleAccountsInfo(keys: PublicKey[]) {
-        regs.push(keys);
-        return [{ data: registryBuf() }, null];
+        const m = keys[1].toBase58();
+        if (m === mSkipped) return [null, null];
+        return [{ data: registryBuf() }, m === mWaiting ? { data: stale } : null];
       },
       async getLatestBlockhash() { return { blockhash: BH, lastValidBlockHeight: 1 }; },
-      async sendRawTransaction() {
-        const n = regs.length;
-        if (n === 2) throw new Error("custom program error: 0x26");
-        if (n === 4) throw new Error("unrelated boom");
+      async sendRawTransaction(raw: Buffer) {
+        const m = sendKey(raw);
+        if (m === mNoFees) throw new Error("custom program error: 0x26");
+        if (m === mWaiting) throw new Error("custom program error: 0x1b");
+        if (m === mFailed) throw new Error("unrelated boom");
         return "sig";
       },
       async getBlockHeight() { return 2; },
       async getSignatureStatuses() { return { value: [{ slot: 1, confirmations: 1, err: null, confirmationStatus: "confirmed" }] }; },
+      async getSlot() { return 5_000; },
     };
-    void outcomeFor;
-    // Serialise so the call counter maps to a market.
-    const out = { cranked: 0, noFees: 0, failed: 0 };
-    for (const a of addrs.slice(0, 4)) {
-      const r = await crankAllLpFeesOnce(conn as never, KEEPER, { markets: [{ marketAddress: a }] } as never, false);
-      out.cranked += r.cranked.length;
-      out.noFees += r.noFees.length;
-      out.failed += r.failed.length;
-    }
-    assert.deepEqual(out, { cranked: 2, noFees: 1, failed: 1 });
+    const r = await crankAllLpFeesOnce(
+      conn as never,
+      KEEPER,
+      { markets: [mCranked, mNoFees, mSkipped, mWaiting, mFailed].map((marketAddress) => ({ marketAddress })) } as never,
+      false,
+    );
+    assert.deepEqual(r.cranked, [mCranked]);
+    assert.deepEqual(r.noFees, [mNoFees]);
+    assert.deepEqual(r.skipped, [mSkipped]);
+    assert.deepEqual(r.waiting.map((w) => w.market), [mWaiting]);
+    assert.deepEqual(r.failed.map((w) => w.market), [mFailed]);
   });
 
   it("sweep buckets 'waiting' separately from 'failed' and skipped on a dry-run", async () => {
@@ -453,9 +461,10 @@ describe("crankAllLpFeesOnce / makeLpFeeJob — a failed crank must not look lik
   it("job: bound landed crank with a booked senior draw carries events", async () => {
     const { out } = await run({
       reg: registryBuf({ bound: true }),
-      sim: { err: null, logs: ["Program log: p3_senior_draw_booked amount=1000"] },
+      sim: { err: null, logs: ["Program log: p3_senior_draw_booked moved=10 junior_cover=4 senior_loss=6 C=100 outstanding=0"] },
     });
     assert.equal(out.kind, "done");
+    assert.ok(out.kind === "done" && (out.events?.length ?? 0) > 0, "landed booking must raise an event");
   });
 
   it("job: Custom(38) -> nothing; no vault -> skipped", async () => {
