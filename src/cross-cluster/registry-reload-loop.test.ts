@@ -3,7 +3,7 @@
  * `updated` reconcile, and the failure paths that must never blank a running keeper.
  * Tests only; complements registry-row-validation / registry-program-set tests.
  */
-import { describe, it, afterEach } from "node:test";
+import { describe, it, afterEach, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
 import os from "os";
@@ -12,6 +12,7 @@ import { reloadRegistryOnce, startRegistryReloadLoop } from "./registry-reload.t
 import type { MarketEntry, Registry } from "./registry.ts";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "reg-reload-loop-"));
+after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 const write = (name: string, markets: unknown[], extra: Record<string, unknown> = {}): string => {
   const p = path.join(tmp, name);
   fs.writeFileSync(p, JSON.stringify({ version: 1, description: "disk", markets, ...extra }));
@@ -96,8 +97,10 @@ describe("reloadRegistryOnce reconcile", () => {
     assert.deepEqual(reloadRegistryOnce(reg, p), { added: 0, removed: 0, updated: 0 });
     assert.equal(reg.markets.length, 1);
     assert.ok(logs.some((l) => l.includes("lists no markets while 1 are tracked")));
+    logs = [];
     const none = live([]);
     assert.deepEqual(reloadRegistryOnce(none, p), { added: 0, removed: 0, updated: 0 });
+    assert.ok(!logs.some((l) => l.includes("lists no markets")), "empty file is fine when nothing is tracked");
   });
 });
 
@@ -107,14 +110,17 @@ describe("startRegistryReloadLoop", () => {
     const reg = live([A]);
     const p = write("loop.json", [A]);
     const done = startRegistryReloadLoop(reg, { registryPath: p, intervalMs: 15 });
-    await new Promise((r) => setTimeout(r, 40));
-    assert.equal(reg.markets.length, 1);
-    write("loop.json", [A, B]);
-    const deadline = Date.now() + 2000;
-    while (reg.markets.length !== 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
-    assert.equal(reg.markets.length, 2, "loop must pick up the new row without a restart");
-    process.emit("SIGTERM");
-    await done;
+    try {
+      await new Promise((r) => setTimeout(r, 40));
+      assert.equal(reg.markets.length, 1);
+      write("loop.json", [A, B]);
+      const deadline = Date.now() + 2000;
+      while (reg.markets.length !== 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+      assert.equal(reg.markets.length, 2, "loop must pick up the new row without a restart");
+    } finally {
+      process.emit("SIGTERM");
+      await done;
+    }
     assert.ok(logs.some((l) => l.includes("starting: path=") && l.includes("interval=15ms")));
     assert.ok(logs.some((l) => l.includes("stopped.")));
   });
@@ -122,7 +128,7 @@ describe("startRegistryReloadLoop", () => {
   it("an unexpected throw inside a cycle is logged and does not kill the loop", async () => {
     capture();
     let reads = 0;
-    // `markets` throws on the second read (after the in-try empty-list check is skipped), i.e. outside
+    // `markets` throws on every read; the in-try empty-list check is short-circuited, so the first read is outside
     // reloadRegistryOnce's own try/catch, so only the loop's defence-in-depth catch can save it.
     const reg = {
       version: 1,
@@ -135,11 +141,14 @@ describe("startRegistryReloadLoop", () => {
     } as unknown as Registry;
     const p = write("throw.json", [A]);
     const done = startRegistryReloadLoop(reg, { registryPath: p, intervalMs: 10 });
-    const deadline = Date.now() + 2000;
-    while (reads < 3 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
-    assert.ok(reads >= 3, "loop kept cycling after a throw");
-    process.emit("SIGINT");
-    await done;
+    try {
+      const deadline = Date.now() + 2000;
+      while (reads < 3 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+      assert.ok(reads >= 3, "loop kept cycling after a throw");
+    } finally {
+      process.emit("SIGINT");
+      await done;
+    }
     assert.ok(logs.some((l) => l.includes("unexpected error: boom")));
   });
 });
