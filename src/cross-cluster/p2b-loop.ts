@@ -106,6 +106,7 @@ export class P2bLoop {
   private readonly wallet: WalletBalanceState = createWalletBalanceState();
   private lastHedgedAt = 0;
   private hedgedRecords: HedgedLockoutRecord[] = [];
+  private gapActive = false;
   private ticks = 0;
 
   constructor(
@@ -153,7 +154,9 @@ export class P2bLoop {
       if (missing.size > 0) {
         console.warn(`[p2b] snapshots ${snaps.size}/${refs.length}: ${missing.size} markets have no snapshot this tick (tags 103/104, hedged-lockout and earn-gap skip them)`);
       }
-      await this.deps.sink.reconcile("p2b:snapshot-gap", missing.size > 0 ? [snapshotGapAlert(refs.length, snaps.size, chunkStats.droppedChunks)] : []);
+      // only touches the sink while a gap exists or just closed: a fully-read tick behaves exactly as before
+      if (missing.size > 0 || this.gapActive) await this.deps.sink.reconcile("p2b:snapshot-gap", missing.size > 0 ? [snapshotGapAlert(refs.length, snaps.size, chunkStats.droppedChunks)] : []);
+      this.gapActive = missing.size > 0;
       const list: VaultMarketSnapshot[] = [...snaps.values()];
 
       // 1. tag 104: every tick, close-only markets only
