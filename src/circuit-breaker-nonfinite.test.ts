@@ -20,7 +20,7 @@ function drive(price: number, checks: number, stepMs: number) {
   return { s, out };
 }
 
-describe("scratch: non-finite / non-positive source on sustained path", () => {
+describe("circuit breaker: non-finite / non-positive source on sustained path", () => {
   for (const [name, p] of [["NaN", NaN], ["zero", 0], ["negative", -5], ["Infinity", Infinity]] as const) {
     it(`${name} source is never published`, () => {
       const { s, out } = drive(p, 40, 30_000);
