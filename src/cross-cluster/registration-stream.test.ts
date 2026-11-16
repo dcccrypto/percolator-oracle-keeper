@@ -69,7 +69,7 @@ describe("registration-stream", () => {
     onPayload!({ eventType: "INSERT", new: { slab_address: "AAAAAAAAAAAA" } });
     mock.timers.tick(100);
     onPayload!({ eventType: "UPDATE", new: { slab_address: "BBBBBBBBBBBB" } });
-    mock.timers.tick(249);
+    mock.timers.tick(149); // window runs from the FIRST event (not sliding)
     assert.equal(seen.length, 0);
     mock.timers.tick(1);
     assert.deepEqual(seen, [{ type: "UPDATE", slabAddress: "BBBBBBBBBBBB" }]);
