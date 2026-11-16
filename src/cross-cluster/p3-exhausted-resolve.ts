@@ -163,7 +163,11 @@ async function simulate(conn: ExhaustedJobConnection, keeper: { publicKey: Publi
   return r.value;
 }
 
+/** Consecutive cycles a market must read missing/undecodable before its exhausted mark is dropped. */
+export const UNREADABLE_CLEAR_AFTER = 3;
+
 export function makeExhaustedResolveJob(cfg: ExhaustedJobConfig): FeeJob {
+  const unreadable = new Map<string, number>();
   return {
     name: "p3-exhausted",
     async run(ctx, m): Promise<FeeJobOutcome> {
@@ -177,13 +181,25 @@ export function makeExhaustedResolveJob(cfg: ExhaustedJobConfig): FeeJob {
       }
       const [info] = await conn.getMultipleAccountsInfo([market], "confirmed");
       const d = info ? new Uint8Array(info.data) : null;
-      if (!d || marketMode(d) !== 0) {
-        // Resolved / Recovery / closed: the resolve happened (or the valve took it); stop withholding.
-        if (reg.has(m.marketAddress)) {
-          reg.clear(m.marketAddress);
-          return { kind: "done", detail: "exhausted market left Live; push withholding lifted" };
+      const mode = d ? marketMode(d) : null;
+      if (mode === 0) {
+        unreadable.delete(m.marketAddress);
+      } else {
+        if (!reg.has(m.marketAddress)) return { kind: "nothing" };
+        // A DEFINITE Resolved / Recovery mode byte means the resolve happened (or the valve took
+        // it): stop withholding. A missing or undecodable account (mode null) is also what a lagging
+        // or failed-over RPC node returns; lifting the withholding on that would let the next push
+        // reset last_good_oracle_slot and restart the stale window, so require consecutive misses.
+        if (mode === null) {
+          const n = (unreadable.get(m.marketAddress) ?? 0) + 1;
+          if (n < UNREADABLE_CLEAR_AFTER) {
+            unreadable.set(m.marketAddress, n);
+            return { kind: "nothing" };
+          }
         }
-        return { kind: "nothing" };
+        unreadable.delete(m.marketAddress);
+        reg.clear(m.marketAddress);
+        return { kind: "done", detail: "exhausted market left Live; push withholding lifted" };
       }
       if (!reg.has(m.marketAddress)) {
         if (!cfg.vaultLpFor) return { kind: "nothing" };
