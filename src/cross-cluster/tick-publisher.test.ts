@@ -148,6 +148,7 @@ test("publisher: url/key/timeout fall back to env, trimmed; stays disabled when 
     p.publish([inp(1)], 1, 1);
     await tick();
     assert.equal(seen!.url, "https://env.example/t");
+    assert.equal(seen!.init.signal instanceof AbortSignal, true);
     assert.equal((seen!.init.headers as Record<string, string>).authorization, "Bearer envkey");
     assert.equal(p.counters().sent, 1);
   });
@@ -162,11 +163,12 @@ test("publisher: url/key/timeout fall back to env, trimmed; stays disabled when 
 test("publisher: invalid timeout (NaN, zero, negative) falls back to the default instead of aborting at once", async () => {
   for (const bad of [Number.NaN, 0, -5]) {
     const p = createTickPublisher({ url: "https://u.example/t", key: "k", timeoutMs: bad, fetchImpl: (async (_u: string, init: RequestInit) => {
+      await new Promise((r) => setTimeout(r, 15));
       assert.equal(init.signal!.aborted, false);
       return new Response("ok");
     }) as unknown as typeof fetch });
     p.publish([inp(1)], 1, 1);
-    await tick();
+    await new Promise((r) => setTimeout(r, 40));
     assert.equal(p.counters().sent, 1, String(bad));
   }
   await withEnv({ TICK_PUBLISH_TIMEOUT_MS: "garbage" }, async () => {

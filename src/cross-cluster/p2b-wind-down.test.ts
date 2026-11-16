@@ -432,7 +432,7 @@ describe("runner: defaults, logging and failure paths", () => {
     return lines;
   };
 
-  it("with no walletLow / now / log deps: uses the real clock and console.log; a stale mark is logged there", async () => {
+  it("with no log dep: a stale mark is logged through console.log", async () => {
     const g = bare({ holders: [holder(1, "short")] });
     const lines = await withConsole(async () => {
       const out = await g.r.runMarket(snap(roMarket({ episodeSince: BigInt(NOW - 9000), markSlot: BigInt(NOW - 200) })));
@@ -475,13 +475,13 @@ describe("runner: defaults, logging and failure paths", () => {
     const g = bare({ holders: [holder(1, "short")], sims: [{ err: null, logs: [CLOSED_LOG], unitsConsumed: 123_456 }] });
     const lines = await withConsole(async () => { await g.r.runMarket(EXPIRED()); });
     assert.match(lines[0], /landed on \w{8}….*\(simulated 123456 CU of 600000\)/);
-    const h = bare({ holders: [holder(1, "short")], sims: [{ err: null, logs: [CLOSED_LOG], unitsConsumed: undefined }] });
+    const h = bare({ holders: [holder(1, "short")], sims: [{ err: null, logs: [CLOSED_LOG] }] });
     h.c.conn.simulateTransaction = (async () => ({ context: { slot: 1 }, value: { err: null, logs: [CLOSED_LOG], accounts: null, unitsConsumed: undefined, returnData: null } })) as never;
     const l2 = await withConsole(async () => { await h.r.runMarket(EXPIRED()); });
     assert.match(l2[0], /\(simulated \? CU of 600000\)/);
   });
 
-  it("a send that lands but failed on chain is 'failed': logged, not counted as sent, and not cooled down as capped", async () => {
+  it("a send that lands but failed on chain is 'failed': logged, not counted as sent", async () => {
     const g = bare({ holders: [holder(1, "short")], confirmErr: { InstructionError: [1, { Custom: 5 }] }, sims: [{ err: null, logs: [CLOSED_LOG] }] });
     const lines = await withConsole(async () => {
       assert.deepEqual(await g.r.runMarket(EXPIRED()), { kind: "acted", armed: 0, closed: 0, sims: 1, sent: 0 });
@@ -494,7 +494,7 @@ describe("runner: defaults, logging and failure paths", () => {
   it("a send that never confirms is logged 'not landed'", async () => {
     const g = bare({ holders: [holder(1, "short")], sims: [{ err: null, logs: [CLOSED_LOG] }] });
     g.c.conn.getSignatureStatuses = (async () => ({ context: { slot: 1 }, value: [null] })) as never;
-    g.c.conn.getBlockHeight = (async () => 1_000_000) as never;
+    (g.c.conn as unknown as Record<string, unknown>).getBlockHeight = (async () => 1_000_000) as never;
     const lines = await withConsole(async () => {
       assert.deepEqual(await g.r.runMarket(EXPIRED()), { kind: "acted", armed: 0, closed: 0, sims: 1, sent: 0 });
     });
@@ -508,7 +508,7 @@ describe("runner: defaults, logging and failure paths", () => {
     });
   });
 
-  it("market with no data, or one the program cannot read as close-only, is 'none'", async () => {
+  it("market with no data is 'none'", async () => {
     const g = bare({ holders: [holder(1, "short")] });
     assert.deepEqual(await g.r.runMarket({ ...snap(roMarket()), marketData: null } as never), { kind: "none" });
   });
@@ -536,6 +536,7 @@ describe("pure helpers: remaining branches", () => {
     assert.equal(classifyWindDownError("weird"), "other");
     assert.equal(classifyWindDownError({ InstructionError: [1, "ProgramFailedToComplete"] }, ["Program failed: exceeded CUs meter at BPF instruction"]), "compute");
     assert.equal(classifyWindDownError({ InstructionError: [1, "ComputationalBudgetExceeded"] }), "compute");
+    assert.equal(classifyWindDownError({ InstructionError: [1, "ProgramFailedToComplete"] }, ["exceeded CUs meter"]), "compute", "compute class is checked before custom-code mapping");
     assert.equal(classifyWindDownError({ InstructionError: [1, "ProgramFailedToComplete"] }, ["some other failure"]), "other");
   });
 });
