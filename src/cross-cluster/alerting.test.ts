@@ -166,6 +166,63 @@ describe("AlertSink", () => {
     assert.ok(!lines.some((l) => l.includes("SECRET-TOKEN")));
   });
 
+  describe("failed webhook does not hold the cooldown", () => {
+    const URL_ = "https://hooks.example.com/services/SECRET-TOKEN";
+    function flaky(failures: number) {
+      let t = 1_000_000;
+      let calls = 0;
+      const lines: string[] = [];
+      const sink = new AlertSink({
+        thresholds: T,
+        webhookUrl: URL_,
+        now: () => t,
+        post: async (u) => {
+          calls++;
+          if (calls <= failures) throw new Error(`HTTP 500 from ${u}`);
+        },
+        log: (l) => lines.push(l),
+        logError: (l) => lines.push(l),
+      });
+      return { sink, lines, calls: () => calls, tick: () => { t += 1000; } };
+    }
+
+    it("reconcile retries next cycle after a failed post, then honours the cooldown", async () => {
+      const f = flaky(1);
+      assert.equal((await f.sink.reconcile("crank", [LAG])).length, 1);
+      f.tick();
+      assert.equal((await f.sink.reconcile("crank", [LAG])).length, 1, "retried");
+      f.tick();
+      assert.equal((await f.sink.reconcile("crank", [LAG])).length, 0, "delivered: cooldown holds");
+      assert.equal(f.calls(), 2);
+    });
+
+    it("fire retries next cycle after a failed post, then honours the cooldown", async () => {
+      const f = flaky(1);
+      assert.equal(await f.sink.fire("s", LAG), true);
+      f.tick();
+      assert.equal(await f.sink.fire("s", LAG), true, "retried");
+      f.tick();
+      assert.equal(await f.sink.fire("s", LAG), false, "delivered: cooldown holds");
+      assert.equal(f.calls(), 2);
+    });
+
+    it("retry is capped for a persistently failing webhook (reconcile and fire)", async () => {
+      const f = flaky(Infinity);
+      for (let i = 0; i < 10; i++) { await f.sink.reconcile("crank", [LAG]); f.tick(); }
+      assert.equal(f.calls(), 3);
+      const g = flaky(Infinity);
+      for (let i = 0; i < 10; i++) { await g.sink.fire("s", LAG); g.tick(); }
+      assert.equal(g.calls(), 3);
+    });
+
+    it("failure logs never echo the URL, even if the error message contains it", async () => {
+      const f = flaky(2);
+      await f.sink.fire("s", LAG);
+      assert.ok(f.lines.some((l) => /webhook delivery failed: HTTP 500 from <url>/.test(l)));
+      assert.ok(!f.lines.some((l) => l.includes("SECRET-TOKEN")));
+    });
+  });
+
   it("health lines are single-line JSON with bigint support", () => {
     const c = capture();
     c.sink.health("crank", { big: 5n, markets: [{ m: "SOL", lag: 3 }] });

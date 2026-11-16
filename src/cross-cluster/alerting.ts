@@ -780,6 +780,9 @@ export function telegramTargetOrOff(env: Env, logError: (l: string) => void = (l
   }
 }
 
+/** Max consecutive failed webhook posts per alert before the cooldown is kept. */
+const WEBHOOK_RETRY_CAP = 3;
+
 export class AlertSink {
   private tgChain: Promise<void> = Promise.resolve();
   private tgPending = 0;
@@ -789,6 +792,8 @@ export class AlertSink {
   /** True while reconcile() is delivering a set that itself contains zero-pushes. */
   private zeroPushesInFlight = false;
   private readonly lastSent = new Map<string, number>();
+  /** Consecutive failed webhook deliveries per alert key (caps the retry-on-failure rollback). */
+  private readonly webhookFails = new Map<string, number>();
   /** Active alert key -> the severity it last fired with (echoed on RESOLVED). */
   private readonly activeKeys = new Map<string, AlertSeverity>();
   private readonly opts: Required<Omit<AlertSinkOptions, "webhookUrl" | "telegram">> & { webhookUrl?: string; telegram?: TelegramTarget };
@@ -831,7 +836,7 @@ export class AlertSink {
       if (last === undefined || now - last >= this.opts.thresholds.cooldownMs) {
         this.lastSent.set(key, now);
         fired.push(a);
-        await this.deliver("ALERT", a, key);
+        await this.deliver("ALERT", a, key, now);
       }
     }
     this.zeroPushesInFlight = false;
@@ -839,6 +844,7 @@ export class AlertSink {
       if (!key.startsWith(`${scope}|`) || activeNow.has(key)) continue;
       this.activeKeys.delete(key);
       this.lastSent.delete(key);
+      this.webhookFails.delete(key);
       const [, kind, subject] = key.split("|");
       await this.deliver("ALERT-RESOLVED", {
         kind: kind as AlertKind,
@@ -858,7 +864,7 @@ export class AlertSink {
     const last = this.lastSent.get(key);
     if (last !== undefined && now - last < this.opts.thresholds.cooldownMs) return false;
     this.lastSent.set(key, now);
-    await this.deliver("ALERT", a, key);
+    await this.deliver("ALERT", a, key, now);
     return true;
   }
 
@@ -923,7 +929,7 @@ export class AlertSink {
       });
   }
 
-  private async deliver(tag: "ALERT" | "ALERT-RESOLVED", a: Alert, key: string): Promise<void> {
+  private async deliver(tag: "ALERT" | "ALERT-RESOLVED", a: Alert, key: string, stamp?: number): Promise<void> {
     const line = `[${tag}] ${JSON.stringify(a, bigintSafe)}`;
     if (tag === "ALERT") this.opts.logError(line);
     else this.opts.log(line);
@@ -932,9 +938,22 @@ export class AlertSink {
     if (this.opts.webhookUrl) {
       try {
         await this.opts.post(this.opts.webhookUrl, JSON.stringify({ text, alert: a }, bigintSafe));
+        this.webhookFails.delete(key);
       } catch (err) {
         // Never echo the URL — it is a credential.
-        this.opts.logError(`[alerting] webhook delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+        const raw = err instanceof Error ? err.message : String(err);
+        this.opts.logError(`[alerting] webhook delivery failed: ${raw.split(this.opts.webhookUrl).join("<url>")}`);
+        // An alert nobody got must not hold the cooldown: roll the stamp back so the next cycle retries,
+        // but only WEBHOOK_RETRY_CAP times in a row so a dead webhook cannot retry every cycle forever.
+        if (tag === "ALERT" && stamp !== undefined) {
+          const fails = (this.webhookFails.get(key) ?? 0) + 1;
+          if (fails < WEBHOOK_RETRY_CAP) {
+            this.webhookFails.set(key, fails);
+            if (this.lastSent.get(key) === stamp) this.lastSent.delete(key);
+          } else {
+            this.webhookFails.delete(key); // give up this window; cooldown stands
+          }
+        }
       }
     }
     this.enqueueTelegram(tag, a, key, text);
