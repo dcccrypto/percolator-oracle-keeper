@@ -15,6 +15,8 @@ import fs from "node:fs";
 export interface RestartRecord {
   launches: number[]; // epoch ms, pruned to the window
   lastAlertAt?: number;
+  /** Consecutive failed webhook deliveries for the current alert window. */
+  alertFails?: number;
 }
 export interface RestartHealth {
   launchesInWindow: number;
@@ -38,7 +40,7 @@ export function restartConfig(env: Readonly<Record<string, string | undefined>>)
 function load(path: string): RestartRecord {
   try {
     const j = JSON.parse(fs.readFileSync(path, "utf8")) as RestartRecord;
-    return { launches: Array.isArray(j.launches) ? j.launches.filter((n) => Number.isFinite(n)) : [], lastAlertAt: j.lastAlertAt };
+    return { launches: Array.isArray(j.launches) ? j.launches.filter((n) => Number.isFinite(n)) : [], lastAlertAt: j.lastAlertAt, alertFails: Number.isFinite(j.alertFails) ? j.alertFails : undefined };
   } catch {
     return { launches: [] };
   }
@@ -55,13 +57,40 @@ export function recordLaunch(
   rec.launches = [...rec.launches.filter((t) => now - t < windowMs), now];
   const escalated = rec.launches.length >= threshold;
   const alertDue = escalated && (rec.lastAlertAt === undefined || now - rec.lastAlertAt >= windowMs);
-  if (alertDue) rec.lastAlertAt = now;
+  if (alertDue) {
+    // A new window (previous stamp expired) starts with a fresh retry budget; a retry after a failure keeps its count.
+    if (rec.lastAlertAt !== undefined) rec.alertFails = 0;
+    rec.lastAlertAt = now;
+  }
   try {
     fs.writeFileSync(path, JSON.stringify(rec));
   } catch {
     /* read-only location: escalation degrades to in-memory only */
   }
   return { health: view(rec.launches, now, threshold, windowMs), alertDue };
+}
+
+/** Max failed webhook deliveries retried per alert window; a dead endpoint cannot loop forever. */
+export const MAX_ALERT_RETRIES = 3;
+
+/**
+ * Call when the webhook delivery for a due alert FAILED. recordLaunch already stamped lastAlertAt, which would
+ * suppress the alert for a whole window even though nothing was delivered. Roll the stamp back so the next
+ * launch retries, up to MAX_ALERT_RETRIES failures per window; after that the stamp stays (window-bound cap).
+ * Returns true if a retry remains.
+ */
+export function recordAlertFailure(path: string, now: number = Date.now()): boolean {
+  const rec = load(path);
+  rec.alertFails = (rec.alertFails ?? 0) + 1;
+  const retry = rec.alertFails < MAX_ALERT_RETRIES;
+  if (retry) delete rec.lastAlertAt;
+  else rec.lastAlertAt = now; // cap reached: suppress for the rest of the window
+  try {
+    fs.writeFileSync(path, JSON.stringify(rec));
+  } catch {
+    /* read-only location: nothing to roll back */
+  }
+  return retry;
 }
 
 export function readHealth(path: string, now: number, threshold: number, windowMs: number): RestartHealth {

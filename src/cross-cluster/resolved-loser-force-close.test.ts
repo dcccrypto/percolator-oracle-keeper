@@ -598,6 +598,17 @@ describe("K-COV4: owner token account (ATA) creation for a payout", () => {
     assert.deepEqual(r.released, [], "the winner still waits");
   });
 
+  it("a close refused AFTER progress (calls>0) is labelled 'refused after progress: <err>', not 'done'", async () => {
+    const w = ataWorld(false);
+    const lines: string[] = [];
+    const r = await run(w, AFTER, new LoserForceCloseState(), CFG({ log: (l) => lines.push(l) }));
+    assert.equal(r.calls, 1);
+    const ev = lines
+      .map((l) => JSON.parse(l.replace(/^\[resolved-loser-force-close\] /, "")) as { event: string; stop?: string })
+      .find((e) => e.event === "loser_force_closed");
+    assert.match(ev?.stop ?? "", /^refused after progress: /);
+  });
+
   it("with the ATA budget at 0 the keeper does not create it and reports the refusal", async () => {
     const w = ataWorld(false);
     const r = await run(w, AFTER, new LoserForceCloseState(), CFG({ maxAtaCreatesPerCycle: 0 }));
