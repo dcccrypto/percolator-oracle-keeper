@@ -562,7 +562,8 @@ export function selectSweepBatch(
   exclude: ReadonlySet<string> = new Set(),
   epochs: SideEpochs | null = null,
 ): PositionedPortfolio[] {
-  if (k <= 0) return [];
+  k = Math.trunc(k);
+  if (!(k > 0)) return [];
   const candidates: RankItem[] = [];
   for (const p of positioned) {
     const key = keyOf(p.pubkey);
