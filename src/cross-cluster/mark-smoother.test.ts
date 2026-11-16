@@ -260,4 +260,51 @@ describe("#92 cold-start manipulation window", () => {
     for (let i = 0; i < 40; i++) out = s.smooth(POOL, 1_000_000n, T0 + i * TICK);
     assert.equal(out, 1_000_000n, "a primed window must keep publishing");
   });
+
+  describe("time order (wall-clock steps backwards)", () => {
+    const opts = { windowMs: 90_000, minSamples: 3 };
+
+    it("lead 2: forward jump then a step back does not leave a negative span stalling publishing", () => {
+      const s = createMarkSmoother(opts);
+      s.smooth(POOL, 100n, T0);
+      s.smooth(POOL, 100n, T0 + 500_000); // forward jump
+      // clock steps back to T0 and runs normally: a fresh window must prime on real elapsed time (~84s), not wait for the clock to pass T0+500s
+      let out: bigint | null = null;
+      let publishedAt = -1;
+      for (let i = 0; i < 30 && out === null; i++) {
+        out = s.smooth(POOL, 100n, T0 + i * TICK);
+        publishedAt = i;
+      }
+      assert.equal(out, 100n);
+      assert.ok(publishedAt <= 13, `published after ${publishedAt} ticks`);
+      assert.ok(s.status(POOL).spanMs >= 0, "span never negative");
+    });
+
+    it("lead 1: a sample behind newer ones is not retained past windowMs (stale samples leak into the median)", () => {
+      const s = createMarkSmoother(opts);
+      s.smooth(POOL, 999n, T0 + 300_000); // far-future sample at the front
+      let out: bigint | null = null;
+      for (let i = 0; i < 14; i++) out = s.smooth(POOL, 1n, T0 + i * TICK);
+      // every sample in the window must lie within windowMs of the newest one
+      const st = s.status(POOL);
+      assert.ok(st.spanMs <= opts.windowMs, `span ${st.spanMs} exceeds window`);
+      assert.equal(out, 1n);
+    });
+
+    it("lead 1b: ordered input is unchanged (equal timestamps keep both samples)", () => {
+      const s = createMarkSmoother(opts);
+      s.smooth(POOL, 5n, T0);
+      s.smooth(POOL, 5n, T0);
+      assert.equal(s.status(POOL).samples, 2);
+    });
+
+    it("lead 3: peek() right after smooth() holds only in-window samples (the keeper's only call pattern)", () => {
+      const s = createMarkSmoother(opts);
+      for (let i = 0; i < 5; i++) s.smooth(POOL, 7n, T0 + i * TICK);
+      // priming not satisfied (span 28s); the bypass path peeks the window the same cycle
+      assert.equal(s.smooth(POOL, 7n, T0 + 5 * TICK), null);
+      assert.equal(s.peek(POOL), 7n);
+      // NOT a bug in the keeper: peek() has no clock; a pool no longer smoothed is not peeked (smooth() runs first each cycle).
+    });
+  });
 });

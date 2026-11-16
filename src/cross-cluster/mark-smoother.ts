@@ -187,9 +187,13 @@ export function createMarkSmoother(opts: MarkSmootherOptions = {}): MarkSmoother
         win = [];
         windows.set(poolAddress, win);
       }
+      // The age eviction below assumes the window is in time order. A wall-clock step BACKWARDS (NTP) would append a
+      // sample behind newer ones: it is never evicted by age, span goes negative (publishing stalls until the clock
+      // catches up or the count cap trims), and samples older than windowMs leak into the median. Restart priming
+      // instead: withholding is the fail-safe direction, and time-ordered input is untouched.
+      if (win.length > 0 && nowMs < win[win.length - 1].t) win.length = 0;
       win.push({ t: nowMs, px: priceE6 });
-      // Evict by age, then by count (oldest first — the array is append-only
-      // in time order; a caller stepping time backwards just evicts nothing).
+      // Evict by age, then by count (oldest first — the array is time-ordered).
       const cutoff = nowMs - windowMs;
       let firstLive = 0;
       while (firstLive < win.length && win[firstLive].t < cutoff) firstLive++;
