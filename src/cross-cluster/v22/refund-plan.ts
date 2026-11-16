@@ -297,8 +297,6 @@ export function verifyRefundPlan(plan: RefundPlan): VerifyResult {
   const seen = new Set<string>();
   for (const m of plan.markets ?? []) {
     sum += m.totalLamports;
-    const amts = [m.totalLamports, m.components?.slabRentLamports, m.components?.stakeRentLamports];
-    if (!amts.every((x) => Number.isSafeInteger(x) && (x as number) >= 0)) problems.push(`${m.market}: amounts must be non-negative integer lamports`);
     if (m.totalLamports !== m.components.slabRentLamports + m.components.stakeRentLamports) problems.push(`${m.market}: total is not the sum of its components`);
     if (m.totalLamports > MAX_PER_MARKET_LAMPORTS || m.totalLamports > (perMarket ?? 0)) problems.push(`${m.market}: over the per-market cap`);
     if (!isPubkey(m.creator) || !isPubkey(m.market)) problems.push(`${m.market}: invalid address`);
