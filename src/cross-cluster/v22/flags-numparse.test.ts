@@ -63,6 +63,9 @@ describe("v22 flags: integer flags are strict decimal", () => {
     assert.equal(probe(k, r, "0"), "THROWS");
     assert.equal(probe(k, r, "-3"), "THROWS");
   });
+  it("leading zeros stay accepted as plain decimal (same as G9_DRAW_CAP_ATOMS)", () => {
+    assert.equal(probe("KEEPER_V22_TICK_MS", (f) => f.tickMs, "00012"), "12");
+  });
   it("nonNeg flag accepts 0, rejects negatives", () => {
     const [k, r] = NONNEG[0];
     assert.equal(probe(k, r, "0"), "0");
