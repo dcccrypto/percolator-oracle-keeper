@@ -322,6 +322,31 @@ export function buildRefreshCrankIx(
   return ix;
 }
 
+/** The no-observation crank data is a constant (nowSlot 0, no hints): encoded once, each ix gets its own copy. */
+let refreshCrankData: Uint8Array | null = null;
+function refreshData(): Uint8Array {
+  refreshCrankData ??= encodePermissionlessCrank({ nowSlot: 0n, observations: [] });
+  return refreshCrankData.slice();
+}
+
+/** Observation-crank data for `market` (one base58 + hint lookup); a plan builds it once and copies it per ix. */
+function observationData(assets: ReadonlyArray<number>, oracleCount: number): Uint8Array {
+  return encodePermissionlessCrank({
+    nowSlot: 0n, // wrapper authenticates against Clock::get()
+    observations: observationHints(assets, oracleCount),
+  });
+}
+
+function crankIxWithData(owner: PublicKey, market: PublicKey, portfolio: PublicKey, data: Uint8Array, oracleAccounts: ReadonlyArray<PublicKey> = []): TransactionInstruction {
+  const keys = buildAccountMetas(ACCOUNTS_PERMISSIONLESS_CRANK_BASE, { owner, market, portfolio });
+  for (const a of oracleAccounts) keys.push({ pubkey: a, isSigner: false, isWritable: false });
+  return new TransactionInstruction({
+    programId: WRAPPER_PROGRAM_ID,
+    keys,
+    data: data as unknown as Buffer,
+  });
+}
+
 function buildPermissionlessCrankIx(
   owner: PublicKey,
   market: PublicKey,
@@ -329,17 +354,8 @@ function buildPermissionlessCrankIx(
   withObservation: boolean,
   oracleAccounts: ReadonlyArray<PublicKey> = [],
 ): TransactionInstruction {
-  const keys = buildAccountMetas(ACCOUNTS_PERMISSIONLESS_CRANK_BASE, { owner, market, portfolio });
-  if (withObservation) for (const a of oracleAccounts) keys.push({ pubkey: a, isSigner: false, isWritable: false });
-  const data = encodePermissionlessCrank({
-    nowSlot: 0n, // wrapper authenticates against Clock::get()
-    observations: withObservation ? observationHints(observationAssetsFor(market.toBase58()), oracleAccounts.length) : [],
-  });
-  return new TransactionInstruction({
-    programId: WRAPPER_PROGRAM_ID,
-    keys,
-    data: data as unknown as Buffer,
-  });
+  if (!withObservation) return crankIxWithData(owner, market, portfolio, refreshData());
+  return crankIxWithData(owner, market, portfolio, observationData(observationAssetsFor(market.toBase58()), oracleAccounts.length), oracleAccounts);
 }
 
 // ── Transaction plan ──────────────────────────────────────────────────────
@@ -606,12 +622,16 @@ export function planCrankTx(params: {
   const repairCu = repairs.length * REPAIR_CU;
   // K-6: a multi-asset market's observation cranks carry one hint per asset and cost more; single-asset: hints = 1,
   // every figure below is the pre-K-6 one.
-  const hints = observationAssetsFor(market.toBase58()).length;
+  const assets = observationAssetsFor(market.toBase58());
+  const hints = assets.length;
   const catchupCu = catchupCrankCuFor(CATCHUP_CRANK_CU, hints);
   // CU-capped for every hint count (v22price 2026-10-22: the single-asset count used to be uncapped by compute).
   const catchupN = Math.min(catchup, maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, hints, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM - repairCu));
+  // One observation-crank encoding (base58 + hint lookup) for every catch-up and the accrual of this market.
+  let obsData: Uint8Array | null = null;
+  const obsIx = (): TransactionInstruction => crankIxWithData(owner, market, lpPortfolio, (obsData ??= observationData(assets, 0)).slice());
   for (let i = 0; i < catchupN; i++) {
-    cranks.push({ kind: "catchup", portfolio: lpPortfolio, ix: buildObservationCrankIx(owner, market, lpPortfolio) });
+    cranks.push({ kind: "catchup", portfolio: lpPortfolio, ix: obsIx() });
   }
   // The observation crank settles the LP it targets: a heavy LP (3+ legs) makes the accrual itself the big crank.
   const accrueCu = accrueCrankCuFor(cost && params.lp && cost.isSolo(params.lp) ? cost.worstRefreshCu(params.lp) : ACCRUE_CRANK_CU, hints);
@@ -625,12 +645,20 @@ export function planCrankTx(params: {
       computeUnits: Math.min(MAX_TX_CU, repairCu + catchupN * catchupCu + ACCRUAL_TX_CU_HEADROOM),
     };
   }
-  cranks.push({ kind: "accrue", portfolio: lpPortfolio, ix: buildObservationCrankIx(owner, market, lpPortfolio) });
+  cranks.push({ kind: "accrue", portfolio: lpPortfolio, ix: obsIx() });
   let cu = repairCu + catchupN * catchupCu + accrueCu;
   /** Packing ceiling: the headroom is reserved, never spent on another refresh. */
   const packCap = MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM;
 
-  const ordered = [...refreshTargets].sort((x, y) => Number(x.isLp) - Number(y.isLp));
+  // Stable partition: non-LP first, LP last (same order as the stable sort on Number(isLp)).
+  const ordered: PositionedPortfolio[] = [];
+  let lpTail: PositionedPortfolio[] | null = null;
+  for (const t of refreshTargets) {
+    if (t.isLp) (lpTail ??= []).push(t);
+    else ordered.push(t);
+  }
+  if (lpTail) for (const t of lpTail) ordered.push(t);
+  const liqTargets = params.liquidateTargets ?? [];
   const overflow: PositionedPortfolio[] = [];
   for (const p of ordered) {
     const refreshCu = cost ? cost.refreshCu(p, REFRESH_CRANK_CU) : REFRESH_CRANK_CU;
@@ -641,7 +669,7 @@ export function planCrankTx(params: {
     cranks.push({ kind: "refresh", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
     cu += refreshCu;
     const liquidateCu = cost ? cost.liquidateCu(p, LIQUIDATE_CRANK_CU) : LIQUIDATE_CRANK_CU;
-    if (!p.isLp && (params.liquidateTargets ?? []).some((t) => t.equals(p.pubkey)) && cu + liquidateCu <= packCap) {
+    if (!p.isLp && liqTargets.length > 0 && liqTargets.some((t) => t.equals(p.pubkey)) && cu + liquidateCu <= packCap) {
       cranks.push({ kind: "liquidate", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
       cu += liquidateCu;
     }
