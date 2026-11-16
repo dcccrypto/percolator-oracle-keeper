@@ -56,10 +56,30 @@ const GROUP_BY_VERSION: Readonly<Record<number, GroupHeaderOffsets>> = { 18: GRO
 /** Wrapper VERSIONs whose market header this module decodes. */
 export const TERMINAL_STATE_VERSIONS: ReadonlySet<number> = new Set(Object.keys(GROUP_BY_VERSION).map(Number));
 
+/**
+ * One DataView per buffer instead of one per read (same fix as SDK #451). A DataView over a Uint8Array is a live window
+ * (it sees later writes) and the array's buffer/offset/length are fixed, so caching it never changes a result. A
+ * one-entry fast path covers the push loop calling the decoders back to back on the same bytes.
+ */
+const VIEWS = new WeakMap<Uint8Array, DataView>();
+let lastBytes: Uint8Array | null = null;
+let lastView: DataView | null = null;
+function viewOf(d: Uint8Array): DataView {
+  if (d === lastBytes && lastView !== null) return lastView;
+  let v = VIEWS.get(d);
+  if (v === undefined) {
+    v = new DataView(d.buffer, d.byteOffset, d.byteLength);
+    VIEWS.set(d, v);
+  }
+  lastBytes = d;
+  lastView = v;
+  return v;
+}
+
 /** The header table for a wrapper account of a known VERSION (magic checked), else null. Never a guess. */
 function groupOffsetsFor(d: Uint8Array): GroupHeaderOffsets | null {
   if (d.length < 16) return null;
-  const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
+  const v = viewOf(d);
   if (v.getBigUint64(0, true) !== WRAPPER_MAGIC) return null;
   return GROUP_BY_VERSION[v.getUint16(8, true)] ?? null;
 }
@@ -87,7 +107,7 @@ export function isTerminalMarket(d: Uint8Array): boolean {
 }
 
 function u64(d: Uint8Array, off: number): bigint {
-  return new DataView(d.buffer, d.byteOffset, d.byteLength).getBigUint64(off, true);
+  return viewOf(d).getBigUint64(off, true);
 }
 
 /** null: not a VERSION-18/19 wrapper account of kind 1/8, or too short. Never a guess. */
