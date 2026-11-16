@@ -115,7 +115,7 @@ describe("startRegistryReloadLoop", () => {
       assert.equal(reg.markets.length, 1);
       write("loop.json", [A, B]);
       const deadline = Date.now() + 2000;
-      while (reg.markets.length !== 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+      while ((reg.markets.length as number) !== 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
       assert.equal(reg.markets.length, 2, "loop must pick up the new row without a restart");
     } finally {
       process.emit("SIGTERM");
