@@ -65,3 +65,23 @@ for (const [name, extra, samples] of [
     assert.ok(recorded.some((r) => JSON.parse(r)[2].length > 0), "stream must exercise log/trip paths");
   });
 }
+
+test("recordMarkInForce never mutates a previously captured deque; out-of-order time matches reference", () => {
+  for (const mod of [neu, old as unknown as typeof neu]) {
+    const st: neu.CircuitBreakerState = { symbol: "X", lastPrice: 100, circuitBreakerTrips: 0, cbTripPrice: 0, cbConsecutiveTrips: 0 };
+    mod.recordMarkInForce(st, 100, 1000);
+    mod.recordMarkInForce(st, 90, 2000);
+    const maxBefore = st.cbWindowMax;
+    const snap = JSON.stringify(maxBefore);
+    mod.recordMarkInForce(st, 120, 500); // out of order, dominates
+    assert.equal(JSON.stringify(maxBefore), snap);
+    assert.notEqual(st.cbWindowMax, maxBefore);
+  }
+  const a: neu.CircuitBreakerState = { symbol: "X", lastPrice: 1, circuitBreakerTrips: 0, cbTripPrice: 0, cbConsecutiveTrips: 0 };
+  const b = { ...a };
+  for (const [p, t] of [[100, 1000], [NaN, 1500], [0, 1600], [-5, 1700], [90, 500], [100, 2000], [Infinity, 2100]] as Array<[number, number]>) {
+    neu.recordMarkInForce(a, p, t);
+    old.recordMarkInForce(b, p, t);
+    assert.equal(JSON.stringify(a), JSON.stringify(b));
+  }
+});
