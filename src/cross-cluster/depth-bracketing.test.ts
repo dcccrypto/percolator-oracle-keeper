@@ -137,6 +137,20 @@ describe("L-3 min of samples", () => {
     assert.match(line, /^\[keeper\]\[WARN\] depth-bracketing \{/);
     assert.equal(JSON.parse(line.slice(line.indexOf("{"))).event, "depth_bracketing_suspected");
   });
+  it("a fractional drop threshold returns a signal instead of throwing (RangeError from BigInt)", () => {
+    for (const thr of [0.333, 2.505, 12.5]) {
+      const w = new DepthSampleWindow(30_000, thr);
+      assert.doesNotThrow(() => w.detectBracket("P", 10_000n, 9_999n));
+      assert.notEqual(w.detectBracket("P", 10_000n, 5_000n), null);
+    }
+    assert.equal(new DepthSampleWindow(30_000, 12.5).detectBracket("P", 10_000n, 8_800n), null);
+    assert.notEqual(new DepthSampleWindow(30_000, 12.5).detectBracket("P", 10_000n, 8_750n), null);
+  });
+  it("a non-finite drop threshold falls back to the default (never throws)", () => {
+    const w = new DepthSampleWindow(30_000, Number.NaN);
+    assert.doesNotThrow(() => w.detectBracket("P", 10_000n, 5_000n));
+    assert.equal(w.detectBracket("P", 10_000n, 8_500n), null);
+  });
   it("a pool missing from the re-read adds no sample (a flaky read never zeroes depth)", () => {
     const w = new DepthSampleWindow(30_000);
     w.record("P", 10_000n, "pre", 0);

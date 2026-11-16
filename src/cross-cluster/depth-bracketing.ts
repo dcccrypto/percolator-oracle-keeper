@@ -113,8 +113,14 @@ export class DepthSampleWindow {
   private readonly samples = new Map<string, Sample[]>();
   constructor(
     private readonly windowMs = DEFAULT_DEPTH_MIN_WINDOW_MS,
-    private readonly dropPct = DEFAULT_DEPTH_BRACKET_DROP_PCT,
-  ) {}
+    dropPct = DEFAULT_DEPTH_BRACKET_DROP_PCT,
+  ) {
+    // BigInt() throws RangeError on a non-integer, so the threshold is held as integer basis points. A non-finite or
+    // negative value falls back to the default rather than throwing inside the push path.
+    const pct = Number.isFinite(dropPct) && dropPct >= 0 ? dropPct : DEFAULT_DEPTH_BRACKET_DROP_PCT;
+    this.dropBps = BigInt(Math.round(pct * 100));
+  }
+  private readonly dropBps: bigint;
 
   record(pool: string, reserveE6: bigint, phase: DepthSamplePhase, atMs: number): void {
     if (reserveE6 < 0n) return;
@@ -163,7 +169,7 @@ export class DepthSampleWindow {
   detectBracket(pool: string, preE6: bigint, postE6: bigint): BracketSignal | null {
     if (preE6 <= 0n || postE6 >= preE6) return null;
     const dropBps = ((preE6 - postE6) * 10_000n) / preE6;
-    if (dropBps < BigInt(this.dropPct * 100)) return null;
+    if (dropBps < this.dropBps) return null;
     return { pool, preReserveE6: preE6, postReserveE6: postE6, dropPct: Number(dropBps) / 100 };
   }
 
