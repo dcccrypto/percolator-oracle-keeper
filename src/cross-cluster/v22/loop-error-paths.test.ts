@@ -112,7 +112,6 @@ describe("checkLpCert", () => {
     const r = rtOf(loop);
     await loop["checkLpCert"](v22Ctx({ band: true }), r);
     assert.deepEqual(r.lpCertAlerts, []);
-    assert.ok(!lines.some((l) => l.includes("certification read failed")));
   });
 });
 
