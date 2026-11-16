@@ -151,6 +151,10 @@ describe("L-3 min of samples", () => {
     assert.doesNotThrow(() => w.detectBracket("P", 10_000n, 5_000n));
     assert.equal(w.detectBracket("P", 10_000n, 8_500n), null);
   });
+  it("an enormous finite drop threshold is clamped (never throws, never fires)", () => {
+    const w = new DepthSampleWindow(30_000, Number.MAX_VALUE);
+    assert.equal(w.detectBracket("P", 10_000n, 1n), null);
+  });
   it("a pool missing from the re-read adds no sample (a flaky read never zeroes depth)", () => {
     const w = new DepthSampleWindow(30_000);
     w.record("P", 10_000n, "pre", 0);

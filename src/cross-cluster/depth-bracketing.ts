@@ -117,7 +117,7 @@ export class DepthSampleWindow {
   ) {
     // BigInt() throws RangeError on a non-integer, so the threshold is held as integer basis points. A non-finite or
     // negative value falls back to the default rather than throwing inside the push path.
-    const pct = Number.isFinite(dropPct) && dropPct >= 0 ? dropPct : DEFAULT_DEPTH_BRACKET_DROP_PCT;
+    const pct = Number.isFinite(dropPct) && dropPct >= 0 ? Math.min(dropPct, 100) : DEFAULT_DEPTH_BRACKET_DROP_PCT;
     this.dropBps = BigInt(Math.round(pct * 100));
   }
   private readonly dropBps: bigint;
