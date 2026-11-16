@@ -91,7 +91,7 @@ describe("markWindowBand / recordMarkInForce", () => {
     assert.equal(s.cbWindowMax, undefined);
     recordMarkInForce(s, 100, 500);
     recordMarkInForce(s, 100, 100); // older time → lifted to 500
-    assert.equal(s.cbWindowMax?.at(-1)?.at, 500);
+    assert.equal((s as CircuitBreakerState).cbWindowMax?.at(-1)?.at, 500);
   });
 });
 
@@ -116,7 +116,7 @@ describe("default clock/log/window fallbacks", () => {
       assert.equal(s.lastPrice, 100);
       assert.equal(logs.length, 1);
       assert.match(logs[0], /Circuit breaker! 100 → 150 \(50\.0% > 10%\) \[1\/3/);
-      // default window = 1h, default cumulative = 3 × maxMovePct (30%)
+      // default cumulative = 3 × maxMovePct (30%)
       const b = markWindowBand(s, 30, 3_600_000);
       assert.ok(b);
       assert.ok(Math.abs(b.hi - 130) < 1e-9);
@@ -300,7 +300,7 @@ describe("sustained relocation gating (gapSustained)", () => {
     const s = mk(100);
     checkCircuitBreaker(s, 120, c); // check 1, t=0
     t = 100; // time satisfied, but only 2 checks < default 20
-    assert.notEqual(checkCircuitBreaker(s, 120, c), 120);
+    assert.equal(checkCircuitBreaker(s, 120, c), 101);
     assert.equal(s.cbGapChecks, 2);
     assert.equal(s.cbSnapPending, undefined);
   });
