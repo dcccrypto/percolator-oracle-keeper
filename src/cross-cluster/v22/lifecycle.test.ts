@@ -1197,6 +1197,140 @@ describe("engine: discovery edge branches (an unregistered market is dropped, ne
   });
 });
 
+describe("engine: failure isolation and send outcomes (each reachable from V22Loop.tick -> observe / endTick)", () => {
+  it("classify off: observe returns null and endTick makes no RPC at all", async () => {
+    const w = world();
+    const { ctx } = addMarket(w, matured({ authority: OTHER }));
+    const { e } = engineFor(w, { classify: false, discoveryMs: 600_000 });
+    e.beginTick();
+    assert.equal(e.observe(ctx), null);
+    await e.endTick();
+    assert.equal(w.gpaCalls.length, 0);
+    assert.equal(w.exec.sims.length, 0);
+  });
+
+  it("observe never throws: a failing registered() lookup is logged and the market is simply not tracked", () => {
+    const w = world();
+    const { ctx, addr } = addMarket(w, matured({ authority: OTHER }));
+    (w as { registered: unknown }).registered = {
+      has() {
+        throw new Error("registry lookup exploded");
+      },
+    };
+    const { e, logs } = engineFor(w);
+    e.beginTick();
+    assert.equal(e.observe(ctx), null);
+    assert.equal(logs.some((l) => l.includes("classify failed") && l.includes("registry lookup exploded")), true);
+    assert.equal(e.view(addr), null);
+  });
+
+  it("an alert sink that throws is logged and does not stop the fee / resolve work of the same tick", async () => {
+    const w = world();
+    const { ctx } = addMarket(w, matured({ authority: OTHER }));
+    const { e, ledger, sink, logs } = engineFor(w, { staleResolve: "on" });
+    sink.reconcile = async () => {
+      throw new Error("alert backend down");
+    };
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [ctx]);
+    assert.equal(logs.some((l) => l.includes("alert delivery failed") && l.includes("alert backend down")), true);
+    assert.equal(w.exec.sent.length, 1, "the resolve still went out");
+  });
+
+  it("a failing 'resolved' alert does not undo the resolve (the market stays terminal, the attempt stays landed)", async () => {
+    const w = world();
+    const { addr, ctx } = addMarket(w, matured({ authority: OTHER }));
+    resetPushDeadlines();
+    const { e, ledger, sink } = engineFor(w, { staleResolve: "on" });
+    sink.fire = async () => {
+      throw new Error("pager down");
+    };
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length, 1);
+    assert.equal(isKnownTerminal(addr), true);
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length, 1, "never again");
+  });
+
+  it("a warn-band fee round that throws is recorded as failed (visible on the view) and logged; the tick continues", async () => {
+    const w = world();
+    const { addr, ctx } = addMarket(w, market({ lastGood: ageToLastGood(12_000n), authority: OTHER }));
+    const { e, logs } = engineFor(w, { warnBandFees: true }, {
+      forceFees: async () => {
+        throw new Error("fee rpc 500");
+      },
+    });
+    await runTick(e, w, [ctx]);
+    assert.match(e.view(addr)?.fees ?? "", /^failed: .*fee rpc 500/);
+    assert.equal(logs.some((l) => l.includes("warn-band fee round failed")), true);
+  });
+
+  it("the program refusing the simulation (not matured) is recorded as an error decision, nothing is sent, and it is not retried before resolveRetryMs", async () => {
+    const w = world();
+    const { addr, ctx } = addMarket(w, matured({ authority: OTHER }));
+    const orig = w.conn.simulateTransaction as (...a: unknown[]) => Promise<{ context: unknown; value: Record<string, unknown> }>;
+    (w.conn as unknown as Record<string, unknown>).simulateTransaction = async (...a: unknown[]) => {
+      const r = await orig(...a);
+      return { ...r, value: { ...r.value, err: { InstructionError: [2, { Custom: 27 }] } } };
+    };
+    const { e, ledger, logs } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length, 0);
+    assert.equal(e.view(addr)?.resolve?.decision, "error");
+    assert.equal(logs.some((l) => l.includes("refused by the program")), true);
+    const sims = w.exec.sims.length;
+    w.now += 20_000;
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sims.length, sims, "one attempt per window");
+  });
+
+  it("a simulation RPC that throws is recorded as a failed attempt, nothing is sent", async () => {
+    const w = world();
+    const { addr, ctx } = addMarket(w, matured({ authority: OTHER }));
+    (w.conn as unknown as Record<string, unknown>).simulateTransaction = async () => {
+      throw new Error("sim rpc timeout");
+    };
+    const { e, ledger, logs } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length, 0);
+    assert.equal(e.view(addr)?.resolve?.decision, "error");
+    assert.equal(logs.some((l) => l.includes("tag 39 failed")), true);
+  });
+
+  it("a tx that was sent but did not confirm is an error decision (no markTerminal, no 'resolved' alert) and is not retried inside resolveRetryMs", async () => {
+    const w = world();
+    const { addr, ctx } = addMarket(w, matured({ authority: OTHER }));
+    resetPushDeadlines();
+    (w.conn as unknown as Record<string, unknown>).confirmTransaction = async () => ({ context: { slot: 1 }, value: { err: { InstructionError: [0, "Custom"] } } });
+    (w.conn as unknown as Record<string, unknown>).getSignatureStatuses = async () => ({ context: { slot: 1 }, value: [{ slot: 1, confirmations: 0, err: { InstructionError: [0, "Custom"] }, confirmationStatus: "confirmed" }] });
+    const { e, ledger, sink, logs } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length, 1);
+    assert.equal(e.view(addr)?.resolve?.decision, "error");
+    assert.equal(isKnownTerminal(addr), false);
+    assert.equal(sink.fired.length, 0);
+    assert.equal(logs.some((l) => /tag 39 (failed|not-landed) /.test(l)), true);
+    w.now += 20_000;
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length, 1, "retry only after resolveRetryMs");
+  });
+
+  it("a getSlot failure marks the tick not-clean: classification and alerts still run, but no fee round or resolve is attempted", async () => {
+    const w = world();
+    const { ctx } = addMarket(w, matured({ authority: OTHER }));
+    w.slotFails = true;
+    const { e, ledger, sink } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length + w.exec.sims.length, 0);
+    assert.equal(sink.active("v22-lifecycle:dead-price-matured").length, 1);
+  });
+});
+
 describe("V22Loop wiring", () => {
   it("tick feeds the engine: /health gains v22.lifecycle (additive), nothing is sent with the defaults", async () => {
     const { V22Loop } = await import("./loop.ts");
