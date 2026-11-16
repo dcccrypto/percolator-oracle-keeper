@@ -34,6 +34,7 @@
  */
 import { PublicKey } from "@solana/web3.js";
 import type { AssetSource, DexType, MarketEntry } from "./registry.ts";
+import { detectLayout, engineSlotBase } from "./market-layout.ts";
 import { decodeMarketRefreshState, isAssetLossStale } from "./positioned-refresh.ts";
 import type { MarketRefreshState } from "./positioned-refresh.ts";
 
@@ -306,15 +307,65 @@ export function maxCatchupCranksFor(singleAssetCap: number, base: number, hints:
 
 // ── Refresh state over several assets ──────────────────────────────────────────────────────────────────────────
 
-/** Per-asset refresh state of the observed assets (asset order). Assets out of range are skipped. */
+/**
+ * Per-asset refresh state of the observed assets (asset order). Assets out of range are skipped.
+ *
+ * Perf: one layout detection and one DataView for the whole list (it used to be one of each per asset, plus the
+ * allocation of a fresh DataView per field read). Field-for-field identical to `decodeMarketRefreshState(data, i)`
+ * per asset (pinned by multi-asset-plan-equality.test.ts). On an unknown layout every asset throws, so the result is
+ * empty, exactly as before (the layout-guard refusal counter now ticks once per call instead of once per asset).
+ */
 export function decodeAssetRefreshStates(data: Uint8Array, assets: ReadonlyArray<number>): Array<{ assetIndex: number; state: MarketRefreshState }> {
   const out: Array<{ assetIndex: number; state: MarketRefreshState }> = [];
+  if (assets.length === 0) return out;
+  const det = detectLayout(data);
+  if (!det.known) return out;
+  const L = det.layout;
+  const A = L.asset;
+  const g = L.groupOff;
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const u64 = (off: number): bigint => dv.getBigUint64(off, true);
+  const u128 = (off: number): bigint => u64(off) | (u64(off + 8) << 64n);
+  const maxAccrualDtSlots = u64(g + L.header.maxAccrualDtSlots);
+  const currentSlot = u64(g + L.header.currentSlot);
+  const lossStaleActive = data[g + L.header.lossStaleActive] !== 0;
   for (const assetIndex of assets) {
-    try {
-      out.push({ assetIndex, state: decodeMarketRefreshState(data, assetIndex) });
-    } catch {
-      // out of range for this account: not an asset of this market
-    }
+    if (assetIndex < 0 || assetIndex >= det.slots) continue; // out of range: not an asset of this market
+    const a = engineSlotBase(L, assetIndex);
+    const lifecycle = data[a + A.lifecycle];
+    const storedPosLong = u64(a + A.storedPosLong);
+    const storedPosShort = u64(a + A.storedPosShort);
+    const staleLong = u64(a + A.staleLong);
+    const staleShort = u64(a + A.staleShort);
+    const contributesToLossStale =
+      (lifecycle === LIFECYCLE_ACTIVE || lifecycle === LIFECYCLE_DRAIN_ONLY) &&
+      (u128(a + A.oiEffLong) !== 0n ||
+        u128(a + A.oiEffShort) !== 0n ||
+        storedPosLong !== 0n ||
+        storedPosShort !== 0n ||
+        staleLong !== 0n ||
+        staleShort !== 0n ||
+        u64(a + A.pendingOblLong) !== 0n ||
+        u64(a + A.pendingOblShort) !== 0n ||
+        u128(a + A.lossWeightSumLong) !== 0n ||
+        u128(a + A.lossWeightSumShort) !== 0n);
+    out.push({
+      assetIndex,
+      state: {
+        maxAccrualDtSlots,
+        currentSlot,
+        lossStaleActive,
+        lifecycle,
+        slotLast: u64(a + A.slotLast),
+        kfEpochLong: u64(a + A.kfEpochLong),
+        kfEpochShort: u64(a + A.kfEpochShort),
+        storedPosLong,
+        storedPosShort,
+        staleLong,
+        staleShort,
+        contributesToLossStale,
+      },
+    });
   }
   return out;
 }
@@ -332,7 +383,7 @@ export function decodeAssetRefreshStates(data: Uint8Array, assets: ReadonlyArray
  */
 export function decodeMarketRefreshStateFor(data: Uint8Array, assets: ReadonlyArray<number>): MarketRefreshState {
   if (assets.length === 1 && assets[0] === 0) return decodeMarketRefreshState(data);
-  const base = decodeMarketRefreshState(data);
+  const base = decodeMarketRefreshState(data); // throws on an unknown layout / unreadable asset 0, as before
   const per = decodeAssetRefreshStates(data, assets);
   if (per.length === 0) return base;
   let storedPosLong = 0n;
