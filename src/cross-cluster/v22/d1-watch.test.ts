@@ -279,3 +279,71 @@ describe("d1-watch: V22Loop fires, escalates, resolves and reports on /health", 
     assert.equal(ADL_D1_ALERT_SCOPE, "v22-adl-close-only");
   });
 });
+
+// ── branch coverage: env edges, tracker edges, evaluator edges ─────────────────
+
+describe("d1-watch: untaken branches", () => {
+  it("env: whitespace-only is unset (default, no error); padded values are trimmed; > 10,000,000 is refused", () => {
+    const errs: string[] = [];
+    assert.deepEqual(adlD1ThresholdsFromEnv({ ALERT_ADL_WIND_DOWN_BOUND_SLOTS: "   " }, (l) => errs.push(l)), T);
+    assert.deepEqual(adlD1ThresholdsFromEnv({ ALERT_ADL_WIND_DOWN_BOUND_SLOTS: " 4500 " }, (l) => errs.push(l)), { boundSlots: 4_500n, graceSlots: 1_500n });
+    assert.deepEqual(adlD1ThresholdsFromEnv({ ALERT_ADL_WIND_DOWN_GRACE_SLOTS: "10000000" }, (l) => errs.push(l)), { boundSlots: 9_000n, graceSlots: 10_000_000n });
+    assert.equal(errs.length, 0);
+    assert.deepEqual(adlD1ThresholdsFromEnv({ ALERT_ADL_WIND_DOWN_GRACE_SLOTS: "10000001" }, (l) => errs.push(l)), T);
+    assert.equal(errs.length, 1);
+  });
+  it("env: the default logger is console.error", () => {
+    const orig = console.error;
+    const seen: string[] = [];
+    console.error = (m: string) => void seen.push(String(m));
+    try {
+      assert.deepEqual(adlD1ThresholdsFromEnv({ ALERT_ADL_WIND_DOWN_BOUND_SLOTS: "nope" }), T);
+    } finally {
+      console.error = orig;
+    }
+    assert.equal(seen.length, 1);
+    assert.match(seen[0], /ALERT_ADL_WIND_DOWN_BOUND_SLOTS/);
+  });
+  it("tracker: a clock that did not advance gives age 0; a later episode is not sinceBoot; ended-below-bound is not counted past bound", () => {
+    const tr = new AdlEpisodeTracker(T);
+    assert.equal(tr.observe([reading(false)], 100n).length, 0); // first read, healthy
+    const e1 = tr.observe([reading(true)], 200n);
+    assert.equal(e1[0].sinceBoot, false);
+    const e2 = tr.observe([reading(true)], 150n); // slot went backwards
+    assert.equal(e2[0].ageSlots, 0n);
+    assert.equal(e2[0].slotsToBound, 9_000n);
+    tr.observe([reading(false)], 100n); // ends with now < start: age 0
+    const sum = tr.summary([]);
+    assert.equal(sum.endedEpisodes, 1);
+    assert.equal(sum.endedPastBound, 0);
+    assert.equal(sum.longestEndedSlots, "0");
+    tr.reset(500n); // nothing open: no-op
+    assert.equal(tr.summary([]).endedEpisodes, 1);
+  });
+  it("tracker: a vanished asset and reset() end episodes; past-bound ends are counted; a long ended episode becomes the longest", () => {
+    const tr = new AdlEpisodeTracker(T);
+    tr.observe([reading(true, 0), reading(true, 1)], 1_000n);
+    tr.observe([reading(true, 0)], 1_100n); // asset 1 vanished: ended at age 100
+    assert.equal(tr.summary([]).endedEpisodes, 1);
+    assert.equal(tr.summary([]).longestEndedSlots, "100");
+    tr.reset(1_000n + 9_000n);
+    const s = tr.summary([]);
+    assert.equal(s.endedEpisodes, 2);
+    assert.equal(s.endedPastBound, 1);
+    assert.equal(s.longestEndedSlots, "9000");
+  });
+  it("evaluate: no matching reading omits OI; sinceBoot and 'already eligible' are worded; terminal is silent", () => {
+    const tr = new AdlEpisodeTracker(T);
+    tr.observe([reading(true)], 1_000n);
+    const eps = tr.observe([reading(true)], 1_000n + 9_000n);
+    const base = { label: "M", market: "mk", nowSlot: 10_000n, terminal: false, episodes: eps };
+    const alerts = evaluateAdlD1({ ...base, readings: [] }, T);
+    assert.equal(alerts.length, 1);
+    assert.equal(alerts[0].kind, "adl-close-only");
+    assert.equal(alerts[0].data && "oiEffLong" in alerts[0].data, false);
+    assert.match(alerts[0].message, /observed since keeper boot/);
+    assert.match(alerts[0].message, /already eligible/);
+    assert.doesNotMatch(alerts[0].message, /OI long/);
+    assert.deepEqual(evaluateAdlD1({ ...base, terminal: true, readings: [] }, T), []);
+  });
+});
