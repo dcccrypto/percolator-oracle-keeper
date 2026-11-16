@@ -285,3 +285,131 @@ describe("windDownOnce account shape gating (v5 pool)", () => {
     assert.equal(s.sends(), 0);
   });
 });
+
+describe("windDownOnce v5 pool: failure edges (K-COV)", () => {
+  type Over = Record<string, unknown>;
+  const withOver = (s: ReturnType<typeof stubV5>, o: Over): TerminalConnection => ({ ...(s.conn as unknown as Over), ...o }) as unknown as TerminalConnection;
+  const OK_SIM = { context: { slot: 1 }, value: { err: null, logs: [] } };
+
+  it("shape probe RPC failure: legacy for this cycle, NOT cached, the cycle still completes", async () => {
+    const s = stubV5(2, { deployedIsUpgraded: true });
+    const real = s.conn.simulateTransaction.bind(s.conn);
+    const conn = withOver(s, { async simulateTransaction(tx: VersionedTransaction) {
+      if (tx.message.compiledInstructions[1].accountKeyIndexes.length > 9) throw new Error("sim rpc down");
+      return real(tx);
+    } });
+    const st = new TerminalInsuranceState();
+    const r = await windDownOnce(conn, KEEPER, TEXTIT.toBase58(), false, CFG, st);
+    assert.equal(r.outcome.kind, "nothing");
+    assert.equal(st.shape, null, "an RPC failure is not cached");
+    assert.equal(s.sims.at(-1)!.length, 9, "legacy list used this cycle");
+  });
+
+  it("a stake-program answer that is not the legacy refusal (e.g. 31) at the shape probe means upgraded -> v5, cached", async () => {
+    const s = stubV5(1, { deployedIsUpgraded: true });
+    const st = new TerminalInsuranceState();
+    await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, st);
+    assert.equal(st.shape?.value, "v5");
+  });
+
+  it("getTokenAccountsByOwner failing: no stray, the amount-0 step still runs", async () => {
+    const s = stubV5(2, { deployedIsUpgraded: true });
+    const conn = withOver(s, { async getTokenAccountsByOwner() { throw new Error("gtabo down"); } });
+    const r = await windDownOnce(conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "nothing");
+    assert.equal(r.steps.length, 1);
+  });
+
+  it("a stray vault-authority token account is passed on the amount-0 step; dry-run reports DRY-RUN + sweep and sends nothing", async () => {
+    const stray = k();
+    const s = stubV5(2, { deployedIsUpgraded: true });
+    const conn = withOver(s, {
+      async getTokenAccountsByOwner() { return { context: { slot: 1 }, value: [{ pubkey: stray, account: {} }] }; },
+      async simulateTransaction(tx: VersionedTransaction) {
+        const keys = tx.message.compiledInstructions[1].accountKeyIndexes.map((i) => tx.message.staticAccountKeys[i].toBase58());
+        s.sims.push(keys);
+        return OK_SIM;
+      },
+    });
+    const r = await windDownOnce(conn, KEEPER, TEXTIT.toBase58(), true, CFG, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "skipped");
+    assert.match((r.outcome as { reason: string }).reason, /DRY-RUN: tag 29\(0\) would book \+ sweep/);
+    assert.ok(s.sims.at(-1)!.includes(stray.toBase58()));
+    assert.equal(s.sends(), 0);
+  });
+
+  it("dry-run without a stray: DRY-RUN reason has no sweep", async () => {
+    const s = stubV5(2, { deployedIsUpgraded: true });
+    const conn = withOver(s, { async simulateTransaction() { return OK_SIM; } });
+    const r = await windDownOnce(conn, KEEPER, TEXTIT.toBase58(), true, CFG, new TerminalInsuranceState());
+    assert.equal((r.outcome as { reason: string }).reason, "DRY-RUN: tag 29(0) would book");
+  });
+
+  it("a clean simulation whose send lands: done, booked via amount 0", async () => {
+    const s = stubV5(2, { deployedIsUpgraded: true });
+    const conn = withOver(s, { async simulateTransaction() { return OK_SIM; } });
+    const r = await windDownOnce(conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "done");
+    assert.match((r.outcome as { detail: string }).detail, /tag 29\(0\) booked pushed\/stray insurance/);
+  });
+
+  it("send throws: a failed step, not an exception", async () => {
+    const s = stubV5(2, { deployedIsUpgraded: true });
+    const conn = withOver(s, { async simulateTransaction() { return OK_SIM; }, async sendRawTransaction() { throw new Error("send blew up"); } });
+    const r = await windDownOnce(conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+    assert.deepEqual(r.outcome, { kind: "failed", error: "tag 29(0): send blew up" });
+  });
+
+  it("send lands on chain but fails with another code: failed with the landed-but-failed detail", async () => {
+    const s = stubV5(2, { deployedIsUpgraded: true });
+    const err = { InstructionError: [1, { Custom: 99 }] };
+    const conn = withOver(s, {
+      async simulateTransaction() { return OK_SIM; },
+      async getSignatureStatuses() { return { context: { slot: 2 }, value: [{ slot: 2, confirmations: 1, err, confirmationStatus: "confirmed" }] }; },
+    });
+    const r = await windDownOnce(conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "failed");
+    assert.match((r.outcome as { error: string }).error, /landed but failed/);
+  });
+
+  it("send lands on chain with Custom(31): nothing (wind-down complete)", async () => {
+    const s = stubV5(2, { deployedIsUpgraded: true });
+    const err = { InstructionError: [1, { Custom: 31 }] };
+    const conn = withOver(s, {
+      async simulateTransaction() { return OK_SIM; },
+      async getSignatureStatuses() { return { context: { slot: 2 }, value: [{ slot: 2, confirmations: 1, err, confirmationStatus: "confirmed" }] }; },
+    });
+    const st = new TerminalInsuranceState();
+    const r = await windDownOnce(conn, KEEPER, TEXTIT.toBase58(), false, CFG, st);
+    assert.equal(r.outcome.kind, "nothing");
+    assert.ok(st.done.has(TEXTIT.toBase58()));
+  });
+
+  it("send lands on chain with Custom(46): creator-required, retried next cycle", async () => {
+    const s = stubV5(2, { deployedIsUpgraded: true });
+    const err = { InstructionError: [1, { Custom: 46 }] };
+    const conn = withOver(s, {
+      async simulateTransaction() { return OK_SIM; },
+      async getSignatureStatuses() { return { context: { slot: 2 }, value: [{ slot: 2, confirmations: 1, err, confirmationStatus: "confirmed" }] }; },
+    });
+    const orig = console.warn;
+    console.warn = () => {};
+    try {
+      const r = await windDownOnce(conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+      assert.equal(r.steps[0].outcome, "creator-required");
+      assert.equal(r.outcome.kind, "skipped");
+    } finally {
+      console.warn = orig;
+    }
+  });
+
+  it("an unknown simulation error is a failed step with the error and last error log in the detail", async () => {
+    const s = stubV5(2, { deployedIsUpgraded: true });
+    const conn = withOver(s, { async simulateTransaction() {
+      return { context: { slot: 1 }, value: { err: { InstructionError: [1, { Custom: 77 }] }, logs: ["Program log: Error: weird"] } };
+    } });
+    const r = await windDownOnce(conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "failed");
+    assert.match((r.outcome as { error: string }).error, /Custom.*77.*Error: weird/);
+  });
+});

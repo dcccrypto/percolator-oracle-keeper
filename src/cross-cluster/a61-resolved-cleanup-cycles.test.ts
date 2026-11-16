@@ -21,11 +21,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ComputeBudgetProgram, Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
 import { deriveLpVaultRegistry, deriveStakePool, deriveStakeVaultAuth, parsePortfolioV17 } from "@percolatorct/sdk";
-import { asset0InsuranceAuthority, creatorCollateralAta, decodeTerminalState, isTerminalFlat, makeTerminalInsuranceJob, TerminalInsuranceState, terminalInsuranceConfigFromEnv } from "./terminal-insurance.ts";
+import { asset0InsuranceAuthority, creatorCollateralAta, decodeTerminalState, isTerminalFlat, makeTerminalInsuranceJob, TerminalInsuranceState, terminalInsuranceConfigFromEnv, windDownOnce } from "./terminal-insurance.ts";
 import { runFeeJobSweep } from "./fee-jobs.ts";
-import { decodeVaultLpState, deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
+import { decodeVaultLpState, deriveVaultLpState, nftEscrowAuthority } from "./resolved-portfolio-cleanup.ts";
 import { decodeStakePoolAnyVersion } from "./stake-pool-decode.ts";
-import { STAKE_PROGRAM_ID, WRAPPER_PROGRAM_ID } from "../program-ids.ts";
+import { NFT_PROGRAM_ID, STAKE_PROGRAM_ID, WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fx = (n: string): Buffer => Buffer.from(readFileSync(join(here, "__fixtures__", `${n}.b64`), "utf8").trim(), "base64");
@@ -299,5 +299,83 @@ describe("A6-1 resolved cleanup keeps running until nothing is materialized (rea
     const rows = await cycles(chain({ budget: 0n, pool: "bound", withPortfolios: false }), PLAN.slice(0, 3));
     assert.ok(rows[0].flat && rows[0].done);
     assert.deepEqual([rows[1].calls, rows[2].calls], [0, 0]);
+  });
+});
+
+describe("terminal-insurance windDownOnce: cleanup side effects (K-COV)", () => {
+  /** A stake-bound Resolved market whose only portfolio is an EMPTY NFT-escrowed one (closable only after the grace). */
+  function pdaChain(): Chain {
+    const ch = chain({ budget: 0n, pool: "bound", withPortfolios: false });
+    const pf = mkPf("v22-codec-pf-5sx1tsw1", Keypair.generate().publicKey, nftEscrowAuthority(NFT_PROGRAM_ID));
+    emptyClaim(pf);
+    ch.pfs.set(pf.key.toBase58(), pf);
+    ch.sync();
+    return ch;
+  }
+  async function oneCycle(ch: Chain, conn: unknown) {
+    const st = new TerminalInsuranceState();
+    ch.slot = ch.resolvedSlot() + FCD + 10n;
+    const logs: string[] = [];
+    const w = console.warn;
+    console.warn = (...a: unknown[]) => { logs.push(a.join(" ")); };
+    try {
+      return { r: await windDownOnce(conn as never, KEEPER, MKT.toBase58(), false, { ...CFG, receiptCleanup: false }, st), logs };
+    } finally {
+      console.warn = w;
+    }
+  }
+
+  it("an empty NFT-escrowed portfolio closed after the grace raises the terminal-pda-portfolio-closed alert and the market is re-read", async () => {
+    const ch = pdaChain();
+    const { r, logs } = await oneCycle(ch, ch.conn());
+    assert.equal(ch.pfs.size, 0, "closed by tag 8");
+    const ev = (r.outcome.events ?? []).find((e) => e.kind === "terminal-pda-portfolio-closed");
+    assert.ok(ev, "alert raised");
+    assert.equal(ev!.severity, "warn");
+    assert.equal(ev!.subject, MKT.toBase58());
+    assert.match(ev!.message, /closed EMPTY NFT-escrowed portfolio .* after the 216000-slot grace/);
+    assert.ok(logs.some((l) => /PDA-owned portfolio .* after the grace period/.test(l)));
+    assert.equal(r.state?.kind, "resolved");
+    assert.equal((r.state as { materializedPortfolios: bigint }).materializedPortfolios, 0n, "state refreshed after the close");
+  });
+
+  it("the post-close market re-read failing keeps the pre-cleanup view and does not throw", async () => {
+    const ch = pdaChain();
+    const real = ch.conn() as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    let afterClose = false;
+    const conn = {
+      ...real,
+      async sendRawTransaction(...a: unknown[]) { const s = await real.sendRawTransaction(...a); afterClose = true; return s; },
+      async getMultipleAccountsInfo(...a: unknown[]) { if (afterClose) throw new Error("rpc down"); return real.getMultipleAccountsInfo(...a); },
+    };
+    const { r } = await oneCycle(ch, conn);
+    assert.equal(ch.pfs.size, 0);
+    assert.equal((r.state as { materializedPortfolios: bigint }).materializedPortfolios, 1n, "stale pre-cleanup view kept");
+    assert.notEqual(r.outcome.kind, "failed");
+  });
+
+  it("the post-close re-read returning a non-resolved account keeps the pre-cleanup view", async () => {
+    const ch = pdaChain();
+    const real = ch.conn() as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    let afterClose = false;
+    const conn = {
+      ...real,
+      async sendRawTransaction(...a: unknown[]) { const s = await real.sendRawTransaction(...a); afterClose = true; return s; },
+      async getMultipleAccountsInfo(keys: PublicKey[], ...a: unknown[]) {
+        if (afterClose && keys.length === 1) return [null];
+        return real.getMultipleAccountsInfo(keys, ...a);
+      },
+    };
+    const { r } = await oneCycle(ch, conn);
+    assert.equal((r.state as { materializedPortfolios: bigint }).materializedPortfolios, 1n);
+  });
+
+  it("getSlot failing falls back to slot 0 (full PDA grace): the escrowed portfolio is NOT closed", async () => {
+    const ch = pdaChain();
+    const real = ch.conn() as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    const conn = { ...real, async getSlot() { throw new Error("slot rpc down"); } };
+    const { r } = await oneCycle(ch, conn);
+    assert.equal(ch.pfs.size, 1, "kept: unknown clock keeps the full grace");
+    assert.ok(!(r.outcome.events ?? []).some((e) => e.kind === "terminal-pda-portfolio-closed"));
   });
 });
