@@ -478,7 +478,7 @@ describe("runPlannedTx: refusals, probes, shrinking and the prune budget", () =>
     assert.equal(r.outcome.kind, "failed");
     assert.match((r.outcome as { error: string }).error, /prune budget exhausted/);
     assert.equal(f.sent.length, 0);
-    assert.equal(r.pruned.length, SWEEP_MAX_PRUNES + 4);
+    assert.equal(r.pruned.length, SWEEP_MAX_PRUNES + 3 + 1, "budget = MAX_PRUNES + 3, attempts 0..budget inclusive");
     assert.ok(r.pruned.every((p) => p.reason === "hard"));
   });
 
@@ -604,7 +604,7 @@ describe("runSettleRound: quarantine, deferrals, gap backoff, rent, protective",
     assert.equal(pairingStats.hardRefusals, 5);
   });
 
-  it("a band refusal is quarantined too, and the quarantine cap stops one bad code from quarantining the whole book", async () => {
+  it("the quarantine cap stops one bad code from quarantining the whole book", async () => {
     const c = cps(6);
     const bad = c.slice(0, 4).map((p) => p.pubkey);
     const quarantine = new Map<string, bigint>();
@@ -625,6 +625,17 @@ describe("runSettleRound: quarantine, deferrals, gap backoff, rent, protective",
     await runSettleRound(deps(g.conn), CTX, { lp: LP, counterparties: c, quarantine: q2, nowSlot: 50 }, DEFAULT_SWEEP_ROUND_CONFIG);
     assert.equal(q2.size, 4);
     assert.equal(pairingStats.quarantineCapped, 0);
+  });
+
+  it("a band refusal (104) is quarantined like a hard one and counted as expected", async () => {
+    const c = cps(3);
+    const quarantine = new Map<string, bigint>();
+    const f = fakeExecConn({ simErr: failOn([c[1].pubkey], (i) => customAt(i, 104)) });
+    const r = await runSettleRound(deps(f.conn), CTX, { lp: LP, counterparties: c, quarantine, nowSlot: 40 }, DEFAULT_SWEEP_ROUND_CONFIG);
+    assert.deepEqual(r.missing.map((m) => [m.key, m.why]), [[keyOf(c[1]), "band"]]);
+    assert.equal(quarantine.get(keyOf(c[1])), 40n + BigInt(QUARANTINE_LADDER[0]));
+    assert.equal(pairingStats.bandExpected, 1);
+    assert.equal(pairingStats.hardRefusals, 0);
   });
 
   it("strict holds the LP on a refused counterparty (held, counted); prefer sends it and counts the unpaired settle", async () => {
@@ -891,6 +902,9 @@ describe("runSettleRound: MERGED_ROUND on a multi-asset market", () => {
     assert.ok(n >= 1);
     assert.equal(r.lpSettled, false);
     assert.equal(boom.sent.length, 0);
+    assert.equal(pairingStats.mergedFallbacks, 2, "null-units fallback + thrown simulation, both contained in the merged path");
+    assert.ok(out.some((l) => /merged round skipped, phased plan: error: sim transport down/.test(l)), out.join("\n"));
+    assert.ok(!(r.abandoned ?? "").startsWith("round failed"), r.abandoned ?? "");
   });
 
   it("a merged tx that LANDS FAILED is not followed by the phased plan: abandoned, one send, the LP not settled", async () => {
