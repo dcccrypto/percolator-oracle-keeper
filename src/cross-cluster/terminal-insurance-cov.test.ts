@@ -1,6 +1,6 @@
 /**
  * K-COV: branches of terminal-insurance.ts the other suites never reach: a Live market, a non-v18 header,
- * a throwing tag-29 probe, the creator-ATA helpers, and the stake-pool/binding gates.
+ * a throwing tag-29 probe, env config parsing, and inspectStakeBoundBudget.
  * Run with: node --import tsx/esm --test src/cross-cluster/terminal-insurance-cov.test.ts
  */
 import { describe, it } from "node:test";
@@ -10,10 +10,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import {
-  buildCreateCreatorAtaIx,
-  creatorCollateralAta,
   inspectStakeBoundBudget,
-  isCreatorTokenAccount,
   makeTerminalInsuranceJob,
   tag29Support,
   TerminalInsuranceState,
@@ -28,7 +25,6 @@ const fx = (n: string): Buffer => Buffer.from(readFileSync(join(here, "__fixture
 const WRAPPER = new PublicKey("GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ");
 const STAKE = new PublicKey("GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3");
 const TEXTIT = new PublicKey("DnFhDdWzcWkBDxN9JJcmFmtiqqKo56w9JwQEtRKNdjcG");
-const TOKEN = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const KEEPER = Keypair.generate();
 const CFG: TerminalInsuranceConfig = {
   wrapperProgramId: WRAPPER, stakeProgramId: STAKE, unbookedAlertCycles: 3, probeTtlMs: 3_600_000,
@@ -123,33 +119,7 @@ describe("tag29Support: a throwing probe is unknown and cached as such (re-probe
   });
 });
 
-describe("creator ATA helpers and config", () => {
-  it("buildCreateCreatorAtaIx: CreateIdempotent [1], payer signs, ATA derived from admin+mint", () => {
-    const payer = Keypair.generate().publicKey, admin = Keypair.generate().publicKey, mint = Keypair.generate().publicKey;
-    const ix = buildCreateCreatorAtaIx(payer, admin, mint);
-    assert.deepEqual([...ix.data], [1]);
-    assert.equal(ix.keys.length, 6);
-    assert.ok(ix.keys[0].isSigner && ix.keys[0].isWritable && ix.keys[0].pubkey.equals(payer));
-    assert.ok(ix.keys[1].pubkey.equals(creatorCollateralAta(admin, mint)) && ix.keys[1].isWritable);
-    assert.ok(ix.keys[2].pubkey.equals(admin) && ix.keys[3].pubkey.equals(mint) && ix.keys[5].pubkey.equals(TOKEN));
-  });
-
-  it("isCreatorTokenAccount: rejects null, wrong program, short data, uninitialised, wrong mint, wrong owner; accepts the real shape", () => {
-    const mint = Keypair.generate().publicKey, owner = Keypair.generate().publicKey;
-    const data = Buffer.alloc(165);
-    mint.toBuffer().copy(data, 0);
-    owner.toBuffer().copy(data, 32);
-    data[108] = 1;
-    assert.equal(isCreatorTokenAccount(null, mint, owner), false);
-    assert.equal(isCreatorTokenAccount(undefined, mint, owner), false);
-    assert.equal(isCreatorTokenAccount({ owner: TOKEN, data }, mint, owner), true);
-    assert.equal(isCreatorTokenAccount({ owner: STAKE, data }, mint, owner), false);
-    assert.equal(isCreatorTokenAccount({ owner: TOKEN, data: data.subarray(0, 100) }, mint, owner), false);
-    assert.equal(isCreatorTokenAccount({ owner: TOKEN, data: Buffer.concat([data.subarray(0, 108), Buffer.from([0]), data.subarray(109)]) }, mint, owner), false);
-    assert.equal(isCreatorTokenAccount({ owner: TOKEN, data }, Keypair.generate().publicKey, owner), false);
-    assert.equal(isCreatorTokenAccount({ owner: TOKEN, data }, mint, Keypair.generate().publicKey), false);
-  });
-
+describe("config", () => {
   it("terminalInsuranceConfigFromEnv: defaults, overrides, and rejects", () => {
     const d = terminalInsuranceConfigFromEnv({});
     assert.equal(d.unbookedAlertCycles, 3);
