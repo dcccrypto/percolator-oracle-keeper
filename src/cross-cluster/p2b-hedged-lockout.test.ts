@@ -479,7 +479,7 @@ describe("branch pins: monitor skips", () => {
     assert.deepEqual(await evaluateHedgedLockouts(c.conn as never, [s], T), { alerts: [], records: [] });
     assert.equal(c.calls.length, 0);
   });
-  it("a truncated v2.2 slab with a growth block is never thrown and yields nothing", async () => {
+  it("a truncated v2.2 slab (growth decode throws) is swallowed: never thrown, nothing emitted", async () => {
     const d = new Uint8Array(Buffer.from(live.accounts[0].slab, "base64")).subarray(0, 200);
     const s = snapshot({ marketData: d, registryData: registryBytes({ bound: true }), vaultLpData: vaultLpStateBytes({ lp }) });
     const c = fakeConn({ accounts: new Map([[lp.toBase58(), lpBytes]]) });
