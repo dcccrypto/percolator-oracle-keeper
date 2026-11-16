@@ -37,6 +37,7 @@ import { restartHealth } from "../restart-escalation.ts";
 import { levGuardHealthFields, v22HealthFields } from "./v22/health.ts";
 import { layoutGuardSnapshot } from "./layout-guard-metrics.ts";
 import type { LayoutGuardSnapshot } from "./layout-guard-metrics.ts";
+import { parsePositiveNumberEnv } from "../env-utils.ts";
 import { rpcMetrics } from "./rpc-metrics.ts";
 import { getCachedBlockhash, invalidateBlockhash } from "./blockhash-cache.ts";
 import type { CrankRefreshHealth } from "./refresh-coordination.ts";
@@ -1002,21 +1003,13 @@ export function resetPrimedPools(): void {
   primedPools.clear();
 }
 
-function parseCrossClusterPositiveNumberEnv(
+export function parseCrossClusterPositiveNumberEnv(
   name: string,
   fallback: number,
   maxExclusive?: number,
 ): number {
-  const raw = process.env[name];
-  const value = raw === undefined || raw.trim() === "" ? fallback : Number(raw);
-
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`${name} must be a finite positive number`);
-  }
-  if (maxExclusive !== undefined && value >= maxExclusive) {
-    throw new Error(`${name} must be less than ${maxExclusive}`);
-  }
-  return value;
+  // Shared plain-decimal parser (#355): Number() accepted 0x10, 1e3, 0b11, +5.
+  return parsePositiveNumberEnv(name, fallback, maxExclusive);
 }
 
 function parseCrossClusterPositiveIntegerEnv(name: string, fallback: number): number {
