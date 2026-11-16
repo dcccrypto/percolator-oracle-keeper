@@ -182,7 +182,7 @@ export function makeExhaustedResolveJob(cfg: ExhaustedJobConfig): FeeJob {
       const [info] = await conn.getMultipleAccountsInfo([market], "confirmed");
       const d = info ? new Uint8Array(info.data) : null;
       const mode = d ? marketMode(d) : null;
-      if (mode === 0) {
+      if (mode === 0 && d) {
         unreadable.delete(m.marketAddress);
       } else {
         if (!reg.has(m.marketAddress)) return { kind: "nothing" };
