@@ -13,14 +13,14 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-async function loadWithFloor(value: string | undefined) {
-  const prev = process.env.MIN_POOL_LIQUIDITY_USD;
-  if (value === undefined) delete process.env.MIN_POOL_LIQUIDITY_USD;
-  else process.env.MIN_POOL_LIQUIDITY_USD = value;
-  const mod = await import(`./price-reader.ts?floor=${encodeURIComponent(String(value))}`);
-  if (prev === undefined) delete process.env.MIN_POOL_LIQUIDITY_USD;
-  else process.env.MIN_POOL_LIQUIDITY_USD = prev;
-  return mod as typeof import("./price-reader.ts");
+// One module instance with the floor set (no `?query` re-imports): re-importing the same file under
+// distinct URLs makes node's coverage report merge unrelated copies of price-reader.ts and collapse the
+// aggregate (68% lines / 14% funcs for a file that is ~99% covered). The "no floor configured" case is
+// asserted in price-reader-reads.test.ts, which runs with the env unset.
+process.env.MIN_POOL_LIQUIDITY_USD = "1000";
+const mod = (await import("./price-reader.ts")) as typeof import("./price-reader.ts");
+async function loadWithFloor(_value: string) {
+  return mod;
 }
 
 const dlmm = { dexType: "meteora-dlmm", poolAddress: "PoolDLMM1111", label: "SOL/USDC — meteora-dlmm" };
@@ -48,13 +48,6 @@ describe("#212 unenforceable depth floor", () => {
     const { warnDepthFloorUnenforceable } = await loadWithFloor("1000");
     const lines: string[] = [];
     assert.equal(warnDepthFloorUnenforceable(pump, new Set(), (l) => lines.push(l)), false);
-    assert.equal(lines.length, 0);
-  });
-
-  it("is silent when no floor is configured — there is nothing to be unenforceable", async () => {
-    const { warnDepthFloorUnenforceable } = await loadWithFloor(undefined);
-    const lines: string[] = [];
-    assert.equal(warnDepthFloorUnenforceable(dlmm, new Set(), (l) => lines.push(l)), false);
     assert.equal(lines.length, 0);
   });
 
