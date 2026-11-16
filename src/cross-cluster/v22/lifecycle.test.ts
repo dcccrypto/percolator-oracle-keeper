@@ -1161,7 +1161,8 @@ describe("engine: discovery edge branches (an unregistered market is dropped, ne
   it("between scans (resolve dry): a market that vanishes, changes owner, stops decoding, or turns Resolved is dropped; a Recovery one is dropped but re-scanned; a live one stays", async () => {
     const w = world();
     const names = ["stay", "gone", "foreign", "bad", "resolved", "recovery"] as const;
-    const m = Object.fromEntries(names.map((n) => [n, addMarket(w, matured({ authority: OTHER }), false)])) as Record<(typeof names)[number], { addr: string }>;
+    const m = {} as Record<(typeof names)[number], { addr: string }>;
+    for (const n of names) m[n] = addMarket(w, matured({ authority: OTHER }), false);
     const sizes: number[] = [];
     const { e } = engineFor(w, { discoveryMs: 600_000, staleResolve: "dry" });
     await runTick(e, w, []); // the scan loads all six
