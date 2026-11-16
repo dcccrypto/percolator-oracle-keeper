@@ -10,7 +10,6 @@ import { readFileSync } from "node:fs";
 import { Keypair, PublicKey, TransactionInstruction } from "@solana/web3.js";
 import {
   ENGINE_NON_PROGRESS,
-  LAYOUT_PROBLEM_LOG_EVERY,
   MAX_REFRESH_PRUNES,
   MAX_REFRESH_PRUNE_BUDGET,
   crankSample,
@@ -233,7 +232,7 @@ describe("layoutHealthFor / v22OwnedLayoutHealth", () => {
 
   it("variant-B market on the legacy path is unsupported", () => {
     const b = MARKET_LAYOUTS.find((l) => l.id === "v2.2-b");
-    if (!b) return; // table without a variant-B row: nothing to assert
+    assert.ok(b, "variant-B row exists");
     const h = layoutHealthFor({ known: true, layout: b, slots: 1 }, { storedPosLong: 0n, storedPosShort: 0n });
     assert.equal(h.kind, "unsupported");
     assert.match(h.problem ?? "", /KEEPER_V22/);
@@ -265,9 +264,6 @@ describe("layoutHealthFor / v22OwnedLayoutHealth", () => {
     assert.equal(v22OwnedLayoutHealth({ known: false, accountLen: 1, slots: null, version: null, reason: "x" }, null).kind, "unknown");
   });
 
-  it("LAYOUT_PROBLEM_LOG_EVERY is a positive cadence", () => {
-    assert.ok(LAYOUT_PROBLEM_LOG_EVERY > 0);
-  });
 });
 
 describe("refreshPruneBudget", () => {

@@ -166,11 +166,9 @@ describe("crankOneMarket — failure and edge branches", () => {
     assert.match(st.lastErrorMsg ?? "", /compute exhausted/);
   });
 
-  it("a benign no-progress (Custom 22 on the accrual, clock current) is not a revert", async () => {
+  it("Custom 22 on the first crank never sends and never counts a send error", async () => {
     const { conn, calls } = fakeConn({ sim: () => ({ err: { InstructionError: [1, { Custom: 22 }] } }) });
     const st = freshCrankMarketState();
-    // market pre-read: portfolio list is prepended with refreshes; only the accrual index matters, force the
-    // accrual by making simulation fail on the first crank of the plan.
     const r = await quiet(() => crankOneMarket(conn as never, keeper, entry, st, false));
     assert.equal(calls.sent, 0);
     assert.equal(st.totalErrors, 0);
@@ -441,7 +439,7 @@ describe("runSweepFollowups", () => {
 import { startRecoveryCrankLoop } from "./recovery-cranker.ts";
 
 describe("startRecoveryCrankLoop", () => {
-  it("cranks each cycle, tracks late-registered markets, drops retired ones, reports health and stops on SIGINT", async () => {
+  it("cranks each cycle, tracks late-registered markets, reports health and stops on SIGINT", async () => {
     const { conn } = fakeConn({ getProgramAccounts: async () => [] });
     const beats = { n: 0, started: 0, stopped: 0 };
     const liveness = {
