@@ -106,13 +106,14 @@ describe("expected codes are exactly the program's refusals of tag 39 (prog d27f
 
 describe("matured gate equals the program's age >= permissionless_resolve_stale_slots", () => {
   const w = (age: bigint, stale = STALE) => staleResolveWindow(market({ lastGood: NOW - age, stale }), NOW);
+  const matured = (win: ReturnType<typeof staleResolveWindow>) => (win && win.enabled ? win.matured : undefined);
   it("boundary: stale-1 not matured, stale matured, stale+1 matured", () => {
-    assert.equal(w(STALE - 1n)?.matured, false);
-    assert.equal(w(STALE)?.matured, true);
-    assert.equal(w(STALE + 1n)?.matured, true);
+    assert.equal(matured(w(STALE - 1n)), false);
+    assert.equal(matured(w(STALE)), true);
+    assert.equal(matured(w(STALE + 1n)), true);
   });
   it("last_good in the future (saturating_sub = 0) is not matured; window 0 is disabled", () => {
-    assert.equal(staleResolveWindow(market({ lastGood: NOW + 50n }), NOW)?.matured, false);
+    assert.equal(matured(staleResolveWindow(market({ lastGood: NOW + 50n }), NOW)), false);
     assert.equal(w(900_000n, 0n)?.enabled, false);
   });
   it("the guard follows: age stale-1 holds on matured, age stale resolves", () => {
