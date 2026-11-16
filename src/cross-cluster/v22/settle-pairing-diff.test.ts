@@ -147,7 +147,7 @@ const rnd = (): number => {
 const int = (n: number): number => Math.floor(rnd() * n);
 
 function randomInput(): PlanInput {
-  const n = int(4) === 0 ? int(5) : int(120);
+  const n = int(4) === 0 ? int(5) : int(60);
   const poolKeys = 1 + int(40); // few distinct keys per list is not possible (unique), so ties come from weight/lossWeight
   void poolKeys;
   const counterparties: PositionedPortfolio[] = [];

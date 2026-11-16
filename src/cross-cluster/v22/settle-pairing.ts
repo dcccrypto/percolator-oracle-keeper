@@ -177,11 +177,20 @@ function heaviestFirst(xs: ReadonlyArray<PositionedPortfolio>): Weighed[] {
  * has an accrue crank of its own beside it, never a second account): `cap <= 0` means the tx's other occupant
  * (a heavy LP) already uses the whole budget, so nothing rides.
  */
-function takeUpTo(list: Weighed[], cap: number): { taken: Weighed[]; rest: Weighed[] } {
+function takeUpTo(list: Weighed[], off: number, cap: number, minW: number): { taken: Weighed[]; rest: Weighed[]; restOff: number } {
+  const head = list[off];
+  // A solo head that cannot ride normally goes out alone and takes the tx: the rest is the same array one further on (no copy).
+  if (head !== undefined && head.solo && head.w > cap && cap > 0) return { taken: [head], rest: list, restOff: off + 1 };
   const taken: Weighed[] = [];
   const rest: Weighed[] = [];
   let used = 0;
-  for (const e of list) {
+  for (let i = off; i < list.length; i++) {
+    // Nothing left in the list can fit once even the lightest entry overflows (and the solo exception needs an empty tx).
+    if (taken.length > 0 && used + minW > cap) {
+      for (let j = i; j < list.length; j++) rest.push(list[j]);
+      break;
+    }
+    const e = list[i];
     if (used + e.w <= cap) {
       taken.push(e);
       used += e.w;
@@ -190,10 +199,14 @@ function takeUpTo(list: Weighed[], cap: number): { taken: Weighed[]; rest: Weigh
       used = Number.POSITIVE_INFINITY;
     } else rest.push(e);
   }
-  return { taken, rest };
+  return { taken, rest, restOff: 0 };
 }
 
-const sumW = (xs: ReadonlyArray<Weighed>): number => xs.reduce((n, e) => n + e.w, 0);
+const sumW = (xs: ReadonlyArray<Weighed>, off = 0): number => {
+  let n = 0;
+  for (let i = off; i < xs.length; i++) n += xs[i].w;
+  return n;
+};
 const ps = (xs: ReadonlyArray<Weighed>): PositionedPortfolio[] => xs.map((e) => e.p);
 
 /**
@@ -206,6 +219,8 @@ export function planSettleRound(i: PlanInput): RoundPlan {
   const maxTxs = i.maxTxsPerRound ?? DEFAULT_MAX_TXS_PER_ROUND;
   const lpW = i.lpWeight ?? 3;
   const C = heaviestFirst(i.counterparties);
+  // Lightest weight in the set (the early-exit bound of takeUpTo); the list is heaviest-first, so it is the last entry.
+  const minW = C.length > 0 ? C[C.length - 1].w : 0;
   const notes: string[] = [];
   const base = { mode: i.mode, needsPushHold: false, notes };
 
@@ -228,39 +243,45 @@ export function planSettleRound(i: PlanInput): RoundPlan {
     // Legacy #147 shape: LP crank in every tx, chunks of counterparties.
     const txs: PlannedTx[] = [];
     let rest = C;
-    while (rest.length > 0 && txs.length < maxTxs) {
-      const { taken, rest: r } = takeUpTo(rest, W - lpW);
+    let off = 0;
+    while (off < rest.length && txs.length < maxTxs) {
+      const { taken, rest: r, restOff } = takeUpTo(rest, off, W - lpW, minW);
       if (taken.length === 0) break;
       txs.push(lpTx(txs.length, taken));
       rest = r;
+      off = restOff;
     }
     notes.push("pairing off: the LP is settled in every tx (legacy #147 shape)");
-    return { ...base, txs, lpTxIndex: txs.length > 0 ? txs.length - 1 : null, paired: false, unvisited: ps(rest), unpairedLpSettle: true, lpDeferred: false, phases: [txs.map((t) => t.index)] };
+    return { ...base, txs, lpTxIndex: txs.length > 0 ? txs.length - 1 : null, paired: false, unvisited: ps(rest.slice(off)), unpairedLpSettle: true, lpDeferred: false, phases: [txs.map((t) => t.index)] };
   }
 
   // ── multi-tx paired round: counterparty txs first (accrue NOT on the LP), the LP tx last.
   const anchorW = i.anchor ? FLAT_ANCHOR_WEIGHT : 0;
   const cpTxs: PlannedTx[] = [];
   let remaining = C;
+  let remOff = 0;
   // Phase 1: fill txs from the heaviest until what is left fits the LP tx's capacity.
-  while (sumW(remaining) > W - lpW && cpTxs.length < maxTxs - 1) {
+  while (sumW(remaining, remOff) > W - lpW && cpTxs.length < maxTxs - 1) {
     let taken: Weighed[];
     let rest: Weighed[];
+    let restOff: number;
     if (i.anchor) {
-      ({ taken, rest } = takeUpTo(remaining, W - anchorW));
+      ({ taken, rest, restOff } = takeUpTo(remaining, remOff, W - anchorW, minW));
       if (taken.length === 0) break;
       cpTxs.push({ index: cpTxs.length, accrue: "anchor", accrueTarget: i.anchor, refresh: ps(taken), settlesLp: false, weight: anchorW + sumW(taken) });
     } else {
       // accrue through the first counterparty (its settle IS the accrue crank): it costs its own weight once.
-      ({ taken, rest } = takeUpTo(remaining, W));
+      ({ taken, rest, restOff } = takeUpTo(remaining, remOff, W, minW));
       if (taken.length === 0) break;
       const [first, ...others] = taken;
       cpTxs.push({ index: cpTxs.length, accrue: "counterparty", accrueTarget: first.p.pubkey, refresh: ps(others), settlesLp: false, weight: sumW(taken) });
     }
     remaining = rest;
+    remOff = restOff;
   }
   const lpCap = W - lpW;
-  const { taken: lpTaken, rest: unvisited } = takeUpTo(remaining, lpCap);
+  const { taken: lpTaken, rest: unvisitedAll, restOff: unvisitedOff } = takeUpTo(remaining, remOff, lpCap, minW);
+  const unvisited = unvisitedOff === 0 ? unvisitedAll : unvisitedAll.slice(unvisitedOff);
   const lastIdx = cpTxs.length;
 
   if (unvisited.length > 0) {
