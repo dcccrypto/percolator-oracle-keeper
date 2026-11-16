@@ -357,7 +357,7 @@ describe("lp-cert-liveness: untaken branches", () => {
   it("evaluate: among two warn assets with equal remaining the first is kept; a warn never replaces a critical", () => {
     const s = (assetIndex: number, stale: bigint, remaining: bigint) => ({ assetIndex, certified: false, staleSlots: stale, horizonSlots: 1_000n, deadlineSlot: 5_000n, remainingSlots: remaining, horizonSource: "on-chain" as const });
     const out = evaluateVaultLpCrankStaleness(
-      { label: "M", market: "mk", terminal: false, nowSlot: 1n, assets: [s(1, 600n, 400n), s(2, 300n, 700n), s(3, 300n, 400n)] },
+      { label: "M", market: "mk", terminal: false, nowSlot: 1n, assets: [s(1, 600n, 400n), s(2, 300n, 700n), s(3, 300n, 100n)] },
       T,
     );
     assert.equal(out.length, 1);
@@ -367,11 +367,11 @@ describe("lp-cert-liveness: untaken branches", () => {
     assert.equal(eq[0].data?.assetIndex, 4);
     assert.equal(eq[0].severity, "warn");
   });
-  it("level: horizon below one slot per pct still rounds by integer math (stale 0 is ok even uncertified)", () => {
+  it("level: zero stale slots is ok even when uncertified (early exit)", () => {
     assert.equal(lpCertLevelOf({ assetIndex: 0, certified: false, staleSlots: 0n, horizonSlots: 1n, deadlineSlot: 1n, remainingSlots: 0n, horizonSource: "on-chain" }, T), "ok");
   });
   it("decode: an undecodable LP portfolio throws (caller keeps the last state)", () => {
-    assert.throws(() => readLpCertAssets(bandMarket({ epoch: 7n, anchorSlot: 10_000n, currentSlot: 10_100n }), L, [0], new Uint8Array(4)));
+    assert.throws(() => readLpCertAssets(bandMarket({ epoch: 7n, anchorSlot: 10_000n, currentSlot: 10_100n }), L, [0], new Uint8Array(4)), Error);
   });
   it("decode: two active legs on one asset keep the smaller band_epoch_snap in either order; other assets' legs are ignored", () => {
     const G = LAYOUT_V22.portfolio;

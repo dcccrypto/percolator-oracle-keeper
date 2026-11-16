@@ -312,7 +312,7 @@ describe("d1-watch: untaken branches", () => {
     const e2 = tr.observe([reading(true)], 150n); // slot went backwards
     assert.equal(e2[0].ageSlots, 0n);
     assert.equal(e2[0].slotsToBound, 9_000n);
-    tr.observe([reading(false)], 100n); // ends with now < start: age 0
+    tr.observe([reading(false)], 100n); // ends with now < start: age clamped to 0 (coverage of the clamp; longest starts at 0, so only the count is a hard check)
     const sum = tr.summary([]);
     assert.equal(sum.endedEpisodes, 1);
     assert.equal(sum.endedPastBound, 0);
