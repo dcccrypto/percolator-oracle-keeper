@@ -91,6 +91,12 @@ describe("rpc-failover branches: construction and helpers", () => {
   });
 
   it("rpcFailoverHealth: degraded only when a registered failover reports rpc-degraded", async () => {
+    assert.equal(rpcFailoverHealth().degraded, false); // empty registry
+    const ok = mk(healthy, [A]);
+    await call(ok.f);
+    registerRpcFailover("branches-test-ok", ok.f);
+    assert.equal(rpcFailoverHealth().degraded, false);
+    // NB: the registry has no unregister; entries persist for the rest of this file (own process under node --test)
     const down = mk(() => new Response("nope", { status: 429 }), [A]);
     await call(down.f).catch(() => {});
     registerRpcFailover("branches-test-down", down.f);
@@ -177,13 +183,15 @@ describe("rpc-failover branches: all down, recovery, non-retryable", () => {
     }
     const { f } = mk((u, m, n) => (u === A && m === "getBalance" ? new Unreadable("x", { status: 402 }) : healthy(u, m, n)), [A, B]);
     const r = await call(f);
-    assert.ok([200, 402].includes(r.status));
+    assert.equal(r.status, 402);
+    assert.equal(f.snapshot().activeIndex, 0);
+    assert.equal(f.snapshot().endpoints[0].state, "ok");
     const g = mk((u, m, n) => (u === A && m === "getBalance" ? new Response("forbidden", { status: 403 }) : healthy(u, m, n)), [A, B]);
     assert.equal((await call(g.f)).status, 200);
     assert.match(g.f.snapshot().endpoints[0].lastError ?? "", /403|auth/i);
   });
 
-  it("500/502/504 fail over; a blockhash reply that is not JSON is passed through unjudged", async () => {
+  it("a 502 fails over; a blockhash reply that is not JSON is passed through unjudged", async () => {
     const { f } = mk((u, m, n) => (u === A && m === "getBalance" ? new Response("oops", { status: 502 }) : healthy(u, m, n)), [A, B]);
     assert.equal((await call(f)).status, 200);
     const bh = mk((u, m, n) => (m === "getLatestBlockhash" ? new Response("<html>not json</html>", { status: 200 }) : healthy(u, m, n)), [A, B]);
@@ -230,8 +238,9 @@ describe("rpc-failover branches: chain speed measurement", () => {
     const first = sampleCalls;
     tick(2000);
     await call(f);
-    assert.ok(sampleCalls >= first);
-    assert.equal(f.snapshot().slotRate.measured === null || f.snapshot().slotRate.measured > 0, true);
+    assert.ok(first > 0);
+    assert.equal(sampleCalls, first, "no re-measure inside rateRefreshMs");
+    assert.equal(f.snapshot().slotRate.measured, 2.5);
 
     const err = mk((u, m, n) => (m === "getRecentPerformanceSamples" ? new Response("no", { status: 500 }) : healthy(u, m, n)), [A, B]);
     await call(err.f);
