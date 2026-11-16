@@ -89,7 +89,9 @@ async function runDryRun(registry: object | undefined): Promise<string> {
   let err = "";
   child.stdout.on("data", (c) => (out += c));
   child.stderr.on("data", (c) => (err += c));
+  const killer = setTimeout(() => child.kill("SIGKILL"), 170_000);
   const code = await new Promise<number | null>((r) => child.on("close", r));
+  clearTimeout(killer);
   assert.equal(code, 0, `dry-run exited ${code}: ${err}`);
   return out;
 }
@@ -126,7 +128,7 @@ describe("src/dry-run.ts (read-only CLI)", () => {
     accounts.set(CANON_METEORA, "empty-data");
     const out = await runDryRun({ version: 1, markets: [] });
     assert.match(out, /Raydium CLMM \.\.\. ERROR: .*boom from fake rpc/);
-    assert.match(out, /Meteora DLMM \.\.\. SKIP: (pool account has empty data|pool owner)/);
+    assert.match(out, /Meteora DLMM \.\.\. SKIP: pool account has empty data/);
     assert.doesNotMatch(out, /SOL\/USD reference for this run/);
     assert.match(out, /Dry-run complete/);
   });
