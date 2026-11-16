@@ -178,3 +178,72 @@ describe("duplicate pushes from two pushers are harmless", () => {
     assert.ok(!getQuarantinedMarkets().includes(market));
   });
 });
+
+describe("pusher-role untaken branches", () => {
+  it("env: blank/whitespace falls back to default; non-integer, zero and negative throw", () => {
+    assert.equal(pusherConfigFromEnv({ PUSHER_REFRESH_MS: "   " }).refreshMs, DEFAULT_PUSHER_CONFIG.refreshMs);
+    assert.equal(pusherConfigFromEnv({ PUSHER_TAKEOVER_SLOTS: "7" }).takeoverSlots, 7n);
+    for (const bad of ["0", "-5", "1.5", "abc"]) assert.throws(() => pusherConfigFromEnv({ PUSHER_STALE_STATE_MS: bad }), /positive integer/);
+  });
+  it("rpcEndpointProblem: missing own is fatal, missing primary is fine, unparseable URLs compare trimmed", () => {
+    assert.match(rpcEndpointProblem(undefined, "https://a.example") ?? "", /required/);
+    assert.equal(rpcEndpointProblem("https://a.example", undefined), null);
+    assert.match(rpcEndpointProblem("not a url", "  not a url ") ?? "", /OWN RPC/);
+    assert.equal(rpcEndpointProblem("not a url", "other junk"), null);
+    assert.equal(rpcEndpointProblem("https://h.example/x?api-key=a", "https://h.example/x?api-key=b"), null);
+    assert.match(rpcEndpointProblem("https://h.example/x", "https://h.example/x") ?? "", /OWN RPC/);
+  });
+  it("default clock: gate methods use Date.now when no time is passed", () => {
+    const g = new TakeoverGate(CFG);
+    assert.equal(g.isStandby(M), false);
+    g.update(M, 0n, 1_000_000n);
+    assert.equal(g.gapSlots(M)! >= 1_000_000n, true);
+    assert.equal(g.isStandby(M), false);
+    g.recordPush(M);
+    assert.equal(g.activeAlerts().length, 1);
+    assert.equal(g.health([M])[M].takeoverPushes, 1);
+  });
+  it("alerts: label falls back to the market address; unknown market health is all-null/zero", () => {
+    const g = new TakeoverGate(CFG, () => 0);
+    g.recordPush(M, 0);
+    const [a] = g.activeAlerts(0);
+    assert.equal(a.subject, M);
+    g.setLabel(M, "SOL-PERP");
+    assert.equal(g.activeAlerts(0)[0].subject, "SOL-PERP");
+    const other = Keypair.generate().publicKey.toBase58();
+    assert.deepEqual(g.health([other], 0)[other], { standby: false, gapSlots: null, lastGoodSlot: null, takeoverPushes: 0, lastTakeoverAgoMs: null });
+  });
+  it("gapSlots: lastGood ahead of the cluster slot clamps to 0; clock going backwards adds no slots; staleness boundary", () => {
+    const g = new TakeoverGate(CFG, () => 0);
+    g.update(M, 500n, 100n, 1_000);
+    assert.equal(g.gapSlots(M, 1_000), 0n);
+    assert.equal(g.isStandby(M, 1_000), true);
+    g.update(M, 10n, 100n, 1_000);
+    assert.equal(g.gapSlots(M, 500), 90n); // negative elapsed clamps to 0 slots
+    assert.equal(g.gapSlots(M, 1_000 + 30_000), 90n + 75n); // exactly staleStateMs is still known
+    assert.equal(g.gapSlots(M, 1_000 + 30_001), null);
+  });
+  it("refresh: empty market list does no RPC; null and short accounts leave state untouched", async () => {
+    let calls = 0;
+    const conn = { async getSlot() { calls++; return 1; }, async getMultipleAccountsInfo() { calls++; return []; } };
+    const g = new TakeoverGate(CFG, () => 0);
+    await refreshTakeoverGate(conn as never, g, [], 0);
+    assert.equal(calls, 0);
+    const M2 = Keypair.generate().publicKey.toBase58();
+    const conn2 = {
+      async getSlot() { return 9_000; },
+      async getMultipleAccountsInfo() { return [null, { data: Buffer.alloc(175) }]; },
+    };
+    await refreshTakeoverGate(conn2 as never, g, [M, M2], 0);
+    assert.equal(g.gapSlots(M, 0), null);
+    assert.equal(g.gapSlots(M2, 0), null);
+    assert.equal(g.isStandby(M, 0), false);
+  });
+  it("refresh: default nowMs is the wall clock; an invalid market address is swallowed (fail open)", async () => {
+    const conn = { async getSlot() { return 5; }, async getMultipleAccountsInfo() { const b = Buffer.alloc(176); b.writeBigUInt64LE(1n, 168); return [{ data: b }]; } };
+    const g = new TakeoverGate(CFG);
+    await refreshTakeoverGate(conn as never, g, [M]);
+    assert.notEqual(g.gapSlots(M), null);
+    await assert.doesNotReject(refreshTakeoverGate(conn as never, g, ["not-a-pubkey"]));
+  });
+});
