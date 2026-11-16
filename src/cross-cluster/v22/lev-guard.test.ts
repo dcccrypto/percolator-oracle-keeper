@@ -534,6 +534,14 @@ describe("guard account length (K-2)", () => {
     assert.equal(g!.guard.touchedTags[0], keyTagOf(t));
     assert.notEqual(await k.w1Once(w.market.toBase58(), "T"), "guard unreadable");
   });
+  it("on a pin that predates SDK#491 a 4600 B guard is a guard but readGuard is null (W1 reports guard unreadable)", { skip: sdkHasV2 && "pin has the v2 decoder" }, async () => {
+    const w = world(TRIG_LEN);
+    w.accounts.set(w.guardKey.toBase58(), { owner: PROGRAM, data: guardBytes({ market: w.market, ...TRIG_LEN, v2: true }) });
+    const { k } = keeperOf(levConn({ accounts: w.accounts }).conn, cfg({ w1: true }), { loadPortfolios: async () => [] });
+    assert.equal(await k.hasGuard(w.market.toBase58()), true);
+    assert.equal(await k.readGuard(w.market.toBase58()), null);
+    assert.equal(await k.w1Once(w.market.toBase58(), "T"), "guard unreadable");
+  });
   it("lengths 4599 / 4601 are refused (no guard); a 4600 B record with version 1 does not decode", async () => {
     for (const len of [4599, 4601]) {
       const w = world();

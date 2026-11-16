@@ -361,7 +361,7 @@ export class LevGuardKeeper {
       const market = new PublicKey(marketAddress);
       const [info, slot] = await Promise.all([this.d.conn.getAccountInfo(deriveLevGuardV22(this.d.programId, market)[0], "confirmed"), this.d.conn.getSlot("confirmed")]);
       if (!info || !info.owner.equals(this.d.programId)) return null;
-      // decodeLevGuardV22 (SDK 0a6ac576) accepts exactly 4,456 B, 4,472 B (v1) or 4,600 B (v2, SDK#491) and throws on any other length (-> null below).
+      // decodeLevGuardV22 accepts exactly 4,456 B / 4,472 B (v1) and, from SDK#491, 4,600 B (v2); it throws on any other length (-> null below). On a pin that predates #491 a 4,600 B guard is a guard (hasGuard) but reads as null here until the pin moves.
       return { guard: decodeLevGuardV22(new Uint8Array(info.data)), slot: BigInt(slot) };
     } catch {
       return null;
