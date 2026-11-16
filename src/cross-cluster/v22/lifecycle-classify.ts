@@ -106,7 +106,8 @@ export function openInterestIsZero(data: Uint8Array): boolean | null {
     let sawAsset = false;
     for (let i = 0; i < det.slots; i++) {
       const lifecycle = data[engineSlotBase(det.layout, i) + det.layout.asset.lifecycle];
-      if (lifecycle !== 2 && lifecycle !== 3) continue; // Active / DrainOnly only
+      // Active / DrainOnly / Recovery: a Recovery asset stays inside a Live market and can still hold OI (engine v16.rs:8534).
+      if (lifecycle !== 2 && lifecycle !== 3 && lifecycle !== 5) continue;
       const a = decodeAdlState(data, i);
       if (!a) return null;
       sawAsset = true;
