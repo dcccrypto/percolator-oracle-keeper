@@ -27,6 +27,7 @@ import {
   CARDS, USDC, WSOL_MINT, SOL_E6, Acc, ctx, meteora, mintAcc, mockConn, pump, put, raydium, vault,
 } from "./price-reader-fixtures.ts";
 
+delete process.env.MIN_POOL_LIQUIDITY_USD; // floor-off paths are asserted here; the floor has its own file
 beforeEach(() => resetSlotWatermarksForTests());
 const rnd = () => Keypair.generate().publicKey;
 type Dex = "raydium-clmm" | "meteora-dlmm" | "pumpswap";
@@ -153,7 +154,7 @@ describe("readPoolPriceE6 refusals (single-pool path)", () => {
     assert.match(dr.skipReason!, /^PumpSwap: /);
   });
 
-  it("unsupported dexType falls through to the exhaustiveness guard", async () => {
+  it("an unknown dexType is refused at the owner check (the exhaustiveness guard is unreachable behind it)", async () => {
     const accts = new Map<string, Acc>();
     const pool = raydium(accts, WSOL_MINT, USDC, SOL_E6);
     const { conn } = mockConn(accts, "https://ep-r-unsup");
@@ -397,10 +398,12 @@ describe("readAtWatermark", () => {
       /Minimum context slot has not been reached \(served 50 < watermark 100\)/,
     );
     assert.equal(seen, 100);
-    await readAtWatermark(c, async () => ctx(3, 100));
+    let after: number | undefined;
+    await readAtWatermark(c, async (m) => { after = m; return ctx(3, 100); });
+    assert.equal(after, 100, "the rejected read did not lower the watermark");
   });
 
-  it("non-min-slot errors propagate untouched and do not count toward the poison counter", async () => {
+  it("non-min-slot errors propagate untouched and never set a watermark", async () => {
     const c = conn("https://ep-w-other");
     for (let i = 0; i < 5; i++) {
       await assert.rejects(readAtWatermark(c, async () => { throw new Error("socket hang up"); }), /socket hang up/);

@@ -9,7 +9,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair } from "@solana/web3.js";
-import { USDC, WSOL_MINT, Acc, meteora, mintAcc, mockConn, pump, put, raydium, SOL_E6 } from "./price-reader-fixtures.ts";
+import { USDC, WSOL_MINT, Acc, mintAcc, mockConn, pump, put, raydium, SOL_E6 } from "./price-reader-fixtures.ts";
 
 process.env.MIN_POOL_LIQUIDITY_USD = "1000";
 const pr = await import("./price-reader.ts");
@@ -45,7 +45,7 @@ describe("liquidity floor ($1,000)", () => {
     assert.equal(d.priceE6, 5_000n);
   });
 
-  it("single-pool path: an unmeasurable depth (WSOL quote, no SOL rate) is refused as 'unknown'... after the no-rate guard", async () => {
+  it("single-pool path: a WSOL quote with no SOL rate is refused by the no-rate guard; with a rate it clears the floor", async () => {
     const accts = new Map<string, Acc>();
     const base = rnd();
     put(accts, base, { data: mintAcc(6) });
@@ -97,7 +97,6 @@ describe("liquidity floor ($1,000)", () => {
   it("the default logger and the shared warned-set are used when none are passed (readPoolPriceE6 on a raydium pool)", async () => {
     const accts = new Map<string, Acc>();
     const pool = raydium(accts, WSOL_MINT, USDC, SOL_E6);
-    const mpool = meteora(accts, rnd(), USDC);
     put(accts, USDC, { data: mintAcc(6) });
     const { conn } = mockConn(accts, "https://ep-f-default");
     const lines: string[] = [];
@@ -107,7 +106,6 @@ describe("liquidity floor ($1,000)", () => {
       await pr.readPoolPriceE6(conn, { poolAddress: pool.toBase58(), dexType: "raydium-clmm", label: "R" }, new Map());
       await pr.readPoolPriceE6(conn, { poolAddress: pool.toBase58(), dexType: "raydium-clmm", label: "R" }, new Map());
     } finally { console.warn = ow; }
-    void mpool;
     assert.equal(lines.filter((l) => l.includes("NOT ENFORCEABLE")).length, 1);
   });
 });
