@@ -68,7 +68,7 @@ function envNum(env: Env, name: string, fallback: number, opts: { min: number; m
   if (raw === undefined || raw.trim() === "") return fallback;
   // int vars: plain decimal digits only (Number() would take 0x3e8, 1e4, +5, 6e4 ...), and a safe integer.
   const n = opts.int ? (/^\d+$/.test(raw.trim()) ? Number(raw.trim()) : NaN) : Number(raw);
-  if (!Number.isFinite(n) || (opts.int && !Number.isSafeInteger(n)) || n < opts.min || n > opts.max || (opts.int && !Number.isInteger(n))) {
+  if (!Number.isFinite(n) || (opts.int && !Number.isSafeInteger(n)) || n < opts.min || n > opts.max) {
     throw new Error(`${name}="${raw}" must be ${opts.int ? "an integer" : "a number"} in [${opts.min}, ${opts.max}]`);
   }
   return n;

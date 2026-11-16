@@ -139,7 +139,7 @@ test("publisher: TICK_PUBLISH_TIMEOUT_MS accepts plain decimal only; 1e9 / 0x10 
   AbortSignal.timeout = ((ms: number) => { seen.push(ms); return orig.call(AbortSignal, ms); }) as typeof AbortSignal.timeout;
   const saved = process.env.TICK_PUBLISH_TIMEOUT_MS;
   try {
-    for (const v of ["1e9", "0x10", "2500", "9e2"]) {
+    for (const v of ["1e9", "0x10", "2500", "9e2", "3000000000", " 2600 "]) {
       process.env.TICK_PUBLISH_TIMEOUT_MS = v;
       const p = createTickPublisher({ url: "https://u.example/t", key: "k", now: () => 5, log: () => {}, fetchImpl: (async () => new Response("ok")) as typeof fetch });
       p.publish([inp(1)], 1, 1);
@@ -149,5 +149,5 @@ test("publisher: TICK_PUBLISH_TIMEOUT_MS accepts plain decimal only; 1e9 / 0x10 
     AbortSignal.timeout = orig;
     if (saved === undefined) delete process.env.TICK_PUBLISH_TIMEOUT_MS; else process.env.TICK_PUBLISH_TIMEOUT_MS = saved;
   }
-  assert.deepEqual(seen, [1500, 1500, 2500, 1500]);
+  assert.deepEqual(seen, [1500, 1500, 2500, 1500, 1500, 2600]);
 });
