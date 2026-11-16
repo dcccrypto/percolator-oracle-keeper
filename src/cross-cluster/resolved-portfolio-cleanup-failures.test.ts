@@ -21,6 +21,7 @@ import {
   portfolioLenForMarketData,
   positionNftFor,
   RESOLVED_RECEIPT_OFF,
+  ownerAta,
   decodePositionNft,
   POSITION_NFT_LEN,
   POSITION_NFT_LEN_LEGACY,
@@ -60,7 +61,7 @@ const emptyEscrowed = (): Buffer => {
   return b;
 };
 
-interface Tx { tags: number[]; keys: string[]; }
+interface Tx { tags: number[]; keys: string[]; ixAccounts: string[][]; }
 interface Opts {
   gpa?: () => Promise<never>;
   multi?: () => Promise<never>;
@@ -82,6 +83,7 @@ function conn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, o: Opts) {
       return pid === WRAPPER.toBase58() ? ix.data[0] : pid.startsWith("ATok") ? -1 : -2;
     }),
     keys: tx.message.staticAccountKeys.map((k) => k.toBase58()),
+    ixAccounts: nonComputeBudgetCompiled(tx.message.compiledInstructions, tx.message.staticAccountKeys).map((ix) => ix.accountKeyIndexes.map((i) => tx.message.staticAccountKeys[i].toBase58())),
   });
   const c = {
     async getProgramAccounts() {
@@ -146,9 +148,13 @@ describe("resolved cleanup: read / probe RPC failures", () => {
     assert.equal(c.sims.length, 0);
   });
   it("the market account read failing falls back to the v2.1 length and the scan still runs", async () => {
+    const filters: unknown[] = [];
     const c = conn([{ pubkey: pf(), data: withOwner(owner()) }], { accountInfo: async () => { throw new Error("getAccountInfo 500"); }, sim: afterProbe(() => ({ err: null })) });
+    const orig = (c.conn as unknown as { getProgramAccounts: (...a: unknown[]) => Promise<unknown> }).getProgramAccounts;
+    (c.conn as unknown as { getProgramAccounts: (...a: unknown[]) => Promise<unknown> }).getProgramAccounts = (...a) => { filters.push((a[1] as { filters: unknown[] }).filters[0]); return orig(...a); };
     const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CFG, new CleanupState());
     assert.equal(r.closed, 1);
+    assert.deepEqual(filters, [{ dataSize: portfolioLenForMarketData(null) }]);
   });
   it("portfolioLenForMarketData: unreadable/short -> v2.1 length; an unknown VERSION throws (nothing scanned at a guess)", () => {
     const v21 = portfolioLenForMarketData(null);
@@ -188,6 +194,15 @@ describe("resolved cleanup: read / probe RPC failures", () => {
     const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CFG, new CleanupState());
     assert.equal(r.closed, 1);
     assert.deepEqual(c.sent.map((t) => t.tags), [[-1, 30, 8]]);
+  });
+});
+
+describe("resolved cleanup: never throws", () => {
+  it("getLatestBlockhash rejecting is reported, not thrown (doc: 'Never throws'; terminal-insurance does not wrap the call)", async () => {
+    const c = conn([{ pubkey: pf(), data: withOwner(owner()) }], { blockhash: async () => { throw new Error("blockhash 503"); }, sim: afterProbe(() => ({ err: null })) });
+    const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CFG, new CleanupState());
+    assert.equal(c.sent.length, 0);
+    assert.match(r.remaining[0].reason, /blockhash: blockhash 503/);
   });
 });
 
@@ -259,12 +274,14 @@ describe("resolved cleanup: partial batch", () => {
     assert.deepEqual(c.sent.map((t) => t.tags), [[-1, 30, 8]]);
     assert.match(r.remaining[0].reason, /ATA-create budget for this cycle used/);
   });
-  it("rent destination: the sent ClosePortfolio names the portfolio's recorded owner (and the owner's ATA for the payout)", async () => {
+  it("rent destination: ClosePortfolio [3] is the recorded owner; CloseResolved pays the owner's ATA", async () => {
     const w = owner();
     const c = conn([{ pubkey: pf(), data: withOwner(w) }], { sim: afterProbe(() => ({ err: null })) });
     await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CFG, new CleanupState());
-    assert.ok(names(c.sent[0]).includes(w.toBase58()), "owner is an account of the close (rent -> owner)");
-    assert.ok(!names(c.sent[0]).slice(1).includes(KEEPER.publicKey.toBase58()) || names(c.sent[0])[0] === KEEPER.publicKey.toBase58(), "keeper is only the fee payer / signer");
+    assert.deepEqual(c.sent[0].tags, [30, 8]);
+    assert.equal(c.sent[0].ixAccounts[1][3], w.toBase58(), "ClosePortfolio rent destination [3] = owner");
+    assert.equal(c.sent[0].ixAccounts[0][3], ownerAta(w, MINT).toBase58(), "CloseResolved payout [3] = owner ATA");
+    assert.equal(c.sent[0].ixAccounts[1][0], KEEPER.publicKey.toBase58(), "keeper is the closer [0]");
   });
   it("per-cycle bound applies per index: bound reached leaves the tail reported, tail never simulated", async () => {
     const all = [pf(), pf(), pf()];
@@ -274,7 +291,7 @@ describe("resolved cleanup: partial batch", () => {
     assert.equal(r.remaining.length, 2);
     assert.ok(c.sims.slice(1).every((t) => t.keys.includes(all[0].toBase58()) || !all.slice(1).some((k) => t.keys.includes(k.toBase58()))));
   });
-  it("CloseResolved chunk path: a chunk that errors stops that portfolio with the label, the next portfolio proceeds", async () => {
+  it("a portfolio whose first CloseResolved chunk is refused is reported; the next portfolio still closes", async () => {
     const a = pf(), b = pf();
     const c = conn([a, b].map((k) => ({ pubkey: k, data: withOwner(owner()) })), {
       sim: afterProbe((t) => (t.keys.includes(a.toBase58()) ? (t.tags.includes(30) && t.tags.length === 1 ? { err: E(21) } : { err: E(61) }) : { err: null })),
@@ -306,7 +323,7 @@ describe("resolved cleanup: NFT-escrow and vault-LP failure branches", () => {
     const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CFG, new CleanupState(), AFTER_GRACE);
     assert.match(r.remaining[0].reason, /send RPC timeout/);
   });
-  it("registry-owned portfolio: vault-LP state read throwing leaves it reported as unbound, nothing sent", async () => {
+  it("registry-owned portfolio with an unreadable/undecodable vault-LP state is reported as unbound, nothing sent", async () => {
     const real = deriveLpVaultRegistry(WRAPPER, SOL)[0];
     const c = conn([{ pubkey: pf(), data: withOwner(real) }], { multi: async () => { throw new Error("gMA 502"); }, sim: afterProbe(() => ({ err: null })) });
     const r = await cleanupResolvedPortfolios(c.conn, KEEPER, SOL, MINT, false, CFG, new CleanupState(), AFTER_GRACE);
@@ -367,9 +384,9 @@ describe("resolved cleanup: receipt-revisit failure branches", () => {
     assert.equal(r.topupSwept.length, 1);
     assert.ok(r.remaining.some((x) => /tag-46 sweep over the 1-per-cycle bound/.test(x.reason)));
   });
-  it("the receipt re-read failing skips the sweep (no 46 is sent blind)", async () => {
+  it("the receipt re-read failing skips the sweep (no 46 is sent blind, even though it would simulate OK)", async () => {
     let calls = 0;
-    const base = conn([{ pubkey: pf(), data: withOpenReceipt(owner()) }], { sim: refuseCloses(() => null) });
+    const base = conn([{ pubkey: pf(), data: withOpenReceipt(owner()) }], { sim: refuseCloses((t) => (t.tags.length === 1 && t.tags[0] === 46 ? { err: null } : null)) });
     const orig = (base.conn as unknown as { getMultipleAccountsInfo: (k: PublicKey[]) => Promise<unknown> }).getMultipleAccountsInfo;
     (base.conn as unknown as { getMultipleAccountsInfo: (k: PublicKey[]) => Promise<unknown> }).getMultipleAccountsInfo = async (k) => {
       if (++calls >= 2) throw new Error("gMA 502");
@@ -385,11 +402,11 @@ describe("positionNftFor / decodePositionNft: error and stale-record branches", 
   const portfolio = pf();
   const group = pf();
   it("getProgramAccounts throwing -> null (never throws)", async () => {
-    const r = await positionNftFor({ getProgramAccounts: async () => { throw new Error("gPA down"); } }, NFT, portfolio, { marketGroup: group, portfolioId: 1n });
+    const r = await positionNftFor({ getProgramAccounts: (async () => { throw new Error("gPA down"); }) as never }, NFT, portfolio, { marketGroup: group, portfolioId: 1n });
     assert.equal(r, null);
   });
   it("no records -> null", async () => {
-    const r = await positionNftFor({ getProgramAccounts: async () => [] }, NFT, portfolio, { marketGroup: group, portfolioId: 1n });
+    const r = await positionNftFor({ getProgramAccounts: (async () => []) as never }, NFT, portfolio, { marketGroup: group, portfolioId: 1n });
     assert.equal(r, null);
   });
   it("decodePositionNft rejects a wrong-length buffer", () => {
@@ -406,10 +423,10 @@ describe("positionNftFor / decodePositionNft: error and stale-record branches", 
     legacy.copy(v3, 0);
     group.toBuffer().copy(v3, 199);
     v3.writeBigUInt64LE(7n, 231);
-    const mk = (rows: Buffer[]) => ({ getProgramAccounts: async (_p: PublicKey, o: { filters: Array<{ dataSize?: number }> }) => {
+    const mk = (rows: Buffer[]) => ({ getProgramAccounts: (async (_p: PublicKey, o: { filters: Array<{ dataSize?: number }> }) => {
       const size = o.filters[0].dataSize;
       return rows.filter((r) => r.length === size).map((r) => ({ pubkey: pf(), account: { data: r, owner: NFT, lamports: 1, executable: false } }));
-    } });
+    }) as never });
     const live = { marketGroup: group, portfolioId: 7n };
     assert.equal((await positionNftFor(mk([v3]), NFT, d.portfolio, live))?.holder, d.holder.toBase58());
     assert.equal(await positionNftFor(mk([v3]), NFT, d.portfolio, { ...live, portfolioId: 8n }), null, "stale incarnation");
