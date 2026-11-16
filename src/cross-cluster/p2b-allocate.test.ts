@@ -238,6 +238,14 @@ describe("allocateConfigFromEnv", () => {
     assert.throws(() => allocateConfigFromEnv({ P2B_ALLOCATE_INTERVAL_MS: "5" }, false), /P2B_ALLOCATE_INTERVAL_MS/);
     assert.throws(() => allocateConfigFromEnv({ P2B_ALLOCATE_JITTER_PCT: "95" }, false), /P2B_ALLOCATE_JITTER_PCT/);
   });
+  it("integer vars accept only plain decimal digits (no 0x / exponent / sign / underscore / decimals)", () => {
+    for (const bad of ["0x3e8", "1e4", "6e4", "+60000", "60_000", "60000.0", "0b1111", "1e400"]) {
+      assert.throws(() => allocateConfigFromEnv({ P2B_ALLOCATE_INTERVAL_MS: bad }, false), /P2B_ALLOCATE_INTERVAL_MS/, bad);
+      assert.throws(() => allocateConfigFromEnv({ P2B_ALLOCATE_CU: bad }, false), /P2B_ALLOCATE_CU/, bad);
+    }
+    assert.equal(allocateConfigFromEnv({ P2B_ALLOCATE_INTERVAL_MS: " 60000 " }, false).intervalMs, 60_000); // surrounding whitespace is trimmed
+    assert.equal(allocateConfigFromEnv({ P2B_ALLOCATE_JITTER_PCT: "12.5" }, false).jitter, 0.125); // non-int var keeps decimals
+  });
 });
 
 describe("tag 103: bond tranche account (EARN-10)", () => {

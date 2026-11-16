@@ -132,3 +132,22 @@ test("publisher: a non-https url fails closed at startup (throws), and the messa
   assert.equal(createTickPublisher({ url: "http://localhost:8787/y", key }).enabled, true);
   assert.equal(createTickPublisher({ url: "", key }).enabled, false);
 });
+
+test("publisher: TICK_PUBLISH_TIMEOUT_MS accepts plain decimal only; 1e9 / 0x10 fall back to the 1500 ms default", async () => {
+  const orig = AbortSignal.timeout;
+  const seen: number[] = [];
+  AbortSignal.timeout = ((ms: number) => { seen.push(ms); return orig.call(AbortSignal, ms); }) as typeof AbortSignal.timeout;
+  const saved = process.env.TICK_PUBLISH_TIMEOUT_MS;
+  try {
+    for (const v of ["1e9", "0x10", "2500", "9e2"]) {
+      process.env.TICK_PUBLISH_TIMEOUT_MS = v;
+      const p = createTickPublisher({ url: "https://u.example/t", key: "k", now: () => 5, log: () => {}, fetchImpl: (async () => new Response("ok")) as typeof fetch });
+      p.publish([inp(1)], 1, 1);
+      await tick();
+    }
+  } finally {
+    AbortSignal.timeout = orig;
+    if (saved === undefined) delete process.env.TICK_PUBLISH_TIMEOUT_MS; else process.env.TICK_PUBLISH_TIMEOUT_MS = saved;
+  }
+  assert.deepEqual(seen, [1500, 1500, 2500, 1500]);
+});
