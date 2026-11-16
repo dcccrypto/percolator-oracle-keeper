@@ -122,6 +122,16 @@ describe("R3.24 (a) push-deadline urgency", () => {
     assert.match(dl.urgentReason ?? "", /band pin on asset 0 4000\/9000/);
   });
 
+  it("a Recovery-lifecycle (5) asset's pin is NOT a push deadline: engine band_pin_expired_at counts Active/DrainOnly only", () => {
+    const read = PIN_SINCE_C4 + 5_000n;
+    const d = c4AtBoot(read - 10n);
+    const det = detectLayout(d);
+    assert.ok(det.known);
+    assert.ok(pushDeadlineOf(d, read)?.pin, "control: Active asset with the same pin has a deadline");
+    d[engineSlotBase(det.layout, 0) + det.layout.asset.lifecycle] = 5;
+    assert.equal(pushDeadlineOf(d, read)?.pin, null);
+  });
+
   it("a young pin and a fresh oracle are NOT urgent (the priming gate keeps its anti-manipulation job)", () => {
     const read = PIN_SINCE_C4 + 1_000n;
     const dl = pushDeadlineOf(c4AtBoot(read - 10n), read);

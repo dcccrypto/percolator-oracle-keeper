@@ -160,6 +160,10 @@ describe("windDownV22Once", () => {
     const r2 = await windDownV22Once(latchedCtx({ lifecycle: 4 }), freshWindDownV22State(), { exec: execCtx(f.conn), fetchPortfolios });
     assert.deepEqual(r2, []);
     assert.equal(f.sent.length + f.sims.length, 0);
+    // Recovery (5): engine adl_wind_down_eligible -> require_asset_live_reducible accepts Active/DrainOnly only (tag 104 would be refused)
+    const r3 = await windDownV22Once(latchedCtx({ lifecycle: 5 }), freshWindDownV22State(), { exec: execCtx(f.conn), fetchPortfolios });
+    assert.deepEqual(r3, []);
+    assert.equal(f.sent.length + f.sims.length, 0);
   });
 });
 
