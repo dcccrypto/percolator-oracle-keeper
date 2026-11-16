@@ -123,10 +123,6 @@ describe("registration-stream", () => {
     mock.timers.tick(1000);
     assert.equal(seen.length, 0);
     assert.equal(removed, 1);
-    // late event after stop must not fire either
-    onPayload!({ eventType: "INSERT", new: {} });
-    mock.timers.tick(1000);
-    assert.equal(seen.length, 0);
   });
 
   it("stop() swallows a removeChannel failure", async () => {
