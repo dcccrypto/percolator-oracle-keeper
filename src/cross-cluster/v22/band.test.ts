@@ -32,7 +32,10 @@ describe("band.ts terminalKindOf", () => {
     d[10] = 8;
     assert.equal(terminalKindOf(d), "closed");
   });
-  it("an undecodable account (too short / unknown) is not terminal", () => {
+  it("an undecodable account (too short, or unknown kind byte) is not terminal", () => {
+    const u = live();
+    u[10] = 3;
+    assert.equal(terminalKindOf(u), null);
     assert.equal(terminalKindOf(new Uint8Array(16)), null);
   });
 });
