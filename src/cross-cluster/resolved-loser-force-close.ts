@@ -340,7 +340,7 @@ export async function forceCloseResolvedLosers(
         const tx = mkTx(ixs, calls);
         const r = await simWatch(tx, c.pubkey);
         if (r.err) {
-          stop = calls === 0 ? `CloseResolved refused: ${errText(r.err)}` : "done";
+          stop = calls === 0 ? `CloseResolved refused: ${errText(r.err)}` : `refused after progress: ${errText(r.err)}`;
           break;
         }
         if (!r.post || Buffer.from(r.post).equals(Buffer.from(current))) {
