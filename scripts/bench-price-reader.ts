@@ -21,16 +21,22 @@ async function run(n: number, cycles: number) {
   for (let i = 0; i < 30; i++) await call(); // warm JIT + decimals
   (globalThis as { gc?: () => void }).gc?.();
   const h0 = process.memoryUsage().heapUsed;
-  const t0 = process.hrtime.bigint();
   let pools = 0;
-  for (let i = 0; i < cycles; i++) pools = (await call()).size;
-  const ms = Number(process.hrtime.bigint() - t0) / 1e6 / cycles;
+  const batches: number[] = [];
+  for (let b = 0; b < 7; b++) {
+    const c0 = process.cpuUsage();
+    for (let i = 0; i < cycles; i++) pools = (await call()).size;
+    const c = process.cpuUsage(c0);
+    batches.push((c.user + c.system) / 1000 / cycles); // CPU ms/cycle: robust to a loaded host
+  }
+  batches.sort((x, y) => x - y);
   const h1 = process.memoryUsage().heapUsed;
-  return { n, msPerCycle: +ms.toFixed(3), priced: pools, heapDeltaKB: Math.round((h1 - h0) / 1024) };
+  const ms = batches[0];
+  return { n, msPerCycle: +ms.toFixed(3), medianMs: +batches[3].toFixed(3), priced: pools, heapDeltaKB: Math.round((h1 - h0) / 1024) };
 }
 
 const out = [];
-for (const n of [16, 64]) out.push(await run(n, 300));
+for (const n of [16, 64]) out.push(await run(n, 150));
 console.log = log;
 log(which, JSON.stringify(out));
 void err; void warn;
