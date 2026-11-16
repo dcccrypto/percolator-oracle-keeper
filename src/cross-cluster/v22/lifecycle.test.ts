@@ -21,7 +21,10 @@ import type { ClassifyInput, MarketLifecycle } from "./lifecycle-classify.ts";
 import { ObservationLedger } from "./lifecycle-ledger.ts";
 import { PRE_SEND_CHECKS, RESOLVE_GUARDS, buildStaleResolveIx, decideResolve, preSendVerdict, resolveStaleOnce } from "./lifecycle-resolve.ts";
 import type { PreSendInput, ResolveInput } from "./lifecycle-resolve.ts";
-import { MARKET_HEADER_V22, LifecycleEngine } from "./lifecycle.ts";
+import { MARKET_HEADER_V22, LifecycleEngine, fileStore } from "./lifecycle.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { Alert } from "../alerting.ts";
 import { fakeExecConn, key, v22MarketBytes } from "./test-helpers.ts";
 
@@ -1076,6 +1079,123 @@ describe("flags", () => {
 });
 
 beforeEach(() => resetPushDeadlines());
+
+describe("fileStore (quiet-clock persistence; reached via cfg.stateFile in the V22Loop-built engine)", () => {
+  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "lc-store-"));
+  it("round-trips, drops malformed entries, and never throws on a missing, corrupt or wrong-version file", () => {
+    const dir = tmp();
+    const file = path.join(dir, "nested", "quiet.json");
+    const st = fileStore(file);
+    assert.deepEqual(st.load(), {}, "missing file");
+    st.save({ A: { quietSinceMs: 5, feeSum: "7" } });
+    assert.deepEqual(st.load(), { A: { quietSinceMs: 5, feeSum: "7" } });
+    fs.writeFileSync(file, JSON.stringify({ version: 1, markets: { A: { quietSinceMs: 5, feeSum: "7" }, B: { quietSinceMs: "x", feeSum: "1" }, C: null, D: { quietSinceMs: 1, feeSum: 2 } } }));
+    assert.deepEqual(st.load(), { A: { quietSinceMs: 5, feeSum: "7" } }, "only well-typed entries survive");
+    fs.writeFileSync(file, JSON.stringify({ version: 2, markets: { A: { quietSinceMs: 5, feeSum: "7" } } }));
+    assert.deepEqual(st.load(), {}, "wrong version");
+    fs.writeFileSync(file, JSON.stringify({ version: 1 }));
+    assert.deepEqual(st.load(), {}, "no markets");
+    fs.writeFileSync(file, "{not json");
+    assert.deepEqual(st.load(), {}, "corrupt");
+  });
+  it("a failed save is swallowed and keeps the previous file", () => {
+    const dir = tmp();
+    const blocker = path.join(dir, "file");
+    fs.writeFileSync(blocker, "x");
+    const st = fileStore(path.join(blocker, "sub", "quiet.json")); // parent is a file: mkdir fails
+    assert.doesNotThrow(() => st.save({ A: { quietSinceMs: 1, feeSum: "1" } }));
+    assert.deepEqual(st.load(), {});
+  });
+  it("the engine restores the quiet clock from cfg.stateFile and saves it (at most every 5 minutes) after a tick", async () => {
+    const dir = tmp();
+    const file = path.join(dir, "quiet.json");
+    const w = world();
+    const { addr, ctx } = addMarket(w, market({ lastGood: ageToLastGood(100n), authority: keeper.publicKey }));
+    const mk = () => new LifecycleEngine({ conn: w.conn as never, keeper, programId: WRAPPER_PROGRAM_ID, cfg: cfg({ discoveryMs: 0, stateFile: file }), dryRun: false, registered: (m) => w.registered.has(m), sink: new FakeSink(), ledger: new ObservationLedger(120_000), now: () => w.now, log: () => {} });
+    const a = mk();
+    await runTick(a, w, [ctx]);
+    const saved = JSON.parse(fs.readFileSync(file, "utf8")) as { version: number; markets: Record<string, { quietSinceMs: number }> };
+    assert.equal(saved.version, 1);
+    assert.equal(saved.markets[addr].quietSinceMs, w.now);
+    w.now += 3 * 86_400_000;
+    const b = mk(); // a restart: the clock continues from the saved start instead of from zero
+    await runTick(b, w, [ctx]);
+    assert.equal(b.view(addr)?.quietDays, 3);
+  });
+});
+
+describe("engine: discovery edge branches (an unregistered market is dropped, never mis-tracked)", () => {
+  /** Put `data` (or a foreign owner / null) behind the market address for every read after this call. */
+  function override(w: World, addr: string, v: "gone" | "foreign" | Uint8Array): void {
+    const orig = w.conn.getMultipleAccountsInfoAndContext as (pks: PublicKey[], c?: string) => Promise<{ context: { slot: number }; value: Array<unknown> }>;
+    (w.conn as unknown as Record<string, unknown>).getMultipleAccountsInfoAndContext = async (pks: PublicKey[], c?: string) => {
+      const r = await orig(pks, c);
+      pks.forEach((pk, i) => {
+        if (pk.toBase58() !== addr) return;
+        r.value[i] = v === "gone" ? null : v === "foreign" ? { data: Buffer.from(w.markets.get(addr) as Uint8Array), owner: OTHER, lamports: 1, executable: false } : { data: Buffer.from(v), owner: WRAPPER_PROGRAM_ID, lamports: 1, executable: false };
+      });
+      return r;
+    };
+  }
+  const GARBAGE = new Uint8Array(10);
+
+  it("first scan: a market that is gone, foreign-owned, or does not decode is not tracked; a healthy one still is", async () => {
+    const w = world();
+    const ok = addMarket(w, matured({ authority: OTHER }), false);
+    const gone = addMarket(w, matured({ authority: OTHER }), false);
+    const foreign = addMarket(w, matured({ authority: OTHER }), false);
+    const bad = addMarket(w, matured({ authority: OTHER }), false);
+    override(w, gone.addr, "gone");
+    override(w, foreign.addr, "foreign");
+    override(w, bad.addr, GARBAGE);
+    const { e } = engineFor(w, { discoveryMs: 600_000 });
+    await runTick(e, w, []);
+    assert.notEqual(e.view(ok.addr), null);
+    assert.equal(e.view(gone.addr), null);
+    assert.equal(e.view(foreign.addr), null);
+    assert.equal(e.view(bad.addr), null, "undecodable layout is dropped, not classified");
+  });
+
+  it("between scans (resolve dry): a market that vanishes, changes owner, stops decoding, or turns Resolved is dropped; a Recovery one is dropped but re-scanned; a live one stays", async () => {
+    const w = world();
+    const names = ["stay", "gone", "foreign", "bad", "resolved", "recovery"] as const;
+    const m = Object.fromEntries(names.map((n) => [n, addMarket(w, matured({ authority: OTHER }), false)])) as Record<(typeof names)[number], { addr: string }>;
+    const sizes: number[] = [];
+    const { e } = engineFor(w, { discoveryMs: 600_000, staleResolve: "dry" });
+    await runTick(e, w, []); // the scan loads all six
+    for (const n of names) assert.notEqual(e.view(m[n].addr), null, `${n} tracked after the scan`);
+    const orig0 = w.conn.getMultipleAccountsInfoAndContext as (pks: PublicKey[]) => Promise<unknown>;
+    (w.conn as unknown as Record<string, unknown>).getMultipleAccountsInfoAndContext = async (pks: PublicKey[]) => (sizes.push(pks.length), orig0(pks));
+    override(w, m.gone.addr, "gone");
+    override(w, m.foreign.addr, "foreign");
+    override(w, m.bad.addr, GARBAGE);
+    override(w, m.resolved.addr, matured({ authority: OTHER, resolved: true }));
+    override(w, m.recovery.addr, matured({ authority: OTHER, recovery: true }));
+    w.now += 20_000; // inside discoveryMs: the between-scans re-read
+    await runTick(e, w, []);
+    assert.deepEqual(sizes, [6], "one batched read of the six re-read markets");
+    assert.notEqual(e.view(m.stay.addr), null);
+    for (const n of ["gone", "foreign", "bad", "resolved", "recovery"] as const) assert.equal(e.view(m[n].addr), null, `${n} dropped`);
+    // Resolved is cached terminal (never re-read by the next scan); Recovery is not.
+    sizes.length = 0;
+    w.now += 600_000;
+    await runTick(e, w, []);
+    const full = sizes.reduce((a, b) => a + b, 0);
+    assert.equal(full, 5 * 3, "next scan reads stay + gone + foreign + bad + recovery (3 accounts each), not the cached-terminal Resolved one");
+  });
+
+  it("a registry market that is also seen by the scan is not double-tracked; a discovery RPC failure is logged and does not stop the tick", async () => {
+    const w = world();
+    const reg = addMarket(w, matured({ authority: OTHER }));
+    (w.conn as unknown as Record<string, unknown>).getProgramAccounts = async () => {
+      throw new Error("gpa down");
+    };
+    const { e, logs, sink } = engineFor(w, { discoveryMs: 600_000 });
+    await runTick(e, w, [reg.ctx]);
+    assert.equal(logs.some((l) => l.includes("discovery failed")), true);
+    assert.equal(sink.active("v22-lifecycle:dead-price-matured").length, 1, "the registered market is still alerted");
+  });
+});
 
 describe("V22Loop wiring", () => {
   it("tick feeds the engine: /health gains v22.lifecycle (additive), nothing is sent with the defaults", async () => {
