@@ -196,9 +196,11 @@ describe("pusher-role untaken branches", () => {
   it("default clock: gate methods use Date.now when no time is passed", () => {
     const g = new TakeoverGate(CFG);
     assert.equal(g.isStandby(M), false);
-    g.update(M, 0n, 1_000_000n);
-    assert.equal(g.gapSlots(M)! >= 1_000_000n, true);
+    g.update(M, 0n, 100n, 0); // stamped at epoch 0: stale under the real wall clock
+    assert.equal(g.gapSlots(M), null);
     assert.equal(g.isStandby(M), false);
+    g.update(M, 0n, 1_000_000n); // default stamp = now
+    assert.equal(g.gapSlots(M)! >= 1_000_000n, true);
     g.recordPush(M);
     assert.equal(g.activeAlerts().length, 1);
     assert.equal(g.health([M])[M].takeoverPushes, 1);
@@ -230,13 +232,17 @@ describe("pusher-role untaken branches", () => {
     await refreshTakeoverGate(conn as never, g, [], 0);
     assert.equal(calls, 0);
     const M2 = Keypair.generate().publicKey.toBase58();
+    const M3 = Keypair.generate().publicKey.toBase58();
+    const ok = Buffer.alloc(176);
+    ok.writeBigUInt64LE(8_990n, 168);
     const conn2 = {
       async getSlot() { return 9_000; },
-      async getMultipleAccountsInfo() { return [null, { data: Buffer.alloc(175) }]; },
+      async getMultipleAccountsInfo() { return [null, { data: Buffer.alloc(175) }, { data: ok }]; },
     };
-    await refreshTakeoverGate(conn2 as never, g, [M, M2], 0);
+    await refreshTakeoverGate(conn2 as never, g, [M, M2, M3], 0);
     assert.equal(g.gapSlots(M, 0), null);
     assert.equal(g.gapSlots(M2, 0), null);
+    assert.equal(g.gapSlots(M3, 0), 10n); // a later valid account is still read: bad entries are skipped, not thrown on
     assert.equal(g.isStandby(M, 0), false);
   });
   it("refresh: default nowMs is the wall clock; an invalid market address is swallowed (fail open)", async () => {
