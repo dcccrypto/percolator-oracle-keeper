@@ -1245,6 +1245,32 @@ describe("engine: failure isolation and send outcomes (each reachable from V22Lo
     assert.equal(lines.some((l) => l.includes("classify failed")), true, "default logger is console.log");
   });
 
+  it("view(): a Resolved market has no age / window, a stale_slots=0 market has an age but no window, and a sent / dry-run decision is reported as such", async () => {
+    const w = world();
+    const done = addMarket(w, matured({ authority: OTHER, resolved: true }));
+    const nowin = addMarket(w, market({ staleSlots: 0n, lastGood: ageToLastGood(900_000n), authority: OTHER }));
+    const sendable = addMarket(w, matured({ authority: OTHER }));
+    const { e, ledger } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [done.ctx, nowin.ctx, sendable.ctx]);
+    const vDone = e.view(done.addr);
+    assert.equal(vDone?.ageSlots, null);
+    assert.equal(vDone?.staleSlots, null);
+    assert.equal(vDone?.pctOfWindow, null);
+    const vNo = e.view(nowin.addr);
+    assert.notEqual(vNo?.ageSlots, null);
+    assert.equal(vNo?.staleSlots, null);
+    assert.equal(vNo?.pctOfWindow, null);
+    assert.equal(e.view(sendable.addr)?.resolve?.decision, "sent");
+    const w2 = world();
+    const d = addMarket(w2, matured({ authority: OTHER }));
+    const dry = engineFor(w2, { staleResolve: "dry" });
+    primeLedger(dry.ledger, w2, 3_600_000);
+    await runTick(dry.e, w2, [d.ctx]);
+    assert.equal(dry.e.view(d.addr)?.resolve?.decision, "dry-run");
+    assert.equal(dry.e.view("nope"), null);
+  });
+
   it("an alert sink that throws is logged and does not stop the fee / resolve work of the same tick", async () => {
     const w = world();
     const { ctx } = addMarket(w, matured({ authority: OTHER }));
