@@ -72,7 +72,7 @@ export function binArrayAddress(lbPair: PublicKey, index: number): PublicKey {
 }
 
 /** (1 + binStep/10000)^binId as a Q64.64 integer (floor), computed in Q128 so the 64-bit result keeps its precision. */
-export function priceQ64(binId: number, binStep: number): bigint {
+export function priceQ64Uncached(binId: number, binStep: number): bigint {
   const ONE = 1n << 128n;
   let base = ONE + (BigInt(binStep) << 128n) / 10_000n;
   let e = BigInt(Math.abs(binId));
@@ -84,6 +84,31 @@ export function priceQ64(binId: number, binStep: number): bigint {
   }
   if (binId < 0) r = (ONE * ONE) / r;
   return r >> 64n;
+}
+
+const PRICE_CACHE_MAX = 100_000;
+const priceCache = new Map<number, Map<number, bigint>>();
+let priceCacheSize = 0;
+
+/** Memoised priceQ64Uncached per (binStep, binId): same pure result, computed once. Bounded; cleared when full. */
+export function priceQ64(binId: number, binStep: number): bigint {
+  let m = priceCache.get(binStep);
+  if (!m) {
+    m = new Map();
+    priceCache.set(binStep, m);
+  }
+  const hit = m.get(binId);
+  if (hit !== undefined) return hit;
+  if (priceCacheSize >= PRICE_CACHE_MAX) {
+    priceCache.clear();
+    priceCacheSize = 0;
+    m = new Map();
+    priceCache.set(binStep, m);
+  }
+  const v = priceQ64Uncached(binId, binStep);
+  m.set(binId, v);
+  priceCacheSize++;
+  return v;
 }
 
 export type Refusal = { ok: false; reason: string };
@@ -178,6 +203,7 @@ export function computeDlmmDepth(inp: DlmmDepthInput): { ok: true; depth: DlmmDe
 
   // Every array in the +-2% range must be present and pass the layout checks.
   const views = new Map<number, DataView>();
+  const lbPairBytes = inp.lbPair.toBuffer();
   for (const idx of plan.indexes) {
     const a = inp.binArrays.get(idx);
     if (!a) return { ok: false, reason: `bin array ${idx} missing` };
@@ -185,7 +211,7 @@ export function computeDlmmDepth(inp: DlmmDepthInput): { ok: true; depth: DlmmDe
     if (!hasDisc(a, BIN_ARRAY_DISC)) return { ok: false, reason: `bin array ${idx} discriminator mismatch` };
     const dv = new DataView(a.buffer, a.byteOffset, a.byteLength);
     if (dv.getBigInt64(8, true) !== BigInt(idx)) return { ok: false, reason: `bin array ${idx} index field mismatch` };
-    if (inp.lbPair.toBase58() !== new PublicKey(a.subarray(24, 56)).toBase58()) return { ok: false, reason: `bin array ${idx} belongs to another pool` };
+    if (Buffer.compare(lbPairBytes, a.subarray(24, 56)) !== 0) return { ok: false, reason: `bin array ${idx} belongs to another pool` };
     views.set(idx, dv);
   }
   const bin = (id: number) => {

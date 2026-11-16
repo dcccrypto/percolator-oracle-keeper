@@ -17,6 +17,7 @@ import {
   computeDlmmDepth,
   planDlmmBinArrays,
   priceQ64,
+  priceQ64Uncached,
 } from "./dlmm-depth.ts";
 
 const USDC = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
@@ -270,5 +271,15 @@ describe("computeDlmmDepth on captured MAINNET pools", () => {
     assert.ok(plan.ok);
     m.delete(plan.indexes[0]);
     assert.equal(computeDlmmDepth({ lbPair: pool, poolData: data, binArrays: m, decimals: { base: fx.baseDecimals, quote: fx.quoteDecimals } }).ok, false);
+  });
+});
+
+describe("priceQ64 cache equals the uncached square-and-multiply", () => {
+  it("identical for binId -5000..5000 across bin steps (twice, cold then warm)", () => {
+    for (const step of [1, 5, 10, 25, 100, 400]) {
+      for (let pass = 0; pass < 2; pass++) {
+        for (let id = -5000; id <= 5000; id++) assert.equal(priceQ64(id, step), priceQ64Uncached(id, step), `step ${step} id ${id}`);
+      }
+    }
   });
 });
