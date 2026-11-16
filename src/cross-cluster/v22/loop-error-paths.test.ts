@@ -111,7 +111,8 @@ describe("checkLpCert", () => {
     const loop = mkLoop({}, f.conn, { lines });
     const r = rtOf(loop);
     await loop["checkLpCert"](v22Ctx({ band: true }), r);
-    assert.ok(Array.isArray(r.lpCertAlerts));
+    assert.deepEqual(r.lpCertAlerts, []);
+    assert.ok(!lines.some((l) => l.includes("certification read failed")));
   });
 });
 
@@ -174,8 +175,7 @@ describe("checkDepthCapacity", () => {
     const good = v22Ctx({ band: true });
     const ctx = Object.create(good, { band: { value: { ...good.band, bandBps: 0x1_0000_0000n } } });
     loop["checkDepthCapacity"](ctx, r, "pumpswap");
-    assert.ok(Array.isArray(r.depthAlerts));
-    assert.ok(Array.isArray(r.lastDepth));
+    assert.ok(Array.isArray(r.lastDepth), "depth reading recorded (was null before)");
   });
 
   it("a read that throws keeps the previous state and logs", () => {
@@ -265,7 +265,8 @@ describe("tick: job branches and the per-market error guard", () => {
     let reads = 0;
     Object.assign(f.conn, {
       async getAccountInfo() {
-        if (++reads > 0) throw new Error("rpc 500 https://x.helius-rpc.com/?api-key=SECRET123");
+        reads++;
+        throw new Error("rpc 500 https://x.helius-rpc.com/?api-key=SECRET123");
         return null;
       },
     });
@@ -288,7 +289,7 @@ describe("tick: job branches and the per-market error guard", () => {
     assert.equal(h.ticks, 2);
     const m = h.markets[MARKET.toBase58()];
     assert.equal(m.layout, "v2.2-b");
-    assert.ok("g9" in m || "stakeSync" in m || "earnExit" in m || "fee78" in m, `expected some job state on /health, got ${Object.keys(m).join(",")}`);
+    assert.ok("g9" in m, `expected g9 on /health, got ${Object.keys(m).join(",")}`);
   });
 
   it("an unreadable (RPC) market read does not stop the other markets and is not v2.2-noted", async () => {
@@ -439,6 +440,7 @@ describe("runRoundFor / publishHealth / catch-up edges", () => {
     const loop = mkLoop({}, f.conn, { lines });
     await loop["multiAssetCatchup"](v22Ctx({ band: true }), LP, 3);
     assert.ok(lines.some((l) => l.includes("[v22][catchup]")));
+    assert.ok(calls >= 2, `fallback must still simulate (calls=${calls})`);
   });
 });
 
