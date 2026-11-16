@@ -22,4 +22,4 @@ for i in range(800):
     J, m, h = L.holder_terms(objs, x, age, un)
     out.append(dict(h=hs, x=x, age=age, un=un, J=J, m=m, H=h, pis={k: L.pi_default(k, age, un) for k in kinds}))
 print("H9", L.H9_FULL_SALE, file=sys.stderr)
-json.dump(out, open("terms.json", "w"))
+json.dump(out, open("holder-terms.json", "w"))
