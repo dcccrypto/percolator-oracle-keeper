@@ -47,12 +47,12 @@ describe("selectSweepBatch differential", () => {
       const n = rnd(40);
       const pool = Array.from({ length: n }, (_, i) => new PublicKey(Uint8Array.from({ length: 32 }, (_, j) => (j === 31 ? i : j === 30 ? 7 : 1))));
       const mk = (): PositionedPortfolio[] =>
-        pool.map((pubkey, i) => ({
+        (pool.map((pubkey) => ({
           pubkey, longLegs: 1, shortLegs: 0, isLp: rnd(8) === 0,
           lossWeight: rnd(4) === 0 ? undefined : BigInt(rnd(5)),
           kfEpochSnapLong: rnd(3) === 0 ? undefined : rnd(5) === 0 ? null : BigInt(rnd(3)),
           kfEpochSnapShort: rnd(3) === 0 ? undefined : rnd(5) === 0 ? null : BigInt(rnd(3)),
-        })).concat(rnd(5) === 0 && n > 0 ? [{ pubkey: pool[0], longLegs: 1, shortLegs: 0, isLp: false, lossWeight: 2n } as PositionedPortfolio] : []);
+        })) as PositionedPortfolio[]).concat(rnd(5) === 0 && n > 0 ? [{ pubkey: pool[0], longLegs: 1, shortLegs: 0, isLp: false, lossWeight: 2n } as PositionedPortfolio] : []);
       const pos = mk();
       const epochs: SideEpochs | null = rnd(4) === 0 ? null : { long: BigInt(rnd(3)), short: BigInt(rnd(3)) };
       const a = freshSweepCursor(), b = freshSweepCursor();
