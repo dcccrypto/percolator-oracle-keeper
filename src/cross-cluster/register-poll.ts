@@ -251,6 +251,17 @@ export function pollOnce(registry: Registry, config: RegisterPollConfig): Promis
   return pollChain;
 }
 
+/** Registry changes made in memory that have not yet reached disk. */
+let unsavedChanges = false;
+let saveFailures = 0;
+export const MAX_SAVE_ATTEMPTS = 5;
+
+/** Test hook: reset the pending-save state. */
+export function _resetSaveStateForTest(): void {
+  unsavedChanges = false;
+  saveFailures = 0;
+}
+
 async function runPollOnce(registry: Registry, config: RegisterPollConfig): Promise<number> {
   // SOURCE OF TRUTH: the `markets` table, filtered to keeper_status='active'.
   // This used to GET the Vercel blob. The row already carried everything needed
@@ -341,15 +352,28 @@ async function runPollOnce(registry: Registry, config: RegisterPollConfig): Prom
   for (const r of removed) console.log(`[register-poll] retired ${r} (absent from ${ABSENCE_THRESHOLD} consecutive queries)`);
   for (const u of updated) console.log(`[register-poll] updated binding for ${u}`);
 
-  if (added.length > 0 || removed.length > 0 || updated.length > 0) {
+  if (added.length > 0 || removed.length > 0 || updated.length > 0) unsavedChanges = true;
+
+  // A failed save used to be final: the change lived only in memory, the next poll saw nothing new to
+  // reconcile, and so never wrote it again (a restart then lost the registration). Keep the change flagged
+  // and retry the save each cycle, capped so a dead disk cannot spam forever.
+  if (unsavedChanges) {
     try {
       saveRegistry(registry, config.registryPath);
+      unsavedChanges = false;
+      saveFailures = 0;
     } catch (err) {
+      saveFailures++;
+      const giveUp = saveFailures >= MAX_SAVE_ATTEMPTS;
       console.error(
-        `[register-poll] saveRegistry(${config.registryPath}) failed — the change is in ` +
-          `memory for this session but was NOT persisted: ` +
+        `[register-poll] saveRegistry(${config.registryPath}) failed (attempt ${saveFailures}/${MAX_SAVE_ATTEMPTS}) — the change is in ` +
+          `memory for this session but was NOT persisted${giveUp ? "; giving up until the next change" : "; will retry next cycle"}: ` +
           `${err instanceof Error ? err.message : String(err)}`,
       );
+      if (giveUp) {
+        unsavedChanges = false;
+        saveFailures = 0;
+      }
     }
   }
 
