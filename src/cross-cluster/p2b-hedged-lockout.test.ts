@@ -32,6 +32,7 @@ import {
   evaluateHedgedLockout,
   evaluateHedgedLockouts,
   g8NCapQ,
+  hedgedLockoutAlert,
   hedgedLockoutPlacement,
   hedgedLockoutThresholdsFromEnv,
   vaultLpEffectivePositionQ,
@@ -40,6 +41,8 @@ import type { HedgedLockoutInput } from "./p2b-hedged-lockout.ts";
 import { isV18MarketHeader } from "./adl-state.ts";
 import { ADL_ONE, engineBase, fakeConn, fx, patchedMarket, registryBytes, snapshot, vaultLpStateBytes } from "./p2b-test-helpers.ts";
 import { readU64 } from "./p2b-markets.ts";
+import { detectLayout } from "./market-layout.ts";
+import { V22_CONFIG_OFF } from "./v22/market.ts";
 
 const T = DEFAULT_HEDGED_LOCKOUT_THRESHOLDS;
 const N = 1_000_000_000n; // N_cap with C_m = 1e9 atoms, lambda 1x, price 1.0
@@ -351,5 +354,144 @@ describe("monitor over snapshots", () => {
     for (const f of ["sol-market-v18", "ansem-market-v18", "jup-market-v18", "cate-market-v18"]) {
       assert.equal(decodeAssetGrowthV19(new Uint8Array(fx(f)), 0), null, f);
     }
+  });
+});
+
+describe("branch pins: env thresholds", () => {
+  it("blank / whitespace values fall back to the defaults", () => {
+    assert.deepEqual(hedgedLockoutThresholdsFromEnv({ HEDGED_LOCKOUT_UTIL_BPS: "", HEDGED_LOCKOUT_FLAT_BPS: "   " }), { utilBps: 9000, flatBps: 300 });
+  });
+  it("inclusive bounds are accepted (util 1..20000, flat 0..10000)", () => {
+    assert.deepEqual(hedgedLockoutThresholdsFromEnv({ HEDGED_LOCKOUT_UTIL_BPS: "1", HEDGED_LOCKOUT_FLAT_BPS: "0" }), { utilBps: 1, flatBps: 0 });
+    assert.deepEqual(hedgedLockoutThresholdsFromEnv({ HEDGED_LOCKOUT_UTIL_BPS: "20000", HEDGED_LOCKOUT_FLAT_BPS: "10000" }), { utilBps: 20000, flatBps: 10000 });
+  });
+  it("out-of-range, fractional and garbage values throw naming the variable", () => {
+    for (const v of ["0", "20001", "-5", "1.5", "abc"]) {
+      assert.throws(() => hedgedLockoutThresholdsFromEnv({ HEDGED_LOCKOUT_UTIL_BPS: v }), /HEDGED_LOCKOUT_UTIL_BPS/, v);
+    }
+    for (const v of ["-1", "10001", "2.5", "x"]) {
+      assert.throws(() => hedgedLockoutThresholdsFromEnv({ HEDGED_LOCKOUT_FLAT_BPS: v }), /HEDGED_LOCKOUT_FLAT_BPS/, v);
+    }
+  });
+});
+
+describe("branch pins: vaultLpEffectivePositionQ synthetic legs", () => {
+  const A = { aLong: 2_000n, aShort: 500n };
+  const leg = (o: Partial<{ active: boolean; assetIndex: number; side: number; basisPosQ: bigint; aBasis: bigint }>) => ({ active: true, assetIndex: 0, side: 0, basisPosQ: 1_000n, aBasis: 1_000n, ...o });
+  const pos = (legs: ReturnType<typeof leg>[], idx = 0) => vaultLpEffectivePositionQ({ legs } as never, idx, A);
+  it("inactive legs and other assets are ignored", () => {
+    assert.equal(pos([leg({ active: false }), leg({ assetIndex: 3 })]), 0n);
+  });
+  it("long leg scales by A_long / a_basis (floor); short leg is negative and scales by A_short", () => {
+    assert.equal(pos([leg({})]), 2_000n);
+    assert.equal(pos([leg({ side: 1 })]), -500n);
+    assert.equal(pos([leg({ basisPosQ: 1_001n, aBasis: 1_000n, side: 1 })]), -500n); // floor(1001*500/1000)=500
+  });
+  it("negative basis uses its magnitude; the side decides the sign", () => {
+    assert.equal(pos([leg({ basisPosQ: -1_000n })]), 2_000n);
+    assert.equal(pos([leg({ basisPosQ: -1_000n, side: 1 })]), -500n);
+  });
+  it("a_basis of 0 means no ADL scaling (abs basis as-is)", () => {
+    assert.equal(pos([leg({ aBasis: 0n })]), 1_000n);
+    assert.equal(pos([leg({ aBasis: 0n, side: 1 })]), -1_000n);
+  });
+  it("a long and a short leg on the same asset net", () => {
+    assert.equal(pos([leg({}), leg({ side: 1 })]), 2_000n - 500n);
+  });
+});
+
+describe("branch pins: evaluateHedgedLockout edges", () => {
+  it("zero C_m: status no-capacity carrying nCapQ 0n and null utilisation fields", () => {
+    const v = evaluateHedgedLockout(input({ uLong: 9900, uShort: 9900, cM: 0n }), T);
+    assert.equal(v.status, "no-capacity");
+    assert.equal(v.nCapQ, 0n);
+    assert.equal(v.utilLongBps, null);
+    assert.equal(v.lpNetBps, null);
+  });
+  it("no growth: the NONE verdict has every figure null", () => {
+    assert.deepEqual(evaluateHedgedLockout(input({ uLong: 9900, uShort: 9900, g: null }), T), {
+      status: "no-growth", nCapQ: null, usersLongQ: null, usersShortQ: null, utilLongBps: null, utilShortBps: null, lpNetBps: null,
+    });
+  });
+  it("a short LP's |net| counts as its magnitude against the flat threshold (-3.00% alerts, -3.01% does not)", () => {
+    assert.equal(evaluateHedgedLockout(input({ uLong: 9500, uShort: 9500, lp: -300 }), T).status, "alert");
+    const v = evaluateHedgedLockout(input({ uLong: 9500, uShort: 9500, lp: -301 }), T);
+    assert.equal(v.status, "ok");
+    assert.equal(v.lpNetBps, 301n);
+  });
+});
+
+describe("branch pins: hedgedLockoutAlert", () => {
+  const verdict = (o: Partial<ReturnType<typeof evaluateHedgedLockout>>) => ({ ...evaluateHedgedLockout(input({ uLong: 9500, uShort: 9500 }), T), ...o });
+  it("renders percentages and thresholds; data carries numbers and the N_cap as a string", () => {
+    const a = hedgedLockoutAlert("MKT", "LBL", verdict({ lpNetBps: 64n }), { utilBps: 8500, flatBps: 150 });
+    assert.equal(a.kind, "hedged-lockout");
+    assert.equal(a.severity, "warn");
+    assert.equal(a.subject, "LBL");
+    assert.match(a.message, /users long 95%, users short 95% of N_cap; threshold 85%/);
+    assert.match(a.message, /\|net\| 0\.64% of N_cap, flat <= 1\.5%/);
+    assert.deepEqual(a.data, { market: "MKT", utilLongBps: 9500, utilShortBps: 9500, lpNetBps: 64, nCapQ: N.toString() });
+  });
+  it("null figures render as '?' and null in data", () => {
+    const a = hedgedLockoutAlert("MKT", "LBL", verdict({ utilLongBps: null, utilShortBps: null, lpNetBps: null, nCapQ: null }), T);
+    assert.match(a.message, /users long \?, users short \? of N_cap/);
+    assert.match(a.message, /\|net\| \? of N_cap/);
+    assert.deepEqual(a.data, { market: "MKT", utilLongBps: null, utilShortBps: null, lpNetBps: null, nCapQ: null });
+  });
+});
+
+describe("branch pins: v2.2 placement", () => {
+  const slab = () => new Uint8Array(Buffer.from(live.accounts[0].slab, "base64"));
+  const bandOff = () => {
+    const det = detectLayout(slab());
+    assert.ok(det.known);
+    return det.layout.groupOff + V22_CONFIG_OFF.bandBps;
+  };
+  it("band_bps above u32 saturates to MAX_SAFE_INTEGER", () => {
+    const d = slab();
+    new DataView(d.buffer, d.byteOffset).setBigUint64(bandOff(), 0x1_0000_0000n, true);
+    assert.equal(hedgedLockoutPlacement(d, 0, 7)!.v22!.bandBps, Number.MAX_SAFE_INTEGER);
+    new DataView(d.buffer, d.byteOffset).setBigUint64(bandOff(), 0xffff_ffffn, true);
+    assert.equal(hedgedLockoutPlacement(d, 0, 7)!.v22!.bandBps, 0xffff_ffff);
+  });
+  it("an unknown-layout / short account is null", () => {
+    assert.equal(hedgedLockoutPlacement(slab().subarray(0, 100), 0, 1), null);
+  });
+  it("an asset index far past the account end is null (data shorter than the asset state)", () => {
+    assert.equal(hedgedLockoutPlacement(slab(), 1_000_000, 1), null);
+  });
+});
+
+describe("branch pins: monitor skips", () => {
+  const lpBytes = new Uint8Array(fx("cate-lp-portfolio-v18"));
+  const lp = Keypair.generate().publicKey;
+  const mk = () => patchedMarket({ effectivePriceE6: 1_000n, growthLambdaBps: 10_000, oiEffLong: 950_000_000_000n + 6_400_773_782n, oiEffShort: 950_000_000_000n });
+  it("no vault LP state -> skipped without an RPC read", async () => {
+    const s = snapshot({ marketData: mk(), registryData: registryBytes({ bound: true }) });
+    assert.equal(s.vaultLp, null);
+    const c = fakeConn({ accounts: new Map([[lp.toBase58(), lpBytes]]) });
+    assert.deepEqual(await evaluateHedgedLockouts(c.conn as never, [s], T), { alerts: [], records: [] });
+    assert.equal(c.calls.length, 0);
+  });
+  it("no market data -> skipped without an RPC read", async () => {
+    const s = snapshot({ marketData: null, registryData: registryBytes({ bound: true }), vaultLpData: vaultLpStateBytes({ lp }) });
+    const c = fakeConn({ accounts: new Map([[lp.toBase58(), lpBytes]]) });
+    assert.deepEqual(await evaluateHedgedLockouts(c.conn as never, [s], T), { alerts: [], records: [] });
+    assert.equal(c.calls.length, 0);
+  });
+  it("a truncated v2.2 slab with a growth block is never thrown and yields nothing", async () => {
+    const d = new Uint8Array(Buffer.from(live.accounts[0].slab, "base64")).subarray(0, 200);
+    const s = snapshot({ marketData: d, registryData: registryBytes({ bound: true }), vaultLpData: vaultLpStateBytes({ lp }) });
+    const c = fakeConn({ accounts: new Map([[lp.toBase58(), lpBytes]]) });
+    assert.deepEqual(await evaluateHedgedLockouts(c.conn as never, [s], T), { alerts: [], records: [] });
+  });
+  it("two markets: only the hedged one alerts; records keep order and market/label", async () => {
+    const hot = snapshot({ label: "HOT", marketData: mk(), registryData: registryBytes({ bound: true }), vaultLpData: vaultLpStateBytes({ lp }) });
+    const cold = snapshot({ label: "COLD", marketData: patchedMarket({ effectivePriceE6: 1_000n, growthLambdaBps: 10_000 }), registryData: registryBytes({ bound: true }), vaultLpData: vaultLpStateBytes({ lp }) });
+    const c = fakeConn({ accounts: new Map([[lp.toBase58(), lpBytes]]) });
+    const r = await evaluateHedgedLockouts(c.conn as never, [cold, hot], T);
+    assert.deepEqual(r.records.map((x) => [x.label, x.verdict.status]), [["COLD", "ok"], ["HOT", "alert"]]);
+    assert.deepEqual(r.alerts.map((a) => a.subject), ["HOT"]);
+    assert.equal(r.records[1].market, hot.ref.marketAddress);
   });
 });
