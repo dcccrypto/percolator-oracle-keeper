@@ -1224,6 +1224,27 @@ describe("engine: failure isolation and send outcomes (each reachable from V22Lo
     assert.equal(e.view(addr), null);
   });
 
+  it("with only the required deps (as V22Loop passes them) the engine defaults to Date.now, console.log, the shared ledger and no store", (t) => {
+    const w = world();
+    const { ctx } = addMarket(w, matured({ authority: OTHER }));
+    const lines: string[] = [];
+    t.mock.method(console, "log", (s: string) => lines.push(String(s)));
+    const e = new LifecycleEngine({
+      conn: w.conn as never,
+      keeper,
+      programId: WRAPPER_PROGRAM_ID,
+      cfg: cfg({ discoveryMs: 0 }),
+      dryRun: false,
+      registered: () => {
+        throw new Error("boom");
+      },
+      sink: new FakeSink(),
+    });
+    e.beginTick();
+    assert.equal(e.observe(ctx), null);
+    assert.equal(lines.some((l) => l.includes("classify failed")), true, "default logger is console.log");
+  });
+
   it("an alert sink that throws is logged and does not stop the fee / resolve work of the same tick", async () => {
     const w = world();
     const { ctx } = addMarket(w, matured({ authority: OTHER }));
@@ -1317,6 +1338,19 @@ describe("engine: failure isolation and send outcomes (each reachable from V22Lo
     w.now += 20_000;
     await runTick(e, w, [ctx]);
     assert.equal(w.exec.sent.length, 1, "retry only after resolveRetryMs");
+  });
+
+  it("noteReadFailure (called by V22Loop for a registry read that failed for an RPC reason) makes the tick not-clean for the ledger and restarts the observation clock; beginTick resets it", async () => {
+    const w = world();
+    const { ctx } = addMarket(w, matured({ authority: OTHER }));
+    const { e, ledger } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    e.beginTick();
+    e.noteReadFailure();
+    e.observe(ctx);
+    await e.endTick();
+    assert.equal(w.exec.sent.length, 0, "a tick with a read failure is not a clean observation: no resolve");
+    assert.equal(ledger.continuousMs(w.now) < 3_600_000, true, "the ledger saw a failed tick");
   });
 
   it("a getSlot failure marks the tick not-clean: classification and alerts still run, but no fee round or resolve is attempted", async () => {
