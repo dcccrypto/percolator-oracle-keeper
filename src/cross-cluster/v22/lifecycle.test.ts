@@ -5,7 +5,7 @@
  *
  * Nothing here touches a network: every connection is a recording fake.
  */
-import { describe, it, beforeEach } from "node:test";
+import { describe, it, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import { WRAPPER_PROGRAM_ID } from "../../program-ids.ts";
@@ -1081,7 +1081,9 @@ describe("flags", () => {
 beforeEach(() => resetPushDeadlines());
 
 describe("fileStore (quiet-clock persistence; reached via cfg.stateFile in the V22Loop-built engine)", () => {
-  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "lc-store-"));
+  const dirs: string[] = [];
+  after(() => dirs.forEach((d) => fs.rmSync(d, { recursive: true, force: true })));
+  const tmp = () => (dirs.push(fs.mkdtempSync(path.join(os.tmpdir(), "lc-store-"))), dirs[dirs.length - 1]);
   it("round-trips, drops malformed entries, and never throws on a missing, corrupt or wrong-version file", () => {
     const dir = tmp();
     const file = path.join(dir, "nested", "quiet.json");
@@ -1098,7 +1100,7 @@ describe("fileStore (quiet-clock persistence; reached via cfg.stateFile in the V
     fs.writeFileSync(file, "{not json");
     assert.deepEqual(st.load(), {}, "corrupt");
   });
-  it("a failed save is swallowed and keeps the previous file", () => {
+  it("a failed save is swallowed and does not throw", () => {
     const dir = tmp();
     const blocker = path.join(dir, "file");
     fs.writeFileSync(blocker, "x");
@@ -1184,7 +1186,7 @@ describe("engine: discovery edge branches (an unregistered market is dropped, ne
     assert.equal(full, 5 * 3, "next scan reads stay + gone + foreign + bad + recovery (3 accounts each), not the cached-terminal Resolved one");
   });
 
-  it("a registry market that is also seen by the scan is not double-tracked; a discovery RPC failure is logged and does not stop the tick", async () => {
+  it("a discovery RPC failure is logged and does not stop the tick", async () => {
     const w = world();
     const reg = addMarket(w, matured({ authority: OTHER }));
     (w.conn as unknown as Record<string, unknown>).getProgramAccounts = async () => {
@@ -1284,18 +1286,22 @@ describe("engine: failure isolation and send outcomes (each reachable from V22Lo
     assert.equal(w.exec.sent.length, 1, "the resolve still went out");
   });
 
-  it("a failing 'resolved' alert does not undo the resolve (the market stays terminal, the attempt stays landed)", async () => {
+  it("a failing 'resolved' alert does not undo the resolve (the market stays terminal and is never resolved again)", async () => {
     const w = world();
     const { addr, ctx } = addMarket(w, matured({ authority: OTHER }));
     resetPushDeadlines();
     const { e, ledger, sink } = engineFor(w, { staleResolve: "on" });
+    let fired = 0;
     sink.fire = async () => {
+      fired++;
       throw new Error("pager down");
     };
     primeLedger(ledger, w, 3_600_000);
     await runTick(e, w, [ctx]);
     assert.equal(w.exec.sent.length, 1);
     assert.equal(isKnownTerminal(addr), true);
+    assert.equal(fired, 1, "the alert was attempted");
+    w.now += cfg().resolveRetryMs + 1; // past the retry window: only the landed flag keeps it from re-sending
     await runTick(e, w, [ctx]);
     assert.equal(w.exec.sent.length, 1, "never again");
   });
