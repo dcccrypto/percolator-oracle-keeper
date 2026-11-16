@@ -113,7 +113,7 @@ describe("matured gate equals the program's age >= permissionless_resolve_stale_
   });
   it("last_good in the future (saturating_sub = 0) is not matured; window 0 is disabled", () => {
     assert.equal(staleResolveWindow(market({ lastGood: NOW + 50n }), NOW)?.matured, false);
-    assert.equal(w(10_000_000n, 0n)?.enabled, false);
+    assert.equal(w(900_000n, 0n)?.enabled, false);
   });
   it("the guard follows: age stale-1 holds on matured, age stale resolves", () => {
     assert.equal(guardOf(green({ lc: lcOf(STALE - 1n) })), "matured");
@@ -226,7 +226,7 @@ describe("pre-send checks", () => {
     assert.match(preSendVerdict(inp({ fresh: market({ lastGood: lg, recovery: true }) }))!, /mode is no longer Live/);
     assert.match(preSendVerdict(inp({ clusterSlot: lg + STALE - 1n }))!, /no longer matured/);
     assert.equal(preSendVerdict(inp({ clusterSlot: lg + STALE })), null);
-    assert.match(preSendVerdict(inp({ fresh: market({ lastGood: lg + 1n }) }))!, /no longer matured/);
+    assert.match(preSendVerdict(inp({ fresh: market({ lastGood: lg + 1n }) }))!, /moved/);
     assert.match(preSendVerdict(inp({ fresh: market({ lastGood: lg - 1n }) }))!, /moved/);
   });
   it("window switched off on chain -> not matured", () => {
