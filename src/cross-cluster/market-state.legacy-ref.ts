@@ -1,5 +1,6 @@
 /**
- * cross-cluster/market-state.ts
+ * TEST ORACLE ONLY: frozen pre-change copy of market-state.ts (per-read DataView), used by market-state-view-equality.test.ts.
+ * Do not import from production code.
  *
  * Terminal-state decode for a wrapper market account, shared by the push loop,
  * the cranker, the fee jobs and the wind-down (split out of terminal-insurance.ts

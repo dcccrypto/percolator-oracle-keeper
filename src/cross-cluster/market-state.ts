@@ -58,16 +58,16 @@ export const TERMINAL_STATE_VERSIONS: ReadonlySet<number> = new Set(Object.keys(
 
 /**
  * One DataView per buffer instead of one per read (same fix as SDK #451). A DataView over a Uint8Array is a live window
- * (it sees later writes) and the array's buffer/offset/length are fixed, so caching it never changes a result. A
+ * (it sees later writes) and a view is rebuilt if the array's length no longer matches (resizable buffers), so caching never changes a result. A
  * one-entry fast path covers the push loop calling the decoders back to back on the same bytes.
  */
 const VIEWS = new WeakMap<Uint8Array, DataView>();
 let lastBytes: Uint8Array | null = null;
 let lastView: DataView | null = null;
 function viewOf(d: Uint8Array): DataView {
-  if (d === lastBytes && lastView !== null) return lastView;
+  if (d === lastBytes && lastView !== null && lastView.byteLength === d.byteLength) return lastView;
   let v = VIEWS.get(d);
-  if (v === undefined) {
+  if (v === undefined || v.byteLength !== d.byteLength) {
     v = new DataView(d.buffer, d.byteOffset, d.byteLength);
     VIEWS.set(d, v);
   }
