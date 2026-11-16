@@ -42,7 +42,7 @@ describe("stakeCommitTargetOnce edge branches", () => {
     assert.equal(f.sims.length, 0);
   });
 
-  it("a custom stakeProgramId derives the pool and is used for the instruction", async () => {
+  it("a custom stakeProgramId derives the pool and selects the pool PDA in the instruction accounts", async () => {
     const other = Keypair.generate().publicKey;
     const ctx = late();
     const f = fakeExecConn();

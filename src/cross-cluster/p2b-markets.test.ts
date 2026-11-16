@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair, PublicKey } from "@solana/web3.js";
-import { PROGRAM, registryBytes, vaultLpStateBytes } from "./p2b-test-helpers.ts";
+import { PROGRAM, deriveLpVaultRegistry, deriveVaultLpState, registryBytes, vaultLpStateBytes } from "./p2b-test-helpers.ts";
 import { readU128, readU64, readVaultMarketSnapshots } from "./p2b-markets.ts";
 import type { MarketRef, SnapshotConnection } from "./p2b-markets.ts";
 
@@ -30,6 +30,8 @@ describe("readVaultMarketSnapshots", () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0].length, 3);
     assert.ok(calls[0][0].equals(market));
+    assert.ok(calls[0][1].equals(deriveLpVaultRegistry(PROGRAM, market)[0]));
+    assert.ok(calls[0][2].equals(deriveVaultLpState(PROGRAM, market)));
     const s = out.get(market.toBase58())!;
     assert.equal(s.slot, 777);
     assert.deepEqual([...s.marketData!], [1, 2, 3]);
