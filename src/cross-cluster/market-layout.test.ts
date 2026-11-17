@@ -581,6 +581,22 @@ describe("detectLayout guard branches (byte buffers built from table constants)"
     assert.ok(d2.known && d2.layout.id === "v2.1-drift" && d2.slots === m);
   });
 
+  it("AMBIGUOUS_ROW: two rows with the same VERSION and length are refused, naming both", () => {
+    quiet();
+    const legacy = layoutById("v2.1-legacy");
+    const dup: MarketLayout = { ...legacy, id: "v2.1-drift" };
+    const rows = MARKET_LAYOUTS as MarketLayout[];
+    rows.push(dup);
+    try {
+      const d = unknown(detectLayout(emptyMarket(legacy)));
+      assert.equal(describeUnknownLayout(d), `unknown market layout: length ${marketAccountLen(legacy, 1)} with VERSION 18 is ambiguous between v2.1-legacy / v2.1-drift`);
+      assert.equal(layoutGuardSnapshot().byCode.AMBIGUOUS_ROW, 1);
+    } finally {
+      rows.pop();
+    }
+    assert.equal(MARKET_LAYOUTS.length, 4);
+  });
+
   it("ROW_DISAGREES_WITH_SDK: an SDK table whose geometry moved refuses the account", () => {
     quiet();
     const l = layoutById("v2.2-b");
