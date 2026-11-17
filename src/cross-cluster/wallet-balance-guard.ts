@@ -44,7 +44,10 @@ export function shouldRefreshBalance(
   nowMs: number,
   intervalMs: number,
 ): boolean {
-  return nowMs - state.lastCheckAt >= intervalMs;
+  const elapsed = nowMs - state.lastCheckAt;
+  // Negative elapsed = wall clock stepped backwards: re-read now rather than go
+  // blind until the clock catches up. Fail closed on non-finite input too.
+  return !(elapsed >= 0 && elapsed < intervalMs);
 }
 
 export type BalanceTransition = "went-low" | "recovered" | null;

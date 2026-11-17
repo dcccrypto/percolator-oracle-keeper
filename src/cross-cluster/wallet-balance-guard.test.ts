@@ -44,6 +44,14 @@ describe("#71 wallet-balance guard logic", () => {
     assert.equal(shouldRefreshBalance(s, 1_000 + 30_000, 30_000), true);
   });
 
+  it("refreshes when the wall clock steps backwards (negative elapsed) instead of stalling", () => {
+    const s = createWalletBalanceState();
+    s.lastCheckAt = 1_000_000;
+    // NTP step back by 10 min: without this, no refresh until the clock catches up.
+    assert.equal(shouldRefreshBalance(s, 1_000_000 - 600_000, 30_000), true);
+    assert.equal(shouldRefreshBalance(s, 1_000_000 - 1, 30_000), true);
+  });
+
   it("goes low below the threshold and reports the edge once", () => {
     const s = createWalletBalanceState();
     assert.equal(applyBalanceReading(s, MIN - 1, MIN, 1), "went-low");
