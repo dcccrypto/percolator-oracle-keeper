@@ -1,4 +1,4 @@
-import { test, describe, mock } from "node:test";
+import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -111,4 +111,3 @@ describe("startHealthFileMirror", () => {
     assert.ok(fs.existsSync(f), "file was never written after the hang");
   });
 });
-void mock;
