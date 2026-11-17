@@ -104,6 +104,8 @@ interface PoolState {
   minRes: bigint;
   /** atMs is non-decreasing along the list, so expired samples are exactly a prefix. */
   ordered: boolean;
+  /** Holds a non-finite timestamp: use the plain filter (matches the original for NaN/Infinity). */
+  irregular: boolean;
 }
 
 /** The bracketing signature: a sharp drop between a pre-push read and the post-push re-read. */
@@ -135,10 +137,11 @@ export class DepthSampleWindow {
     if (reserveE6 < 0n) return;
     let st = this.samples.get(pool);
     if (!st) {
-      st = { list: [], minAt: atMs, minRes: reserveE6, ordered: true };
+      st = { list: [], minAt: atMs, minRes: reserveE6, ordered: true, irregular: false };
       this.samples.set(pool, st);
     }
     const list = st.list;
+    if (!Number.isFinite(atMs)) st.irregular = true;
     if (list.length > 0 && atMs < list[list.length - 1].atMs) st.ordered = false;
     list.push({ atMs, reserveE6, phase });
     if (list.length === 1) {
@@ -162,22 +165,26 @@ export class DepthSampleWindow {
     let minAt = list[0].atMs;
     let minRes = list[0].reserveE6;
     let ordered = true;
+    let irregular = !Number.isFinite(list[0].atMs);
     for (let i = 1; i < list.length; i++) {
       const s = list[i];
       if (s.atMs < list[i - 1].atMs) ordered = false;
+      if (!Number.isFinite(s.atMs)) irregular = true;
       if (s.atMs < minAt) minAt = s.atMs;
       if (s.reserveE6 < minRes) minRes = s.reserveE6;
     }
     st.ordered = ordered;
+    st.irregular = irregular;
     st.minAt = minAt;
     st.minRes = minRes;
   }
 
   /** Drop every sample older than the window (same predicate as before). No-op unless the oldest one is expired. */
   private prune(pool: string, st: PoolState, nowMs: number): void {
-    if (nowMs - st.minAt <= this.windowMs) return;
+    const regular = !st.irregular && Number.isFinite(nowMs) && Number.isFinite(this.windowMs);
+    if (regular && nowMs - st.minAt <= this.windowMs) return;
     const list = st.list;
-    if (st.ordered) {
+    if (regular && st.ordered) {
       // Ordered window: the expired samples are a prefix. Drop it in one splice; rescan only if it held the min.
       let k = 0;
       let lostMin = false;

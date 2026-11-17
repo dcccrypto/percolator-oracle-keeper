@@ -57,6 +57,28 @@ function run(seed: number, windowMs: number, dropPct: number, ops: number, mode:
 }
 
 describe("DepthSampleWindow differential vs legacy", () => {
+  it("matches on NaN / Infinity timestamps and windows", () => {
+    const stamps = [1000, NaN, Infinity, 2000, -Infinity, 500];
+    for (const win of [30_000, NaN, Infinity]) {
+      for (let m = 0; m < 300; m++) {
+        const a = new DepthSampleWindow(win);
+        const b = new LegacyDepthSampleWindow(win);
+        let x = m + 1;
+        for (let i = 0; i < 8; i++) {
+          x = (Math.imul(x, 1103515245) + 12345) >>> 0;
+          const at = stamps[x % stamps.length];
+          const now = stamps[(x >>> 8) % stamps.length];
+          const r = BigInt((x >>> 4) % 9);
+          a.record("p", r, "pre", at);
+          b.record("p", r, "pre", at);
+          assert.equal(a.size("p"), b.size("p"));
+          assert.equal(a.minReserve("p", now), b.minReserve("p", now));
+          assert.equal(a.lastPre("p", now), b.lastPre("p", now));
+        }
+      }
+    }
+  });
+
   it("replays >= 20k random calls with 0 mismatches", () => {
     let total = 0;
     for (const [seed, win, drop, mode] of [
