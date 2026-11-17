@@ -182,8 +182,10 @@ export class VaultLpCranker {
     }
     const prev = this.lastMark.get(marketAddress);
     if (prev === priceE6) return "no-move";
-    this.lastMark.set(marketAddress, priceE6);
+    // Busy: do NOT record the price. The in-flight crank may have simulated before this push landed, so the
+    // next push at this same price must still be cranked rather than short-circuit as "no-move".
     if (this.inflight.has(marketAddress)) return "busy";
+    this.lastMark.set(marketAddress, priceE6);
     this.inflight.add(marketAddress);
     try {
       const market = new PublicKey(marketAddress);
