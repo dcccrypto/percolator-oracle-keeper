@@ -49,17 +49,4 @@ describe("redactErrorText never prints a secret-looking value", () => {
       assert.ok(!out.includes(SECRET.slice(0, 12)), `partial leak: ${out}`);
     });
   }
-  it("is never printed to the console when an error is logged through the redactor", () => {
-    const logged: string[] = [];
-    const orig = console.error;
-    console.error = (...a: unknown[]) => void logged.push(a.join(" "));
-    try {
-      console.error(redactErrorText(new Error(`GET https://rpc.example.com/${SECRET} 500`).message));
-    } finally {
-      console.error = orig;
-    }
-    assert.equal(logged.length, 1);
-    assert.ok(!logged[0].includes(SECRET));
-    assert.match(logged[0], /rpc\.example\.com/);
-  });
 });

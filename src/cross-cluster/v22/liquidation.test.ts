@@ -633,14 +633,14 @@ describe("F1 branch coverage: synthetic margin inputs and guard bounds", () => {
   const P: import("./liquidation.ts").MarginParams = {
     mmrBps: 1_000n,
     minNonzeroMmReq: 10n,
-    assets: new Map([[0, { priceE6: 2_000_000n, rawTargetE6: 2_000_000n, aLong: 100n, aShort: 100n }]]),
+    assets: new Map([[0, { priceE6: 2_000_000n, rawTargetE6: 2_000_000n, aLong: 100n, aShort: 200n }]]),
   };
   const withTarget = (raw: bigint): import("./liquidation.ts").MarginParams => ({ ...P, assets: new Map([[0, { ...P.assets.get(0)!, rawTargetE6: raw }]]) });
 
   it("a short leg and a negative basis use |basis|, the short A, and no penalty when raw target equals the mark", () => {
     const m = marginOf({ equity: 1_000n, legs: [{ assetIndex: 0, side: 1, basis: -1_000_000n, aBasis: 100n }] }, P);
-    assert.equal(m.notional, 2_000_000n);
-    assert.equal(m.requirement, 200_000n, "10% of notional beats the 10-atom floor");
+    assert.equal(m.notional, 4_000_000n, "short A (200), not long A (100)");
+    assert.equal(m.requirement, 400_000n, "10% of notional beats the 10-atom floor");
   });
   it("aBasis <= 0 falls back to the raw |basis|", () => {
     const m = marginOf({ equity: 0n, legs: [{ assetIndex: 0, side: 0, basis: 3_000_000n, aBasis: 0n }] }, P);
@@ -649,10 +649,11 @@ describe("F1 branch coverage: synthetic margin inputs and guard bounds", () => {
   it("adverse lag: short with raw above the mark is penalised; long with raw above and short with raw below are not", () => {
     const leg = (side: number) => ({ equity: 100n, legs: [{ assetIndex: 0, side, basis: 1_000_000n, aBasis: 100n }] });
     const base = marginOf(leg(1), P).requirement;
-    assert.equal(marginOf(leg(1), withTarget(3_000_000n)).requirement, base + 1_000_000n);
-    assert.equal(marginOf(leg(0), withTarget(3_000_000n)).requirement, base, "long, raw above mark: favourable");
+    const baseL = marginOf(leg(0), P).requirement;
+    assert.equal(marginOf(leg(1), withTarget(3_000_000n)).requirement, base + 2_000_000n, "q = 1e6 * aShort 200 / 100");
+    assert.equal(marginOf(leg(0), withTarget(3_000_000n)).requirement, baseL, "long, raw above mark: favourable");
     assert.equal(marginOf(leg(1), withTarget(1_000_000n)).requirement, base, "short, raw below mark: favourable");
-    assert.equal(marginOf(leg(0), withTarget(1_000_000n)).requirement, base + 1_000_000n, "long, raw below mark: adverse");
+    assert.equal(marginOf(leg(0), withTarget(1_000_000n)).requirement, baseL + 1_000_000n, "long, raw below mark: adverse");
   });
   it("a leg on an unknown asset or a zero-priced asset is ignored (flat)", () => {
     const flat = { equity: 5n, legs: [{ assetIndex: 7, side: 0, basis: 1n, aBasis: 1n }] };
