@@ -40,6 +40,10 @@ describe("errorText", () => {
     assert.doesNotThrow(() => errorText({ slot: 1n }));
     assert.equal(typeof errorText(circ), "string");
   });
+  it("a value whose toJSON and toString both throw yields a placeholder, not a throw", () => {
+    const evil = { toJSON() { throw new Error("j"); }, toString() { throw new Error("s"); } };
+    assert.equal(errorText(evil), "[unprintable error]");
+  });
   it("describeProgramError survives an unserialisable error object", () => {
     const circ: Record<string, unknown> = {};
     circ.self = circ;

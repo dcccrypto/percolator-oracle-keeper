@@ -39,7 +39,17 @@ export function errorText(err: unknown): string {
     const logs = (err as Error & { logs?: unknown }).logs;
     return Array.isArray(logs) && logs.length ? `${err.message}\n${logs.join("\n")}` : err.message;
   }
-  return typeof err === "string" ? err : JSON.stringify(err ?? null) ?? String(err);
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err ?? null) ?? String(err);
+  } catch {
+    // circular / BigInt-bearing thrown value: this runs inside catch blocks and must not throw itself
+    try {
+      return String(err);
+    } catch {
+      return "[unprintable error]";
+    }
+  }
 }
 
 /** The custom program code of an error value / message / SendTransactionError (incl. its logs), or null. */
