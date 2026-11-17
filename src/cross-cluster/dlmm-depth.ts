@@ -86,7 +86,7 @@ export function priceQ64Uncached(binId: number, binStep: number): bigint {
   return r >> 64n;
 }
 
-const PRICE_CACHE_MAX = 100_000;
+let PRICE_CACHE_MAX = 100_000;
 const priceCache = new Map<number, Map<number, bigint>>();
 let priceCacheSize = 0;
 
@@ -109,6 +109,15 @@ export function priceQ64(binId: number, binStep: number): bigint {
   m.set(binId, v);
   priceCacheSize++;
   return v;
+}
+
+/** Test hook: lower the memo cap and empty the memo (returns the previous cap). Not used in production. */
+export function __setPriceCacheMaxForTest(max: number): number {
+  const prev = PRICE_CACHE_MAX;
+  PRICE_CACHE_MAX = max;
+  priceCache.clear();
+  priceCacheSize = 0;
+  return prev;
 }
 
 export type Refusal = { ok: false; reason: string };

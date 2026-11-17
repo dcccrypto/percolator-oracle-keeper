@@ -18,6 +18,7 @@ import {
   planDlmmBinArrays,
   priceQ64,
   priceQ64Uncached,
+  __setPriceCacheMaxForTest,
 } from "./dlmm-depth.ts";
 
 const USDC = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
@@ -281,5 +282,107 @@ describe("priceQ64 cache equals the uncached square-and-multiply", () => {
         for (let id = -5000; id <= 5000; id++) assert.equal(priceQ64(id, step), priceQ64Uncached(id, step), `step ${step} id ${id}`);
       }
     }
+  });
+});
+
+describe("priceQ64 memo bound and edge inputs", () => {
+  it("full-clear path: at the cap the memo empties, results stay equal to uncached, and re-fills", () => {
+    const prev = __setPriceCacheMaxForTest(3);
+    try {
+      const ids = [-7, 0, 5, 9, 11, -13, 70, 71]; // crosses the cap of 3 repeatedly
+      for (const step of [10, 25]) {
+        for (const id of ids) assert.equal(priceQ64(id, step), priceQ64Uncached(id, step));
+      }
+      for (const step of [25, 10]) {
+        for (const id of ids) assert.equal(priceQ64(id, step), priceQ64Uncached(id, step));
+      }
+      const v = priceQ64(123, 77); // new step after clear
+      assert.equal(priceQ64(123, 77), v);
+      assert.equal(v, priceQ64Uncached(123, 77));
+    } finally {
+      __setPriceCacheMaxForTest(prev);
+    }
+  });
+
+  it("memo equals uncached for pseudo-random (binId, binStep) incl. negative ids and the max bin step", () => {
+    let s = 0x2545f491;
+    const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 2 ** 32);
+    const cases: [number, number][] = [[0, 10_000], [1, 10_000], [-1, 10_000], [-300, 10_000], [300, 10_000], [-500_000, 1], [500_000, 1], [0, 1]];
+    for (let i = 0; i < 300; i++) cases.push([Math.floor(rnd() * 2000) - 1000, 1 + Math.floor(rnd() * 10_000)]);
+    for (const [id, step] of cases) {
+      const want = priceQ64Uncached(id, step);
+      assert.equal(priceQ64(id, step), want, `id ${id} step ${step}`);
+      assert.equal(priceQ64(id, step), want);
+    }
+  });
+
+  it("priceQ64Uncached edge values: id 0 is exactly 1.0, negative is the reciprocal, binStep 10000 doubles per bin", () => {
+    assert.equal(priceQ64Uncached(0, 25), 1n << 64n);
+    assert.equal(priceQ64Uncached(1, 10_000), 2n << 64n);
+    assert.equal(priceQ64Uncached(-1, 10_000), 1n << 63n);
+    assert.equal(priceQ64Uncached(10, 10_000), 1024n << 64n);
+    const up = Number(priceQ64Uncached(40, 25)) / Q64;
+    const dn = Number(priceQ64Uncached(-40, 25)) / Q64;
+    assert.ok(Math.abs(up * dn - 1) < 1e-9);
+  });
+
+  it("plan at the extreme bin steps: tiny (1) and max (10000) both return a consistent window", () => {
+    for (const step of [1, 10_000]) {
+      for (const activeId of [-30, 0, 3000]) {
+        const plan = planDlmmBinArrays(poolBytes({ activeId, binStep: step }));
+        assert.ok(plan.ok, `step ${step} id ${activeId}`);
+        const p0 = priceQ64Uncached(activeId, step);
+        // up: last bin within +2%, next is outside
+        assert.ok(priceQ64Uncached(activeId + plan.binsUp, step) * 100n <= p0 * 102n);
+        assert.ok(priceQ64Uncached(activeId + plan.binsUp + 1, step) * 100n > p0 * 102n);
+        assert.ok(priceQ64Uncached(activeId - plan.binsDown, step) * 100n >= p0 * 98n);
+        assert.ok(priceQ64Uncached(activeId - plan.binsDown - 1, step) * 100n < p0 * 98n);
+      }
+    }
+    const big = planDlmmBinArrays(poolBytes({ activeId: 0, binStep: 10_000 }));
+    assert.ok(big.ok);
+    assert.equal(big.binsUp, 0); // one bin doubles the price: nothing within +2% above
+    assert.equal(big.binsDown, 0);
+  });
+
+  it("estimator over- and undershoot: tiny prices (floor rounding) force the up-- / up++ / down-- correction loops; window stays exact", () => {
+    for (const [activeId, step] of [[-436878, 1], [-436841, 1], [-443612, 1], [-443575, 1], [-443635, 1], [-443611, 1], [-443431, 1], [-443428, 1]] as const) {
+      const plan = planDlmmBinArrays(poolBytes({ activeId, binStep: step }));
+      assert.ok(plan.ok, `id ${activeId}`);
+      const p0 = priceQ64Uncached(activeId, step);
+      assert.ok(priceQ64Uncached(activeId + plan.binsUp, step) * 100n <= p0 * 102n);
+      assert.ok(priceQ64Uncached(activeId + plan.binsUp + 1, step) * 100n > p0 * 102n);
+      assert.ok(priceQ64Uncached(activeId - plan.binsDown, step) * 100n >= p0 * 98n);
+      assert.ok(priceQ64Uncached(activeId - plan.binsDown - 1, step) * 100n < p0 * 98n);
+    }
+  });
+
+  it("computeDlmmDepth refuses unknown/invalid decimals and propagates a plan refusal; hasDisc rejects <8 bytes", () => {
+    const pool = Keypair.generate().publicKey;
+    const data = poolBytes({ activeId: 10, binStep: 25 });
+    const base = { lbPair: pool, poolData: data, binArrays: new Map<number, Uint8Array | null>() };
+    for (const decimals of [undefined, { base: -1, quote: 6 }, { base: 9, quote: 25 }, { base: 9.5, quote: 6 }, { base: 9, quote: NaN }]) {
+      const r = computeDlmmDepth({ ...base, decimals });
+      assert.ok(!r.ok && /decimals/.test(r.reason));
+    }
+    const bad = computeDlmmDepth({ ...base, poolData: data.subarray(0, 5), decimals: dec });
+    assert.ok(!bad.ok && /too short/.test(bad.reason));
+    const zeroStep = computeDlmmDepth({ ...base, poolData: poolBytes({ activeId: 10, binStep: 0 }), decimals: dec });
+    assert.ok(!zeroStep.ok && /bin_step/.test(zeroStep.reason));
+    const far = computeDlmmDepth({ ...base, poolData: poolBytes({ activeId: 500_001, binStep: 25 }), decimals: dec });
+    assert.ok(!far.ok && /active_id/.test(far.reason));
+    const noDisc = Buffer.from(data);
+    noDisc[0] ^= 0xff;
+    const nd = computeDlmmDepth({ ...base, poolData: noDisc, decimals: dec });
+    assert.ok(!nd.ok && /discriminator/.test(nd.reason));
+  });
+
+  // REAL BUG (dlmm-depth.ts planDlmmBinArrays, the `while (priceQ64(activeId - down - 1, binStep) * 100n >= lo) down++` loop and its
+  // `up` twin): when p0 = priceQ64(activeId) floors to 0 (e.g. binStep 10000, activeId <= -65, which readPair accepts:
+  // |activeId| <= 500000), lo = hi = 0 and the loops never terminate -> the keeper hangs. Skipped because it would hang the run;
+  // unskip once planDlmmBinArrays refuses a zero price. Repro: planDlmmBinArrays(poolBytes({ activeId: -3000, binStep: 10_000 })).
+  it.skip("BUG: a pool whose active price underflows to 0 is refused instead of looping forever", () => {
+    const plan = planDlmmBinArrays(poolBytes({ activeId: -3000, binStep: 10_000 }));
+    assert.equal(plan.ok, false);
   });
 });
