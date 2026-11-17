@@ -1,5 +1,6 @@
 import { Keypair } from "@solana/web3.js";
-import { planCrankTx, planRefreshTx, chunkOverflowTargets, V22_LEG_COST, type PositionedPortfolio } from "../src/cross-cluster/positioned-refresh.js";
+import type { PositionedPortfolio } from "../src/cross-cluster/positioned-refresh.js";
+const { planCrankTx, planRefreshTx, chunkOverflowTargets, V22_LEG_COST } = await import(process.env.LEGACY ? "../src/cross-cluster/positioned-refresh.legacy-ref.js" : "../src/cross-cluster/positioned-refresh.js");
 
 const owner = Keypair.generate().publicKey;
 const market = Keypair.generate().publicKey;

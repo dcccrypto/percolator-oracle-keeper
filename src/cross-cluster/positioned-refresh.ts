@@ -563,8 +563,21 @@ export function catchupAllowsRefresh(catchup: number): boolean {
 
 /** Byte-exact key of a PublicKey (what `equals` compares), without BN arithmetic. */
 const keyOf = (k: PublicKey): string => Buffer.from(k.toBytes()).toString("latin1");
-/** Membership set for the liquidation targets: O(1) per lookup instead of a BN-compare scan per target. */
-const liquidateKeySet = (ts: ReadonlyArray<PublicKey> | undefined): Set<string> => new Set((ts ?? []).map(keyOf));
+/**
+ * Membership set for the liquidation targets: O(1) per lookup instead of a BN-compare scan per target. Cached per
+ * array (the follow-up planner is called once per overflow group with the SAME list; rebuilding per call was slower
+ * than the scan). Callers replace the list rather than mutate it; the length check guards a push / pop.
+ */
+const liqSetCache = new WeakMap<object, { n: number; set: Set<string> }>();
+const liquidateKeySet = (ts: ReadonlyArray<PublicKey> | undefined): Set<string> => {
+  if (!ts || ts.length === 0) return EMPTY_KEYS;
+  const hit = liqSetCache.get(ts);
+  if (hit && hit.n === ts.length) return hit.set;
+  const set = new Set(ts.map(keyOf));
+  liqSetCache.set(ts, { n: ts.length, set });
+  return set;
+};
+const EMPTY_KEYS: Set<string> = new Set();
 
 /**
  * Build the per-market crank sequence:
