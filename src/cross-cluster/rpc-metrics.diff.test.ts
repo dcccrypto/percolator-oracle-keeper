@@ -55,6 +55,7 @@ test("differential: snapshot() identical to legacy over a random call stream", (
       // mostly small steps, sometimes jumps past the 60 s / 300 s windows, sub-second ticks too
       const j = r();
       t += j < 0.7 ? Math.floor(r() * 400) : j < 0.97 ? Math.floor(r() * 20_000) : Math.floor(r() * 700_000);
+      if (r() < 0.02) t -= Math.floor(r() * 90_000); // clock stepping backwards (stale stamps > now)
       const body = randomBody(r);
       const status = ((x) => (x < 0.05 ? 429 : x < 0.1 ? 0 : 200))(r());
       const ep = eps[Math.floor(r() * 2)];
