@@ -43,7 +43,7 @@ describe("thresholdsFromEnv overrides", () => {
 
   it("each variable alone changes only its own field", () => {
     for (const [name, key] of Object.entries(ENV_TO_KEY)) {
-      // 100_000 keeps slotLagCritical >= slotLagWarn only for critical; set warn low-safe below.
+      // Warn must stay <= the default critical (450), so it gets a small value; everything else a large one.
       const value = key === "slotLagWarn" ? "7" : "100000";
       const t = thresholdsFromEnv({ [name]: value });
       for (const k of Object.keys(DEFAULT_THRESHOLDS) as (keyof AlertThresholds)[]) {

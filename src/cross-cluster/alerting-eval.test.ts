@@ -67,7 +67,7 @@ describe("evaluateCrankHealth: loss-stale / lapsed / bankrupt / layout", () => {
     const first = evaluateCrankHealth(sample({ lossStaleCycles: 1 }), freshStreaks(), T, NOW);
     assert.equal(first.streaks.lossStaleSince, NOW);
     assert.ok(!kinds(first.active).includes("loss-stale-prolonged"));
-    // Within the bound: still quiet, start preserved.
+    // Exactly at the bound (comparison is strict >): still quiet, start preserved.
     const mid = evaluateCrankHealth(sample({ lossStaleCycles: 2 }), first.streaks, T, NOW + T.lossStaleProlongedMs);
     assert.equal(mid.streaks.lossStaleSince, NOW);
     assert.ok(!kinds(mid.active).includes("loss-stale-prolonged"));
@@ -170,7 +170,7 @@ describe("evaluateCrankHealth: loss-stale / lapsed / bankrupt / layout", () => {
     assert.match(first.message, /since keeper boot/);
     assert.match(first.message, /Both sides still hold OI/);
     assert.equal(a.streaks.adlObserved, true);
-    // Second cycle far later: continues the same episode, critical, no "since boot" (adl already observed earlier).
+    // Second cycle far later, on an episode injected with sinceBoot:false (sinceBoot is fixed at episode start): critical, no "since boot".
     const later = evaluateCrankHealth(
       sample({ adl: adl({ oiEffShort: 0n }), chainSlot: 1_000_000n + BigInt(T.adlReduceOnlyCriticalSlots) }),
       { ...a.streaks, reduceOnlySince: { slot: 1_000_000n, ms: NOW, sinceBoot: false } },
@@ -361,7 +361,7 @@ describe("evaluateMarketPush", () => {
       NOW,
     );
     assert.equal(both.status, "mark-lagging");
-    // sourceDeadMs below sourceFrozenMs: effective dead threshold is max(...), so a freshly frozen source is only warn.
+    // sourceDeadMs below sourceFrozenMs: the alert is critical as soon as it fires, never warn; below sourceFrozenMs nothing fires.
     const odd = evaluateMarketPush(ms({ sourceUnchangedSince: NOW - 1_000 }), { ...T, sourceFrozenMs: 1_000, sourceDeadMs: 10 }, NOW);
     assert.equal(odd.active[0].severity, "critical");
     const odd2 = evaluateMarketPush(ms({ sourceUnchangedSince: NOW - 1_000 }), { ...T, sourceFrozenMs: 2_000, sourceDeadMs: 10 }, NOW);
