@@ -57,6 +57,7 @@ export function analysePortfolios(
   let overrideWhy: string | null = null;
   let lpData: Uint8Array | null = null;
   let undecodable = 0;
+  let offAssetLp: { activeLegs: number; risk: PositionedPortfolio["risk"] } | null = null;
   for (const { pubkey, data } of accounts) {
     if (data.length !== p.portfolioLen) continue;
     let parsed;
@@ -102,13 +103,15 @@ export function analysePortfolios(
       if (keeperFlat) overrideAnchor = pubkey;
       else overrideWhy = `override ${pubkey.toBase58()} is ${isLp ? "the vault LP" : anyActive ? "not flat" : parsed.matcherEnabled ? "a matcher portfolio" : "not owned by the keeper"}`;
     }
+    // The LP's legs on OTHER assets still make its refresh heavy (activeLegs / risk): keep them for the flat-LP fallback below.
+    if (isLp && longLegs + shortLegs === 0) offAssetLp = { activeLegs, risk: riskSnapOf(parsed) };
     if (longLegs + shortLegs === 0) continue;
     all.push({ pubkey, longLegs, shortLegs, isLp, activeLegs, lossWeight, kfEpochSnapLong: kfLong, kfEpochSnapShort: kfShort, risk: riskSnapOf(parsed) });
     if (minAbs !== null) minLegAbs.set(pubkey.toBase58(), minAbs);
   }
   let lp: PositionedPortfolio | null = all.find((x) => x.isLp) ?? null;
   // A flat LP (no legs on the asset) is still the LP: it settles at the end of every round.
-  if (!lp && p.lpPortfolio) lp = { pubkey: p.lpPortfolio, longLegs: 0, shortLegs: 0, isLp: true, lossWeight: 0n };
+  if (!lp && p.lpPortfolio) lp = { pubkey: p.lpPortfolio, longLegs: 0, shortLegs: 0, isLp: true, lossWeight: 0n, ...(offAssetLp ?? {}) };
   if (p.anchorOverride && !overrideSeen) overrideWhy = `override ${p.anchorOverride.toBase58()} is not a decodable portfolio of this market`;
   // a passing override wins; a failing one is IGNORED (discovery of the keeper's own flat portfolio stays)
   return { all, counterparties: all.filter((x) => !x.isLp), lp, minLegAbs, flatAnchor: overrideAnchor ?? flatAnchor, lpData, anchorOverrideRejected: overrideWhy, undecodable };
@@ -139,7 +142,9 @@ export async function loadV22Positioned(
 export function parseAccrueAnchors(raw: string | undefined): Map<string, PublicKey> {
   const out = new Map<string, PublicKey>();
   for (const part of (raw ?? "").split(",")) {
-    const [m, a] = part.trim().split(":");
+    const bits = part.trim().split(":");
+    if (bits.length !== 2) continue;
+    const [m, a] = bits;
     if (!m || !a) continue;
     try {
       out.set(new PublicKey(m).toBase58(), new PublicKey(a));
