@@ -8,7 +8,6 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { PublicKey } from "@solana/web3.js";
 import { STAKE_POOL_FIELD_OFF_V5, STAKE_POOL_SIZE_V5, deriveStakePool } from "@percolatorct/sdk";
 import {
   COMMIT_TARGET_BACKOFF_SLOTS,
@@ -69,9 +68,6 @@ describe("stakeCommitTargetOnce branches", () => {
       assert.equal(f.sent.length, 0);
       assert.equal(st.backoffUntil.size, 0);
     }
-    // a non-Error throw path is covered by String(e); a long message is cut to 80 chars
-    const r = await stakeCommitTargetOnce(execCtx(fakeExecConn().conn), late(), new Uint8Array(3), freshStakeCommitTargetState());
-    if (r.kind === "skipped") assert.ok(r.reason.length <= "pool is not a v5 pool ()".length + 80);
   });
   it("the same pool becomes actionable on the next tick once good bytes arrive (a bad read does not stick)", async () => {
     const st = freshStakeCommitTargetState();
@@ -83,7 +79,7 @@ describe("stakeCommitTargetOnce branches", () => {
     const r = await stakeCommitTargetOnce(execCtx(fakeExecConn().conn), late(), pool(0n), freshStakeCommitTargetState());
     assert.deepEqual(r, { kind: "skipped", reason: "no pending deploy target" });
   });
-  it("waiting, then sent at the due slot; committed counter bumps only on sent", async () => {
+  it("waiting, then sent past the due slot (exact boundary is in jobs.test.ts); committed counter bumps only on sent", async () => {
     const st = freshStakeCommitTargetState();
     const w = await stakeCommitTargetOnce(execCtx(fakeExecConn().conn), v22Ctx({ currentSlot: 5000n }), pool(4000n), st);
     assert.deepEqual(w, { kind: "waiting", dueSlot: 220_000n });
@@ -91,8 +87,6 @@ describe("stakeCommitTargetOnce branches", () => {
     const s = await stakeCommitTargetOnce(execCtx(fakeExecConn().conn), late(), pool(100_000n), st);
     assert.equal(s.kind, "sent");
     assert.equal(st.committed, 1);
-    const [poolKey] = deriveStakePool(late().market, STAKE_PROGRAM_ID);
-    assert.ok(poolKey instanceof PublicKey);
   });
   it("dry-run -> dry-run, committed unchanged", async () => {
     const st = freshStakeCommitTargetState();
@@ -102,7 +96,7 @@ describe("stakeCommitTargetOnce branches", () => {
     assert.equal(st.committed, 0);
     assert.equal(f.sent.length, 0);
   });
-  it("40 -> quiet + backoff; backoff holds until the due slot then retries (boundary)", async () => {
+  it("40 -> quiet + backoff; backoff holds until backoffUntil then retries (boundary)", async () => {
     const st = freshStakeCommitTargetState();
     const f = fakeExecConn({ simErr: () => customAt(0, 40) });
     const c = late(); // readSlot 400000
@@ -123,7 +117,7 @@ describe("stakeCommitTargetOnce branches", () => {
     assert.equal(st.backoffUntil.size, 1);
     assert.equal(f.sent.length, 0);
   });
-  it("LEAD 1 (transient RPC error): a throwing RPC during the send is 'failed' + backoff, never 'no target'/'quiet'", async () => {
+  it("LEAD 1 (transient RPC error): a throwing RPC (getLatestBlockhash, before simulation) is 'failed' + backoff, never 'no target'/'quiet'", async () => {
     const st = freshStakeCommitTargetState();
     const f = fakeExecConn();
     const conn = { ...f.conn, getLatestBlockhash: async () => { throw new Error("fetch failed 503"); } } as typeof f.conn;
@@ -132,9 +126,10 @@ describe("stakeCommitTargetOnce branches", () => {
     assert.equal(st.backoffUntil.size, 1);
     assert.equal(st.committed, 0);
   });
-  it("LEAD 2: readSlot non-integer/NaN throws RangeError out of BigInt() (typed number from getSlot; documented, not reachable from RPC)", async () => {
+  it("LEAD 2: readSlot NaN and 1.5 throw RangeError out of BigInt() (not reachable from RPC)", async () => {
     const bad = { ...late(), readSlot: NaN };
     await assert.rejects(stakeCommitTargetOnce(execCtx(fakeExecConn().conn), bad, pool(100_000n), freshStakeCommitTargetState()), RangeError);
+    await assert.rejects(stakeCommitTargetOnce(execCtx(fakeExecConn().conn), { ...late(), readSlot: 1.5 }, pool(100_000n), freshStakeCommitTargetState()), RangeError);
     // a negative slot is a valid BigInt and simply reads as "waiting"
     const neg = { ...late(), readSlot: -1 };
     assert.equal((await stakeCommitTargetOnce(execCtx(fakeExecConn().conn), neg, pool(100_000n), freshStakeCommitTargetState())).kind, "waiting");
@@ -143,5 +138,7 @@ describe("stakeCommitTargetOnce branches", () => {
     const f = fakeExecConn();
     const r = await stakeCommitTargetOnce(execCtx(f.conn), late(), pool(100_000n), freshStakeCommitTargetState(), { stakeProgramId: key(9) });
     assert.equal(r.kind, "sent");
+    assert.ok(f.sent[0].keys[0].includes(deriveStakePool(late().market, key(9))[0].toBase58()));
+    assert.ok(!f.sent[0].keys[0].includes(deriveStakePool(late().market, STAKE_PROGRAM_ID)[0].toBase58()));
   });
 });
