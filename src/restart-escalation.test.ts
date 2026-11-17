@@ -49,7 +49,7 @@ test("a failed webhook delivery does not burn the alert window; retries are capp
   assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, true);
   assert.equal(recordAlertFailure(p), true); // delivery failed -> stamp rolled back
   assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, true); // retried on next launch
-  for (let i = 0; i < MAX_ALERT_RETRIES - 1; i++) recordAlertFailure(p);
+  for (let i = 0; i < MAX_ALERT_RETRIES - 1; i++) recordAlertFailure(p, t);
   // cap reached: stamp stays, a dead endpoint is not retried again this window
   assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, false);
 });
