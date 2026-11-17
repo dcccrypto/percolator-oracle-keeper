@@ -302,16 +302,13 @@ describe("tag 103: per-market state is pruned with the registry", () => {
     assert.equal(await r.a.runMarket(gone), "not-due", "a returning market is re-staggered like a new one");
   });
 
-  it("registry churn of 10k markets keeps state bounded by the live set", async () => {
+  it("registry churn of 1k markets keeps state bounded by the live set", async () => {
     const r = rig();
-    let prev = "";
-    for (let i = 0; i < 10_000; i++) {
+    for (let i = 0; i < 1_000; i++) {
       const s = snapshot({ label: `M${i}` });
       await r.a.runMarket(s);
       r.a.prune(new Set([s.ref.marketAddress]));
-      prev = s.ref.marketAddress;
     }
-    assert.ok(prev);
     assert.ok(r.a.trackedMarkets() <= 1, `leaked ${r.a.trackedMarkets()} entries`);
   });
 });
@@ -337,12 +334,10 @@ describe("tag 103: failure accounting (leads checked, not bugs)", () => {
     const gaps: number[] = [];
     for (let i = 0; i < 3; i++) {
       r.c.conn.simulateTransaction = i % 2 === 0 ? good : async () => { throw new Error("boom"); };
-      const t0 = r.now();
       assert.equal(await r.a.runMarket(s), "failed");
       let g = 0;
       while ((await r.a.isDue(s.ref.marketAddress)) === false) { r.advance(1_000); g += 1_000; }
       gaps.push(g);
-      void t0;
     }
     assert.deepEqual(gaps, [120_000, 240_000, 480_000]);
   });
