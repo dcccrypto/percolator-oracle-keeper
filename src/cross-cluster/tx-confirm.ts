@@ -61,6 +61,32 @@ const READ_CAP_MS = 5_000;
 
 /** `{"InstructionError":[i,{"Custom":N}]}` -> N. */
 export function customCodeOf(err: unknown): number | null {
+  const fast = customCodeFast(err);
+  if (fast !== undefined) return fast;
+  return customCodeOfSlow(err);
+}
+
+/**
+ * Fast path for exactly `{InstructionError:[<number>,{Custom:<safe uint>}]}` (plain objects, no other keys):
+ * the only shape where the stringified text's first `"Custom":N` is provably that field. Anything else -> undefined.
+ */
+function customCodeFast(err: unknown): number | undefined {
+  if (typeof err !== "object" || err === null || Object.getPrototypeOf(err) !== Object.prototype) return undefined;
+  const keys = Object.keys(err);
+  if (keys.length !== 1 || keys[0] !== "InstructionError") return undefined;
+  const ie = (err as { InstructionError: unknown }).InstructionError;
+  if (!Array.isArray(ie) || ie.length !== 2 || typeof ie[0] !== "number") return undefined;
+  const inner = ie[1];
+  if (typeof inner !== "object" || inner === null || Object.getPrototypeOf(inner) !== Object.prototype) return undefined;
+  const ik = Object.keys(inner);
+  if (ik.length !== 1 || ik[0] !== "Custom") return undefined;
+  const n = (inner as { Custom: unknown }).Custom;
+  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) return undefined;
+  return n + 0; // +0 normalises -0
+}
+
+/** The original string path; also the reference implementation for the differential test. */
+export function customCodeOfSlow(err: unknown): number | null {
   const text = typeof err === "string" ? err : JSON.stringify(err ?? "");
   const dec = text.match(/"Custom"\s*:\s*(\d+)/);
   if (dec) return Number(dec[1]);
