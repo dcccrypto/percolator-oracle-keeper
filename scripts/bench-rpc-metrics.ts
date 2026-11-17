@@ -5,7 +5,9 @@
  * bodies a mix of ~100 B and ~50 KB (single + a few batches), then 1k snapshot() calls.
  * Prints median-of-5 ops/sec and ns/op per phase.
  */
-import { RpcMetrics, methodsOfBody, type RpcEndpointLabel } from "../src/cross-cluster/rpc-metrics.ts";
+import * as cur from "../src/cross-cluster/rpc-metrics.ts";
+import * as base from "../src/cross-cluster/rpc-metrics.legacy.ts"; // frozen copy of the pre-change implementation
+import type { RpcEndpointLabel } from "../src/cross-cluster/rpc-metrics.ts";
 
 function rng(seed: number): () => number {
   let s = seed >>> 0;
@@ -33,23 +35,38 @@ for (let i = 0; i < 10_000; i++) {
 }
 
 const median = (a: number[]) => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
-const callNs: number[] = [];
-const snapNs: number[] = [];
+// CPU time (not wall) so a loaded host does not skew it; base and cur are interleaved.
+const cpuNs = () => {
+  const u = process.cpuUsage();
+  return (u.user + u.system) * 1000;
+};
 let sink = 0;
-for (let run = 0; run < 5; run++) {
+function once(impl: typeof cur): [number, number] {
   let t = 1_700_000_000_000;
-  const m = new RpcMetrics(() => t);
-  let t0 = process.hrtime.bigint();
+  const m = new impl.RpcMetrics(() => t);
+  let t0 = cpuNs();
   for (const c of calls) {
     t += c.dt;
-    for (const meth of methodsOfBody(c.body)) m.record(c.ep, meth, c.status);
+    for (const meth of impl.methodsOfBody(c.body)) m.record(c.ep, meth, c.status);
   }
-  callNs.push(Number(process.hrtime.bigint() - t0) / calls.length);
-  t0 = process.hrtime.bigint();
+  const callNs = (cpuNs() - t0) / calls.length;
+  t0 = cpuNs();
   for (let i = 0; i < 1000; i++) sink += m.snapshot().totalPerMinute.devnet ?? 0;
-  snapNs.push(Number(process.hrtime.bigint() - t0) / 1000);
+  return [callNs, (cpuNs() - t0) / 1000];
+}
+const res = { base: [[], []] as number[][], cur: [[], []] as number[][] };
+once(base);
+once(cur); // warm-up
+for (let run = 0; run < 5; run++) {
+  for (const [name, impl] of [["base", base], ["cur", cur]] as const) {
+    const [c, s] = once(impl);
+    res[name][0].push(c);
+    res[name][1].push(s);
+  }
 }
 const row = (name: string, ns: number) => `${name}: ${ns.toFixed(0)} ns/op, ${Math.round(1e9 / ns).toLocaleString()} ops/s`;
-console.log(row("methodsOfBody+record (10k calls)", median(callNs)));
-console.log(row("snapshot (1k)", median(snapNs)));
+for (const name of ["base", "cur"] as const) {
+  console.log(`[${name}] ` + row("methodsOfBody+record (10k calls)", median(res[name][0])));
+  console.log(`[${name}] ` + row("snapshot (1k)", median(res[name][1])));
+}
 if (sink < 0) console.log(sink);
