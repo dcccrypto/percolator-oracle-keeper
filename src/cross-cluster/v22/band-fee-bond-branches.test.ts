@@ -159,10 +159,13 @@ describe("fee-bond.ts planning", () => {
     assert.equal(planBondFee(ctx, key(1), p, "prefer", 0).shape, "lp-only-unpaired");
   });
   it("paired: counterparties ordered heaviest first", () => {
-    const cps = [pf(1, 1), pf(2, 3), pf(3, 2)];
+    const cps = [pf(1, 1), pf(2, 2), pf(3, 1)]; // weights 4, 5, 4
     const p = planBondFee(v22Ctx(), key(1), positioned(cps), "prefer", 1000);
+    assert.equal(p.shape, "paired");
+    assert.equal(p.tx.refresh.length, 3);
     const ws = p.tx.refresh.map((c) => portfolioWeight(c));
     assert.deepEqual(ws, [...ws].sort((a, b) => b - a));
+    assert.deepEqual(ws, [5, 4, 4]);
   });
   it("mode off ignores positioned and budget", () => {
     const p = planBondFee(v22Ctx(), key(1), positioned([pf(1)]), "off", 1000);
@@ -181,19 +184,35 @@ describe("fee-bond.ts crankBondFee outcomes", () => {
     assert.deepEqual(r, { kind: "skipped", reason: "not-bond" });
     assert.equal(f.sims.length, 0);
   });
-  it("refused with an unexpected code on a non-deferrable shape stays 'refused' (paired and lp-only-unpaired)", async () => {
+  it("refused with an unexpected code on a non-deferrable shape stays 'refused' (lp-only-unpaired, then paired)", async () => {
     const f = fakeExecConn({ simErr: () => customAt(0, 999) });
     const r = await crankBondFee(sd(f.conn), v22Ctx(), big(), { mode: "prefer", weightBudget: 32 });
     assert.equal(r.kind, "refused");
     if (r.kind === "refused") assert.equal(r.shape, "lp-only-unpaired");
     assert.equal(f.sent.length, 0);
     assert.equal(pairingStats.feeUnpairedLpSettles, 0);
+    const g = fakeExecConn({ simErr: () => customAt(0, 999) });
+    const r2 = await crankBondFee(sd(g.conn), v22Ctx(), positioned([pf(1)]), { mode: "prefer", weightBudget: 32 });
+    assert.equal(r2.kind, "refused");
+    if (r2.kind === "refused") assert.equal(r2.shape, "paired");
   });
-  it("refused 38 is 'nothing' on every shape", async () => {
-    const f = fakeExecConn({ simErr: () => customAt(0, NO_FEES_TO_CRANK) });
-    assert.equal((await crankBondFee(sd(f.conn), v22Ctx(), big(), { mode: "strict", weightBudget: 32 })).kind, "nothing");
+  it("refused 38 is 'nothing' on fee-only, paired, lp-only-unpaired and after-round; other codes on fee-only/after-round are 'deferred'", async () => {
+    const mk = () => fakeExecConn({ simErr: () => customAt(0, NO_FEES_TO_CRANK) });
+    for (const [pos, p] of [
+      [big(), { mode: "strict" as const, weightBudget: 32 }],
+      [positioned([pf(1)]), { mode: "prefer" as const, weightBudget: 32 }],
+      [big(), { mode: "prefer" as const, weightBudget: 32 }],
+      [positioned([pf(1)]), { mode: "prefer" as const, weightBudget: 32, afterRound: true }],
+    ] as const) assert.equal((await crankBondFee(sd(mk().conn), v22Ctx(), pos, p)).kind, "nothing");
+    const d = fakeExecConn({ simErr: () => customAt(0, 999) });
+    assert.equal((await crankBondFee(sd(d.conn), v22Ctx(), big(), { mode: "strict", weightBudget: 32 })).kind, "deferred");
+    const e = fakeExecConn({ simErr: () => customAt(0, 999) });
+    assert.equal((await crankBondFee(sd(e.conn), v22Ctx(), positioned([pf(1)]), { mode: "prefer", weightBudget: 32, afterRound: true })).kind, "deferred");
   });
-  it("landed-failed with a non-38 code is 'failed' with the code; with no code says 'none'; not-landed says 'not landed'", async () => {
+  it("bound but no ext skips with no-ext", () => {
+    assert.equal(bondFeeSkipReason(v22Ctx({ bound: true, ext: false })), "no-ext");
+  });
+  it("landed-failed with a non-38 code is 'failed' with the code; 38 on chain is 'nothing'", async () => {
     const f = fakeExecConn({ confirmFail: () => 7 });
     const r = await crankBondFee(sd(f.conn), v22Ctx(), positioned([pf(1)]), { mode: "prefer", weightBudget: 32 });
     assert.equal(r.kind, "failed");
@@ -201,6 +220,9 @@ describe("fee-bond.ts crankBondFee outcomes", () => {
     const g = fakeExecConn({ confirmStatus: "err" });
     const r2 = await crankBondFee(sd(g.conn), v22Ctx(), positioned([pf(1)]), { mode: "prefer", weightBudget: 32 });
     assert.equal(r2.kind, "failed");
+    if (r2.kind === "failed") assert.match(r2.error, /landed but failed on chain \(code 1\)/);
+    const h = fakeExecConn({ confirmFail: () => 38 });
+    assert.equal((await crankBondFee(sd(h.conn), v22Ctx(), positioned([pf(1)]), { mode: "prefer", weightBudget: 32 })).kind, "nothing");
   });
   it("fee-only strict shape that sends cleanly is 'sent' and counts neither unpaired nor after-round", async () => {
     const f = fakeExecConn();
