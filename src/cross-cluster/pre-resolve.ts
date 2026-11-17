@@ -134,7 +134,7 @@ export async function drainFeeLegsBeforeResolve(
     // layout) or a stake-bound market has no readable budget, the stranding check never ran.
     if (t.state === null || (t.stakeBound && t.budget === null)) {
       blockers.push(
-        `stake-bound insurance budget could not be read (${t.state === null ? "market terminal state unreadable" : "budget unknown"}): ` +
+        `insurance budget / stake-binding could not be read (${t.state === null ? "market terminal state unreadable" : "budget unknown"}): ` +
           "the F-9 stranding check did not run — fix the read and rerun before resolving",
       );
     }

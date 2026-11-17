@@ -128,10 +128,10 @@ describe("pre-resolve fails closed when the terminal view is unknown", () => {
   zero.fill(0, 16 + 496, 16 + 560);
 
   it("stake-bound with budget null is a blocker, not safe", async () => {
-    const deps: PreResolveDeps = { ...noCranks, inspectTerminal: async () => ({ ...base, stakeBound: true, support: "supported" }) };
+    const deps: PreResolveDeps = { ...noCranks, inspectTerminal: async () => ({ ...base, state: { kind: "live", budget: 0n, materializedPortfolios: 0n }, stakeBound: true, support: "supported" }) };
     const r = await drainFeeLegsBeforeResolve(conn(zero, zero).c, Keypair.generate(), SOL, false, CFG, undefined, deps, tcfg);
     assert.equal(r.safeToResolve, false);
-    assert.match(r.blockers.join("\n"), /budget/i);
+    assert.match(r.blockers.join("\n"), /budget unknown/);
   });
 
   it("terminal state unreadable (inspect swallowed an error) is a blocker, not safe", async () => {

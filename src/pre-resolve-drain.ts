@@ -11,7 +11,7 @@
  *      warnings may still print — claim those before CloseSlab)
  *   2  NOT safe: a Live-only leg is still owed and would be lost at resolve,
  *      or a stake-bound insurance budget would be stranded (no stake tag 29)
- *   1  error (bad args, RPC failure)
+ *   1  error (bad args, RPC failure, market account missing or unreadable layout — never treated as Live)
  *
  * On a market that is already Resolved (or a CloseSlab tombstone) it runs the
  * post-resolve wind-down instead (stake F-9): tag 29 with the insurance budget,
