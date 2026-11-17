@@ -35,7 +35,8 @@ import { devnetConnectionConfig } from "./rpc-headers.ts";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
-  return i >= 0 ? process.argv[i + 1] : undefined;
+  const v = i >= 0 ? process.argv[i + 1] : undefined;
+  return v === undefined || v.startsWith("--") ? undefined : v; // a following flag is not a value
 }
 
 function loadKeypair(): Keypair {
@@ -62,7 +63,12 @@ async function main(): Promise<number> {
   const tcfg = terminalInsuranceConfigFromEnv(process.env);
   const info = await conn.getAccountInfo(new PublicKey(market), "confirmed");
   const ts = info ? decodeTerminalState(new Uint8Array(info.data)) : null;
-  if (ts && ts.kind !== "live") {
+  if (!ts) {
+    // Fail closed: a missing account or an undecodable layout is unknown, not Live.
+    console.error(`[pre-resolve][fatal] market ${market} ${info ? "has an unreadable/unsupported layout" : "account not found"}; refusing to treat it as Live`);
+    return 1;
+  }
+  if (ts.kind !== "live") {
     const w = await windDownAfterResolve(conn, keeper, market, dryRun, tcfg);
     console.log(`[wind-down] market is ${w.state}; stake-bound=${w.stakeBound} budget=${w.budget ?? "?"} tag29=${w.support ?? "n/a"}`);
     for (const s of w.steps) console.log(`[wind-down] tag 29(amount=${s.amount}): ${s.outcome} — ${s.detail}`);

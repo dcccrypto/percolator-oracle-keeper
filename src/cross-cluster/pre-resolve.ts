@@ -130,6 +130,14 @@ export async function drainFeeLegsBeforeResolve(
   if (terminalCfg && deps.inspectTerminal) {
     const t = await deps.inspectTerminal(conn, keeper, marketAddress, terminalCfg, new TerminalInsuranceState());
     terminal = { stakeBound: t.stakeBound, budget: t.budget, support: t.support };
+    // Fail closed: if the view could not be read (RPC error swallowed by inspect, undecodable
+    // layout) or a stake-bound market has no readable budget, the stranding check never ran.
+    if (t.state === null || (t.stakeBound && t.budget === null)) {
+      blockers.push(
+        `stake-bound insurance budget could not be read (${t.state === null ? "market terminal state unreadable" : "budget unknown"}): ` +
+          "the F-9 stranding check did not run — fix the read and rerun before resolving",
+      );
+    }
     if (t.stakeBound && t.budget !== null && t.budget > 0n && t.state && t.state.kind !== "closed" && t.state.materializedPortfolios > 0n) {
       warnings.push(
         `stake-bound insurance budget ${t.budget} atoms: tag 29 can only recover it once ALL ${t.state.materializedPortfolios} materialized portfolio(s) are closed by their owners (wrapper tag 41 needs 0 after resolve; E2E B12) — get owners to close, or recover while Live (tag 23 → 24)`,
@@ -160,6 +168,8 @@ export async function windDownAfterResolve(
 ): Promise<WindDownReport> {
   const r = await run(conn, keeper, marketAddress, dryRun, cfg, new TerminalInsuranceState());
   const budgetLeft = r.stakeBound && r.budget !== null && r.budget > 0n && r.outcome.kind !== "done";
+  // Unknown is not complete: unreadable state, or a stake-bound non-tombstone market with no readable budget.
+  const unknown = r.state === null || (r.stakeBound && r.budget === null && r.state.kind !== "closed");
   return {
     market: marketAddress,
     state: r.state?.kind ?? "unknown",
@@ -168,6 +178,6 @@ export async function windDownAfterResolve(
     support: r.support,
     steps: r.steps,
     outcome: JSON.stringify(r.outcome),
-    complete: !budgetLeft && r.outcome.kind !== "failed",
+    complete: !budgetLeft && !unknown && r.outcome.kind !== "failed",
   };
 }
