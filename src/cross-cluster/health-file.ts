@@ -14,6 +14,10 @@
 import fs from "node:fs";
 import path from "node:path";
 
+const MAX_TIMER_MS = 2_147_483_647;
+/** A readHealth that has not settled after this long is abandoned so the next tick can run. */
+const READ_TIMEOUT_MS = 15_000;
+
 export interface HealthFileConfig {
   file: string;
   intervalMs: number;
@@ -26,19 +30,25 @@ export function healthFileConfigFromEnv(env: Readonly<Record<string, string | un
   if (!path.isAbsolute(file)) throw new Error(`KEEPER_HEALTH_FILE must be an absolute path, got "${file}"`);
   const raw = env.KEEPER_HEALTH_FILE_MS?.trim();
   if (raw !== undefined && raw !== "" && !/^\d+$/.test(raw)) throw new Error(`KEEPER_HEALTH_FILE_MS="${raw}" must be a positive integer`);
-  return { file, intervalMs: Math.max(5_000, raw ? Number(raw) : 30_000) };
+  // Node clamps any timer delay above 2^31-1 to 1 ms, which would turn a huge value into a write every millisecond.
+  return { file, intervalMs: Math.min(MAX_TIMER_MS, Math.max(5_000, raw ? Number(raw) : 30_000)) };
 }
 
 /** Write one snapshot. Returns true when the file was replaced. Never throws. */
 export async function writeHealthSnapshot(readHealth: () => Promise<string>, file: string, source: string, now: () => Date = () => new Date()): Promise<boolean> {
+  const tmp = `${file}.tmp-${process.pid}`;
   try {
     const health: unknown = JSON.parse(await readHealth());
-    const tmp = `${file}.tmp-${process.pid}`;
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(tmp, JSON.stringify({ writtenAt: now().toISOString(), source, health }, null, 1));
     fs.renameSync(tmp, file);
     return true;
   } catch {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* best effort */
+    }
     return false;
   }
 }
@@ -49,7 +59,17 @@ export function startHealthFileMirror(cfg: HealthFileConfig, readHealth: () => P
   const tick = (): void => {
     if (busy) return;
     busy = true;
-    void writeHealthSnapshot(readHealth, cfg.file, source).finally(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const guarded = (): Promise<string> =>
+      Promise.race([
+        readHealth(),
+        new Promise<string>((_, rej) => {
+          timer = setTimeout(() => rej(new Error("readHealth timed out")), READ_TIMEOUT_MS);
+          timer.unref?.();
+        }),
+      ]);
+    void writeHealthSnapshot(guarded, cfg.file, source).finally(() => {
+      clearTimeout(timer);
       busy = false;
     });
   };

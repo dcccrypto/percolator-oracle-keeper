@@ -56,6 +56,12 @@ describe("writeHealthSnapshot", () => {
     assert.equal(await writeHealthSnapshot(async () => "{}", f, "s"), false);
     assert.deepEqual(fs.readdirSync(d), ["target"]);
   });
+  test("cleanup failure is swallowed (tmp path is a directory)", async () => {
+    const d = tmpDir();
+    const f = path.join(d, "h.json");
+    fs.mkdirSync(`${f}.tmp-${process.pid}`);
+    assert.equal(await writeHealthSnapshot(async () => "{}", f, "s"), false);
+  });
 });
 
 describe("startHealthFileMirror", () => {
