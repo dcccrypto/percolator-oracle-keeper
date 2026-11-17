@@ -40,6 +40,23 @@ export interface VaultMarketSnapshot {
 
 export type SnapshotConnection = Pick<Connection, "getMultipleAccountsInfoAndContext">;
 
+/**
+ * PDA derivation (findProgramAddress) dominates a tick; the (programId, market) -> PDA mapping is pure,
+ * and the same markets recur every tick, so memoise it (bounded; cleared when full).
+ */
+const DERIVED_MAX = 4096;
+const derivedCache = new Map<string, [PublicKey, PublicKey]>();
+function derivedKeys(programId: PublicKey, market: PublicKey): [PublicKey, PublicKey] {
+  const ck = programId.toBase58() + ":" + market.toBase58();
+  let v = derivedCache.get(ck);
+  if (!v) {
+    v = [deriveLpVaultRegistry(programId, market)[0], deriveVaultLpState(programId, market)];
+    if (derivedCache.size >= DERIVED_MAX) derivedCache.clear();
+    derivedCache.set(ck, v);
+  }
+  return v;
+}
+
 /** Read the snapshot of every market in `markets`. A failed chunk leaves its markets out (never throws). */
 export async function readVaultMarketSnapshots(
   conn: SnapshotConnection,
@@ -61,7 +78,8 @@ export async function readVaultMarketSnapshots(
         continue;
       }
       parsed.push({ ref, market });
-      keys.push(market, deriveLpVaultRegistry(programId, market)[0], deriveVaultLpState(programId, market));
+      const [registryKey, vaultLpKey] = derivedKeys(programId, market);
+      keys.push(market, registryKey, vaultLpKey);
     }
     if (keys.length === 0) continue;
     let res;
@@ -115,7 +133,8 @@ export function readU64(d: Uint8Array, off: number): bigint {
   return new DataView(d.buffer, d.byteOffset, d.byteLength).getBigUint64(off, true);
 }
 
-/** u128 little-endian at `off`. */
+/** u128 little-endian at `off` (one DataView for both halves). */
 export function readU128(d: Uint8Array, off: number): bigint {
-  return readU64(d, off) | (readU64(d, off + 8) << 64n);
+  const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
+  return v.getBigUint64(off, true) | (v.getBigUint64(off + 8, true) << 64n);
 }
