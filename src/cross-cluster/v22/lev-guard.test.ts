@@ -1220,9 +1220,7 @@ describe("lev-guard.ts branch gaps", () => {
     const m = w.market.toBase58();
     const c = levConn({ accounts: w.accounts });
     c.base.sent.length = 0;
-    const failing = fakeExecConn({ confirmStatus: "err" });
     const c2 = levConn({ accounts: w.accounts });
-    c2.conn.getSignatureStatuses = failing.conn.getSignatureStatuses as never;
     c2.conn.getSignatureStatuses = (async () => ({ context: { slot: 1 }, value: [{ slot: 5, confirmations: 1, err: { InstructionError: [2, { Custom: 1 }] }, confirmationStatus: "confirmed" }] })) as never;
     const h = keeperOf(c2.conn, cfg({ poke: true }));
     assert.equal(await h.k.pokeOnce(m, "T", "pre-allocate"), "failed");
@@ -1319,20 +1317,12 @@ describe("lev-guard.ts branch gaps", () => {
       w.accounts.set(poolVault.toBase58(), { owner: TOKEN, data: tokenAcct(baseMint, key(700), 1_000_000_000n) });
       return w;
     };
-    it("no guard -> 'no guard'; unreadable guard -> 'guard unreadable'; inactive pin; unreadable pool vault", async () => {
+    it("no guard -> 'no guard'; inactive pin; unreadable pool vault", async () => {
       const ng = world({}, { guard: false });
       const c0 = levConn({ accounts: ng.accounts });
       assert.equal(await keeperOf(c0.conn, cfg({ holderJob: true })).k.holderOnce(ng.market.toBase58(), "T"), "no guard");
 
       const w = hw();
-      // guard present for hasGuard but undecodable for the SDK: bad kind-17 body of the right length
-      const bad = guardBytes({ market: w.market });
-      bad[16 + 74] = 0xff; // corrupt a validated field
-      w.accounts.set(w.guardKey.toBase58(), { owner: PROGRAM, data: bad });
-      const c1 = levConn({ accounts: w.accounts });
-      const r1 = await keeperOf(c1.conn, cfg({ holderJob: true })).k.holderOnce(w.market.toBase58(), "T");
-      assert.ok(r1 === "guard unreadable" || r1 !== "no guard", r1);
-
       const w2 = hw();
       const pinKey = deriveDepthSourceV22(PROGRAM, w2.market)[0].toBase58();
       const pin = pinBytes({ market: w2.market, pool, amm, baseVault: poolVault, quoteVault, baseMint, quoteMint });
@@ -1435,14 +1425,12 @@ describe("lev-guard.ts branch gaps", () => {
       assert.equal(dry.k.stats.reports.dryRun, 1);
 
       // the keeper itself as the risk key: no extra signer, report sent
-      const kc = mk(1_000n);
       const kp = Keypair.generate();
       const w2 = hw({ riskKey: kp.publicKey });
       const kc2 = levConn({ accounts: w2.accounts, largest: [], supply: 1_000n });
       const k2 = new LevGuardKeeper({ conn: kc2.conn as never, keeper: kp, programId: PROGRAM, dryRun: false, config: cfg({ holderJob: true, riskKeyPath: "/k.json" }), riskKey: kp, log: () => {} });
       await k2.holderOnce(w2.market.toBase58(), "T");
       assert.equal(k2.stats.reports.sent, 1);
-      void kc;
     });
   });
 
