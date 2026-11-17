@@ -142,6 +142,7 @@ export class P2bLoop {
       this.ticks++;
       const refs = this.deps.registry.markets.map(toRef);
       summary.markets = refs.length;
+      this.deps.allocator.prune(new Set(refs.map((r) => r.marketAddress)));
       if (refs.length === 0) return summary;
       await this.refreshWallet();
       const snaps = await readVaultMarketSnapshots(this.deps.conn, this.deps.programId, refs);
