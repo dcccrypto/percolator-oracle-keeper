@@ -73,13 +73,14 @@ export function customCodeOf(err: unknown): number | null {
 function customCodeFast(err: unknown): number | undefined {
   if (typeof err !== "object" || err === null || Object.getPrototypeOf(err) !== Object.prototype) return undefined;
   const keys = Object.keys(err);
-  if (keys.length !== 1 || keys[0] !== "InstructionError") return undefined;
+  if (keys.length !== 1 || keys[0] !== "InstructionError" || "toJSON" in err) return undefined;
   const ie = (err as { InstructionError: unknown }).InstructionError;
-  if (!Array.isArray(ie) || ie.length !== 2 || typeof ie[0] !== "number") return undefined;
+  if (!Array.isArray(ie) || Object.getPrototypeOf(ie) !== Array.prototype || "toJSON" in ie) return undefined;
+  if (ie.length !== 2 || Object.keys(ie).length !== 2 || typeof ie[0] !== "number") return undefined;
   const inner = ie[1];
   if (typeof inner !== "object" || inner === null || Object.getPrototypeOf(inner) !== Object.prototype) return undefined;
   const ik = Object.keys(inner);
-  if (ik.length !== 1 || ik[0] !== "Custom") return undefined;
+  if (ik.length !== 1 || ik[0] !== "Custom" || "toJSON" in inner) return undefined;
   const n = (inner as { Custom: unknown }).Custom;
   if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) return undefined;
   return n + 0; // +0 normalises -0

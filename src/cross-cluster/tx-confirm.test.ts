@@ -265,6 +265,16 @@ describe("customCodeOf differential vs the original implementation", () => {
     }
     assert.equal(mismatches, 0);
   });
+  it("toJSON / subclass shapes fall back to the original path", () => {
+    const a: any = [1, { Custom: 5 }]; a.toJSON = () => [1, { Custom: 7 }];
+    const b: any = { InstructionError: [1, { Custom: 5 }] }; Object.defineProperty(b, "toJSON", { value: () => "x", enumerable: false });
+    const c: any = { Custom: 5 }; Object.defineProperty(c, "toJSON", { value: () => ({ Custom: 9 }), enumerable: false });
+    class A extends Array { toJSON() { return "custom program error: 0x10"; } }
+    const d = A.from([1, { Custom: 5 }]);
+    for (const v of [{ InstructionError: a }, b, { InstructionError: [1, c] }, { InstructionError: d }]) {
+      assert.ok(Object.is(customCodeOf(v), original(v)));
+    }
+  });
   it("edge shapes", () => {
     for (const v of [new Error("x"), { toJSON: () => "custom program error: 0x5" }, Object.create({ InstructionError: 1 }), [], {}]) {
       assert.ok(Object.is(customCodeOf(v), original(v)));
