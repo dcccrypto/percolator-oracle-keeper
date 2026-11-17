@@ -306,7 +306,7 @@ describe("tag 103: per-market state is pruned with the registry", () => {
     const r = rig();
     let prev = "";
     for (let i = 0; i < 10_000; i++) {
-      const s = snapshot({ label: `M${i}`, marketAddress: Keypair.generate().publicKey });
+      const s = snapshot({ label: `M${i}` });
       await r.a.runMarket(s);
       r.a.prune(new Set([s.ref.marketAddress]));
       prev = s.ref.marketAddress;
