@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
 import { deriveLpVaultRegistry, parseWrapperConfigV17, V17_PORTFOLIO_ACCOUNT_LEN, LAYOUTS_BY_VERSION } from "@percolatorct/sdk";
 import {
   buildCreateAtaIdempotentIx,
@@ -46,6 +46,8 @@ const AFTER_GRACE = { nowSlot: 500_000_000n + GRACE, resolvedSlot: 500_000_000n 
 const CFG: CleanupConfig = { wrapperProgramId: WRAPPER, nftProgramId: NFT, maxPerCycle: 8, maxAtaCreatesPerCycle: 4, pdaGraceSlots: GRACE, probeTtlMs: 1000, confirm: { statusRetries: 1, statusRetryDelayMs: 0 }, now: () => 0 };
 const ERR = (code: number, ix = 1) => ({ InstructionError: [ix, { Custom: code }] });
 const PF = () => Keypair.generate().publicKey;
+
+type SimResult = { err: unknown; logs?: string[]; post?: number | null };
 
 function withOwner(owner: PublicKey): Buffer {
   const b = Buffer.from(fx("sol-trader-portfolio-v18"));
@@ -86,7 +88,7 @@ const tagsOf = (tx: VersionedTransaction): number[] =>
 interface Opts {
   pfs?: Array<{ pubkey: PublicKey; data: Buffer }>;
   /** Called per simulation with (tags, 0-based sim index, whether it is a watch (chunk) sim). */
-  sim?: (tags: number[], n: number, watch: boolean) => { err: unknown; logs?: string[]; post?: number | null };
+  sim?: (tags: number[], n: number, watch: boolean) => SimResult;
   /** sendRawTransaction behaviour; default returns a signature. Tags passed. */
   send?: (tags: number[]) => string;
   /** Confirm verdict for sends: "landed" (default) or "dropped". */
@@ -139,7 +141,7 @@ function mkConn(o: Opts) {
       const n = calls.sims.length;
       calls.sims.push(t);
       calls.simKeys.push(tx.message.staticAccountKeys.map((k) => k.toBase58()));
-      const r = (o.sim ?? (() => ({ err: null })))(t, n, !!so?.accounts);
+      const r: SimResult = (o.sim ?? ((): SimResult => ({ err: null })))(t, n, !!so?.accounts);
       const post = r.post === undefined ? n + 1 : r.post;
       const accounts = so?.accounts && post !== null ? [{ data: [Buffer.alloc(32, post).toString("base64"), "base64"] }] : undefined;
       return { context: { slot: 1 }, value: { err: r.err, logs: r.logs ?? [], accounts } };
@@ -235,11 +237,11 @@ describe("positionNftFor: record selection", () => {
     if (len === 239) { (o.group ?? SOL).toBuffer().copy(b, 199); b.writeBigUInt64LE(o.id ?? 4n, 231); }
     return { pubkey: PF(), data: b };
   };
-  const connOf = (records: Array<{ pubkey: PublicKey; data: Buffer }>) => ({
-    async getProgramAccounts(_p: PublicKey, cfg: { filters: Array<{ dataSize?: number }> }) {
-      const size = cfg.filters[0].dataSize;
+  const connOf = (records: Array<{ pubkey: PublicKey; data: Buffer }>): Pick<Connection, "getProgramAccounts"> => ({
+    getProgramAccounts: (async (_p: PublicKey, cfg?: { filters?: Array<{ dataSize?: number }> }) => {
+      const size = cfg?.filters?.[0]?.dataSize;
       return records.filter((r) => r.data.length === size).map((r) => ({ pubkey: r.pubkey, account: { data: r.data, owner: NFT, lamports: 1, executable: false } }));
-    },
+    }) as unknown as Connection["getProgramAccounts"],
   });
   const live = { marketGroup: SOL, portfolioId: 4n };
   it("matching v3 record: mint + holder returned", async () => {
