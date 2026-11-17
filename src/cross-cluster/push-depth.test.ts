@@ -13,6 +13,9 @@ import {
   pushDepthEnabled,
   resolvePushDepth,
   encodePushAuthMarkMaybeDepth,
+  encodePushAuthMarkDexMode,
+  PUSH_AUTH_MARK_LEN,
+  PUSH_AUTH_MARK_WITH_DEPTH_LEN,
   DEPTH_SOURCE_PUMPSWAP_CPMM,
 } from "./push-depth.ts";
 import { buildPushAuthMarkIx } from "./auth-mark-pusher.ts";
@@ -252,5 +255,74 @@ describe("quote reserves exposed by the price reader", () => {
     const reserves = new Map<string, bigint>();
     await readAllPoolPricesE6(conn, [{ poolAddress: pool, dexType: "pumpswap", label: "P", symbol: "P" }], new Map([[pool, { base: 6, quote: 6 }]]), undefined, undefined, undefined, reserves);
     assert.equal(reserves.size, 0);
+  });
+});
+
+describe("isqrt / plus2PctDepthE6 against a BigInt reference", () => {
+  // Independent reference: binary search for the largest r with r*r <= n.
+  const refSqrt = (n: bigint): bigint => {
+    let lo = 0n;
+    let hi = 1n << BigInt(Math.floor(n.toString(2).length / 2) + 2);
+    while (lo < hi) {
+      const mid = (lo + hi + 1n) >> 1n;
+      if (mid * mid <= n) lo = mid;
+      else hi = mid - 1n;
+    }
+    return lo;
+  };
+
+  it("isqrt equals floor(sqrt(n)) for small values, perfect squares and their neighbours", () => {
+    const inputs: bigint[] = [0n, 1n, 2n, 3n, 4n, (1n << 64n) - 1n, 1n << 64n, 1n << 128n, (1n << 128n) - 1n, (1n << 128n) + 1n];
+    for (const r of [5n, 9n, 10n, 1000n, 123456789n, (1n << 32n) - 1n, 1n << 32n, (1n << 64n) + 12345n]) inputs.push(r * r - 1n, r * r, r * r + 1n);
+    for (const n of inputs) assert.equal(isqrt(n), refSqrt(n), `isqrt(${n})`);
+    assert.equal(isqrt(0n), 0n);
+    assert.equal(isqrt(1n), 1n);
+    assert.equal(isqrt(2n), 1n);
+    assert.equal(isqrt(3n), 1n);
+    assert.equal(isqrt(4n), 2n);
+    assert.equal(isqrt((1n << 64n) - 1n), (1n << 32n) - 1n);
+    assert.equal(isqrt(1n << 128n), 1n << 64n);
+  });
+
+  it("isqrt rejects a negative input with RangeError", () => {
+    assert.throws(() => isqrt(-1n), RangeError);
+    assert.throws(() => isqrt(-(1n << 100n)), RangeError);
+  });
+
+  it("plus2PctDepthE6 = r - m, m the smallest integer with 51*m^2 >= 50*r^2", () => {
+    const rs: bigint[] = [1n, 2n, 3n, 7n, 50n, 51n, 100n, 999n, 1_000_000n, 25_000_000_000n, 123_456_789_012n, (1n << 64n) - 1n];
+    for (let r = 1n; r <= 200n; r++) rs.push(r);
+    for (const r of rs) {
+      const target = 50n * r * r;
+      let m = 0n; // reference: linear/binary search of the definition, not the production correction loops
+      let lo = 0n;
+      let hi = r;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1n;
+        if (51n * mid * mid >= target) hi = mid;
+        else lo = mid + 1n;
+      }
+      m = lo;
+      assert.ok(51n * m * m >= target, `m satisfies the inequality for r=${r}`);
+      assert.ok(m === 0n || 51n * (m - 1n) * (m - 1n) < target, `m-1 does not for r=${r}`);
+      assert.equal(plus2PctDepthE6(r), r - m, `depth(${r})`);
+    }
+  });
+
+  it("plus2PctDepthE6: zero reserve is 0n, negative throws RangeError", () => {
+    assert.equal(plus2PctDepthE6(0n), 0n);
+    assert.throws(() => plus2PctDepthE6(-1n), RangeError);
+  });
+});
+
+describe("encodePushAuthMarkDexMode", () => {
+  it("is the SDK 35 B + [mode 2][depth 0 u64] (44 B), and the 35 B prefix is byte-identical to the SDK", () => {
+    const args = ARGS;
+    const base = encodePushAuthMark(args);
+    const out = encodePushAuthMarkDexMode(args);
+    assert.equal(out.length, PUSH_AUTH_MARK_WITH_DEPTH_LEN);
+    assert.deepEqual(out.subarray(0, PUSH_AUTH_MARK_LEN), base);
+    assert.equal(out[PUSH_AUTH_MARK_LEN], 2);
+    assert.deepEqual([...out.subarray(PUSH_AUTH_MARK_LEN + 1)], new Array(8).fill(0));
   });
 });
