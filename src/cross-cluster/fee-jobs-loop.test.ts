@@ -213,14 +213,15 @@ describe("startFeeJobLoop", () => {
 
   it("stops on SIGINT as well as SIGTERM", async () => {
     const job: FeeJob = { name: "lp-fee", async run() { return { kind: "nothing" }; } };
+    let reconciles = 0;
     const sink = {
       health: () => {},
       async fire() {},
-      async reconcile() { process.emit("SIGINT"); },
+      async reconcile() { reconciles++; process.emit("SIGINT"); },
     };
     await drive(startFeeJobLoop([job], ctx, registry, cfg, sink as never));
     assert.ok(logs.some((l) => /cycle 0:/.test(l)));
-    assert.ok(!logs.some((l) => /cycle 1:/.test(l)), "stopped after one cycle");
+    assert.equal(reconciles, 1, "stopped after one cycle");
   });
 
   it("an error escaping the per-job sweep is logged (Error and non-Error) and the loop carries on", async () => {

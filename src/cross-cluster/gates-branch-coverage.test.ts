@@ -123,8 +123,10 @@ describe("s16ac-engine-gate", () => {
 
     const st2 = new S16acGateState();
     assert.deepEqual(await s16acEngineDeployed(fakeConn({}), progId, st2, 1000, () => 0), { on: false, state: "unknown" });
-    const throwing = { getAccountInfo: async () => { throw new Error("rpc down"); } };
+    let throwCalls = 0;
+    const throwing = { getAccountInfo: async () => { throwCalls++; throw new Error("rpc down"); } };
     assert.deepEqual(await s16acEngineDeployed(throwing, progId, st2, 1000, () => 1), { on: false, state: "unknown" });
+    assert.equal(throwCalls, 1, "unknown is not served from cache");
     assert.equal(st2.value?.state, "unknown");
   });
   it("s16acEngineDeployed: a known build gates ON and is cached", async () => {
