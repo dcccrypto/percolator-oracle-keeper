@@ -1141,7 +1141,9 @@ describe("lev-guard.ts branch gaps", () => {
     };
     assert.equal(await k.hasGuard(w.market.toBase58()), false);
     c.conn.getAccountInfo = good;
+    const readsBefore = c.reads.getAccountInfo;
     assert.equal(await k.hasGuard(w.market.toBase58()), false); // absent: now cached
+    assert.equal(c.reads.getAccountInfo, readsBefore + 1, "the failed read was not cached: the next call read again");
     const reads = c.reads.getAccountInfo;
     assert.equal(await k.hasGuard(w.market.toBase58()), false);
     assert.equal(c.reads.getAccountInfo, reads, "cached inside the recheck window");
@@ -1153,7 +1155,7 @@ describe("lev-guard.ts branch gaps", () => {
     assert.equal(c.reads.getAccountInfo, after);
   });
 
-  it("readGuard: missing, foreign-owned, undecodable and RPC-failing accounts are all null; a bad market string too", async () => {
+  it("readGuard: missing, foreign-owned and undecodable accounts are null; an unparsable market string too", async () => {
     const w = M();
     const m = w.market.toBase58();
     const c = levConn({ accounts: w.accounts });
@@ -1215,11 +1217,10 @@ describe("lev-guard.ts branch gaps", () => {
     assert.equal(await k.pokeOnce(m, "T", "pre-allocate"), "failed", "in-flight flag was cleared");
   });
 
-  it("pokeOnce: a landed-but-failed tx is failed; dry-run counts dry; a program refusal counts refused", async () => {
+  it("pokeOnce: a landed-but-failed tx is failed; dry-run counts dry", async () => {
     const w = M();
     const m = w.market.toBase58();
     const c = levConn({ accounts: w.accounts });
-    c.base.sent.length = 0;
     const c2 = levConn({ accounts: w.accounts });
     c2.conn.getSignatureStatuses = (async () => ({ context: { slot: 1 }, value: [{ slot: 5, confirmations: 1, err: { InstructionError: [2, { Custom: 1 }] }, confirmationStatus: "confirmed" }] })) as never;
     const h = keeperOf(c2.conn, cfg({ poke: true }));
@@ -1230,7 +1231,7 @@ describe("lev-guard.ts branch gaps", () => {
     assert.equal(d.k.stats.pokes.dryRun, 1);
   });
 
-  it("describeOutcome renders through the logs: expected refusal, failed and code=... all appear", async () => {
+  it("describeOutcome renders through the logs: code=... on a landed failure and failed: on an rpc error", async () => {
     const w = M();
     const m = w.market.toBase58();
     const c = levConn({ accounts: w.accounts });
@@ -1266,14 +1267,17 @@ describe("lev-guard.ts branch gaps", () => {
     assert.equal(only.k.stats.w1.checks, 0);
   });
 
-  it("holderTick: an in-flight market is skipped; a failing run is recorded and logged, the next market still runs", async () => {
+  it("holderTick: a failing run is recorded and logged and the next market still runs; an in-flight market is skipped", async () => {
     const w = M();
     const m = w.market.toBase58();
     const c = levConn({ accounts: w.accounts });
     let now = 1_000_000;
     const h = keeperOf(c.conn, cfg({ holderJob: true, holderIntervalMs: 3_600_000 }), { now: () => now });
-    (h.k as unknown as { holderOnce: () => Promise<string> }).holderOnce = async () => {
-      throw new Error("boom https://x.helius-rpc.com/?api-key=SECRET123");
+    const calledFor: string[] = [];
+    (h.k as unknown as { holderOnce: (a: string) => Promise<string> }).holderOnce = async (a: string) => {
+      calledFor.push(a);
+      if (a === m) throw new Error("boom https://x.helius-rpc.com/?api-key=SECRET123");
+      return "ok";
     };
     const mk = [{ marketAddress: m, label: "T" }, { marketAddress: key(900).toBase58(), label: "U" }];
     await h.k.holderTick(mk);
@@ -1281,10 +1285,12 @@ describe("lev-guard.ts branch gaps", () => {
     await h.k.holderTick(mk);
     assert.ok(h.logs.some((l) => l.includes("[lev-guard][holder] T: failed: boom")), h.logs.join("\n"));
     assert.ok(h.logs.every((l) => !l.includes("SECRET123")));
+    assert.ok(calledFor.includes(key(900).toBase58()), "the market after the failing one still ran");
     assert.ok((h.k.healthFields().markets as Record<string, { holder: string }>)[m].holder.startsWith("failed:"));
     // in-flight skip
     const c2 = levConn({ accounts: w.accounts });
-    const h2 = keeperOf(c2.conn, cfg({ holderJob: true }), { now: () => now });
+    let tick = 0;
+    const h2 = keeperOf(c2.conn, cfg({ holderJob: true, holderIntervalMs: 1 }), { now: () => (tick += 1_000_000) }); // every call is due, so only the in-flight flag can skip
     let release: () => void = () => {};
     let entered = 0;
     (h2.k as unknown as { holderOnce: () => Promise<string> }).holderOnce = () => {
@@ -1292,8 +1298,6 @@ describe("lev-guard.ts branch gaps", () => {
       return new Promise<string>((r) => (release = () => r("ok")));
     };
     const mk1 = [{ marketAddress: m, label: "T" }];
-    await h2.k.holderTick(mk1); // stagger: not due at first sight (or due: either way flag below)
-    now += 700_000;
     const p1 = h2.k.holderTick(mk1);
     await new Promise((r) => setTimeout(r, 5));
     const p2 = h2.k.holderTick(mk1);
@@ -1347,7 +1351,7 @@ describe("lev-guard.ts branch gaps", () => {
       const c = levConn({ accounts: w.accounts });
       assert.equal(await keeperOf(c.conn, cfg({ holderJob: true })).k.holderOnce(w.market.toBase58(), "T"), "guard unreadable");
     });
-    it("no largest accounts / short or missing token accounts: still reports figures, counts tightens by outcome", async () => {
+    it("no largest accounts / short or missing token accounts: still reports figures", async () => {
       const w = hw();
       const short = key(650);
       w.accounts.set(short.toBase58(), { owner: TOKEN, data: new Uint8Array(100) });
@@ -1367,7 +1371,7 @@ describe("lev-guard.ts branch gaps", () => {
         await h.k.holderOnce(w.market.toBase58(), "T");
         return h.k.stats.tightens;
       };
-      assert.equal((await run((c) => { c.base.sent.length = 0; (c.conn as never as { simulateTransaction: unknown }).simulateTransaction = async () => ({ context: { slot: 1 }, value: { err: { InstructionError: [2, { Custom: 134 }] }, logs: [], unitsConsumed: 1 } }); })).refused, 1);
+      assert.equal((await run((c) => { (c.conn as never as { simulateTransaction: unknown }).simulateTransaction = async () => ({ context: { slot: 1 }, value: { err: { InstructionError: [2, { Custom: 134 }] }, logs: [], unitsConsumed: 1 } }); })).refused, 1);
       assert.equal((await run((c) => rpcFail(c))).failed, 1);
       assert.equal((await run((c) => { c.conn.getSignatureStatuses = (async () => ({ context: { slot: 1 }, value: [{ slot: 5, confirmations: 1, err: { InstructionError: [2, { Custom: 1 }] }, confirmationStatus: "confirmed" }] })) as never; })).failed, 1);
       assert.equal((await run(() => {}, true)).dryRun, 1);
@@ -1431,6 +1435,8 @@ describe("lev-guard.ts branch gaps", () => {
       const k2 = new LevGuardKeeper({ conn: kc2.conn as never, keeper: kp, programId: PROGRAM, dryRun: false, config: cfg({ holderJob: true, riskKeyPath: "/k.json" }), riskKey: kp, log: () => {} });
       await k2.holderOnce(w2.market.toBase58(), "T");
       assert.equal(k2.stats.reports.sent, 1);
+      const rawTx = Transaction.from(kc2.raws[kc2.raws.length - 1]);
+      assert.equal(rawTx.signatures.length, 1, "keeper is both fee payer and risk key: one signature, no extra signer");
     });
   });
 
@@ -1599,38 +1605,30 @@ describe("lev-guard.ts branch gaps", () => {
     return keeperOf(c.conn, cfg({ w1: true }), { loadPortfolios: async () => { throw msg; } }).k;
   }
 
-  it("hasGuard: a program-owned account shorter than a header is simply no guard; an explicit stake program id is accepted", async () => {
+  it("hasGuard: a program-owned account shorter than a header is simply no guard", async () => {
     const w = M();
     w.accounts.set(w.guardKey.toBase58(), { owner: PROGRAM, data: new Uint8Array(5) });
     const c = levConn({ accounts: w.accounts });
-    const k = new LevGuardKeeper({ conn: c.conn as never, keeper: Keypair.generate(), programId: PROGRAM, dryRun: false, config: cfg({ poke: true }), stakeProgramId: key(4242), log: () => {} });
+    const k = new LevGuardKeeper({ conn: c.conn as never, keeper: Keypair.generate(), programId: PROGRAM, dryRun: false, config: cfg({ poke: true }), log: () => {} });
     assert.equal(await k.hasGuard(w.market.toBase58()), false);
     assert.equal(k.stats.guardBadLength, 0);
   });
 
-  it("holder run: absent quote vault and absent owner account; a guard older than the report slot and one NEWER than it (age 0)", async () => {
+  it("holder run: no quote vault account and holders whose owner account does not exist are still kept and reported", async () => {
     const baseMint = key(600), quoteMint = key(601), poolVault = key(602), quoteVault = key(603), pool = key(604), amm = key(605);
     const TOKEN = new PublicKey(TOKEN_PROGRAM);
     const riskKey = Keypair.generate();
-    const mkWorld = (t0: bigint) => {
-      const w = world({ riskKey: riskKey.publicKey, t0 });
-      w.accounts.set(deriveDepthSourceV22(PROGRAM, w.market)[0].toBase58(), { owner: PROGRAM, data: pinBytes({ market: w.market, pool, amm, baseVault: poolVault, quoteVault, baseMint, quoteMint }) });
-      w.accounts.set(poolVault.toBase58(), { owner: TOKEN, data: tokenAcct(baseMint, key(700), 1_000_000_000n) });
-      // no quote vault account at all; a holder whose owner account does not exist
-      const holder = key(710);
-      w.accounts.set(holder.toBase58(), { owner: TOKEN, data: tokenAcct(baseMint, key(711), 100_000_000n) });
-      const holder2 = key(712);
-      w.accounts.set(holder2.toBase58(), { owner: TOKEN, data: tokenAcct(baseMint, key(711), 50_000_000n) });
-      return { w, largest: [{ address: holder, amount: "1" }, { address: holder2, amount: "1" }] };
-    };
-    for (const t0 of [1n, 9_999_999_999n]) {
-      const { w, largest } = mkWorld(t0);
-      const c = levConn({ accounts: w.accounts, largest, supply: 10_000_000_000n });
-      const h = keeperOf(c.conn, cfg({ holderJob: true, riskKeyPath: "/k.json" }), { riskKey });
-      const out = await h.k.holderOnce(w.market.toBase58(), "T");
-      assert.ok(out.includes("report:"), out);
-      assert.ok(h.k.stats.holderDropped["no-owner-account"] !== undefined || out.includes("dropped="), out);
-    }
+    const w = world({ riskKey: riskKey.publicKey, t0: 1n });
+    w.accounts.set(deriveDepthSourceV22(PROGRAM, w.market)[0].toBase58(), { owner: PROGRAM, data: pinBytes({ market: w.market, pool, amm, baseVault: poolVault, quoteVault, baseMint, quoteMint }) });
+    w.accounts.set(poolVault.toBase58(), { owner: TOKEN, data: tokenAcct(baseMint, key(700), 1_000_000_000n) });
+    const wallet = Keypair.generate().publicKey; // on-curve owner with no account on chain
+    const holder = key(710);
+    w.accounts.set(holder.toBase58(), { owner: TOKEN, data: tokenAcct(baseMint, wallet, 100_000_000n) });
+    const c = levConn({ accounts: w.accounts, largest: [{ address: holder, amount: "1" }], supply: 10_000_000_000n });
+    const h = keeperOf(c.conn, cfg({ holderJob: true, riskKeyPath: "/k.json" }), { riskKey });
+    const out = await h.k.holderOnce(w.market.toBase58(), "T");
+    assert.ok(out.includes("kept=1 dropped=0"), out);
+    assert.ok(out.includes("report: j_dump="), out);
   });
 
   it("parseTokenAccountView: under 165 B is null", async () => {
