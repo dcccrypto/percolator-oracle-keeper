@@ -108,6 +108,8 @@ describe("lead 4: warn / matured boundary vs market-state staleResolveWindow", (
         const d = market({ stale, lastGood: NOW - age });
         const band = priceBandOf(d, NOW);
         const w = staleResolveWindow(d, NOW)!;
+        assert.ok(w.enabled, `window enabled stale=${stale}`);
+        if (!w.enabled) continue;
         const expect = w.matured ? "matured" : age * 10_000n >= stale * 5_000n ? "warn" : "fresh";
         assert.equal(band.kind, expect, `stale=${stale} age=${age}`);
         if (band.kind === "warn") assert.equal(band.remainingSlots, w.remaining);
