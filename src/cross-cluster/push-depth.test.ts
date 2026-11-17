@@ -294,7 +294,7 @@ describe("isqrt / plus2PctDepthE6 against a BigInt reference", () => {
     for (let r = 1n; r <= 200n; r++) rs.push(r);
     for (const r of rs) {
       const target = 50n * r * r;
-      let m = 0n; // reference: linear/binary search of the definition, not the production correction loops
+
       let lo = 0n;
       let hi = r;
       while (lo < hi) {
@@ -302,7 +302,7 @@ describe("isqrt / plus2PctDepthE6 against a BigInt reference", () => {
         if (51n * mid * mid >= target) hi = mid;
         else lo = mid + 1n;
       }
-      m = lo;
+      const m = lo;
       assert.ok(51n * m * m >= target, `m satisfies the inequality for r=${r}`);
       assert.ok(m === 0n || 51n * (m - 1n) * (m - 1n) < target, `m-1 does not for r=${r}`);
       assert.equal(plus2PctDepthE6(r), r - m, `depth(${r})`);
