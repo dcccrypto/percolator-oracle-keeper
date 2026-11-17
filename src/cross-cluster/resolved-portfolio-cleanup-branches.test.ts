@@ -100,7 +100,7 @@ interface Opts {
   blockhashThrows?: boolean;
 }
 function mkConn(o: Opts) {
-  const calls = { sims: [] as number[][], sent: [] as number[][], gpaFilters: [] as unknown[], multiCalls: 0 };
+  const calls = { simKeys: [] as string[][], sims: [] as number[][], sent: [] as number[][], gpaFilters: [] as unknown[], multiCalls: 0 };
   let sentSigs = 0;
   const lastTags: number[][] = [];
   const conn = {
@@ -138,6 +138,7 @@ function mkConn(o: Opts) {
       const t = tagsOf(tx);
       const n = calls.sims.length;
       calls.sims.push(t);
+      calls.simKeys.push(tx.message.staticAccountKeys.map((k) => k.toBase58()));
       const r = (o.sim ?? (() => ({ err: null })))(t, n, !!so?.accounts);
       const post = r.post === undefined ? n + 1 : r.post;
       const accounts = so?.accounts && post !== null ? [{ data: [Buffer.alloc(32, post).toString("base64"), "base64"] }] : undefined;
@@ -314,6 +315,7 @@ describe("discovery and gate", () => {
     const r = await run(c);
     assert.equal(r.support, "unsupported");
     assert.equal(r.remaining.length, 2);
+    assert.ok(c.calls.simKeys[0].includes(plain.toBase58()) && !c.calls.simKeys[0].includes(esc.toBase58()), "probe named the plain portfolio, not the escrowed one");
   });
   it("support verdict is cached within the TTL (one probe across two cycles) and re-probed after it", async () => {
     const st = new CleanupState();
@@ -406,16 +408,26 @@ describe("ordinary portfolios: skip / retry paths", () => {
     assert.equal(r.remaining[0].reason.length, 120);
     assert.equal(r.closed, 1, "second portfolio closed despite the first one's exception");
   });
-  it("chunk path: progress then tag 8 refused every time -> 'made progress, not done', ATA budget counted", async () => {
+  it("chunk path: progress then tag 8 refused every time -> 'made progress, not done', ATA create counted against the budget", async () => {
     const c = mkConn({
       pfs: [{ pubkey: PF(), data: withOwner(WALLET) }],
       multi: (keys) => keys.map(() => null),
-      sim: supported((t, _n, watch) => (watch ? { err: null, post: t.includes(30) ? 1 : 1 } : { err: ERR(61, t.length) })),
+      sim: supported((t, _n, watch) => (watch ? { err: null, post: 1 } : { err: ERR(61, t.length) })),
     });
     const r = await run(c);
     assert.equal(r.closed, 0);
     assert.equal(r.progressed, 1);
     assert.match(r.remaining[0].reason, /CloseResolved made progress \(1 chunk call\(s\)\), not done/);
+    assert.ok(c.calls.sent[0].includes(-1), "the chunk carried the ATA create");
+  });
+  it("chunk path: ATA creates in chunked closes consume the per-cycle budget (second portfolio skipped)", async () => {
+    const c = mkConn({
+      pfs: [{ pubkey: PF(), data: withOwner(WALLET) }, { pubkey: PF(), data: withOwner(Keypair.generate().publicKey) }],
+      multi: (keys) => keys.map(() => null),
+      sim: supported((t, _n, watch) => (watch ? { err: null, post: 1 } : { err: ERR(61, t.length) })),
+    });
+    const r = await run(c, { cfg: { maxAtaCreatesPerCycle: 1 } });
+    assert.ok(r.remaining.some((x) => /ATA-create budget for this cycle used/.test(x.reason)));
   });
   it("chunk path: the first chunk sim itself errors -> falls to the (a) error report (no chunk sent)", async () => {
     const c = mkConn({ pfs: [{ pubkey: PF(), data: withOwner(WALLET) }], sim: supported((t) => ({ err: ERR(61, t.length) })) });
@@ -423,9 +435,8 @@ describe("ordinary portfolios: skip / retry paths", () => {
     assert.equal(c.calls.sent.length, 0);
     assert.equal(r.progressed, 0);
   });
-  it("chunk path: a chunk that would change nothing is never sent; reason 'would make no progress'", async () => {
-    // sim post == baseline? the stub's post bytes (32 x n) never equal real portfolio data, so force an error-free
-    // first probe then an identical post on the loop's sim.
+  it("chunk path: a chunk with no returned post-state is never sent; reason 'would make no progress'", async () => {
+    // The RPC returns no post-state for the loop's sim: treated as no progress, never sent.
     let watchN = 0;
     const c = mkConn({
       pfs: [{ pubkey: PF(), data: withOwner(WALLET) }],
@@ -522,7 +533,9 @@ describe("PDA-owned portfolios: error paths", () => {
       assert.equal(c.calls.sent.length, 0);
       assert.equal(r.closed, 0);
       assert.equal(r.vaultLpSettled, 0);
-      assert.match(r.remaining[0].reason, /vault LP: not closable this cycle \(ix 2 Custom\(21\)\)/);
+      // NOTE: the first chunk carries an ATA create at ix 1, so the 101 error sits at ix 2 and runChunks' {1: label} map
+    // cannot name it: the reason shows "ix 2". Cosmetic source quirk, pinned here so a label fix is a deliberate change.
+    assert.match(r.remaining[0].reason, /vault LP: not closable this cycle \(ix 2 Custom\(21\)\)/);
     });
     it("101(0) lands one chunk then makes no progress and tag 8 stays refused: 'made progress, not done'", async () => {
       let w = 0;
@@ -560,10 +573,15 @@ describe("PDA-owned portfolios: error paths", () => {
       assert.match(r.remaining[0].reason, /per-cycle cap of 1 VaultLpSettleResolved\(0\) chunk calls reached/);
       assert.equal(r.progressed, 1);
     });
-    it("an exception in the vault-LP path is caught and reported, with the receipt sweep still gated off", async () => {
-      const c = mkConn({ pfs: [{ pubkey: lp, data: withOwner(REGISTRY) }], vaultLp, sim: supported(() => { throw new Error("vlp boom"); }) });
+    it("an exception in the vault-LP path is caught and reported, and the receipt sweep stays gated off while the LP is unsettled", async () => {
+      const c = mkConn({
+        pfs: [{ pubkey: lp, data: withOwner(REGISTRY) }, { pubkey: PF(), data: emptyPf(WALLET, { present: true, finalized: false }) }],
+        vaultLp,
+        sim: supported((t) => { if (t.includes(101) || t.includes(1011)) throw new Error("vlp boom"); return { err: null }; }),
+      });
       const r = await run(c, { clock: AFTER_GRACE });
-      assert.equal(r.remaining[0].reason, "vlp boom");
+      assert.ok(r.remaining.some((x) => x.reason === "vlp boom"));
+      assert.ok(!c.calls.sent.some((x) => x.includes(46)), "no tag 46 before the vault LP closes");
       assert.deepEqual(r.topupSwept, []);
     });
   });
@@ -625,13 +643,13 @@ describe("resolved-receipt revisit: refusal paths", () => {
     assert.ok(r.remaining.some((x) => /tag-46 sweep over the 1-per-cycle bound; next cycle/.test(x.reason)));
     assert.equal(r.topupSwept.length, 1);
   });
-  it("re-read of the portfolios fails: the sweep is skipped, nothing sent for receipts", async () => {
+  it("re-read of the portfolios fails (chunk read comes back empty): the sweep skips them even though 46 would simulate OK", async () => {
     const pf = PF();
     let calls = 0;
     const c = mkConn({
       pfs: [{ pubkey: pf, data: emptyPf(WALLET, open) }],
       multi: (keys) => { if (calls++ === 0) return keys.map(() => ({ data: Buffer.alloc(165) })); throw new Error("rpc"); },
-      sim: supported((t) => ({ err: ERR(21, t.length) })),
+      sim: supported((t) => (t.includes(46) ? { err: null } : { err: ERR(21, t.length) })),
     });
     const r = await run(c, { clock: AFTER_GRACE });
     assert.ok(!c.calls.sent.some((s) => s.includes(46)));
@@ -639,12 +657,10 @@ describe("resolved-receipt revisit: refusal paths", () => {
   });
   it("an exception in one sweep entry is caught and reported", async () => {
     const pf = PF();
-    let n = 0;
     const c = mkConn({
       pfs: [{ pubkey: pf, data: emptyPf(WALLET, open) }],
       sim: supported((t) => { if (t.includes(46)) throw new Error("sweep boom"); return { err: ERR(21, t.length) }; }),
     });
-    void n;
     const r = await run(c, { clock: AFTER_GRACE });
     assert.ok(r.remaining.some((x) => x.reason === "sweep boom"));
   });
