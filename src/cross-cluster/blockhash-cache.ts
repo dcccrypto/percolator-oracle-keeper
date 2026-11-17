@@ -40,10 +40,17 @@ export async function getCachedBlockhash(
   if (hit && now - hit.at <= maxAge) return hit.value;
   const pending = inflight.get(key);
   if (pending) return pending;
+  // Start the RPC call outside the IIFE so a synchronous throw becomes a rejection awaited below,
+  // i.e. `finally` can never run before `p` is assigned.
+  let started: Promise<{ blockhash: string; lastValidBlockHeight: number }>;
+  try {
+    started = Promise.resolve(conn.getLatestBlockhash(commitment));
+  } catch (e) {
+    started = Promise.reject(e);
+  }
   const p: Promise<CachedBlockhash> = (async () => {
     try {
-      await undefined; // never run the RPC call (or `finally`) before `p` is assigned, even if it throws synchronously
-      const v = await conn.getLatestBlockhash(commitment);
+      const v = await started;
       const value = { blockhash: v.blockhash, lastValidBlockHeight: v.lastValidBlockHeight };
       // Superseded by an invalidate while in flight: hand the value to its own callers but do not cache it.
       // `at` is the fetch START: the hash is at least that old by the time a slow RPC returns.
