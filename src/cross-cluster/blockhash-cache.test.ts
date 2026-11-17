@@ -133,3 +133,17 @@ test("invalidate only drops the matching endpoint, all commitments", async () =>
   a.resolveNext({ blockhash: "y", lastValidBlockHeight: 2 });
   await p;
 });
+
+test("synchronous throw from getLatestBlockhash surfaces the real error and is not cached", async () => {
+  let n = 0;
+  const c = {
+    rpcEndpoint: "sync",
+    getLatestBlockhash: (): Promise<Res> => {
+      n++;
+      throw new Error("sync boom");
+    },
+  };
+  await assert.rejects(getCachedBlockhash(c as any, "confirmed"), /sync boom/);
+  await assert.rejects(getCachedBlockhash(c as any, "confirmed"), /sync boom/);
+  assert.equal(n, 2);
+});

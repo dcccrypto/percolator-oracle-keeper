@@ -42,6 +42,7 @@ export async function getCachedBlockhash(
   if (pending) return pending;
   const p: Promise<CachedBlockhash> = (async () => {
     try {
+      await undefined; // never run the RPC call (or `finally`) before `p` is assigned, even if it throws synchronously
       const v = await conn.getLatestBlockhash(commitment);
       const value = { blockhash: v.blockhash, lastValidBlockHeight: v.lastValidBlockHeight };
       // Superseded by an invalidate while in flight: hand the value to its own callers but do not cache it.
