@@ -2,6 +2,9 @@
  * Test helpers for the v2.2 layer: a recording fake Connection (simulate / send / confirm), a synthetic variant-B
  * market account, and hand-built positioned portfolios. Not a test file (the glob only runs *.test.ts).
  */
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import { LAYOUT_V22, WRAPPER_ACCOUNT_MAGIC } from "@percolatorct/sdk";
 import type { PositionedPortfolio } from "../positioned-refresh.ts";
@@ -146,8 +149,13 @@ export function v22MarketBytes(o: { slots?: number; version?: number; band?: boo
   return new Uint8Array(b);
 }
 
+function fixtureRegistry(): Buffer {
+  return Buffer.from(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "__fixtures__", "solcat-lp-vault-registry-v18.b64"), "utf8").trim(), "base64");
+}
+
 export function registryBytes(o: { bound?: boolean; ext?: boolean; bond?: boolean } = {}): Uint8Array {
-  const b = Buffer.alloc(176);
+  // A parseable registry (real header, domain 0) with the three flag bytes patched.
+  const b = Buffer.from(fixtureRegistry());
   b[160] = o.bound ? 1 : 0;
   b[161] = o.ext ? 1 : 0;
   b[162] = o.bond ? 1 : 0;

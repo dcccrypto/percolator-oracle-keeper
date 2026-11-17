@@ -159,18 +159,21 @@ export function buildV22MarketCtx(p: {
   let ext = false;
   let bond = false;
   if (p.registryData) {
+    let parsed = true;
     try {
       registryDomain = Number(parseLpVaultRegistry(p.registryData).domain);
     } catch {
-      // domain stays 0; the flags below are read from their own bytes
+      parsed = false; // domain unknown (0 is a valid domain): leave every flag false so the jobs skip
     }
-    try {
-      bound = lpVaultRegistryBound(p.registryData);
-    } catch {
-      bound = false; // an invalid bound byte reads as unbound: the jobs that need the vault skip
+    if (parsed) {
+      try {
+        bound = lpVaultRegistryBound(p.registryData);
+      } catch {
+        bound = false; // an invalid bound byte reads as unbound: the jobs that need the vault skip
+      }
+      ext = lpVaultRegistryExtFlag(p.registryData);
+      bond = lpVaultRegistryBondFlag(p.registryData);
     }
-    ext = lpVaultRegistryExtFlag(p.registryData);
-    bond = lpVaultRegistryBondFlag(p.registryData);
   }
   const vaultLpState = deriveVaultLpState(p.programId, market);
   const st = p.vaultLpStateData ? decodeVaultLpState(p.vaultLpStateData) : null;
