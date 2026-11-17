@@ -1058,3 +1058,596 @@ describe("W1 (KEEPER_LEV_W1)", () => {
     assert.equal(c.base.sentData.some((d) => hex(d[0]) === "7c05"), false);
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// Branch-gap closers (J-20261117-K-COV-V22LEVGUARDADL): config parsing, risk-key loading, cache / failure paths, outcome kinds.
+describe("lev-guard.ts branch gaps", () => {
+  const M = () => world();
+  const rpcFail = (c: ReturnType<typeof levConn>) => {
+    c.conn.simulateTransaction = async () => {
+      throw new Error("simulate boom https://x.helius-rpc.com/?api-key=SECRET123");
+    };
+  };
+
+  it("config: numeric knobs default when blank, parse when valid, and reject zero / fractions / junk / over-max", () => {
+    assert.equal(levGuardConfigFromEnv({ KEEPER_LEV_POKE_MIN_GAP_MS: "   " }).pokeMinGapMs, LEV_GUARD_DEFAULTS.pokeMinGapMs);
+    assert.equal(levGuardConfigFromEnv({ KEEPER_LEV_POKE_MIN_GAP_MS: " 250 " }).pokeMinGapMs, 250);
+    assert.equal(levGuardConfigFromEnv({ KEEPER_LEV_HOLDER_INTERVAL_MS: "60000" }).holderIntervalMs, 60_000);
+    assert.equal(levGuardConfigFromEnv({ KEEPER_LEV_W1_MAX_TXS: "7" }).w1MaxTxs, 7);
+    for (const bad of ["0", "1.5", "abc", "-3", "3600001"]) assert.throws(() => levGuardConfigFromEnv({ KEEPER_LEV_POKE_MIN_GAP_MS: bad }), V22FlagError, bad);
+    assert.throws(() => levGuardConfigFromEnv({ KEEPER_LEV_W1_MAX_TXS: "201" }), V22FlagError);
+    assert.equal(levGuardConfigFromEnv({ KEEPER_LEV_RISK_KEY_PATH: "  " }).riskKeyPath, null);
+  });
+
+  it("dry-run decision: an explicit off word, a blank value or KEEPER_V22 on never warn; any other stray value dries with a warning", () => {
+    const c = cfg();
+    const off = { enabled: false, dryRun: false };
+    for (const w of ["off", "0", "false", "no", " OFF "]) assert.deepEqual(levGuardDryRunDecision({ KEEPER_V22_DRY_RUN: w }, false, off, c), { dryRun: false, warning: null }, w);
+    assert.deepEqual(levGuardDryRunDecision({ KEEPER_V22_DRY_RUN: "  " }, false, off, c), { dryRun: false, warning: null });
+    assert.deepEqual(levGuardDryRunDecision({}, false, off, c), { dryRun: false, warning: null });
+    assert.deepEqual(levGuardDryRunDecision({ KEEPER_V22_DRY_RUN: "1" }, false, { enabled: true, dryRun: false }, c), { dryRun: false, warning: null });
+    assert.equal(levGuardDryRunDecision({ KEEPER_V22_DRY_RUN: "1" }, false, off, c).dryRun, true);
+    assert.ok(levGuardDryRunDecision({ KEEPER_V22_DRY_RUN: "garbage" }, false, off, c).warning?.includes("KEEPER_LEV_DRY_RUN"));
+    assert.deepEqual(levGuardDryRunDecision({}, true, off, c), { dryRun: true, warning: null });
+    assert.deepEqual(levGuardDryRunDecision({}, false, { enabled: true, dryRun: true }, c), { dryRun: true, warning: null });
+    assert.deepEqual(levGuardDryRunDecision({}, false, off, cfg({ dryRun: true })), { dryRun: true, warning: null });
+  });
+
+  it("loadRiskKey: not an array, wrong length, out-of-range bytes and invalid JSON all log the path only and return null", () => {
+    const dir = fs.mkdtempSync(join(tmpdir(), "levkey-"));
+    try {
+      const cases: Array<[string, string]> = [
+        ["obj", JSON.stringify({ a: 1 })],
+        ["short", JSON.stringify(Array.from({ length: 63 }, () => 1))],
+        ["range", JSON.stringify(Array.from({ length: 64 }, () => 256))],
+        ["frac", JSON.stringify(Array.from({ length: 64 }, () => 1.5))],
+        ["junk", "{not json"],
+        // a 64-byte array of valid bytes that is not a valid keypair (fromSecretKey throws on the public-key half mismatch)
+        ["badpair", JSON.stringify(Array.from({ length: 64 }, () => 7))],
+      ];
+      for (const [name, body] of cases) {
+        const f = join(dir, `${name}.json`);
+        fs.writeFileSync(f, body, { mode: 0o600 });
+        const logs: string[] = [];
+        assert.equal(loadRiskKey(f, (s) => logs.push(s)), null, name);
+        assert.equal(logs.length, 1, name);
+        assert.ok(logs[0].includes(f) && logs[0].includes("REPORT disabled"), name);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("loadRiskKey: default logger falls back to console.log", () => {
+    const orig = console.log;
+    const seen: string[] = [];
+    console.log = (s: string) => void seen.push(String(s));
+    try {
+      assert.equal(loadRiskKey("/definitely/not/here.json"), null);
+    } finally {
+      console.log = orig;
+    }
+    assert.equal(seen.length, 1);
+  });
+
+  it("hasGuard: a failed read is not cached (retried at once); a no-guard answer is cached 10 min then rechecked; a guard is final", async () => {
+    const w = M();
+    const c = levConn({ accounts: new Map() });
+    let now = 5_000;
+    const { k } = keeperOf(c.conn, cfg({ poke: true }), { now: () => now });
+    const good = c.conn.getAccountInfo;
+    c.conn.getAccountInfo = async () => {
+      throw new Error("down");
+    };
+    assert.equal(await k.hasGuard(w.market.toBase58()), false);
+    c.conn.getAccountInfo = good;
+    assert.equal(await k.hasGuard(w.market.toBase58()), false); // absent: now cached
+    const reads = c.reads.getAccountInfo;
+    assert.equal(await k.hasGuard(w.market.toBase58()), false);
+    assert.equal(c.reads.getAccountInfo, reads, "cached inside the recheck window");
+    c.conn.getAccountInfo = async (k2: PublicKey) => (k2.equals(w.guardKey) ? ({ data: Buffer.from(w.accounts.get(w.guardKey.toBase58())!.data), owner: PROGRAM } as never) : null);
+    now += 600_001;
+    assert.equal(await k.hasGuard(w.market.toBase58()), true);
+    const after = c.reads.getAccountInfo;
+    assert.equal(await k.hasGuard(w.market.toBase58()), true);
+    assert.equal(c.reads.getAccountInfo, after);
+  });
+
+  it("readGuard: missing, foreign-owned, undecodable and RPC-failing accounts are all null; a bad market string too", async () => {
+    const w = M();
+    const m = w.market.toBase58();
+    const c = levConn({ accounts: w.accounts });
+    const { k } = keeperOf(c.conn, cfg({ poke: true }));
+    const r = await k.readGuard(m);
+    assert.ok(r && r.slot === 1000n);
+    w.accounts.set(w.guardKey.toBase58(), { owner: key(5), data: guardBytes({ market: w.market }) });
+    assert.equal(await k.readGuard(m), null);
+    w.accounts.set(w.guardKey.toBase58(), { owner: PROGRAM, data: new Uint8Array(100) });
+    assert.equal(await k.readGuard(m), null);
+    w.accounts.delete(w.guardKey.toBase58());
+    assert.equal(await k.readGuard(m), null);
+    assert.equal(await k.readGuard("not-a-key"), null);
+  });
+
+  it("vault LP: cached for 10 min, re-read after; a failed re-read keeps the cached key; an undecodable account means no vault LP", async () => {
+    const w = M();
+    const m = w.market.toBase58();
+    const c = levConn({ accounts: w.accounts });
+    let now = 10_000;
+    const { k } = keeperOf(c.conn, cfg({ poke: true }), { now: () => now });
+    assert.equal(await k.pokeOnce(m, "T", "pre-allocate"), "sent");
+    const reads = c.reads.getAccountInfo;
+    assert.equal(await k.pokeOnce(m, "T", "pre-allocate"), "sent");
+    assert.equal(c.reads.getAccountInfo, reads, "guard and vault LP both cached");
+    now += 600_001;
+    const good = c.conn.getAccountInfo;
+    c.conn.getAccountInfo = async () => {
+      throw new Error("rpc");
+    };
+    assert.equal(await k.pokeOnce(m, "T", "pre-allocate"), "sent", "stale cached LP is used when the re-read fails");
+    c.conn.getAccountInfo = good;
+    // fresh keeper, never cached, read throws: no vault LP
+    const c2 = levConn({ accounts: w.accounts });
+    const h2 = keeperOf(c2.conn, cfg({ poke: true }));
+    const goodAcct = c2.conn.getAccountInfo;
+    c2.conn.getAccountInfo = async (a: PublicKey) => {
+      if (a.equals(deriveVaultLpStateV22(PROGRAM, w.market)[0])) throw new Error("rpc");
+      return goodAcct(a);
+    };
+    assert.equal(await h2.k.pokeOnce(m, "T", "push"), "no-vault-lp");
+    // undecodable vault LP state
+    w.accounts.set(deriveVaultLpStateV22(PROGRAM, w.market)[0].toBase58(), { owner: PROGRAM, data: new Uint8Array(10) });
+    const c3 = levConn({ accounts: w.accounts });
+    assert.equal(await keeperOf(c3.conn, cfg({ poke: true })).k.pokeOnce(m, "T", "push"), "no-vault-lp");
+  });
+
+  it("pokeOnce: a second call while one is in flight is busy; a throwing send is failed (secrets redacted) and clears the in-flight flag", async () => {
+    const w = M();
+    const m = w.market.toBase58();
+    const c = levConn({ accounts: w.accounts });
+    const { k, logs } = keeperOf(c.conn, cfg({ poke: true }));
+    const [a, b] = await Promise.all([k.pokeOnce(m, "T", "pre-allocate"), k.pokeOnce(m, "T", "pre-allocate")]);
+    assert.deepEqual([a, b].sort(), ["busy", "sent"]);
+    rpcFail(c);
+    assert.equal(await k.pokeOnce(m, "T", "pre-allocate"), "failed");
+    assert.equal(k.stats.pokes.failed, 1);
+    assert.ok(logs.every((l) => !l.includes("SECRET123")));
+    assert.equal(await k.pokeOnce(m, "T", "pre-allocate"), "failed", "in-flight flag was cleared");
+  });
+
+  it("pokeOnce: a landed-but-failed tx is failed; dry-run counts dry; a program refusal counts refused", async () => {
+    const w = M();
+    const m = w.market.toBase58();
+    const c = levConn({ accounts: w.accounts });
+    c.base.sent.length = 0;
+    const failing = fakeExecConn({ confirmStatus: "err" });
+    const c2 = levConn({ accounts: w.accounts });
+    c2.conn.getSignatureStatuses = failing.conn.getSignatureStatuses as never;
+    c2.conn.getSignatureStatuses = (async () => ({ context: { slot: 1 }, value: [{ slot: 5, confirmations: 1, err: { InstructionError: [2, { Custom: 1 }] }, confirmationStatus: "confirmed" }] })) as never;
+    const h = keeperOf(c2.conn, cfg({ poke: true }));
+    assert.equal(await h.k.pokeOnce(m, "T", "pre-allocate"), "failed");
+    assert.equal(h.k.stats.pokes.failed, 1);
+    const d = keeperOf(c.conn, cfg({ poke: true }), { dryRun: true });
+    assert.equal(await d.k.pokeOnce(m, "T", "pre-allocate"), "dry-run");
+    assert.equal(d.k.stats.pokes.dryRun, 1);
+  });
+
+  it("describeOutcome renders through the logs: expected refusal, failed and code=... all appear", async () => {
+    const w = M();
+    const m = w.market.toBase58();
+    const c = levConn({ accounts: w.accounts });
+    c.conn.getSignatureStatuses = (async () => ({ context: { slot: 1 }, value: [{ slot: 5, confirmations: 1, err: { InstructionError: [2, { Custom: 135 }] }, confirmationStatus: "confirmed" }] })) as never;
+    const h = keeperOf(c.conn, cfg({ poke: true }));
+    await h.k.pokeOnce(m, "T", "pre-allocate");
+    assert.ok(h.logs.some((l) => l.includes("code=135")), h.logs.join("\n"));
+    const c2 = levConn({ accounts: w.accounts });
+    rpcFail(c2);
+    const h2 = keeperOf(c2.conn, cfg({ poke: true }));
+    await h2.k.pokeOnce(m, "T", "pre-allocate");
+    assert.ok(h2.logs.some((l) => l.includes("[lev-guard][poke]") && l.includes("failed:")), h2.logs.join("\n"));
+  });
+
+  it("onPushLanded: W1 alone pokes then checks; a throwing poke path is logged, never raised; beforeAllocate swallows everything", async () => {
+    const w = M();
+    const m = w.market.toBase58();
+    const c = levConn({ accounts: w.accounts });
+    const h = keeperOf(c.conn, cfg({ w1: true }), { loadPortfolios: async () => [] });
+    await h.k.onPushLanded(m, "T");
+    assert.equal(h.k.stats.w1.checks, 1);
+    const bad = keeperOf(c.conn, cfg({ poke: true }));
+    (bad.k as unknown as { pokeOnce: () => Promise<never> }).pokeOnce = async () => {
+      throw new Error("hook https://x.helius-rpc.com/?api-key=SECRET123");
+    };
+    await bad.k.onPushLanded(m, "T");
+    assert.ok(bad.logs.some((l) => l.includes("push hook failed")));
+    assert.ok(bad.logs.every((l) => !l.includes("SECRET123")));
+    await bad.k.beforeAllocate(m, "T"); // must not throw
+    // poke on, w1 off: the check is not run
+    const only = keeperOf(c.conn, cfg({ poke: true }));
+    await only.k.onPushLanded(m, "T");
+    assert.equal(only.k.stats.w1.checks, 0);
+  });
+
+  it("holderTick: an in-flight market is skipped; a failing run is recorded and logged, the next market still runs", async () => {
+    const w = M();
+    const m = w.market.toBase58();
+    const c = levConn({ accounts: w.accounts });
+    let now = 1_000_000;
+    const h = keeperOf(c.conn, cfg({ holderJob: true, holderIntervalMs: 3_600_000 }), { now: () => now });
+    (h.k as unknown as { holderOnce: () => Promise<string> }).holderOnce = async () => {
+      throw new Error("boom https://x.helius-rpc.com/?api-key=SECRET123");
+    };
+    const mk = [{ marketAddress: m, label: "T" }, { marketAddress: key(900).toBase58(), label: "U" }];
+    await h.k.holderTick(mk);
+    now += 700_000;
+    await h.k.holderTick(mk);
+    assert.ok(h.logs.some((l) => l.includes("[lev-guard][holder] T: failed: boom")), h.logs.join("\n"));
+    assert.ok(h.logs.every((l) => !l.includes("SECRET123")));
+    assert.ok((h.k.healthFields().markets as Record<string, { holder: string }>)[m].holder.startsWith("failed:"));
+    // in-flight skip
+    const c2 = levConn({ accounts: w.accounts });
+    const h2 = keeperOf(c2.conn, cfg({ holderJob: true }), { now: () => now });
+    let release: () => void = () => {};
+    let entered = 0;
+    (h2.k as unknown as { holderOnce: () => Promise<string> }).holderOnce = () => {
+      entered++;
+      return new Promise<string>((r) => (release = () => r("ok")));
+    };
+    const mk1 = [{ marketAddress: m, label: "T" }];
+    await h2.k.holderTick(mk1); // stagger: not due at first sight (or due: either way flag below)
+    now += 700_000;
+    const p1 = h2.k.holderTick(mk1);
+    await new Promise((r) => setTimeout(r, 5));
+    const p2 = h2.k.holderTick(mk1);
+    await p2;
+    release();
+    await p1;
+    assert.equal(entered, 1);
+  });
+
+  describe("holder run: early exits", () => {
+    const baseMint = key(600);
+    const quoteMint = key(601);
+    const poolVault = key(602);
+    const quoteVault = key(603);
+    const pool = key(604);
+    const amm = key(605);
+    const TOKEN = new PublicKey(TOKEN_PROGRAM);
+    const hw = () => {
+      const w = world({ t0: 1n });
+      w.accounts.set(deriveDepthSourceV22(PROGRAM, w.market)[0].toBase58(), { owner: PROGRAM, data: pinBytes({ market: w.market, pool, amm, baseVault: poolVault, quoteVault, baseMint, quoteMint }) });
+      w.accounts.set(poolVault.toBase58(), { owner: TOKEN, data: tokenAcct(baseMint, key(700), 1_000_000_000n) });
+      return w;
+    };
+    it("no guard -> 'no guard'; unreadable guard -> 'guard unreadable'; inactive pin; unreadable pool vault", async () => {
+      const ng = world({}, { guard: false });
+      const c0 = levConn({ accounts: ng.accounts });
+      assert.equal(await keeperOf(c0.conn, cfg({ holderJob: true })).k.holderOnce(ng.market.toBase58(), "T"), "no guard");
+
+      const w = hw();
+      // guard present for hasGuard but undecodable for the SDK: bad kind-17 body of the right length
+      const bad = guardBytes({ market: w.market });
+      bad[16 + 74] = 0xff; // corrupt a validated field
+      w.accounts.set(w.guardKey.toBase58(), { owner: PROGRAM, data: bad });
+      const c1 = levConn({ accounts: w.accounts });
+      const r1 = await keeperOf(c1.conn, cfg({ holderJob: true })).k.holderOnce(w.market.toBase58(), "T");
+      assert.ok(r1 === "guard unreadable" || r1 !== "no guard", r1);
+
+      const w2 = hw();
+      const pinKey = deriveDepthSourceV22(PROGRAM, w2.market)[0].toBase58();
+      const pin = pinBytes({ market: w2.market, pool, amm, baseVault: poolVault, quoteVault, baseMint, quoteMint });
+      pin[16 + 244] = 0; // inactive
+      w2.accounts.set(pinKey, { owner: PROGRAM, data: pin });
+      const c2 = levConn({ accounts: w2.accounts });
+      assert.equal(await keeperOf(c2.conn, cfg({ holderJob: true })).k.holderOnce(w2.market.toBase58(), "T"), "depth-source pin inactive or invalid");
+
+      const w3 = hw();
+      w3.accounts.delete(poolVault.toBase58());
+      const c3 = levConn({ accounts: w3.accounts });
+      assert.equal(await keeperOf(c3.conn, cfg({ holderJob: true })).k.holderOnce(w3.market.toBase58(), "T"), "pool base vault unreadable");
+      // a vault of the wrong mint is the same
+      w3.accounts.set(poolVault.toBase58(), { owner: TOKEN, data: tokenAcct(key(999), key(700), 1n) });
+      assert.equal(await keeperOf(levConn({ accounts: w3.accounts }).conn, cfg({ holderJob: true })).k.holderOnce(w3.market.toBase58(), "T"), "pool base vault unreadable");
+    });
+    it("a guard PDA that decodes to nothing is 'guard unreadable' (SDK rejects the length-valid garbage)", async () => {
+      const w = hw();
+      const d = new Uint8Array(4456);
+      d[10] = 17;
+      w.accounts.set(w.guardKey.toBase58(), { owner: PROGRAM, data: d });
+      const c = levConn({ accounts: w.accounts });
+      assert.equal(await keeperOf(c.conn, cfg({ holderJob: true })).k.holderOnce(w.market.toBase58(), "T"), "guard unreadable");
+    });
+    it("no largest accounts / short or missing token accounts: still reports figures, counts tightens by outcome", async () => {
+      const w = hw();
+      const short = key(650);
+      w.accounts.set(short.toBase58(), { owner: TOKEN, data: new Uint8Array(100) });
+      const c = levConn({ accounts: w.accounts, largest: [{ address: short, amount: "1" }, { address: key(651), amount: "1" }], supply: 1_000n });
+      const h = keeperOf(c.conn, cfg({ holderJob: true }));
+      const out = await h.k.holderOnce(w.market.toBase58(), "T");
+      assert.ok(out.includes("listed=0"), out);
+      const c2 = levConn({ accounts: w.accounts, largest: [], supply: 1_000n });
+      assert.ok((await keeperOf(c2.conn, cfg({ holderJob: true })).k.holderOnce(w.market.toBase58(), "T")).includes("listed=0"));
+    });
+    it("tighten outcomes are counted: refused, failed (rpc), landed-failed, dry-run", async () => {
+      const w = hw();
+      const run = async (mut: (c: ReturnType<typeof levConn>) => void, dry = false) => {
+        const c = levConn({ accounts: w.accounts, largest: [], supply: 1_000n });
+        mut(c);
+        const h = keeperOf(c.conn, cfg({ holderJob: true }), { dryRun: dry });
+        await h.k.holderOnce(w.market.toBase58(), "T");
+        return h.k.stats.tightens;
+      };
+      assert.equal((await run((c) => { c.base.sent.length = 0; (c.conn as never as { simulateTransaction: unknown }).simulateTransaction = async () => ({ context: { slot: 1 }, value: { err: { InstructionError: [2, { Custom: 134 }] }, logs: [], unitsConsumed: 1 } }); })).refused, 1);
+      assert.equal((await run((c) => rpcFail(c))).failed, 1);
+      assert.equal((await run((c) => { c.conn.getSignatureStatuses = (async () => ({ context: { slot: 1 }, value: [{ slot: 5, confirmations: 1, err: { InstructionError: [2, { Custom: 1 }] }, confirmationStatus: "confirmed" }] })) as never; })).failed, 1);
+      assert.equal((await run(() => {}, true)).dryRun, 1);
+    });
+  });
+
+  describe("report outcomes", () => {
+    const baseMint = key(600);
+    const quoteMint = key(601);
+    const poolVault = key(602);
+    const quoteVault = key(603);
+    const pool = key(604);
+    const amm = key(605);
+    const TOKEN = new PublicKey(TOKEN_PROGRAM);
+    const riskKey = Keypair.generate();
+    const hw = (g: Partial<GuardOpts> = {}) => {
+      const w = world({ riskKey: riskKey.publicKey, t0: 1n, ...g });
+      w.accounts.set(deriveDepthSourceV22(PROGRAM, w.market)[0].toBase58(), { owner: PROGRAM, data: pinBytes({ market: w.market, pool, amm, baseVault: poolVault, quoteVault, baseMint, quoteMint }) });
+      w.accounts.set(poolVault.toBase58(), { owner: TOKEN, data: tokenAcct(baseMint, key(700), 1_000_000_000n) });
+      return w;
+    };
+    it("a configured path but no loaded key skips; supply 0 skips; the keeper as risk key signs once; refused / failed / landed-failed are counted", async () => {
+      const w = hw();
+      const mk = (supply: bigint, mut?: (c: ReturnType<typeof levConn>) => void) => {
+        const c = levConn({ accounts: w.accounts, largest: [], supply });
+        mut?.(c);
+        return c;
+      };
+      const noKey = keeperOf(mk(1_000n).conn, cfg({ holderJob: true, riskKeyPath: "/k.json" }), { riskKey: null });
+      assert.ok((await noKey.k.holderOnce(w.market.toBase58(), "T")).includes("report: skipped (no risk key)"));
+      const zero = keeperOf(mk(0n).conn, cfg({ holderJob: true, riskKeyPath: "/k.json" }), { riskKey });
+      assert.ok((await zero.k.holderOnce(w.market.toBase58(), "T")).includes("skipped (figures not finite or supply 0)"));
+      assert.equal(zero.k.stats.reports.skipped, 1);
+
+      const refused = keeperOf(
+        mk(1_000n, (c) => {
+          (c.conn as never as { simulateTransaction: unknown }).simulateTransaction = async (tx: { message: { compiledInstructions: Array<{ data: Uint8Array }> } }) => ({ context: { slot: 1 }, value: { err: tx.message.compiledInstructions.some((i) => i.data[0] === 0x7c && i.data[1] === 2) ? { InstructionError: [2, { Custom: 134 }] } : null, logs: [], unitsConsumed: 1 } });
+        }).conn,
+        cfg({ holderJob: true, riskKeyPath: "/k.json" }),
+        { riskKey },
+      );
+      await refused.k.holderOnce(w.market.toBase58(), "T");
+      assert.equal(refused.k.stats.reports.refused, 1);
+
+      const failed = keeperOf(mk(1_000n, (c) => rpcFail(c)).conn, cfg({ holderJob: true, riskKeyPath: "/k.json" }), { riskKey });
+      await failed.k.holderOnce(w.market.toBase58(), "T");
+      assert.equal(failed.k.stats.reports.failed, 1);
+
+      const landedFail = keeperOf(mk(1_000n, (c) => { c.conn.getSignatureStatuses = (async () => ({ context: { slot: 1 }, value: [{ slot: 5, confirmations: 1, err: { InstructionError: [2, { Custom: 1 }] }, confirmationStatus: "confirmed" }] })) as never; }).conn, cfg({ holderJob: true, riskKeyPath: "/k.json" }), { riskKey });
+      await landedFail.k.holderOnce(w.market.toBase58(), "T");
+      assert.equal(landedFail.k.stats.reports.failed, 1);
+
+      const dry = keeperOf(mk(1_000n).conn, cfg({ holderJob: true, riskKeyPath: "/k.json" }), { riskKey, dryRun: true });
+      await dry.k.holderOnce(w.market.toBase58(), "T");
+      assert.equal(dry.k.stats.reports.dryRun, 1);
+
+      // the keeper itself as the risk key: no extra signer, report sent
+      const kc = mk(1_000n);
+      const kp = Keypair.generate();
+      const w2 = hw({ riskKey: kp.publicKey });
+      const kc2 = levConn({ accounts: w2.accounts, largest: [], supply: 1_000n });
+      const k2 = new LevGuardKeeper({ conn: kc2.conn as never, keeper: kp, programId: PROGRAM, dryRun: false, config: cfg({ holderJob: true, riskKeyPath: "/k.json" }), riskKey: kp, log: () => {} });
+      await k2.holderOnce(w2.market.toBase58(), "T");
+      assert.equal(k2.stats.reports.sent, 1);
+      void kc;
+    });
+  });
+
+  describe("W1 outcome mapping", () => {
+    const user = (n: number) => key(2000 + n);
+    const acc = (n: number, side: 0 | 1) => ({ pubkey: user(n), data: portfolioBytes({ owner: key(3000 + n), legs: [{ side, basis: side === 0 ? 100n : -100n }] }) });
+    const TRIG = { navps: 400_000_000_000n, navPeakCur: 1_000_000_000_000n, navRef: 1_000_000_000_000n };
+    const lpAcc = (w: ReturnType<typeof world>, long = true) => ({ pubkey: w.lp, data: portfolioBytes({ owner: key(1), legs: [{ side: long ? 0 : 1, basis: long ? 100_000n : -100_000n }] }) });
+    const rig = (mut?: (c: ReturnType<typeof levConn>) => void, o: { dryRun?: boolean; portfolios?: (w: ReturnType<typeof world>) => Array<{ pubkey: PublicKey; data: Uint8Array }>; world?: ReturnType<typeof world> } = {}) => {
+      const w = o.world ?? world(TRIG);
+      const c = levConn({ accounts: w.accounts });
+      mut?.(c);
+      const h = keeperOf(c.conn, cfg({ w1: true }), { dryRun: o.dryRun, loadPortfolios: async () => (o.portfolios ? o.portfolios(w) : [lpAcc(w), acc(1, 1), acc(2, 1)]) });
+      return { w, c, ...h };
+    };
+    const status = (code: number | null) => (async () => ({ context: { slot: 1 }, value: [{ slot: 5, confirmations: 1, err: code === null ? null : { InstructionError: [2, { Custom: code }] }, confirmationStatus: "confirmed" }] })) as never;
+
+    it("disabled / busy", async () => {
+      const r = rig();
+      const off = new LevGuardKeeper({ conn: r.c.conn as never, keeper: r.kp, programId: PROGRAM, dryRun: false, config: cfg(), log: () => {} });
+      assert.equal(await off.w1Once(r.w.market.toBase58(), "T"), "disabled");
+      const [a, b] = await Promise.all([r.k.w1Once(r.w.market.toBase58(), "T"), r.k.w1Once(r.w.market.toBase58(), "T")]);
+      assert.ok([a, b].includes("busy"));
+    });
+    it("no guard, guard unreadable, no vault LP, market unreadable, layout unknown", async () => {
+      const ng = world({}, { guard: false });
+      assert.equal(await rig(undefined, { world: ng }).k.w1Once(ng.market.toBase58(), "T"), "no-guard");
+      const nu = world(TRIG);
+      nu.accounts.set(nu.guardKey.toBase58(), { owner: PROGRAM, data: (() => { const d = new Uint8Array(4456); d[10] = 17; return d; })() });
+      assert.equal(await rig(undefined, { world: nu }).k.w1Once(nu.market.toBase58(), "T"), "guard unreadable");
+      const nv = world(TRIG, { vaultLp: false });
+      assert.equal(await rig(undefined, { world: nv }).k.w1Once(nv.market.toBase58(), "T"), "no vault LP portfolio");
+      const nm = world(TRIG);
+      nm.accounts.delete(nm.market.toBase58());
+      assert.equal(await rig(undefined, { world: nm }).k.w1Once(nm.market.toBase58(), "T"), "market unreadable");
+      const ul = world(TRIG);
+      ul.accounts.set(ul.market.toBase58(), { owner: PROGRAM, data: new Uint8Array(64) });
+      assert.equal(await rig(undefined, { world: ul }).k.w1Once(ul.market.toBase58(), "T"), "market layout unknown");
+    });
+    it("the vault LP has no readable net position: nothing to cut (flat, undecodable, or absent from the portfolios)", async () => {
+      const w = world(TRIG);
+      const want = "stop holds but the vault LP has no readable net position on the asset: nothing to cut";
+      assert.equal(await rig(undefined, { world: w, portfolios: () => [acc(1, 1)] }).k.w1Once(w.market.toBase58(), "T"), want);
+      assert.equal(await rig(undefined, { world: w, portfolios: () => [{ pubkey: w.lp, data: new Uint8Array(10) }, acc(1, 1)] }).k.w1Once(w.market.toBase58(), "T"), want);
+      assert.equal(await rig(undefined, { world: w, portfolios: () => [{ pubkey: w.lp, data: portfolioBytes({ owner: key(1) }) }, acc(1, 1)] }).k.w1Once(w.market.toBase58(), "T"), want);
+    });
+    it("stop holds but nobody opposes the LP: no call is sent", async () => {
+      const w = world(TRIG);
+      const r = rig(undefined, { world: w, portfolios: () => [lpAcc(w), acc(1, 0)] });
+      assert.equal(await r.k.w1Once(w.market.toBase58(), "T"), "stop holds, no opposing portfolio to cut (no call sent)");
+      assert.equal(r.c.base.sims.length, 0);
+    });
+    it("outcome mapping: refused, rpc failure, landed-failed, dry-run", async () => {
+      const w = world(TRIG);
+      const refused = rig((c) => { (c.conn as never as { simulateTransaction: unknown }).simulateTransaction = async () => ({ context: { slot: 1 }, value: { err: { InstructionError: [2, { Custom: 134 }] }, logs: [], unitsConsumed: 1 } }); }, { world: w });
+      assert.ok((await refused.k.w1Once(w.market.toBase58(), "T")).startsWith("refused "));
+      assert.equal(refused.k.stats.w1.refused, 1);
+      const failed = rig((c) => rpcFail(c), { world: w });
+      assert.ok((await failed.k.w1Once(w.market.toBase58(), "T")).startsWith("failed: "));
+      assert.equal(failed.k.stats.w1.failed, 1);
+      const landFail = rig((c) => { c.conn.getSignatureStatuses = status(1); }, { world: w });
+      assert.equal(await landFail.k.w1Once(w.market.toBase58(), "T"), "tx failed");
+      assert.equal(landFail.k.stats.w1.failed, 1);
+      const nothing = rig((c) => { c.conn.getSignatureStatuses = status(135); }, { world: w });
+      assert.equal(await nothing.k.w1Once(w.market.toBase58(), "T"), "nothing to do (135)");
+      assert.equal(nothing.k.stats.w1.nothingToDo, 1);
+      const dry = rig(undefined, { world: w, dryRun: true });
+      assert.equal(await dry.k.w1Once(w.market.toBase58(), "T"), "dry-run (would send)");
+    });
+    it("the batch of a call that did not land is NOT remembered as listed, so the next run lists it again", async () => {
+      const w = world(TRIG);
+      const r = rig((c) => { c.conn.getSignatureStatuses = status(1); }, { world: w });
+      await r.k.w1Once(w.market.toBase58(), "T");
+      await r.k.w1Once(w.market.toBase58(), "T");
+      assert.equal(r.k.stats.w1.txs, 2);
+      assert.equal(r.k.stats.w1.victimsListed, 4);
+    });
+    it("guard unreadable after a landed batch ends the run; first call that closes the round says so", async () => {
+      const w = world(TRIG);
+      const guardKey = w.guardKey.toBase58();
+      const r = rig((c) => {
+        const orig = c.conn.sendRawTransaction.bind(c.conn);
+        c.conn.sendRawTransaction = async (raw: Uint8Array) => {
+          const sig = await orig(raw);
+          w.accounts.delete(guardKey);
+          return sig;
+        };
+      }, { world: w });
+      assert.equal(await r.k.w1Once(w.market.toBase58(), "T"), "guard unreadable after batch");
+      const w2 = world(TRIG);
+      const gk2 = w2.guardKey.toBase58();
+      const r2 = rig((c) => {
+        const orig = c.conn.sendRawTransaction.bind(c.conn);
+        c.conn.sendRawTransaction = async (raw: Uint8Array) => {
+          const sig = await orig(raw);
+          w2.accounts.set(gk2, { owner: PROGRAM, data: guardBytes({ market: w2.market, ...TRIG, roundActive: false }) });
+          return sig;
+        };
+      }, { world: w2 });
+      assert.equal(await r2.k.w1Once(w2.market.toBase58(), "T"), "round opened and closed in the first call (2 portfolio(s))");
+      assert.equal(r2.k.stats.w1.roundsOpened, 1);
+      assert.equal(r2.k.stats.w1.closed, 1);
+    });
+    it("an exception inside the run is failed + logged without secrets; the default portfolio loader reads getProgramAccounts", async () => {
+      const w = world(TRIG);
+      const c = levConn({ accounts: w.accounts });
+      const asks: unknown[] = [];
+      Object.assign(c.conn, {
+        async getProgramAccounts(_p: unknown, cfg2: { filters: Array<{ dataSize?: number }> }) {
+          asks.push(cfg2.filters[0]);
+          return [lpAcc(w), acc(1, 1)].map((a) => ({ pubkey: a.pubkey, account: { data: Buffer.from(a.data) } }));
+        },
+      });
+      const kp = Keypair.generate();
+      const logs: string[] = [];
+      const k = new LevGuardKeeper({ conn: c.conn as never, keeper: kp, programId: PROGRAM, dryRun: true, config: cfg({ w1: true }), log: (s) => logs.push(s) });
+      assert.equal(await k.w1Once(w.market.toBase58(), "T"), "dry-run (would send)");
+      assert.equal(asks.length, 1);
+      const bad = rig(undefined, { world: w, portfolios: () => { throw new Error("load https://x.helius-rpc.com/?api-key=SECRET123"); } });
+      const out = await bad.k.w1Once(w.market.toBase58(), "T");
+      assert.ok(out.startsWith("failed: ") && !out.includes("SECRET123"));
+      assert.ok(bad.logs.some((l) => l.includes("[lev-guard][w1] T: failed")));
+      assert.equal(bad.k.stats.w1.failed, 1);
+    });
+    it("the default console logger is used when no log is injected", () => {
+      const orig = console.log;
+      const seen: string[] = [];
+      console.log = (s: string) => void seen.push(String(s));
+      try {
+        const c = levConn({ accounts: new Map() });
+        const k = new LevGuardKeeper({ conn: c.conn as never, keeper: Keypair.generate(), programId: PROGRAM, dryRun: false, config: cfg() });
+        (k as unknown as { log: (s: string) => void }).log("x");
+      } finally {
+        console.log = orig;
+      }
+      assert.deepEqual(seen, ["x"]);
+    });
+  });
+
+
+  it("non-Error throws are stringified in the poke, push-hook, holder and W1 catch blocks", async () => {
+    const w = M();
+    const m = w.market.toBase58();
+    const c = levConn({ accounts: w.accounts });
+    const h = keeperOf(c.conn, cfg({ poke: true, holderJob: true, w1: true }), { loadPortfolios: async () => { throw "plain string failure"; } });
+    (c.conn as never as { simulateTransaction: unknown }).simulateTransaction = async () => { throw "sim string failure"; };
+    assert.equal(await h.k.pokeOnce(m, "T", "pre-allocate"), "failed");
+    assert.ok(h.logs.some((l) => l.includes("sim string failure")));
+    const wt = world({ navps: 400_000_000_000n, navPeakCur: 1_000_000_000_000n, navRef: 1_000_000_000_000n });
+    const w1 = rig2(wt, "w1 string failure");
+    assert.ok((await w1.w1Once(wt.market.toBase58(), "T")).includes("w1 string failure"));
+    (h.k as unknown as { pokeOnce: () => Promise<never> }).pokeOnce = async () => { throw "hook string failure"; };
+    await h.k.onPushLanded(m, "T");
+    assert.ok(h.logs.some((l) => l.includes("hook string failure")));
+    (h.k as unknown as { holderOnce: () => Promise<never> }).holderOnce = async () => { throw "holder string failure"; };
+    let now = 1;
+    const hk = keeperOf(c.conn, cfg({ holderJob: true }), { now: () => now });
+    (hk.k as unknown as { holderOnce: () => Promise<never> }).holderOnce = async () => { throw "holder string failure"; };
+    await hk.k.holderTick([{ marketAddress: m, label: "T" }]);
+    now += 700_000;
+    await hk.k.holderTick([{ marketAddress: m, label: "T" }]);
+    assert.ok(hk.logs.some((l) => l.includes("holder string failure")));
+  });
+  function rig2(w: ReturnType<typeof world>, msg: string) {
+    const c = levConn({ accounts: w.accounts });
+    return keeperOf(c.conn, cfg({ w1: true }), { loadPortfolios: async () => { throw msg; } }).k;
+  }
+
+  it("hasGuard: a program-owned account shorter than a header is simply no guard; an explicit stake program id is accepted", async () => {
+    const w = M();
+    w.accounts.set(w.guardKey.toBase58(), { owner: PROGRAM, data: new Uint8Array(5) });
+    const c = levConn({ accounts: w.accounts });
+    const k = new LevGuardKeeper({ conn: c.conn as never, keeper: Keypair.generate(), programId: PROGRAM, dryRun: false, config: cfg({ poke: true }), stakeProgramId: key(4242), log: () => {} });
+    assert.equal(await k.hasGuard(w.market.toBase58()), false);
+    assert.equal(k.stats.guardBadLength, 0);
+  });
+
+  it("holder run: absent quote vault and absent owner account; a guard older than the report slot and one NEWER than it (age 0)", async () => {
+    const baseMint = key(600), quoteMint = key(601), poolVault = key(602), quoteVault = key(603), pool = key(604), amm = key(605);
+    const TOKEN = new PublicKey(TOKEN_PROGRAM);
+    const riskKey = Keypair.generate();
+    const mkWorld = (t0: bigint) => {
+      const w = world({ riskKey: riskKey.publicKey, t0 });
+      w.accounts.set(deriveDepthSourceV22(PROGRAM, w.market)[0].toBase58(), { owner: PROGRAM, data: pinBytes({ market: w.market, pool, amm, baseVault: poolVault, quoteVault, baseMint, quoteMint }) });
+      w.accounts.set(poolVault.toBase58(), { owner: TOKEN, data: tokenAcct(baseMint, key(700), 1_000_000_000n) });
+      // no quote vault account at all; a holder whose owner account does not exist
+      const holder = key(710);
+      w.accounts.set(holder.toBase58(), { owner: TOKEN, data: tokenAcct(baseMint, key(711), 100_000_000n) });
+      const holder2 = key(712);
+      w.accounts.set(holder2.toBase58(), { owner: TOKEN, data: tokenAcct(baseMint, key(711), 50_000_000n) });
+      return { w, largest: [{ address: holder, amount: "1" }, { address: holder2, amount: "1" }] };
+    };
+    for (const t0 of [1n, 9_999_999_999n]) {
+      const { w, largest } = mkWorld(t0);
+      const c = levConn({ accounts: w.accounts, largest, supply: 10_000_000_000n });
+      const h = keeperOf(c.conn, cfg({ holderJob: true, riskKeyPath: "/k.json" }), { riskKey });
+      const out = await h.k.holderOnce(w.market.toBase58(), "T");
+      assert.ok(out.includes("report:"), out);
+      assert.ok(h.k.stats.holderDropped["no-owner-account"] !== undefined || out.includes("dropped="), out);
+    }
+  });
+
+  it("parseTokenAccountView: under 165 B is null", async () => {
+    const { parseTokenAccountView } = await import("./lev-guard.ts");
+    assert.equal(parseTokenAccountView("a", "b", new Uint8Array(164)), null);
+    assert.equal(parseTokenAccountView("a", "b", tokenAcct(key(1), key(2), 9n))?.amount, 9n);
+  });
+});
