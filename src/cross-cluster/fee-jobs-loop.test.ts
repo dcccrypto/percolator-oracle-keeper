@@ -210,4 +210,33 @@ describe("startFeeJobLoop", () => {
     assert.equal(t.reconciled.length, 3, "cycle 2 after the 1000ms floor");
     await drive(p);
   });
+
+  it("stops on SIGINT as well as SIGTERM", async () => {
+    const job: FeeJob = { name: "lp-fee", async run() { return { kind: "nothing" }; } };
+    const t = makeSink(Infinity);
+    const sink = {
+      ...t.sink,
+      async reconcile() { process.emit("SIGINT"); },
+    };
+    await drive(startFeeJobLoop([job], ctx, registry, cfg, sink as never));
+    assert.equal(t.health.length, 0 + 1, "exactly one cycle ran before the SIGINT stop");
+  });
+
+  it("an error escaping the per-job sweep is logged (Error and non-Error) and the loop carries on", async () => {
+    let reads = 0;
+    const flaky = {
+      get markets(): unknown[] {
+        reads++;
+        if (reads === 1) return [];
+        if (reads === 2) throw new Error("registry exploded");
+        process.emit("SIGTERM");
+        throw "plain string registry";
+      },
+    };
+    const job: FeeJob = { name: "lp-fee", async run() { return { kind: "nothing" }; } };
+    const t = makeSink(Infinity);
+    await drive(startFeeJobLoop([job], ctx, flaky as never, cfg, t.sink));
+    assert.ok(errors.some((e) => /\[lp-fee\] sweep error — registry exploded/.test(e)));
+    assert.ok(errors.some((e) => /\[lp-fee\] sweep error — plain string registry/.test(e)));
+  });
 });
