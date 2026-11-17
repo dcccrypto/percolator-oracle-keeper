@@ -34,11 +34,6 @@
  * settlement mark.
  */
 
-interface Sample {
-  t: number;
-  px: bigint;
-}
-
 export interface MarkSmootherOptions {
   /** Trailing window the median is computed over (ms). */
   windowMs?: number;
@@ -161,13 +156,73 @@ export interface MarkSmoother {
   reset(): void;
 }
 
-/** Median of a non-empty list; even lengths average the two middles. */
-function medianE6(values: bigint[]): bigint {
-  const sorted = [...values].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-  const n = sorted.length;
-  const mid = n >> 1;
-  if (n % 2 === 1) return sorted[mid];
-  return (sorted[mid - 1] + sorted[mid]) / 2n;
+/**
+ * Per-pool window. `t`/`px` hold the samples in arrival order starting at `head`
+ * (consumed prefix is compacted lazily, so eviction is O(1) amortised instead of a
+ * splice per cycle). `sorted` is the same prices kept ascending, maintained by
+ * binary insert/remove, so the median needs no copy + sort.
+ */
+interface Win {
+  t: number[];
+  px: bigint[];
+  head: number;
+  sorted: bigint[];
+}
+
+/** First index in `a` whose value is >= v. */
+function lowerBound(a: bigint[], v: bigint): number {
+  let lo = 0;
+  let hi = a.length;
+  while (lo < hi) {
+    const m = (lo + hi) >> 1;
+    if (a[m] < v) lo = m + 1;
+    else hi = m;
+  }
+  return lo;
+}
+
+function winLen(w: Win): number {
+  return w.t.length - w.head;
+}
+
+function winPush(w: Win, t: number, px: bigint): void {
+  w.t.push(t);
+  w.px.push(px);
+  w.sorted.splice(lowerBound(w.sorted, px), 0, px);
+}
+
+function winDropOldest(w: Win, count: number): void {
+  for (let i = 0; i < count; i++) {
+    const v = w.px[w.head + i];
+    w.sorted.splice(lowerBound(w.sorted, v), 1); // any equal element is the same multiset
+  }
+  w.head += count;
+  if (w.head >= MAX_SAMPLES_PER_POOL) {
+    w.t.splice(0, w.head);
+    w.px.splice(0, w.head);
+    w.head = 0;
+  }
+}
+
+/**
+ * Median over the window's even-count usable set: the whole window when its
+ * length is even (or 1), else the window minus its single oldest sample. Same
+ * result as sorting that set and averaging the middles, computed from `sorted`
+ * without allocating (the dropped oldest value is skipped by index mapping).
+ */
+function windowMedian(w: Win): bigint {
+  const s = w.sorted;
+  const n = s.length;
+  if (n % 2 === 0 || n === 1) {
+    const mid = n >> 1;
+    if (n % 2 === 1) return s[mid];
+    return (s[mid - 1] + s[mid]) / 2n;
+  }
+  // n odd >= 3: usable has m = n-1 (even) elements = sorted minus one copy of the oldest px.
+  const p = lowerBound(s, w.px[w.head]);
+  const at = (k: number) => s[k < p ? k : k + 1];
+  const mid = (n - 1) >> 1;
+  return (at(mid - 1) + at(mid)) / 2n;
 }
 
 export function createMarkSmoother(opts: MarkSmootherOptions = {}): MarkSmoother {
@@ -178,25 +233,27 @@ export function createMarkSmoother(opts: MarkSmootherOptions = {}): MarkSmoother
   // configures. 5/6 of the 180s default is 150s — comfortably beyond 2x the
   // longest observed churn run (70s), matching the window's own reasoning.
   const minSpanMs = opts.minSpanMs ?? Math.floor(windowMs * DEFAULT_MIN_SPAN_FRACTION);
-  const windows = new Map<string, Sample[]>();
+  const windows = new Map<string, Win>();
 
   return {
     smooth(poolAddress: string, priceE6: bigint, nowMs: number): bigint | null {
       let win = windows.get(poolAddress);
       if (!win) {
-        win = [];
+        win = { t: [], px: [], head: 0, sorted: [] };
         windows.set(poolAddress, win);
       }
-      win.push({ t: nowMs, px: priceE6 });
+      winPush(win, nowMs, priceE6);
       // Evict by age, then by count (oldest first — the array is append-only
       // in time order; a caller stepping time backwards just evicts nothing).
       const cutoff = nowMs - windowMs;
       let firstLive = 0;
-      while (firstLive < win.length && win[firstLive].t < cutoff) firstLive++;
-      if (firstLive > 0) win.splice(0, firstLive);
-      if (win.length > MAX_SAMPLES_PER_POOL) win.splice(0, win.length - MAX_SAMPLES_PER_POOL);
+      const len0 = winLen(win);
+      while (firstLive < len0 && win.t[win.head + firstLive] < cutoff) firstLive++;
+      if (firstLive > 0) winDropOldest(win, firstLive);
+      if (winLen(win) > MAX_SAMPLES_PER_POOL) winDropOldest(win, winLen(win) - MAX_SAMPLES_PER_POOL);
+      const wl = winLen(win);
 
-      if (win.length < minSamples) {
+      if (wl < minSamples) {
         // Do not publish a raw single/few-sample spot. This covers both first
         // listing and steady-state re-prime after a liveness gap fully evicts
         // the window.
@@ -212,7 +269,7 @@ export function createMarkSmoother(opts: MarkSmootherOptions = {}): MarkSmoother
       // Withholding here leaves the previously published on-chain mark in place —
       // stale, but trusted — which is strictly better than substituting one an
       // attacker chose.
-      const span = win[win.length - 1].t - win[0].t;
+      const span = win.t[win.t.length - 1] - win.t[win.head];
       if (span < minSpanMs) return null;
       // Compute over an EVEN count (drop the single oldest sample when odd):
       // an odd-count median flips by parity under a balanced two-level
@@ -222,20 +279,19 @@ export function createMarkSmoother(opts: MarkSmootherOptions = {}): MarkSmoother
       // balanced churn yields the stable midpoint (the fair price of a pool a
       // bot round-trips symmetrically).
       // (A single-sample window has nothing older to drop — use it as-is.)
-      const usable = win.length % 2 === 0 || win.length === 1 ? win : win.slice(1);
-      return medianE6(usable.map((s) => s.px));
+      return windowMedian(win);
     },
     status(poolAddress: string): { samples: number; spanMs: number; minSamples: number; minSpanMs: number } {
-      const win = windows.get(poolAddress) ?? [];
-      const spanMs = win.length > 1 ? win[win.length - 1].t - win[0].t : 0;
-      return { samples: win.length, spanMs, minSamples, minSpanMs };
+      const win = windows.get(poolAddress);
+      const n = win ? winLen(win) : 0;
+      const spanMs = win && n > 1 ? win.t[win.t.length - 1] - win.t[win.head] : 0;
+      return { samples: n, spanMs, minSamples, minSpanMs };
     },
     peek(poolAddress: string): bigint | null {
       const win = windows.get(poolAddress);
       // S3-B6: never a single (or few) read median, even under an urgent deadline.
-      if (!win || win.length === 0 || win.length < minSamples) return null;
-      const usable = win.length % 2 === 0 || win.length === 1 ? win : win.slice(1);
-      return medianE6(usable.map((s) => s.px));
+      if (!win || winLen(win) === 0 || winLen(win) < minSamples) return null;
+      return windowMedian(win);
     },
     reset(): void {
       windows.clear();
