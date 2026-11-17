@@ -63,6 +63,7 @@ function mkConfig(rows: unknown, pools: string[], extra: Record<string, unknown>
       supabaseUrl: "http://x",
       supabaseAnonKey: "k",
       network: "devnet",
+      caps: { maxTotal: 500, maxPerDeployer: 500 },
       mainnetConn: { getMultipleAccountsInfo: async () => [] } as never,
       dexCache: new Map(pools.map((p) => [p, "pumpswap" as const])),
     },
@@ -176,6 +177,9 @@ test("updated and retired bindings are logged and saved", async () => {
   for (let i = 0; i < ABSENCE_THRESHOLD - 1; i++) await pollOnce(registry, cfg);
   assert.ok(logs.some((l) => l.includes(`retired ${gone.marketAddress}`)));
   assert.equal(registry.markets.some((m) => m.marketAddress === gone.marketAddress), false);
+  const saved = JSON.parse(fs.readFileSync(cfg.registryPath, "utf8")).markets;
+  assert.deepEqual(saved.map((m: MarketEntry) => m.marketAddress), [slab]);
+  assert.equal(saved[0].poolAddress, pool);
 });
 
 // ---------------------------------------------------------------- owner filter
@@ -272,6 +276,8 @@ test("pollOnce serializes: a call during a poll queues exactly one re-run", asyn
   const first = pollOnce(registry, cfg);
   const second = pollOnce(registry, cfg);
   const third = pollOnce(registry, cfg);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(fetches, 1); // re-run must not start while run #1 is in flight
   release();
   await Promise.all([first, second, third]);
   assert.equal(fetches, 2);
