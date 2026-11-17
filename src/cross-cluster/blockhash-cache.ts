@@ -48,18 +48,19 @@ export async function getCachedBlockhash(
   } catch (e) {
     started = Promise.reject(e);
   }
-  const p: Promise<CachedBlockhash> = (async () => {
+  const self: { p?: Promise<CachedBlockhash> } = {};
+  const p: Promise<CachedBlockhash> = (self.p = (async () => {
     try {
       const v = await started;
       const value = { blockhash: v.blockhash, lastValidBlockHeight: v.lastValidBlockHeight };
       // Superseded by an invalidate while in flight: hand the value to its own callers but do not cache it.
       // `at` is the fetch START: the hash is at least that old by the time a slow RPC returns.
-      if (inflight.get(key) === p) entries.set(key, { value, at: now });
+      if (inflight.get(key) === self.p) entries.set(key, { value, at: now });
       return value;
     } finally {
-      if (inflight.get(key) === p) inflight.delete(key);
+      if (inflight.get(key) === self.p) inflight.delete(key);
     }
-  })();
+  })());
   inflight.set(key, p);
   return p;
 }
