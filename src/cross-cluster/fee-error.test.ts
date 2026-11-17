@@ -39,6 +39,9 @@ describe("errorText", () => {
     assert.doesNotThrow(() => errorText(circ));
     assert.doesNotThrow(() => errorText({ slot: 1n }));
     assert.equal(typeof errorText(circ), "string");
+    assert.match(errorText(circ), /rpc down/);
+    assert.equal(programErrorCode({ InstructionError: [1, { Custom: 27 }], slot: 1n }), 27);
+    assert.equal(describeProgramError("w", { InstructionError: [1, { Custom: 27 }], slot: 1n }).startsWith("w OracleStale(27)"), true);
   });
   it("a value whose toJSON and toString both throw yields a placeholder, not a throw", () => {
     const evil = { toJSON() { throw new Error("j"); }, toString() { throw new Error("s"); } };
@@ -48,7 +51,7 @@ describe("errorText", () => {
     const circ: Record<string, unknown> = {};
     circ.self = circ;
     assert.doesNotThrow(() => describeProgramError("job", circ));
-    assert.match(describeProgramError("job", { slot: 1n }), /^job: /);
+    assert.match(describeProgramError("job", { slot: 1n }), /^job: .*"slot":"1"/);
   });
 });
 
@@ -135,7 +138,7 @@ describe("staleResolveWait", () => {
     assert.equal(staleResolveWait(27, m, edge - 1n), null);
   });
   it("a last-good slot ahead of the chain slot: age clamps to 0 (no negative age), and it is not matured", () => {
-    assert.equal(staleResolveWait(27, market(18_000n, 90_000n), 50_000n), null);
+    assert.equal(staleResolveWait(27, market(18_000n, 90_000n), 50_000n), null); // not matured (clamp is unreachable from here)
   });
   it("u64-max last-good slot does not overflow into 'matured'", () => {
     assert.equal(staleResolveWait(27, market(18_000n, 2n ** 64n - 1n), 50_000n), null);

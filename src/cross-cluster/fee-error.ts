@@ -41,7 +41,17 @@ export function errorText(err: unknown): string {
   }
   if (typeof err === "string") return err;
   try {
-    return JSON.stringify(err ?? null) ?? String(err);
+    const seen = new WeakSet<object>();
+    return (
+      JSON.stringify(err ?? null, (_k, v: unknown) => {
+        if (typeof v === "bigint") return v.toString();
+        if (typeof v === "object" && v !== null) {
+          if (seen.has(v)) return "[Circular]";
+          seen.add(v);
+        }
+        return v;
+      }) ?? String(err)
+    );
   } catch {
     // circular / BigInt-bearing thrown value: this runs inside catch blocks and must not throw itself
     try {

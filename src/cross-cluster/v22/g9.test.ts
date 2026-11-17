@@ -1,7 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { Keypair } from "@solana/web3.js";
-import { ACCOUNT_KIND, BackstopMode, LAYOUT_V22, WRAPPER_ACCOUNT_MAGIC } from "@percolatorct/sdk";
+import { ACCOUNT_KIND, BackstopMode, LAYOUT_V22, deriveG9FeedAllowlistV22, WRAPPER_ACCOUNT_MAGIC } from "@percolatorct/sdk";
 import { G9_DRAW_RETRY_SLOTS, G9_PROPOSE_RETRY_SLOTS, G9_RESTORE_RETRY_SLOTS, decideG9, freshG9State, g9ExtraTail, g9Once, oracleQualifies } from "./g9.ts";
 import type { V22MarketCtx } from "./market.ts";
 import { customAt, execCtx, fakeExecConn, key, v22Ctx } from "./test-helpers.ts";
@@ -66,13 +65,13 @@ describe("g9 decideG9 (pure)", () => {
     assert.equal(decideG9(ctxLike(), units(1_000n), 10_000n + G9_DRAW_RETRY_SLOTS - 1n, false, s).kind, "none");
     assert.equal(decideG9(ctxLike(), units(1_000n), 19_000n, false, st()).kind, "propose"); // lapsed
   });
-  it("owed backstop restores before it proposes; spaced; u64-max receivable and slot still compare exactly", () => {
+  it("owed backstop restores before it proposes; spaced; u64-max receivable and a 2^60 slot still compare exactly", () => {
     const s = st();
     assert.equal(decideG9(ctxLike(), units(0n, 1n), 0n, false, s).kind, "restore");
     assert.equal(decideG9(ctxLike(), units(0n, U64_MAX), 0n, false, s).kind, "restore");
     s.lastAttempt.set("M|restore", 100n);
     assert.equal(decideG9(ctxLike(), units(0n, 1n), 100n + G9_RESTORE_RETRY_SLOTS - 1n, false, s).kind, "propose");
-    // pending slot near 2^64: the open window is computed in BigInt (no wrap, no float rounding)
+    // pending slot near 2^60: the open window is computed in BigInt (no wrap, no float rounding)
     const a = decideG9(ctxLike(), units(2n ** 60n + 1n), 0n, false, st()) as { remainingSlots: bigint };
     assert.equal(a.remainingSlots, 2n ** 60n + 1n + 9_000n);
   });
@@ -93,6 +92,8 @@ describe("g9 g9ExtraTail", () => {
   it("mainnet propose/draw: allowlist PDA first, then the leg feeds", () => {
     const t = g9ExtraTail(ctx, true, BackstopMode.Draw as 0);
     assert.equal(t.length, 1 + ctx.oracleLegFeeds.length);
+    assert.equal(t[0].toBase58(), deriveG9FeedAllowlistV22(ctx.programId)[0].toBase58());
+    assert.deepEqual(t.slice(1), ctx.oracleLegFeeds);
   });
 });
 
@@ -184,9 +185,5 @@ describe("g9Once", () => {
     const r = await g9Once(execCtx(f.conn), { ...ctx, oracleMode: 0, oracleLegCount: 0 } as V22MarketCtx, unitsBytes(0n, 0n), freshG9State(), { ...P, allowAnyOracleMode: false });
     assert.equal(r.action.kind, "none");
     assert.equal(f.sims.length, 0);
-  });
-
-  it("unused import guard", () => {
-    assert.ok(Keypair.generate());
   });
 });
