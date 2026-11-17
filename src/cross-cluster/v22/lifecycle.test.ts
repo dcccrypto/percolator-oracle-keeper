@@ -124,6 +124,17 @@ describe("classifier: DEAD-INTEREST and the quiet clock", () => {
     assert.equal(openInterestIsZero(market({ oi: 5n })), false);
     assert.equal(classifyMarket(cin(market({ lastGood: ageToLastGood(100n), authority: keeper.publicKey, oi: 5n }), { quietMs: 99 * 86_400_000 })).deadInterest, false);
   });
+  it("a Recovery-lifecycle asset inside a Live market still holds OI: never dead-interest (engine v16.rs:8534 keeps the market Live)", () => {
+    const b = Buffer.from(v22MarketBytes({ slots: 2 }));
+    b.writeBigUInt64LE(STALE, 16 + 136);
+    b.writeBigUInt64LE(ageToLastGood(100n), 16 + 152);
+    Buffer.from(keeper.publicKey.toBytes()).copy(b, assetSlotsOff(L) + 120);
+    b[engineSlotBase(L, 0) + L.asset.lifecycle] = 5; // Recovery, carries OI
+    b.writeBigUInt64LE(5n, engineSlotBase(L, 0) + 289);
+    b[engineSlotBase(L, 1) + L.asset.lifecycle] = 2; // Active, OI 0
+    assert.equal(openInterestIsZero(new Uint8Array(b)), false);
+    assert.equal(classifyMarket(cin(new Uint8Array(b), { quietMs: 99 * 86_400_000 })).deadInterest, false);
+  });
   it("a price already in the warn band is DEAD-PRICE, not dead-interest", () => {
     const lc = classifyMarket(cin(market({ lastGood: ageToLastGood(10_000n), authority: keeper.publicKey }), { quietMs: 99 * 86_400_000 }));
     assert.equal(lc.deadInterest, false);
