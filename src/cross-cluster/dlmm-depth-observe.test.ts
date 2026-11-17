@@ -65,6 +65,17 @@ describe("flag OFF means no extra RPC and no state", () => {
     await o.observe(f.conn, [unit], () => dec, undefined, 1000 + 61_000);
     assert.equal(f.calls.length, 4);
   });
+  it("a market that leaves the unit list is pruned (obs + throttle state), so churn cannot grow the maps", async () => {
+    const f = fakeConn();
+    const o = new DlmmDepthObserver(60_000);
+    await o.observe(f.conn, [unit], () => dec, undefined, 1000);
+    assert.ok(o.get("mkt"));
+    await o.observe(f.conn, [], () => dec, undefined, 1001);
+    assert.equal(o.get("mkt"), undefined);
+    assert.deepEqual(o.sizes(), { obs: 0, lastStart: 0, inFlight: 0 });
+    await o.observe(f.conn, [unit], () => dec, undefined, 1002); // back: observed afresh, not throttled by a stale stamp
+    assert.equal(f.calls.length, 4);
+  });
   it("only meteora-dlmm pool units are observed", async () => {
     const f = fakeConn();
     const o = new DlmmDepthObserver(0);
