@@ -39,8 +39,12 @@ export async function getMultipleAccountsInfoChunked(
   commitment: Commitment,
   opts: { chunkSize?: number; concurrency?: number } = {},
 ): Promise<ChunkedAccountsResult> {
-  const chunkSize = Math.min(Math.max(1, opts.chunkSize ?? MAX_ACCOUNTS_PER_RPC), MAX_ACCOUNTS_PER_RPC);
-  const concurrency = Math.max(1, opts.concurrency ?? DEFAULT_CHUNK_CONCURRENCY);
+  // Non-finite/NaN options fall back to the defaults: Math.max(1, NaN) is NaN, which would
+  // yield empty slices (or zero workers) and report every key UNKNOWN with failedChunks 0.
+  const cs = Number.isFinite(opts.chunkSize) ? Math.floor(opts.chunkSize!) : MAX_ACCOUNTS_PER_RPC;
+  const cc = Number.isFinite(opts.concurrency) ? Math.floor(opts.concurrency!) : DEFAULT_CHUNK_CONCURRENCY;
+  const chunkSize = Math.min(Math.max(1, cs), MAX_ACCOUNTS_PER_RPC);
+  const concurrency = Math.max(1, cc);
   const infos: ChunkedAccountsResult["infos"] = new Array(keys.length).fill(undefined);
   const starts: number[] = [];
   for (let i = 0; i < keys.length; i += chunkSize) starts.push(i);
