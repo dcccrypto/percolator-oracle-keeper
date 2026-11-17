@@ -167,6 +167,161 @@ describe("windDownV22Once", () => {
   });
 });
 
+describe("windDownV22Once: remaining branches", () => {
+  const fetchPortfolios = async () => book();
+  const now = 519_085_747n;
+  const key0 = (ctx: ReturnType<typeof latchedCtx>) => `${ctx.marketAddress}|0`;
+
+  it("windDownHolders skips an unparsable same-length account, an inactive leg and a leg on another asset", () => {
+    const G = LAYOUT_V22.portfolio;
+    const inactive = portfolioBytes({ owner: key(1), legs: [{ side: 0, basis: 100n }] });
+    inactive[G.legsOff + G.leg.active] = 0;
+    const other = portfolioBytes({ owner: key(2), legs: [{ side: 0, basis: 100n, assetIndex: 1 }] });
+    const live = portfolioBytes({ owner: key(3), legs: [{ side: 0, basis: 100n }] });
+    const accts = [
+      { pubkey: key(20), data: new Uint8Array(G.accountLen) }, // right length, no magic: parse throws
+      { pubkey: key(21), data: inactive },
+      { pubkey: key(22), data: other },
+      { pubkey: key(23), data: live },
+    ];
+    const h = windDownHolders(accts, 0, G.accountLen, null);
+    assert.deepEqual(h.map((x) => x.pubkey.toBase58()), [key(23).toBase58()]);
+    assert.equal(h[0].isLp, false);
+  });
+
+  it("windDownTargets: falls back to every holder when the reduce-only side has none; orders users by key", () => {
+    const h = windDownHolders(book(), 0, LAYOUT_V22.portfolio.accountLen, LP);
+    const onlyLongs = h.filter((x) => x.longLegs > 0);
+    // aShort < 1 but no short holder: the reduce-only side is empty
+    const t = windDownTargets({ aLong: ADL_ONE, aShort: A_LATCHED }, onlyLongs);
+    assert.equal(t.length, 2);
+    // out-of-order input is sorted by base58 key, both comparator directions
+    const rev = windDownTargets({ aLong: A_LATCHED, aShort: ADL_ONE }, [...onlyLongs].reverse());
+    const fwd = windDownTargets({ aLong: A_LATCHED, aShort: ADL_ONE }, onlyLongs);
+    assert.deepEqual(rev.map((x) => x.pubkey.toBase58()), fwd.map((x) => x.pubkey.toBase58()));
+    assert.ok(fwd[0].pubkey.toBase58() < fwd[1].pubkey.toBase58());
+  });
+
+  it("a healthy market clears a stale backoff entry", async () => {
+    const f = fakeExecConn();
+    const st = freshWindDownV22State();
+    const ctx = latchedCtx({ aShort: ADL_ONE });
+    st.nextSlot.set(key0(ctx), 99n);
+    assert.deepEqual(await windDownV22Once(ctx, st, { exec: execCtx(f.conn), fetchPortfolios }), []);
+    assert.equal(st.nextSlot.has(key0(ctx)), false);
+  });
+
+  it("a non-custom simulation error is named by its JSON, truncated, and backs off", async () => {
+    const f = fakeExecConn({ simErr: () => "BlockhashNotFound" });
+    const st = freshWindDownV22State();
+    const ctx = latchedCtx();
+    const r = await windDownV22Once(ctx, st, { exec: execCtx(f.conn), fetchPortfolios });
+    assert.deepEqual(r[0].action, { kind: "refused", name: '"BlockhashNotFound"' });
+    assert.equal(st.nextSlot.get(key0(ctx)), BigInt(ctx.readSlot) + WIND_DOWN_V22_RETRY_SLOTS);
+  });
+
+  it("no tag-104 line in the simulation: skipped with a backoff, nothing sent", async () => {
+    const f = fakeExecConn({ simLogs: () => ["Program log: something else"] });
+    const st = freshWindDownV22State();
+    const ctx = latchedCtx();
+    const r = await windDownV22Once(ctx, st, { exec: execCtx(f.conn), fetchPortfolios });
+    assert.equal(r[0].action.kind, "skipped");
+    assert.equal(f.sent.length, 0);
+    assert.equal(st.nextSlot.get(key0(ctx)), BigInt(ctx.readSlot) + WIND_DOWN_V22_RETRY_SLOTS);
+  });
+
+  it("arming that does not land retries after the short backoff, not at the bound", async () => {
+    const f = fakeExecConn({ simLogs: () => notEligible(now, 9_000n, now), confirmStatus: "err" });
+    const st = freshWindDownV22State();
+    const ctx = latchedCtx({ slot: now });
+    const r = await windDownV22Once(ctx, st, { exec: execCtx(f.conn), fetchPortfolios });
+    assert.equal(r[0].action.kind, "armed");
+    assert.equal(st.nextSlot.get(key0(ctx)), now + WIND_DOWN_V22_RETRY_SLOTS);
+  });
+
+  it("waiting past the bound (eligible slot already behind us) re-checks next slot", async () => {
+    const since = 519_000_000n;
+    const f = fakeExecConn({ simLogs: () => notEligible(since, 10n, now) });
+    const st = freshWindDownV22State();
+    const ctx = latchedCtx({ slot: now });
+    const r = await windDownV22Once(ctx, st, { exec: execCtx(f.conn), fetchPortfolios });
+    assert.equal(r[0].action.kind, "waiting");
+    assert.equal(st.nextSlot.get(key0(ctx)), now + 1n);
+  });
+
+  it("a refused close stops the loop and does not mark ADL cleared", async () => {
+    // probe ok (eligible), first close is refused by its own simulation
+    const f = fakeExecConn({ simLogs: () => closed(40n, false, 9n), simErr: (_d, i) => (i === 0 ? null : customAt(0, 27)) });
+    const ctx = latchedCtx();
+    const lines: string[] = [];
+    const r = await windDownV22Once(ctx, freshWindDownV22State(), { exec: execCtx(f.conn), fetchPortfolios, log: (l) => lines.push(l) });
+    assert.equal(r[0].action.kind, "closed");
+    if (r[0].action.kind === "closed") {
+      assert.equal(r[0].action.outcomes.length, 1);
+      assert.equal(r[0].action.outcomes[0].kind, "refused");
+      assert.equal(r[0].action.cleared, false);
+    }
+    assert.equal(f.sent.length, 0);
+    assert.ok(lines.some((l) => l.includes("close x1 [refused]") && !l.includes("ADL cleared")));
+  });
+
+  it("dry-run closes read the log from the dry-run outcome and flag a cleared ADL", async () => {
+    const f = fakeExecConn({ simLogs: () => closed(40n, true, 9n) });
+    const lines: string[] = [];
+    const r = await windDownV22Once(latchedCtx(), freshWindDownV22State(), { exec: execCtx(f.conn, true), fetchPortfolios, log: (l) => lines.push(l) });
+    assert.equal(r[0].action.kind, "closed");
+    if (r[0].action.kind === "closed") {
+      assert.equal(r[0].action.cleared, true);
+      assert.equal(r[0].action.outcomes.length, 1);
+      assert.equal(r[0].action.outcomes[0].kind, "dry-run");
+    }
+    assert.equal(f.sent.length, 0);
+    assert.ok(lines.some((l) => l.includes("ADL cleared")));
+  });
+
+  it("never throws: an Error from the fetch is skipped with its message, a non-Error is stringified, both back off", async () => {
+    const f = fakeExecConn();
+    const st = freshWindDownV22State();
+    const ctx = latchedCtx();
+    const r1 = await windDownV22Once(ctx, st, { exec: execCtx(f.conn), fetchPortfolios: async () => { throw new Error("rpc down"); } });
+    assert.deepEqual(r1[0].action, { kind: "skipped", reason: "rpc down" });
+    assert.equal(st.nextSlot.get(key0(ctx)), BigInt(ctx.readSlot) + WIND_DOWN_V22_RETRY_SLOTS);
+    const r2 = await windDownV22Once(ctx, freshWindDownV22State(), { exec: execCtx(f.conn), fetchPortfolios: async () => { throw "x".repeat(300); } });
+    assert.equal(r2[0].action.kind === "skipped" && r2[0].action.reason.length, 120);
+  });
+
+  it("default fetch: one getProgramAccounts at the portfolio length; default log falls back to exec.log; default simulate/send", async () => {
+    const f = fakeExecConn({ simLogs: () => notEligible(now, 9_000n, now) });
+    const asks: unknown[] = [];
+    const conn = Object.assign(f.conn, {
+      async getProgramAccounts(_p: unknown, cfg: { filters: Array<{ dataSize?: number }> }) {
+        asks.push(cfg.filters[0]);
+        return book().map((a) => ({ pubkey: a.pubkey, account: { data: Buffer.from(a.data) } }));
+      },
+    });
+    const lines: string[] = [];
+    const ex = { ...execCtx(conn), log: (l: string) => lines.push(l) };
+    const r = await windDownV22Once(latchedCtx({ slot: now }), freshWindDownV22State(), { exec: ex });
+    assert.deepEqual(asks, [{ dataSize: LAYOUT_V22.portfolio.accountLen }]);
+    assert.equal(r[0].action.kind, "armed");
+    assert.ok(lines.some((l) => l.includes("[v22][adl-104]")));
+  });
+
+  it("without any log seam it falls back to console.log", async () => {
+    const f = fakeExecConn({ simLogs: () => notEligible(now, 9_000n, now) });
+    const ex = { ...execCtx(f.conn), log: undefined };
+    const orig = console.log;
+    const seen: string[] = [];
+    console.log = (s: string) => void seen.push(String(s));
+    try {
+      await windDownV22Once(latchedCtx({ slot: now }), freshWindDownV22State(), { exec: ex as never, fetchPortfolios });
+    } finally {
+      console.log = orig;
+    }
+    assert.ok(seen.some((l) => l.includes("[v22][adl-104]")));
+  });
+});
+
 describe("KEEPER_V22_ADL_WIND_DOWN", () => {
   it("is OFF by default, its own flag, strict", () => {
     assert.equal(v22FlagsFromEnv({ KEEPER_V22: "on" }).adlWindDown, false);
