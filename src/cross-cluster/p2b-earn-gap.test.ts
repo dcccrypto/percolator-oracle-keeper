@@ -215,3 +215,55 @@ describe("earnGapConfigFromEnv", () => {
     assert.throws(() => earnGapConfigFromEnv({ EARN_GAP_ALERT_CYCLES: "0" }), /EARN_GAP_ALERT_CYCLES/);
   });
 });
+
+describe("coverage: ledger presence, non-Error throws, default deps, env blanks", () => {
+  it("only the sibling ledger present (own missing) still prices without throwing", async () => {
+    const { s } = vault();
+    const accounts = new Map<string, Uint8Array>();
+    accounts.set(deriveLpBackingLedger(PROGRAM, s.market, 3)[0].toBase58(), ownLedger(500));
+    const c = fakeConn({ accounts });
+    const m = mon();
+    await m.run(c.conn as never, [s]);
+    assert.equal(m.health().length, 1, "a vault with only a sibling ledger is priced, not an error");
+    assert.equal(c.calls.length, 1);
+  });
+
+  it("a thrown non-Error value is stringified into the one-shot log line", async () => {
+    const { s } = vault();
+    const logs: string[] = [];
+    const m = new EarnGapMonitor(DEFAULT_EARN_GAP_CONFIG, PROGRAM, () => 0, (l) => logs.push(l));
+    const conn = { getMultipleAccountsInfoAndContext: async () => { throw "rpc down"; } };
+    await m.run(conn as never, [s]);
+    await m.run(conn as never, [s]);
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /rpc down/);
+    assert.deepEqual(m.health(), []);
+  });
+
+  it("an error after a good run drops the record and resets the streak", async () => {
+    const { s, c } = vault();
+    const m = mon({ ...DEFAULT_EARN_GAP_CONFIG, alertCycles: 2 });
+    await m.run(c.conn as never, [s]);
+    assert.equal(m.health().length, 1);
+    const bad = { getMultipleAccountsInfoAndContext: async () => { throw new Error("x"); } };
+    await m.run(bad as never, [s]);
+    assert.deepEqual(m.health(), []);
+    assert.deepEqual(await m.run(c.conn as never, [s]), [], "streak restarted at 1, below 2 cycles");
+  });
+
+  it("default clock and logger: isDue is true before the first run and false right after", async () => {
+    const { s, c } = vault();
+    const m = new EarnGapMonitor(DEFAULT_EARN_GAP_CONFIG, PROGRAM);
+    assert.equal(m.isDue(), true);
+    await m.run(c.conn as never, [s]);
+    assert.equal(m.isDue(), false);
+  });
+
+  it("blank / whitespace env values fall back to the defaults; non-integer and out-of-range throw", () => {
+    assert.deepEqual(earnGapConfigFromEnv({ EARN_GAP_INTERVAL_MS: "  ", EARN_GAP_ALERT_BPS: "" }), DEFAULT_EARN_GAP_CONFIG);
+    assert.throws(() => earnGapConfigFromEnv({ EARN_GAP_ALERT_BPS: "1.5" }), /EARN_GAP_ALERT_BPS/);
+    assert.throws(() => earnGapConfigFromEnv({ EARN_GAP_INTERVAL_MS: "999" }), /EARN_GAP_INTERVAL_MS/);
+    assert.throws(() => earnGapConfigFromEnv({ EARN_GAP_ALERT_BPS: "10001" }), /EARN_GAP_ALERT_BPS/);
+    assert.throws(() => earnGapConfigFromEnv({ EARN_GAP_ALERT_BPS: "x" }), /EARN_GAP_ALERT_BPS/);
+  });
+});
