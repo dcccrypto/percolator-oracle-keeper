@@ -246,6 +246,9 @@ export function pollOnce(registry: Registry, config: RegisterPollConfig): Promis
       return n;
     } finally {
       pollRunning = false;
+      // A rejected poll skips the drain loop; a stale flag would make the NEXT
+      // call run a phantom extra poll.
+      pollRerunQueued = false;
     }
   })();
   return pollChain;
