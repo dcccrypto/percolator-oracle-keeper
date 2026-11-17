@@ -4,7 +4,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { Keypair } from "@solana/web3.js";
+import { Keypair, PublicKey } from "@solana/web3.js";
 import {
   DEFAULT_P2B_GATE_CONFIG,
   P2bFeatureGate,
@@ -295,7 +295,7 @@ describe("coverage: makeTag103Probe candidate skipping and batching", () => {
   });
 
   it("more than 50 markets (100+ keys) are read in batches of 100 and a bound one past the first batch is still found", async () => {
-    const markets = Array.from({ length: 60 }, mk);
+    const markets = Array.from({ length: 60 }, () => PublicKey.unique());
     const accounts = new Map<string, Uint8Array>();
     markets.forEach((m, i) => {
       accounts.set(deriveLpVaultRegistry(PROGRAM, m)[0].toBase58(), registryBytes({ bound: i === 55 }));

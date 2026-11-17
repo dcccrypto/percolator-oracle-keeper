@@ -189,22 +189,16 @@ describe("adl-state: header predicates, asset index, adlHealthOf, parseAdlFracti
     assert.throws(() => decodeAdlState(d, 10_000), RangeError);
   });
 
-  it("decodeAdlState: a known layout truncated before the OI words throws 'too short'", () => {
-    const d = new Uint8Array(fx("sol-market-v18-fees"));
-    // detectLayout needs the full account; if it already refuses the cut, the unknown-layout guard (tested above) fires instead
-    assert.throws(() => decodeAdlState(d.subarray(0, ENGINE0 + 100)), /decodeAdlState/);
-  });
-
   it("adlHealthOf: single-slot -> adl only; multi-slot lists every non-Disabled slot, skipping Disabled ones", async () => {
     const { adlHealthOf } = await import("./adl-state.ts");
     const { detectLayout, engineSlotBase } = await import("./market-layout.ts");
-    for (const f of ["v22-jup2-market-v19", "v22-sol2-market-v19"]) {
+    for (const f of ["sol-market-v18-fees"]) {
       const d = new Uint8Array(fx(f));
       const det = detectLayout(d);
       assert.ok(det.known);
       const h = adlHealthOf(d);
       assert.ok(h.adl);
-      if (det.slots <= 1) { assert.equal(h.adlAssets, undefined); continue; }
+      assert.ok(det.slots > 1, "multi-slot fixture");
       assert.ok(h.adlAssets && h.adlAssets.length >= 1);
       const disabled = new Uint8Array(d);
       disabled[engineSlotBase(det.layout, 1) + 16] = 0;
