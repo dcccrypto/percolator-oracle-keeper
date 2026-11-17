@@ -118,7 +118,21 @@ describe("onPushLanded control flow", () => {
     assert.equal(cn.c.sent, 2);
   });
 
-  it("failed simulation clears lastMark so the same price retries (lead 3: not a bug)", async () => {
+  it("A->B(busy)->A: the return to A after a busy push still cranks", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let first = true;
+    const cn = conn({ sim: async () => { if (first) { first = false; await gate; } return { value: { err: null, logs: [] } }; } });
+    const k = mk(cn);
+    const p1 = k.onPushLanded(MK, 1n);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(await k.onPushLanded(MK, 2n), "busy");
+    release();
+    await p1;
+    assert.equal(await k.onPushLanded(MK, 1n), "cranked");
+  });
+
+  it("failed simulation clears lastMark so the same price retries", async () => {
     let bad = true;
     const cn = conn({ sim: async () => (bad ? { value: { err: { InstructionError: [0, { Custom: 1 }] }, logs: [] } } : { value: { err: null, logs: [] } }) });
     const k = mk(cn);

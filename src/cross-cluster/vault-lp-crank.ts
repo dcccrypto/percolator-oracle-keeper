@@ -129,6 +129,7 @@ export class VaultLpCranker {
   private readonly lookup = new Map<string, { vaultLp: PublicKey | null; at: number }>();
   private readonly lastMark = new Map<string, bigint>();
   private readonly inflight = new Set<string>();
+  private readonly busyMoved = new Set<string>();
   readonly stats = { cranked: 0, benign: 0, failed: 0, suppressed: 0 };
 
   constructor(
@@ -182,9 +183,12 @@ export class VaultLpCranker {
     }
     const prev = this.lastMark.get(marketAddress);
     if (prev === priceE6) return "no-move";
-    // Busy: do NOT record the price. The in-flight crank may have simulated before this push landed, so the
-    // next push at this same price must still be cranked rather than short-circuit as "no-move".
-    if (this.inflight.has(marketAddress)) return "busy";
+    // Busy: the in-flight crank may or may not have observed this price (it sleeps settleMs before simulating), so
+    // flag the market; when that crank finishes lastMark is cleared and the next push cranks whatever its price.
+    if (this.inflight.has(marketAddress)) {
+      this.busyMoved.add(marketAddress);
+      return "busy";
+    }
     this.lastMark.set(marketAddress, priceE6);
     this.inflight.add(marketAddress);
     try {
@@ -231,6 +235,7 @@ export class VaultLpCranker {
       return "failed";
     } finally {
       this.inflight.delete(marketAddress);
+      if (this.busyMoved.delete(marketAddress)) this.lastMark.delete(marketAddress);
     }
   }
 }
