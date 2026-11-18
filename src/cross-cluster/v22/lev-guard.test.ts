@@ -892,7 +892,8 @@ describe("HOLDER JOB (KEEPER_LEV_HOLDER_JOB)", () => {
     now += 700_000;
     await h.k.holderTick(mk);
     assert.ok(h.logs.some((l) => l.includes("[lev-guard][holder] T: failed: run exploded")));
-    assert.match(String(h.k.healthFields().markets[w.market.toBase58()]?.holder), /failed: run exploded/);
+    const healthMarkets = h.k.healthFields().markets as Record<string, { holder?: unknown } | undefined>;
+    assert.match(String(healthMarkets[w.market.toBase58()]?.holder),/failed: run exploded/);
     // in flight: a second tick while the first awaits does not start a second run
     const h2 = keeperOf(c.conn, cfg({ holderJob: true }), { now: () => now });
     let runs = 0;
