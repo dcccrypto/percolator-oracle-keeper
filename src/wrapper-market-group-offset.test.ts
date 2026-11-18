@@ -44,6 +44,12 @@ import {
   VERSION_16,
   VERSION_17,
   HEADER_VERSION_OFF,
+  VERSION_19,
+  assetSlotOffset,
+  V19_MARKET_GROUP_OFF,
+  V19_MARKET_GROUP_LEN,
+  V19_MARKET_ASSET_SLOT_LEN,
+  V19_ASSET_ORACLE_WRAPPER_LEN,
 } from "./wrapper-market-group-offset.js";
 
 /**
@@ -188,5 +194,56 @@ describe("selectMarketGroupOffset", () => {
     assert.equal(MARKET_GROUP_OFF_BY_VERSION[16], 448);
     assert.equal(MARKET_GROUP_OFF_BY_VERSION[18], 592);
     assert.equal(MARKET_GROUP_OFF_BY_VERSION[19], 592);
+  });
+});
+
+describe("selectMarketGroupOffset: v2.2 geometry, boundaries, assetSlotOffset", () => {
+  it("resolves VERSION 19 to the SDK LAYOUT_V22 geometry (not the v2.1 group length)", () => {
+    const r = selectMarketGroupOffset(makeHeader(VERSION_19));
+    assert.deepEqual(r, {
+      ok: true,
+      version: 19,
+      marketGroupOff: V19_MARKET_GROUP_OFF,
+      marketGroupLen: V19_MARKET_GROUP_LEN,
+      assetSlotStride: V19_MARKET_ASSET_SLOT_LEN,
+      wrapperSlotLen: V19_ASSET_ORACLE_WRAPPER_LEN,
+    });
+    assert.equal(V19_MARKET_GROUP_OFF, 592);
+    assert.equal(V19_MARKET_GROUP_LEN, 806);
+    assert.equal(V19_MARKET_ASSET_SLOT_LEN, 2661);
+    assert.equal(V19_ASSET_ORACLE_WRAPPER_LEN, 1024);
+  });
+
+  it("too-short boundary: 9 bytes fail closed, exactly 10 bytes (magic + u16 version) resolve", () => {
+    assert.deepEqual(selectMarketGroupOffset(makeHeader(VERSION_16).subarray(0, HEADER_VERSION_OFF + 1)), { ok: false, reason: "too-short" });
+    const r = selectMarketGroupOffset(makeHeader(VERSION_16).subarray(0, HEADER_VERSION_OFF + 2));
+    assert.equal(r.ok, true);
+    assert.equal((r as { marketGroupOff: number }).marketGroupOff, 448);
+  });
+
+  it("empty and 8-byte (magic-only) buffers fail closed with too-short, never an offset", () => {
+    assert.deepEqual(selectMarketGroupOffset(new Uint8Array(0)), { ok: false, reason: "too-short" });
+    assert.deepEqual(selectMarketGroupOffset(makeHeader(VERSION_17).subarray(0, 8)), { ok: false, reason: "too-short" });
+  });
+
+  it("an all-zero buffer is bad-magic with magic 0n", () => {
+    assert.deepEqual(selectMarketGroupOffset(new Uint8Array(64)), { ok: false, reason: "bad-magic", magic: 0n });
+  });
+
+  it("version 0 and 17 and 65535 are unrecognized (only 16, 18, 19 are known)", () => {
+    for (const v of [0, 17, 65535]) {
+      assert.deepEqual(selectMarketGroupOffset(makeHeader(v)), { ok: false, reason: "unrecognized-version", version: v });
+    }
+  });
+
+  it("assetSlotOffset = marketGroupOff + marketGroupLen + index * stride", () => {
+    const v18 = selectMarketGroupOffset(makeHeader(VERSION_17));
+    const v19 = selectMarketGroupOffset(makeHeader(VERSION_19));
+    assert.ok(v18.ok && v19.ok);
+    assert.equal(assetSlotOffset(v18, 0), 592 + 758);
+    assert.equal(assetSlotOffset(v18, 3), 592 + 758 + 3 * 2325);
+    assert.equal(assetSlotOffset(v19, 0), 592 + 806);
+    assert.equal(assetSlotOffset(v19, 2), 592 + 806 + 2 * 2661);
+    assert.equal(assetSlotOffset({ marketGroupOff: 448, marketGroupLen: 758, assetSlotStride: 2325, wrapperSlotLen: 1024 }, 1), 448 + 758 + 2325);
   });
 });
