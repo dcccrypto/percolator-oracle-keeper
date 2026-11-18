@@ -80,3 +80,14 @@ test("clone does not alias: mutating a candidate leaves the source untouched", (
   recordMarkInForce(sp, 12, now + 4000);
   assert.equal(JSON.stringify(c), before);
 });
+
+test("snapshots taken with cloneCircuitBreakerState stay frozen while the original is written", () => {
+  const now = 1_700_000_000_000;
+  const s: CircuitBreakerState = { lastPrice: 10 } as CircuitBreakerState;
+  recordMarkInForce(s, 10, now);
+  const c = cloneCircuitBreakerState(s);
+  const snap = cloneCircuitBreakerState(c);
+  const before = JSON.stringify(snap);
+  recordMarkInForce(c, 12, now + 1000);
+  assert.equal(JSON.stringify(snap), before);
+});
