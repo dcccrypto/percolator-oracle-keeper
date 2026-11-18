@@ -15,6 +15,7 @@ import { V22_ASSET_BAND_OFF, V22_CONFIG_OFF } from "./market.ts";
 import {
   DEFAULT_LP_CERT_THRESHOLDS,
   FALLBACK_BAND_MAX_EPOCH_SLOTS,
+  FALLBACK_BAND_MIN_PIN_EPOCHS,
   LP_CERT_ALERT_SCOPE,
   evaluateVaultLpCrankStaleness,
   lpCertLevelOf,
@@ -317,5 +318,167 @@ describe("lp-cert-liveness: V22Loop fires, escalates and clears through the shar
     await h.loop.tick();
     assert.equal(h.resolved().length, 1);
     assert.match(h.resolved()[0], /"severity":"critical"/);
+  });
+});
+
+// ── coverage: fallback, lifecycle, clamps, ordering, decode edges ─────────────
+
+describe("lp-cert-liveness: engine-floor fallback (band_rent.rs:83 E >= 150, :86 Pmax >= 8 E)", () => {
+  it("pins the fallback constants to the engine floors", () => {
+    assert.equal(FALLBACK_BAND_MAX_EPOCH_SLOTS, 150n);
+    assert.equal(FALLBACK_BAND_MIN_PIN_EPOCHS, 8n);
+  });
+  it("both words 0: E = 150, Pmax = 8 * 150 = 1,200, horizon 1,350, source fallback", () => {
+    const s = lpCertStalenessOf(asset({ maxEpochSlots: 0n, maxPinSlots: 0n }), 10_100n);
+    assert.ok(s);
+    assert.equal(s.horizonSlots, 1_350n);
+    assert.equal(s.deadlineSlot, 11_350n);
+    assert.equal(s.horizonSource, "fallback-engine-floor");
+  });
+  it("only Pmax reads 0: keeps the on-chain E (600) and derives Pmax = 8 * 600; still flagged fallback", () => {
+    const s = lpCertStalenessOf(asset({ maxPinSlots: 0n }), 10_100n);
+    assert.ok(s);
+    assert.equal(s.horizonSlots, 600n + 4_800n);
+    assert.equal(s.horizonSource, "fallback-engine-floor");
+  });
+  it("only E reads 0: E falls back to 150 and the on-chain Pmax (9,000) is kept; flagged fallback", () => {
+    const s = lpCertStalenessOf(asset({ maxEpochSlots: 0n }), 10_100n);
+    assert.ok(s);
+    assert.equal(s.horizonSlots, 150n + 9_000n);
+    assert.equal(s.horizonSource, "fallback-engine-floor");
+  });
+  it("the fallback is called out in the alert message; on-chain is not", () => {
+    const fb = lpCertStalenessOf(asset({ maxEpochSlots: 0n, maxPinSlots: 0n }), 10_700n);
+    assert.ok(fb);
+    const [a] = evaluateVaultLpCrankStaleness({ label: "B", market: "M", terminal: false, nowSlot: 10_700n, assets: [fb] }, T);
+    assert.match(a.message, /engine-floor fallback/);
+    assert.equal(a.data?.horizonSource, "fallback-engine-floor");
+    const oc = lpCertStalenessOf(asset(), 20_000n);
+    assert.ok(oc);
+    const [b] = evaluateVaultLpCrankStaleness({ label: "B", market: "M", terminal: false, nowSlot: 20_000n, assets: [oc] }, T);
+    assert.doesNotMatch(b.message, /fallback/);
+  });
+});
+
+describe("lp-cert-liveness: lifecycle split", () => {
+  it("Active (2) and DrainOnly (3) apply; every other lifecycle is null", () => {
+    for (const lc of [0, 1, 4, 5, 255]) assert.equal(lpCertStalenessOf(asset({ lifecycle: lc }), 20_000n), null, `lifecycle ${lc}`);
+    for (const lc of [2, 3]) assert.ok(lpCertStalenessOf(asset({ lifecycle: lc }), 20_000n), `lifecycle ${lc}`);
+  });
+  it("Active and DrainOnly produce identical staleness", () => {
+    assert.deepEqual(lpCertStalenessOf(asset({ lifecycle: 2 }), 12_000n), lpCertStalenessOf(asset({ lifecycle: 3 }), 12_000n));
+  });
+});
+
+describe("lp-cert-liveness: clamps and ordering", () => {
+  it("now at or before the anchor: staleSlots 0 (level ok) and the deadline is clamped at 0 remaining after expiry", () => {
+    const before = lpCertStalenessOf(asset(), 9_000n);
+    assert.ok(before);
+    assert.equal(before.staleSlots, 0n);
+    assert.equal(lpCertLevelOf(before, T), "ok");
+    const at = lpCertStalenessOf(asset(), 10_000n);
+    assert.ok(at);
+    assert.equal(at.staleSlots, 0n);
+    const past = lpCertStalenessOf(asset(), 30_000n);
+    assert.ok(past);
+    assert.equal(past.remainingSlots, 0n);
+  });
+  it("degenerate deadline at or before the anchor: horizon clamps to 1 slot", () => {
+    // pin stamped before the anchor with a tiny Pmax drives deadline <= anchor
+    const s = lpCertStalenessOf(asset({ anchorSlot: 10_000n, pinSinceSlot: 5n, maxPinSlots: 1n }), 10_010n);
+    assert.ok(s);
+    assert.equal(s.horizonSlots, 1n);
+    assert.equal(lpCertLevelOf(s, T), "critical");
+    const [a] = evaluateVaultLpCrankStaleness({ label: "B", market: "M", terminal: false, nowSlot: 10_010n, assets: [s] }, T);
+    assert.equal(a.severity, "critical");
+  });
+  it("custom thresholds are honoured", () => {
+    const s = lpCertStalenessOf(asset(), 10_000n + 1_000n);
+    assert.ok(s);
+    assert.equal(lpCertLevelOf(s, { warnPct: 10, criticalPct: 90 }), "warn");
+    assert.equal(lpCertLevelOf(s, { warnPct: 5, criticalPct: 10 }), "critical");
+  });
+  it("evaluate: all assets ok -> no alert; warn asset is not displaced by a later ok asset", () => {
+    const ok = lpCertStalenessOf(asset({ assetIndex: 3, lpLegEpochSnap: 7n }), 12_500n);
+    const warn = lpCertStalenessOf(asset({ assetIndex: 4 }), 12_500n);
+    assert.ok(ok && warn);
+    assert.deepEqual(evaluateVaultLpCrankStaleness({ label: "B", market: "M", terminal: false, nowSlot: 12_500n, assets: [ok] }, T), []);
+    assert.deepEqual(evaluateVaultLpCrankStaleness({ label: "B", market: "M", terminal: false, nowSlot: 12_500n, assets: [] }, T), []);
+    const [a] = evaluateVaultLpCrankStaleness({ label: "B", market: "M", terminal: false, nowSlot: 12_500n, assets: [warn, ok] }, T);
+    assert.equal(a.data?.assetIndex, 4);
+  });
+  it("evaluate: a warn asset after a critical one never replaces it", () => {
+    const crit = lpCertStalenessOf(asset({ assetIndex: 1, anchorSlot: 7_000n }), 12_500n);
+    const warn = lpCertStalenessOf(asset({ assetIndex: 2 }), 12_500n);
+    assert.ok(crit && warn);
+    const [a] = evaluateVaultLpCrankStaleness({ label: "B", market: "M", terminal: false, nowSlot: 12_500n, assets: [crit, warn] }, T);
+    assert.equal(a.severity, "critical");
+    assert.equal(a.data?.assetIndex, 1);
+  });
+  it("evaluate: among equal levels the fewest remaining slots wins, in either input order", () => {
+    // both warn (stale 2,500 / 2,900 of 9,600); asset 6 anchored earlier -> nearer deadline
+    const late = lpCertStalenessOf(asset({ assetIndex: 5, anchorSlot: 10_000n }), 12_900n);
+    const near = lpCertStalenessOf(asset({ assetIndex: 6, anchorSlot: 10_000n - 0n, pinSinceSlot: 10_100n }), 12_900n);
+    assert.ok(late && near);
+    assert.ok(near.remainingSlots < late.remainingSlots);
+    for (const assets of [[late, near], [near, late]]) {
+      const [a] = evaluateVaultLpCrankStaleness({ label: "B", market: "M", terminal: false, nowSlot: 12_900n, assets }, T);
+      assert.equal(a.data?.assetIndex, 6);
+    }
+  });
+});
+
+describe("lp-cert-liveness: env thresholds, extra edges", () => {
+  it("whitespace-only and non-integer values; boundaries 1 and 99 accepted, 0 and 100 rejected", () => {
+    const errs: string[] = [];
+    const f = (e: Record<string, string>) => lpCertThresholdsFromEnv(e, (l) => errs.push(l));
+    assert.deepEqual(f({ ALERT_VAULT_LP_CRANK_WARN_PCT: "   " }), { warnPct: 25, criticalPct: 50 });
+    assert.equal(errs.length, 0);
+    assert.deepEqual(f({ ALERT_VAULT_LP_CRANK_WARN_PCT: "1", ALERT_VAULT_LP_CRANK_CRITICAL_PCT: "99" }), { warnPct: 1, criticalPct: 99 });
+    assert.deepEqual(f({ ALERT_VAULT_LP_CRANK_WARN_PCT: "0" }), { warnPct: 25, criticalPct: 50 });
+    assert.deepEqual(f({ ALERT_VAULT_LP_CRANK_WARN_PCT: "12.5" }), { warnPct: 25, criticalPct: 50 });
+    assert.equal(errs.length, 2);
+    assert.deepEqual(f({ ALERT_VAULT_LP_CRANK_WARN_PCT: "30", ALERT_VAULT_LP_CRANK_CRITICAL_PCT: "30" }), { warnPct: 30, criticalPct: 30 });
+  });
+  it("default logger is console.error", (t) => {
+    const calls: unknown[] = [];
+    t.mock.method(console, "error", (m: unknown) => calls.push(m));
+    assert.deepEqual(lpCertThresholdsFromEnv({ ALERT_VAULT_LP_CRANK_WARN_PCT: "zz" }), { warnPct: 25, criticalPct: 50 });
+    assert.equal(calls.length, 1);
+    assert.match(String(calls[0]), /ALERT_VAULT_LP_CRANK_WARN_PCT="zz"/);
+  });
+});
+
+describe("lp-cert-liveness: decode edges", () => {
+  const mk = () => bandMarket({ epoch: 7n, anchorSlot: 10_000n, currentSlot: 11_000n });
+  it("takes the smallest band_epoch_snap across the LP's active legs on the asset; other-asset and inactive legs are ignored", () => {
+    const G = LAYOUT_V22.portfolio;
+    const off = G.leg.bandEpochSnap;
+    assert.ok(off !== null);
+    const b = Buffer.from(
+      portfolioBytes({
+        owner: key(8),
+        capital: 1_000n,
+        legs: [
+          { side: 0, basis: 5n },
+          { side: 1, basis: 5n },
+          { side: 0, basis: 5n, assetIndex: 3 },
+          { side: 0, basis: 5n },
+        ],
+      }),
+    );
+    const snaps = [5n, 6n, 1n, 2n];
+    snaps.forEach((s, i) => b.writeBigUInt64LE(s, G.legsOff + i * G.legStride + off));
+    // leg 3 (snap 2, asset 0) made inactive: must be ignored
+    b[G.legsOff + 3 * G.legStride + G.leg.active] = 0;
+    const [a] = readLpCertAssets(mk(), L, [0], new Uint8Array(b));
+    assert.equal(a.lpLegEpochSnap, 5n);
+    // order independence: smaller snap first then larger
+    snaps.splice(0, 2, 6n, 5n);
+    snaps.forEach((s, i) => b.writeBigUInt64LE(s, G.legsOff + i * G.legStride + off));
+    assert.equal(readLpCertAssets(mk(), L, [0], new Uint8Array(b))[0].lpLegEpochSnap, 5n);
+  });
+  it("an unparseable LP portfolio throws (caller keeps the last known state)", () => {
+    assert.throws(() => readLpCertAssets(mk(), L, [0], new Uint8Array(8)));
   });
 });
