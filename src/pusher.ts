@@ -20,7 +20,7 @@
 import { Connection, Keypair } from "@solana/web3.js";
 import fs from "fs";
 import { loadRegistryForProgramSet } from "./cross-cluster/registry.ts";
-import { registryRowProblems } from "./cross-cluster/multi-asset.ts";
+import { priceUnitsOfRegistry, registryRowProblems } from "./cross-cluster/multi-asset.ts";
 import { PROGRAM_IDS_RESOLVED, describeProgramIds } from "./program-ids.ts";
 import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
@@ -116,7 +116,10 @@ const gate = new TakeoverGate(CFG);
 const refresh = async (): Promise<void> => {
   const addrs = registry.markets.map((m) => m.marketAddress);
   for (const m of registry.markets) gate.setLabel(m.marketAddress, m.label);
-  await refreshTakeoverGate(devnetConn, gate, addrs);
+  // each asset k > 0 has its own on-chain clock (profile.last_good_oracle_slot); a fresh asset 0 must not hold asset k on standby
+  const assets = new Map<string, number[]>();
+  for (const u of priceUnitsOfRegistry(registry.markets)) if (u.assetIndex > 0) assets.set(u.marketAddress, [...(assets.get(u.marketAddress) ?? []), u.assetIndex]);
+  await refreshTakeoverGate(devnetConn, gate, addrs, Date.now(), assets);
   try {
     await getAlertSink().reconcile("pusher", gate.activeAlerts());
   } catch (err) {
@@ -141,7 +144,7 @@ void startRegistryReloadLoop(registry, {
 }).catch((err) => console.error(`[registry-reload] loop crashed: ${err instanceof Error ? err.message : String(err)}`));
 
 await startKeeperLoop(mainnetConn, devnetConn, keeper, registry, {
-  standby: (m) => gate.isStandby(m),
+  standby: (m, assetIndex) => gate.isStandby(m, undefined, assetIndex ?? 0),
   onPushLanded: (m, _px, label) => {
     gate.recordPush(m);
     console.warn(`[pusher][TAKEOVER] pushed ${label}: the on-chain price was older than ${CFG.takeoverSlots} slots (primary silent)`);
