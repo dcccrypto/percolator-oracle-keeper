@@ -2,7 +2,7 @@
  * Bench: sweep cursor/ordering (selectSweepBatch, markVisited, pruneVisits, refreshPositionedFrom)
  * at N = 1k / 5k / 20k positioned portfolios, 20 rounds each (a round = ceil(N/K) batches
  * walked through the cursor, plus one prune and one refreshPositionedFrom of 64 fresh entries).
- * Reports the median ms per N over 5 runs. Usage: npx tsx scripts/bench-positioned-sweep.ts
+ * Reports the median ms per N over 3 runs. Usage: npx tsx scripts/bench-positioned-sweep.ts
  */
 import { PublicKey } from "@solana/web3.js";
 import { freshSweepCursor, markVisited, pruneVisits, refreshPositionedFrom, selectSweepBatch } from "../src/cross-cluster/positioned-sweep.ts";
@@ -11,7 +11,7 @@ import type { PositionedPortfolio } from "../src/cross-cluster/positioned-refres
 const SIZES = [1000, 5000, 20000];
 const ROUNDS = 20;
 const K = 8;
-const RUNS = 5;
+const RUNS = 3;
 
 function makeRng(seed: number) {
   let s = seed >>> 0;
