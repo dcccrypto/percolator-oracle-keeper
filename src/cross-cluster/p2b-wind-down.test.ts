@@ -459,6 +459,115 @@ describe("windDownConfigFromEnv", () => {
   });
 });
 
+describe("readWindDownView: boundaries", () => {
+  it("a future mark slot clamps the age to 0", () => {
+    const m = roMarket({ episodeSince: BigInt(NOW - 9000), markSlot: BigInt(NOW + 500) });
+    assert.equal(readWindDownView(m, 0, BigInt(NOW))!.markAgeSlots, 0n);
+  });
+
+  it("a truncated or out-of-range read throws (decodeAdlState) and the runner contains it as unreadable", async () => {
+    const m = roMarket();
+    assert.throws(() => readWindDownView(m.subarray(0, 100), 0, BigInt(NOW)));
+    assert.throws(() => readWindDownView(m, 200, BigInt(NOW)));
+    const g = rig({ holders: [holder(1, "short")] });
+    assert.deepEqual(await g.r.runMarket(snap(m.subarray(0, 100))), { kind: "skipped", why: "unreadable" });
+  });
+});
+
+describe("runner: edge turns", () => {
+  it("long-side wind-down winds down the long holders", async () => {
+    const g = rig({ holders: [holder(1, "short"), holder(2, "long")], sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    const out = await g.r.runMarket(snap(patchedMarket({ aLong: RO_SHORT, oiEffLong: BIG_OI, oiEffShort: BIG_OI, episodeSince: BigInt(NOW - 9000) })));
+    assert.equal(out.kind, "acted");
+    assert.equal(g.c.sent.length, 1);
+  });
+
+  it("no market data -> none; a non-Error throw is stringified into the log and contained", async () => {
+    const g = rig({ holders: [holder(1, "short")] });
+    assert.deepEqual(await g.r.runMarket(snapshot({ marketData: null, slot: NOW, label: "PERC" })), { kind: "none" });
+    const lines: string[] = [];
+    const r = new AdlWindDownRunner(DEFAULT_WIND_DOWN_CONFIG, {
+      programId: PROGRAM, conn: fakeConn().conn as never, keeper: KEEPER,
+      fetchHolders: async () => { throw "boom-string"; },
+      mintDecimals: async () => 6, now: () => 1, log: (l) => lines.push(l),
+    });
+    assert.deepEqual(await r.runMarket(snap(roMarket({ episodeSince: BigInt(NOW - 9000) }))), { kind: "skipped", why: "unreadable" });
+    assert.match(lines[0], /PERC: boom-string/);
+  });
+
+  it("the reduce-only side has no holder -> falls back to all holders (a long-only book on a short-side wind-down)", async () => {
+    const g = rig({ holders: [holder(1, "long")], sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    const out = await g.r.runMarket(snap(roMarket({ episodeSince: BigInt(NOW - 9000) })));
+    assert.equal(out.kind, "acted");
+    assert.equal(g.c.sent.length, 1);
+  });
+});
+
+describe("runner: a send that does not land counts nothing", () => {
+  const run = async (c: ReturnType<typeof fakeConn>) => {
+    const lines: string[] = [];
+    const r = new AdlWindDownRunner(DEFAULT_WIND_DOWN_CONFIG, {
+      programId: PROGRAM, conn: c.conn as never, keeper: KEEPER,
+      fetchHolders: async () => [holder(1, "short")],
+      mintDecimals: async () => 6, now: () => 1, log: (l) => lines.push(l), confirm: { statusRetries: 0, statusRetryDelayMs: 1 },
+    });
+    const out = await r.runMarket(snap(roMarket({ episodeSince: BigInt(NOW - 9000) })));
+    return { r, out, lines };
+  };
+
+  it("landed but failed on chain -> logged, not counted as sent", async () => {
+    const c = fakeConn({ sims: [{ err: null, logs: [CLOSED_LOG] }], confirmErr: { InstructionError: [0, { Custom: 5 }] } });
+    const { r, out, lines } = await run(c);
+    assert.deepEqual(out, { kind: "acted", armed: 0, closed: 0, sims: 1, sent: 0 });
+    assert.equal(r.stats.sent, 0);
+    assert.ok(lines.some((l) => /landed but failed on chain sig=/.test(l)));
+  });
+
+  it("a landed send whose simulation reported no CU figure logs '?' and counts as sent", async () => {
+    const c = fakeConn({ sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    const base = c.conn.simulateTransaction.bind(c.conn);
+    (c.conn as Record<string, unknown>).simulateTransaction = async (...a: Parameters<typeof base>) => {
+      const r = await base(...a);
+      return { ...r, value: { ...r.value, unitsConsumed: undefined } };
+    };
+    const { r, out, lines } = await run(c);
+    assert.equal((out as { sent: number }).sent, 1);
+    assert.equal(r.stats.sent, 1);
+    assert.ok(lines.some((l) => /simulated \? CU of/.test(l)));
+  });
+
+  it("never lands (status unknown, blockhash expired) -> 'not landed'", async () => {
+    const c = fakeConn({ sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    (c.conn as Record<string, unknown>).getSignatureStatuses = async () => ({ context: { slot: 1 }, value: [null] });
+    (c.conn as Record<string, unknown>).getBlockHeight = async () => 1_000_000;
+    const { r, out, lines } = await run(c);
+    assert.equal((out as { sent: number }).sent, 0);
+    assert.equal(r.stats.sent, 0);
+    assert.ok(lines.some((l) => /not landed sig=/.test(l)));
+  });
+});
+
+describe("runner: default log and clock", () => {
+  it("without deps.log the line goes to console.log; without deps.now Date.now drives the cooldown", async () => {
+    const lines: string[] = [];
+    const orig = console.log;
+    console.log = (l: string) => { lines.push(String(l)); };
+    try {
+      const c = fakeConn({ sims: [{ err: ie({ Custom: 21 }) }] });
+      let fetches = 0;
+      const r = new AdlWindDownRunner(DEFAULT_WIND_DOWN_CONFIG, { programId: PROGRAM, conn: c.conn as never, keeper: KEEPER, fetchHolders: async () => { fetches++; return [holder(1, "short")]; }, mintDecimals: async () => 6 });
+      await r.runMarket(snap(roMarket({ episodeSince: BigInt(NOW - 9000), markSlot: BigInt(NOW - 200) })));
+      assert.match(lines.join("\n"), /\[p2b-wind-down\] PERC: .*skipped until a push lands/);
+      const s = snap(roMarket({ episodeSince: BigInt(NOW - 9000) }));
+      await r.runMarket(s);
+      assert.deepEqual(await r.runMarket(s), { kind: "skipped", why: "cooldown" });
+      assert.equal(fetches, 1);
+    } finally {
+      console.log = orig;
+    }
+  });
+});
+
 describe("runner: capped turn does not set the cooldown", () => {
   it("per-market send cap reached with holders left -> skippedCap, no cooldown, next tick runs again", async () => {
     let now = 1_000_000;
