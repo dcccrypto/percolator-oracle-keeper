@@ -151,41 +151,91 @@ export interface PlanInput {
   maxTxsPerRound?: number;
 }
 
-function heaviestFirst(xs: ReadonlyArray<PositionedPortfolio>): PositionedPortfolio[] {
-  // Decorate once: base58-encoding a key inside the comparator ran O(n log n) times and dominated the tick.
-  const d = xs.map((p) => ({ p, w: portfolioWeight(p), l: p.lossWeight ?? 0n, k: p.pubkey.toBase58() }));
+/** A counterparty with its weight computed once (portfolioWeight is pure and stable for a given entry). */
+interface Weighted {
+  p: PositionedPortfolio;
+  w: number;
+  solo: boolean;
+}
+
+function heaviestFirst(xs: ReadonlyArray<PositionedPortfolio>): Weighted[] {
+  // Decorate once. The base58 key is only the last tiebreak (equal weight AND equal lossWeight), so it is encoded
+  // lazily and memoised: base58-encoding every key up front dominated the tick, and in a comparator ran O(n log n) times.
+  const d = xs.map((p) => ({ p, w: portfolioWeight(p), solo: V22_LEG_COST.isSolo(p), l: p.lossWeight ?? 0n, k: null as string | null }));
+  const keyOf = (e: (typeof d)[number]): string => (e.k ??= e.p.pubkey.toBase58());
   d.sort((a, b) => {
     if (a.w !== b.w) return b.w - a.w;
     if (a.l !== b.l) return a.l > b.l ? -1 : 1;
-    return a.k < b.k ? -1 : a.k > b.k ? 1 : 0;
+    const ka = keyOf(a);
+    const kb = keyOf(b);
+    return ka < kb ? -1 : ka > kb ? 1 : 0;
   });
-  return d.map((e) => e.p);
+  return d;
 }
 
 /**
- * Greedy pack, in the given order, into a tx with `cap` weight units for refreshes. Skips nothing that fits. A SOLO
+ * The not-yet-packed counterparties, in order: `skipped` (passed over by an earlier tx, in order) followed by
+ * `arr[from..]` (never scanned yet). Splitting it this way lets a round that stops scanning early leave the
+ * unscanned tail untouched instead of copying it.
+ */
+interface Remaining {
+  skipped: Weighted[];
+  arr: Weighted[];
+  from: number;
+  /** Summed weight of everything in it, in order (same value as a fresh reduce). */
+  total: number;
+}
+
+function remainingOf(arr: Weighted[]): Remaining {
+  return { skipped: [], arr, from: 0, total: sumW(arr) };
+}
+const remainingCount = (r: Remaining): number => r.skipped.length + r.arr.length - r.from;
+const remainingList = (r: Remaining): Weighted[] => (r.from === 0 && r.skipped.length === 0 ? r.arr : [...r.skipped, ...r.arr.slice(r.from)]);
+
+/**
+ * Greedy pack, in order, into a tx with `cap` weight units for refreshes. Skips nothing that fits. A SOLO
  * portfolio (heavier than any budget) is taken ALONE when it is the first thing taken and `cap` is positive (the tx
  * has an accrue crank of its own beside it, never a second account): `cap <= 0` means the tx's other occupant
  * (a heavy LP) already uses the whole budget, so nothing rides.
+ *
+ * Once something is taken and even the lightest counterparty (`minW`) no longer fits, the scan stops: the rest
+ * is `skipped ++ unscanned tail`, in the original order, exactly what a full scan would have produced.
+ * `exact` says every weight is an integer (sums are then exact in any order, so running totals equal a reduce).
  */
-function takeUpTo(list: PositionedPortfolio[], cap: number): { taken: PositionedPortfolio[]; rest: PositionedPortfolio[] } {
-  const taken: PositionedPortfolio[] = [];
-  const rest: PositionedPortfolio[] = [];
+function takeUpTo(list: Remaining, cap: number, minW: number, exact: boolean): { taken: Weighted[]; takenW: number; rest: Remaining } {
+  const taken: Weighted[] = [];
+  const skipped: Weighted[] = [];
   let used = 0;
-  for (const p of list) {
-    const w = portfolioWeight(p);
-    if (used + w <= cap) {
-      taken.push(p);
-      used += w;
-    } else if (taken.length === 0 && cap > 0 && V22_LEG_COST.isSolo(p)) {
-      taken.push(p);
+  let takenW = 0;
+  const visit = (e: Weighted): void => {
+    if (used + e.w <= cap) {
+      taken.push(e);
+      used += e.w;
+      takenW += e.w;
+    } else if (taken.length === 0 && cap > 0 && e.solo) {
+      taken.push(e);
       used = Number.POSITIVE_INFINITY;
-    } else rest.push(p);
+      takenW += e.w;
+    } else skipped.push(e);
+  };
+  const full = (): boolean => minW > 0 && taken.length > 0 && used + minW > cap;
+  let i = 0;
+  const sk = list.skipped;
+  for (; i < sk.length && !full(); i++) visit(sk[i]);
+  // Early exit inside the skipped part: the rest of it stays skipped.
+  for (let j = i; j < sk.length; j++) skipped.push(sk[j]);
+  let from = list.from;
+  if (i >= sk.length) {
+    const arr = list.arr;
+    while (from < arr.length && !full()) visit(arr[from++]);
   }
-  return { taken, rest };
+  const rest: Remaining = { skipped, arr: list.arr, from, total: 0 };
+  rest.total = exact ? list.total - takenW : sumW(remainingList(rest));
+  return { taken, takenW, rest };
 }
 
-const sumW = (xs: ReadonlyArray<PositionedPortfolio>): number => xs.reduce((n, p) => n + portfolioWeight(p), 0);
+const sumW = (xs: ReadonlyArray<Weighted>): number => xs.reduce((n, e) => n + e.w, 0);
+const ps = (xs: ReadonlyArray<Weighted>): PositionedPortfolio[] => xs.map((e) => e.p);
 
 /**
  * Plan one round. Pure. `counterparties` is the whole positioned set of the asset minus the LP (the caller passes
@@ -199,59 +249,64 @@ export function planSettleRound(i: PlanInput): RoundPlan {
   const C = heaviestFirst(i.counterparties);
   const notes: string[] = [];
   const base = { mode: i.mode, needsPushHold: false, notes };
+  const all = remainingOf(C);
+  // Lightest weight (C is heaviest first, so the last entry) bounds the early exit of a pack scan.
+  const minW = C.length > 0 ? C[C.length - 1].w : 0;
+  const exact = C.every((e) => Number.isInteger(e.w)) && Number.isSafeInteger(all.total);
 
-  const lpTx = (index: number, refresh: PositionedPortfolio[]): PlannedTx => ({
+  const lpTx = (index: number, refresh: Weighted[], refreshW: number): PlannedTx => ({
     index,
     accrue: "lp",
     accrueTarget: i.lp,
-    refresh,
+    refresh: ps(refresh),
     settlesLp: true,
-    weight: lpW + sumW(refresh),
+    weight: lpW + refreshW,
   });
 
   // ── mode off, or a round that fits one tx: the shapes coincide for the single-tx case.
-  if (C.length === 0 || sumW(C) + lpW <= W) {
-    const tx = lpTx(0, C);
+  if (C.length === 0 || all.total + lpW <= W) {
+    const tx = lpTx(0, C, all.total);
     return { ...base, txs: [tx], lpTxIndex: 0, paired: true, unvisited: [], unpairedLpSettle: false, lpDeferred: false, phases: [[0]] };
   }
 
   if (i.mode === "off") {
     // Legacy #147 shape: LP crank in every tx, chunks of counterparties.
     const txs: PlannedTx[] = [];
-    let rest = C;
-    while (rest.length > 0 && txs.length < maxTxs) {
-      const { taken, rest: r } = takeUpTo(rest, W - lpW);
-      if (taken.length === 0) break;
-      txs.push(lpTx(txs.length, taken));
-      rest = r;
+    let rest = all;
+    while (remainingCount(rest) > 0 && txs.length < maxTxs) {
+      const r = takeUpTo(rest, W - lpW, minW, exact);
+      if (r.taken.length === 0) break;
+      txs.push(lpTx(txs.length, r.taken, r.takenW));
+      rest = r.rest;
     }
     notes.push("pairing off: the LP is settled in every tx (legacy #147 shape)");
-    return { ...base, txs, lpTxIndex: txs.length > 0 ? txs.length - 1 : null, paired: false, unvisited: rest, unpairedLpSettle: true, lpDeferred: false, phases: [txs.map((t) => t.index)] };
+    return { ...base, txs, lpTxIndex: txs.length > 0 ? txs.length - 1 : null, paired: false, unvisited: ps(remainingList(rest)), unpairedLpSettle: true, lpDeferred: false, phases: [txs.map((t) => t.index)] };
   }
 
   // ── multi-tx paired round: counterparty txs first (accrue NOT on the LP), the LP tx last.
   const anchorW = i.anchor ? FLAT_ANCHOR_WEIGHT : 0;
   const cpTxs: PlannedTx[] = [];
-  let remaining = C;
+  let remaining = all;
   // Phase 1: fill txs from the heaviest until what is left fits the LP tx's capacity.
-  while (sumW(remaining) > W - lpW && cpTxs.length < maxTxs - 1) {
-    let taken: PositionedPortfolio[];
-    let rest: PositionedPortfolio[];
+  while (remaining.total > W - lpW && cpTxs.length < maxTxs - 1) {
     if (i.anchor) {
-      ({ taken, rest } = takeUpTo(remaining, W - anchorW));
-      if (taken.length === 0) break;
-      cpTxs.push({ index: cpTxs.length, accrue: "anchor", accrueTarget: i.anchor, refresh: taken, settlesLp: false, weight: anchorW + sumW(taken) });
+      const r = takeUpTo(remaining, W - anchorW, minW, exact);
+      if (r.taken.length === 0) break;
+      cpTxs.push({ index: cpTxs.length, accrue: "anchor", accrueTarget: i.anchor, refresh: ps(r.taken), settlesLp: false, weight: anchorW + r.takenW });
+      remaining = r.rest;
     } else {
       // accrue through the first counterparty (its settle IS the accrue crank): it costs its own weight once.
-      ({ taken, rest } = takeUpTo(remaining, W));
-      if (taken.length === 0) break;
-      const [first, ...others] = taken;
-      cpTxs.push({ index: cpTxs.length, accrue: "counterparty", accrueTarget: first.pubkey, refresh: others, settlesLp: false, weight: sumW(taken) });
+      const r = takeUpTo(remaining, W, minW, exact);
+      if (r.taken.length === 0) break;
+      const [first, ...others] = ps(r.taken);
+      cpTxs.push({ index: cpTxs.length, accrue: "counterparty", accrueTarget: first.pubkey, refresh: others, settlesLp: false, weight: r.takenW });
+      remaining = r.rest;
     }
-    remaining = rest;
   }
   const lpCap = W - lpW;
-  const { taken: lpTaken, rest: unvisited } = takeUpTo(remaining, lpCap);
+  const lpPack = takeUpTo(remaining, lpCap, minW, exact);
+  const lpTaken = lpPack.taken;
+  const unvisited = ps(remainingList(lpPack.rest));
   const lastIdx = cpTxs.length;
 
   if (unvisited.length > 0) {
@@ -261,17 +316,17 @@ export function planSettleRound(i: PlanInput): RoundPlan {
       // The remaining counterparties that fit still go out so the sweep keeps moving; the LP waits.
       const txs = [...cpTxs];
       if (lpTaken.length > 0) {
-        const [first, ...others] = lpTaken;
-        txs.push({ index: txs.length, accrue: i.anchor ? "anchor" : "counterparty", accrueTarget: i.anchor ?? first.pubkey, refresh: i.anchor ? lpTaken : others, settlesLp: false, weight: sumW(lpTaken) + anchorW });
+        const [first, ...others] = ps(lpTaken);
+        txs.push({ index: txs.length, accrue: i.anchor ? "anchor" : "counterparty", accrueTarget: i.anchor ?? first.pubkey, refresh: i.anchor ? ps(lpTaken) : others, settlesLp: false, weight: lpPack.takenW + anchorW });
       }
       return { ...base, needsPushHold: false, txs, lpTxIndex: null, paired: false, unvisited, unpairedLpSettle: false, lpDeferred: true, phases: [txs.map((t) => t.index)] };
     }
     notes.push(`prefer: ${unvisited.length} counterparties do not fit ${maxTxs} txs; the LP settles with them unvisited (counted)`);
-    const txs = [...cpTxs, lpTx(lastIdx, lpTaken)];
+    const txs = [...cpTxs, lpTx(lastIdx, lpTaken, lpPack.takenW)];
     return { ...base, needsPushHold: cpTxs.length > 0, txs, lpTxIndex: lastIdx, paired: false, unvisited, unpairedLpSettle: true, lpDeferred: false, phases: [cpTxs.map((t) => t.index), [lastIdx]] };
   }
 
-  const txs = [...cpTxs, lpTx(lastIdx, lpTaken)];
+  const txs = [...cpTxs, lpTx(lastIdx, lpTaken, lpPack.takenW)];
   notes.push(`paired: ${cpTxs.length} counterparty tx(s) then the LP tx (last); accrue via ${i.anchor ? "a flat anchor" : "the first counterparty of each tx"}`);
   return { ...base, needsPushHold: true, txs, lpTxIndex: lastIdx, paired: true, unvisited: [], unpairedLpSettle: false, lpDeferred: false, phases: cpTxs.length > 0 ? [cpTxs.map((t) => t.index), [lastIdx]] : [[lastIdx]] };
 }
