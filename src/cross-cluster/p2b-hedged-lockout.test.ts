@@ -327,6 +327,7 @@ describe("monitor over snapshots", () => {
     const r = await evaluateHedgedLockouts(c.conn as never, [s], T);
     assert.deepEqual(r, { alerts: [], records: [] });
     assert.equal(c.calls.length, 0);
+    assert.equal(c.calls.length, 0);
   });
 
   it("an unbound market is skipped", async () => {
@@ -444,9 +445,10 @@ describe("coverage of remaining branches (decision + reason asserted)", () => {
     const c = fakeConn({ accounts: new Map([[lp.toBase58(), new Uint8Array(fx("cate-lp-portfolio-v18"))]]) });
     const r = await evaluateHedgedLockouts(c.conn as never, [s], T);
     assert.deepEqual(r, { alerts: [], records: [] });
+    assert.equal(c.calls.length, 0);
   });
 
-  it("monitor: vault LP missing -> skipped; adl missing -> skipped; throwing RPC -> skipped without throwing", async () => {
+  it("monitor: vault LP missing -> skipped; market data missing -> skipped; throwing RPC -> skipped without throwing", async () => {
     const lp = Keypair.generate().publicKey;
     const m = patchedMarket({ effectivePriceE6: 1_000n, growthLambdaBps: 10_000 });
     const noLp = snapshot({ marketData: m, registryData: registryBytes({ bound: true }), vaultLpData: null });
