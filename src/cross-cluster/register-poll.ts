@@ -171,11 +171,20 @@ export function reconcileMarkets(
   const removed: string[] = [];
   const updated: string[] = [];
 
+  // addr -> FIRST index in registry.markets (findIndex semantics), built once so
+  // the per-row lookup is O(1) instead of an O(n) scan (O(n*m) per poll).
+  const indexOf = new Map<string, number>();
+  const local0 = registry.markets;
+  for (let i = 0; i < local0.length; i++) {
+    if (!indexOf.has(local0[i].marketAddress)) indexOf.set(local0[i].marketAddress, i);
+  }
+
   for (const [addr, entry] of desiredByAddr) {
     // Present this cycle — any accumulated absence is stale.
     absences.delete(addr);
-    const idx = registry.markets.findIndex((m) => m.marketAddress === addr);
+    const idx = indexOf.get(addr) ?? -1;
     if (idx === -1) {
+      indexOf.set(addr, registry.markets.length);
       registry.markets.push(entry);
       added.push(addr);
     } else if (entryDiffers(registry.markets[idx], entry)) {
@@ -188,17 +197,22 @@ export function reconcileMarkets(
     }
   }
 
-  for (const local of [...registry.markets]) {
+  const dropped = new Set<string>();
+  for (const local of registry.markets) {
     if (desiredByAddr.has(local.marketAddress)) continue;
     const n = (absences.get(local.marketAddress) ?? 0) + 1;
     absences.set(local.marketAddress, n);
     if (n >= threshold) {
-      registry.markets = registry.markets.filter(
-        (m) => m.marketAddress !== local.marketAddress,
-      );
+      dropped.add(local.marketAddress);
       absences.delete(local.marketAddress);
       removed.push(local.marketAddress);
     }
+  }
+  // One filter pass instead of one per removal (was O(n*removed)).
+  if (dropped.size > 0) {
+    registry.markets = registry.markets.filter(
+      (m) => !dropped.has(m.marketAddress),
+    );
   }
 
   return { added, removed, updated };
