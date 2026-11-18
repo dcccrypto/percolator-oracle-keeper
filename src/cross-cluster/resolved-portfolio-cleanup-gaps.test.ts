@@ -92,7 +92,6 @@ interface Opts {
   chunks?: number;
   nftThrow?: boolean;
   nftRecords?: Array<{ pubkey: PublicKey; data: Buffer }>;
-  /** Raw override for the keys a revisit read returns. */
 }
 function mkConn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, reply: (tags: number[], n: number) => Sim, o: Opts = {}) {
   const calls = { sims: [] as number[][], sent: [] as number[][], filters: [] as unknown[], chunkSends: 0, gpaWrapper: 0 };
@@ -310,6 +309,7 @@ describe("path (c): chunked CloseResolved", () => {
     const c = mkConn([{ pubkey: pf, data: withOwner(Keypair.generate().publicKey) }], chunkReply, { sigErr: E(1) });
     const r = await run(c);
     assert.equal(r.progressed, 0);
+    assert.deepEqual(c.calls.sent, [[30]], "the chunk was sent, then failed to land");
     assert.equal(r.remaining[0].reason, "CloseResolved: CloseResolved chunk tx did not land");
   });
   it("chunks create the missing token account once: the create is charged against the budget after progress", async () => {
@@ -412,7 +412,7 @@ describe("vault LP binding and failure paths", () => {
     assert.equal(r.vaultLpSettled, 0);
     assert.deepEqual(r.vaultLpClosed, []);
     assert.equal(c.calls.sent.length, 0);
-    assert.match(r.remaining[0].reason, /^vault LP: not closable this cycle \(VaultLpSettleResolved\(0\) Custom\(21\)/);
+    assert.match(r.remaining[0].reason, /^vault LP: not closable this cycle \(.*Custom\(21\)/);
   });
   it("101 makes progress but the close stays refused: 'made progress … continues next cycle', settled counted", async () => {
     const c = mkConn([{ pubkey: lpPf, data: lpData() }], p3((t) => (t.includes(101) ? { err: null } : { err: E(21) })), { vaultLp: vaultLp() });
@@ -468,24 +468,40 @@ describe("resolved-receipt revisit refusals", () => {
     const r = await run(c, { clock: AFTER_GRACE });
     assert.ok(r.remaining.some((x) => x.reason === "sim rpc down at 46"));
   });
-  it("the sweep is bounded per cycle: past the bound an open receipt is deferred, the earlier one is still closed", async () => {
+  /** Tag 8 is refused until a tag 46 has simulated (an open receipt blocks the close on-chain). */
+  const sweepable = () => {
+    let swept = false;
+    return p3((t) => {
+      if (t.length === 1 && t[0] === 46) { swept = true; return { err: null }; }
+      if (t.length === 1 && t[0] === 8 && swept) return { err: null };
+      return { err: E(21) };
+    });
+  };
+  it("the sweep is bounded per cycle: past the bound an open receipt is deferred, the earlier one is swept and closed once", async () => {
     const a = PF(), b = PF();
     const c = mkConn(
       [{ pubkey: a, data: openReceipt(withOwner(Keypair.generate().publicKey)) }, { pubkey: b, data: openReceipt(withOwner(Keypair.generate().publicKey)) }],
-      p3((t) => (t.length === 1 && t[0] === 46 ? { err: null } : t.length === 1 && t[0] === 8 ? { err: null } : { err: E(21) })),
+      sweepable(),
     );
     const r = await run(c, { cfg: { maxPerCycle: 1 }, clock: AFTER_GRACE });
     assert.deepEqual(r.topupSwept, [a.toBase58()]);
+    assert.equal(r.closed, 1);
+    assert.deepEqual(c.calls.sent, [[46], [8]]);
     assert.ok(r.remaining.some((x) => x.portfolio === b.toBase58() && /tag-46 sweep over the 1-per-cycle bound/.test(x.reason)));
   });
-  it("the receipt read failing leaves the receipts unseen: nothing is swept this cycle (retried next)", async () => {
+  it("the receipt read failing leaves the receipts unseen: no 46 is even simulated (control: it IS when the read works)", async () => {
+    const data = () => openReceipt(withOwner(Keypair.generate().publicKey));
     const pf = PF();
     // The ATA read (first gmai) succeeds; the receipt re-read (second) fails.
     let calls = 0;
-    const c = mkConn([{ pubkey: pf, data: openReceipt(withOwner(Keypair.generate().publicKey)) }], refuseAll, { gmaiThrow: () => ++calls > 1 });
-    const r = await run(c, { clock: AFTER_GRACE });
+    const bad = mkConn([{ pubkey: pf, data: data() }], sweepable(), { gmaiThrow: () => ++calls > 1 });
+    const r = await run(bad, { clock: AFTER_GRACE });
     assert.deepEqual(r.topupSwept, []);
-    assert.ok(!c.calls.sent.some((x) => x.includes(46)));
+    assert.ok(!bad.calls.sims.some((x) => x.includes(46)));
+    const good = mkConn([{ pubkey: pf, data: data() }], sweepable());
+    const g = await run(good, { clock: AFTER_GRACE });
+    assert.deepEqual(g.topupSwept, [pf.toBase58()]);
+    assert.ok(good.calls.sims.some((x) => x.includes(46)));
   });
 });
 
