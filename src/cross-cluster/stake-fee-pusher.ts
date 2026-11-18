@@ -247,7 +247,7 @@ export function deriveVaultAccounts(wrapperProgramId: PublicKey, market: PublicK
   const k = rawKey(wrapperProgramId, market, mint);
   let v = vaultCache.get(k);
   if (!v) {
-    v = deriveMarketVaultAccounts(wrapperProgramId, market, mint);
+    v = Object.freeze(deriveMarketVaultAccounts(wrapperProgramId, market, mint));
     if (vaultCache.size >= DERIVE_CACHE_MAX) vaultCache.clear();
     vaultCache.set(k, v);
   }

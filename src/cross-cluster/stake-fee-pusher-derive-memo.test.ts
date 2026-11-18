@@ -33,5 +33,12 @@ describe("stake-fee-pusher derive memo", () => {
     const s1 = Keypair.generate().publicKey, s2 = Keypair.generate().publicKey;
     assert.ok(!derivePoolPda(m, s1).equals(derivePoolPda(m, s2)));
     assert.ok(derivePoolPda(m, s2).equals(deriveStakePool(m, s2)[0]));
+    const w1 = Keypair.generate().publicKey, w2 = Keypair.generate().publicKey;
+    const m1 = Keypair.generate().publicKey, m2 = Keypair.generate().publicKey;
+    const a = deriveVaultAccounts(w1, m, m1), b = deriveVaultAccounts(w2, m, m1), c = deriveVaultAccounts(w1, m, m2);
+    assert.ok(a.vaultAuthority.equals(deriveMarketVaultAccounts(w1, m, m1).vaultAuthority));
+    assert.ok(b.vaultAuthority.equals(deriveMarketVaultAccounts(w2, m, m1).vaultAuthority));
+    assert.ok(c.vaultToken.equals(deriveMarketVaultAccounts(w1, m, m2).vaultToken));
+    assert.ok(!a.vaultAuthority.equals(b.vaultAuthority));
   });
 });
