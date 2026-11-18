@@ -66,6 +66,8 @@ describe("FeeJobFailureTracker", () => {
     // job j: B drops out; A continues and hits threshold. other's streak untouched.
     const a = t.alertsFor(mk({ job: "j", waiting: waitingOf("A") }));
     assert.equal(a.length, 1);
+    // job j sweeps with nothing waiting: must not clear other job's streak for the same market.
+    t.alertsFor(mk({ job: "j" }));
     const o = t.alertsFor(mk({ job: "other", waiting: waitingOf("A") }));
     assert.equal(o.length, 1);
     assert.equal(o[0].data?.waitingStreak, FEE_JOB_WAITING_ALERT_AFTER);
@@ -84,7 +86,7 @@ describe("FeeJobFailureTracker", () => {
   });
   it("blocked severity: explicit, critical kinds, and default warn", () => {
     const t = new FeeJobFailureTracker();
-    const b = (alertKind?: never | string, severity?: string) =>
+    const b = (alertKind?: string, severity?: string) =>
       ({ market: "M", label: "M/USDC", reason: "r", alertKind, severity }) as never;
     const al = t.alertsFor(mk({
       blocked: [

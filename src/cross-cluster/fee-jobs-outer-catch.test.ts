@@ -40,7 +40,7 @@ async function drive(p: Promise<void>): Promise<void> {
 
 describe("startFeeJobLoop outer catch", () => {
   for (const [label, thrown, expected] of [
-    ["an Error is clipped to its message", new Error("log boom"), /\[lp-fee\] sweep error — log boom$/],
+    ["an Error reports its message", new Error("log boom"), /\[lp-fee\] sweep error — log boom$/],
     ["a non-Error is stringified", "plain log", /\[lp-fee\] sweep error — plain log$/],
   ] as const) {
     it(`a throw outside the sinks costs one sweep, not the loop: ${label}`, async () => {
@@ -57,6 +57,7 @@ describe("startFeeJobLoop outer catch", () => {
       await drive(startFeeJobLoop([job], ctx, registry, { intervalMs: 1000 }, sink as never));
       assert.equal(errors.length, 2, "both cycles threw in the log line, the loop kept going");
       assert.match(errors[0], expected);
+      assert.match(errors[1], expected);
       assert.equal(reconciled, 0, "the throw precedes the sink calls");
     });
   }
