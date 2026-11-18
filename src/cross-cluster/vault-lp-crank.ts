@@ -143,7 +143,8 @@ export class VaultLpCranker {
     const key = market.toBase58();
     const now = (this.cfg.now ?? Date.now)();
     const c = this.lookup.get(key);
-    if (c && now - c.at < this.cfg.lookupTtlMs) return c.vaultLp;
+    // age >= 0: a backwards clock step makes the age negative; treat that as expired, not fresh.
+    if (c && now - c.at >= 0 && now - c.at < this.cfg.lookupTtlMs) return c.vaultLp;
     let vaultLp: PublicKey | null = null;
     try {
       const [si] = await this.conn.getMultipleAccountsInfo([deriveVaultLpState(this.cfg.wrapperProgramId, market)], "confirmed");
