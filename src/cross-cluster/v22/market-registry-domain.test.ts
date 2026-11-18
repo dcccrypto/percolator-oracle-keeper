@@ -62,7 +62,7 @@ describe("v2.2 market loader: registry domain", () => {
   const bad: Array<[string, Uint8Array]> = [
     ["truncated (100 B)", realRegistry({ domain: 2, len: 100 })],
     ["truncated just before the flags region (175 B)", realRegistry({ domain: 1, len: 175 })],
-    ["wrong VERSION (18)", realRegistry({ domain: 2, version: 18 })],
+    ["unknown VERSION (99)", realRegistry({ domain: 2, version: 99 })],
     ["wrong kind (Market)", realRegistry({ domain: 2, kind: ACCOUNT_KIND.Market })],
   ];
   for (const [name, bytes] of bad) {
