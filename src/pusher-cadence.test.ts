@@ -34,6 +34,12 @@ describe("resolvePusherCadence", () => {
     assert.equal(run("0", undefined).ok, null);
     assert.equal(run("-5", undefined).ok, null);
   });
+  it("floor boundary: 250 ok, 249 rejected, also in dry-run", () => {
+    assert.equal(run("250", "1500").ok?.intervalMs, 250);
+    assert.equal(run("249", "1500").ok, null);
+    assert.equal(run("249", "1500", true).ok, null);
+    assert.match(run("249", "1500").errs.join("\n"), /floor/);
+  });
   it("never-publish cadence fatals live, passes dry-run", () => {
     assert.equal(run("6000", undefined).ok, null);
     assert.deepEqual(run("6000", undefined, true).ok, { intervalMs: 6000, windowMs: 15000 });
