@@ -75,6 +75,7 @@ import type { AdlAssetReading, AdlD1Thresholds, AdlEpisode } from "./d1-watch.ts
 import { ADL_ONE, decodeAdlState } from "../adl-state.ts";
 import { engineSlotBase } from "../market-layout.ts";
 import { LifecycleEngine } from "./lifecycle.ts";
+import { parsePositiveNumberEnv } from "../../env-utils.ts";
 import { crankLpFeesOnce } from "../lp-fee-cranker.ts";
 import { pushStakeFeesOnce, stakeFeeConfigFromEnv } from "../stake-fee-pusher.ts";
 
@@ -182,6 +183,15 @@ export class V22Loop {
   private layoutProblems = new Map<string, string>();
   /** v22price 2026-10-22: when the last catch-up tx (any market) was started; see `catchupSpacingMs`. */
   private lastCatchupAtMs = Number.NEGATIVE_INFINITY;
+  /** KEEPER_V22_CATCHUP_SPACING_MS via the keeper's parser; a bad value keeps the 1500 ms default (never NaN = no pacing). */
+  private catchupSpacingFromEnv(): number {
+    try {
+      return parsePositiveNumberEnv("KEEPER_V22_CATCHUP_SPACING_MS", 1500);
+    } catch (e) {
+      this.log(`[v22] ${e instanceof Error ? e.message : String(e)}; using 1500 ms`);
+      return 1500;
+    }
+  }
   /** Market lifecycle: dead-market classifier, permissionless stale resolve (default OFF), warn-band fee forcing (default OFF). */
   private readonly lifecycle: LifecycleEngine | null;
 
@@ -574,10 +584,14 @@ export class V22Loop {
           // catch-up tx per market per cycle (each with two simulations, a send and status polls) hit the RPC key's rate
           // limit (429) and starved the pushes. Skipped markets catch up on a later cycle; returning true keeps the
           // legacy cranker from sending its own catch-up meanwhile.
-          const spacing = this.d.catchupSpacingMs ?? Number(process.env.KEEPER_V22_CATCHUP_SPACING_MS ?? 1500);
-          const paced = this.now() - this.lastCatchupAtMs < spacing;
+          const spacing = this.d.catchupSpacingMs ?? this.catchupSpacingFromEnv();
+          const nowMs = this.now();
+          const age = nowMs - this.lastCatchupAtMs;
+          // A negative age (wall clock stepped backwards) is expired, not paced: otherwise every market would stay
+          // paced until the clock caught up, and no catch-up (hence no refresh/liquidation) would be sent.
+          const paced = age >= 0 && age < spacing;
           if (!paced) {
-            this.lastCatchupAtMs = this.now();
+            this.lastCatchupAtMs = nowMs;
             await this.multiAssetCatchup(ctx, positioned.flatAnchor ?? positioned.lp.pubkey, n);
           }
           // A9-1: no round this cycle, so publish this cycle's read as the crank-health record. Without it /health kept the
