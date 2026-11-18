@@ -161,8 +161,10 @@ export function buildV22MarketCtx(p: {
   if (p.registryData) {
     try {
       registryDomain = Number(parseLpVaultRegistry(p.registryData).domain);
-    } catch {
-      // domain stays 0; the flags below are read from their own bytes
+    } catch (err) {
+      // Never default to domain 0: a registry the SDK cannot read (truncated, wrong VERSION/kind/magic) may belong to
+      // domain N>0, and the flags below come from the same bytes. Report the market unreadable so no job targets it.
+      return { ok: false, reason: "unreadable", detail: `LP-vault registry unreadable: ${err instanceof Error ? err.message : String(err)}` };
     }
     try {
       bound = lpVaultRegistryBound(p.registryData);
