@@ -27,6 +27,8 @@ interface Entry {
 
 const entries = new Map<string, Entry>();
 const inflight = new Map<string, Promise<CachedBlockhash>>();
+/** Bumped by invalidateBlockhash so a fetch started before an invalidation cannot repopulate the cache. */
+const generations = new Map<string, number>();
 
 export async function getCachedBlockhash(
   conn: Pick<Connection, "getLatestBlockhash" | "rpcEndpoint">,
@@ -37,17 +39,21 @@ export async function getCachedBlockhash(
   const now = (opts.now ?? Date.now)();
   const key = `${conn.rpcEndpoint}|${commitment}`;
   const hit = entries.get(key);
-  if (hit && now - hit.at <= maxAge) return hit.value;
+  // age < 0 means the clock stepped backwards since the entry was stamped: treat as a miss.
+  if (hit && now - hit.at >= 0 && now - hit.at <= maxAge) return hit.value;
   const pending = inflight.get(key);
   if (pending) return pending;
-  const p = (async () => {
+  const gen = generations.get(conn.rpcEndpoint) ?? 0;
+  // Stamp BEFORE the RPC: the hash is at least this old when it returns, never younger.
+  const startedAt = now;
+  const p: Promise<CachedBlockhash> = (async () => {
     try {
       const v = await conn.getLatestBlockhash(commitment);
       const value = { blockhash: v.blockhash, lastValidBlockHeight: v.lastValidBlockHeight };
-      entries.set(key, { value, at: (opts.now ?? Date.now)() });
+      if ((generations.get(conn.rpcEndpoint) ?? 0) === gen) entries.set(key, { value, at: startedAt });
       return value;
     } finally {
-      inflight.delete(key);
+      if (inflight.get(key) === p) inflight.delete(key);
     }
   })();
   inflight.set(key, p);
@@ -56,6 +62,8 @@ export async function getCachedBlockhash(
 
 /** Drop the cached blockhash (all commitments of this endpoint). */
 export function invalidateBlockhash(conn: Pick<Connection, "rpcEndpoint">): void {
+  generations.set(conn.rpcEndpoint, (generations.get(conn.rpcEndpoint) ?? 0) + 1);
+  for (const k of [...inflight.keys()]) if (k.startsWith(`${conn.rpcEndpoint}|`)) inflight.delete(k);
   for (const k of [...entries.keys()]) if (k.startsWith(`${conn.rpcEndpoint}|`)) entries.delete(k);
 }
 
@@ -63,4 +71,5 @@ export function invalidateBlockhash(conn: Pick<Connection, "rpcEndpoint">): void
 export function resetBlockhashCache(): void {
   entries.clear();
   inflight.clear();
+  generations.clear();
 }
