@@ -127,8 +127,9 @@ describe("depth-capacity: untaken branches", () => {
     const noSlot = assessDepthCapacity(record({ lastGoodE6: 0n, lastGoodSlot: 0n }), 0, BAND, at(10n));
     assert.deepEqual([noSlot.status, noSlot.stickyEpochs, noSlot.epochsToZero, noSlot.depthAgeSlots], ["closed", 0, 0, null]);
     const a = depthCapacityAlert("M", "m", noSlot, T, { venue: null, keeperAttestsVenue: true });
-    assert.match(a?.message ?? "", /last depth push never/);
-    assert.equal(a?.data.venue, null);
+    assert.ok(a?.data, "alert with data expected");
+    assert.match(a.message, /last depth push never/);
+    assert.equal(a.data.venue, null);
     const ahead = assessDepthCapacity(record({ lastGoodE6: 0n, lastGoodSlot: at(50n) }), 0, BAND, at(10n));
     assert.deepEqual([ahead.status, ahead.stickyEpochs], ["closed", 0]);
   });
@@ -153,11 +154,13 @@ describe("depth-capacity: untaken branches", () => {
   it("alert: pinned note, venue named, null-capDepth data, decaying warn vs critical boundary", () => {
     const pinned = { ...assessDepthCapacity(record(), 0, BAND, at(131n)), depthDexPinned: true };
     const a = depthCapacityAlert("M", "m", pinned, T, { venue: "pumpswap", keeperAttestsVenue: true });
-    assert.match(a?.message ?? "", /DEX-pinned/);
-    assert.match(a?.message ?? "", /\(venue pumpswap\)/);
-    assert.equal(a?.data.capDepthE6, "0");
+    assert.ok(a?.data, "alert with data expected");
+    assert.match(a.message, /DEX-pinned/);
+    assert.match(a.message, /\(venue pumpswap\)/);
+    assert.equal(a.data.capDepthE6, "0");
     const nullCap = depthCapacityAlert("M", "m", { ...pinned, capDepthE6: null }, T, { keeperAttestsVenue: false });
-    assert.equal(nullCap?.data.capDepthE6, null);
+    assert.ok(nullCap?.data, "alert with data expected");
+    assert.equal(nullCap.data.capDepthE6, null);
     const dec = assessDepthCapacity(record(), 0, BAND, at(3n));
     assert.equal(depthCapacityAlert("M", "m", { ...dec, epochsToZero: T.criticalEpochs }, T, { keeperAttestsVenue: true })?.severity, "critical");
     assert.equal(depthCapacityAlert("M", "m", { ...dec, epochsToZero: T.criticalEpochs + 1 }, T, { keeperAttestsVenue: true })?.severity, "warn");
