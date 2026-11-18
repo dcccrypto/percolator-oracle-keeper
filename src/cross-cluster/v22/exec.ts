@@ -234,11 +234,14 @@ export async function simulateAndSend(
               const raw2 = (sim.value.accounts as Array<{ data: [string, string] } | null> | null | undefined) ?? [];
               why = o.verifyExtended(o.accounts.map((_, i) => (raw2[i] ? new Uint8Array(Buffer.from(raw2[i]!.data[0], "base64")) : null)));
             } catch {
-              why = null;
+              // fail closed: an unverifiable extension is not sent; fall back to the first (already clean) list.
+              why = "verifyExtended threw";
             }
             if (why) {
               list = ixs;
-              tx = firstTx;
+              // firstTx may be signed with a hash that a later refresh replaced; rebuild on the current one so
+              // the sent tx and confirmBySignature's lastValidBlockHeight agree.
+              tx = firstTx.recentBlockhash === blockhash ? firstTx : make(ixs);
               sim = firstSim;
             }
           }
