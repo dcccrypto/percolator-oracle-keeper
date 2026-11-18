@@ -577,3 +577,21 @@ describe("closeFinalizedReceiptPortfolios (receipt-only close)", () => {
     assert.deepEqual(r.failed[1], { portfolio: d.toBase58(), reason: "over the 2-per-cycle bound; next cycle" });
   });
 });
+
+describe("review leads: liveness and error attribution", () => {
+  it("lead 1: a blockhash RPC failure is handled, the pass never throws (documented 'Never throws')", async () => {
+    const pf = PF();
+    const c = mkConn([{ pubkey: pf, data: withOwner(Keypair.generate().publicKey) }], p3(() => ({ err: null })), { blockhashThrow: true });
+    const r = await run(c);
+    assert.equal(c.calls.sent.length, 0);
+    assert.match(r.remaining[0].reason, /blockhash/);
+  });
+  it("lead 2: a chunk error on the CloseResolved ix is labelled CloseResolved even when an ATA create precedes it", async () => {
+    const pf = PF();
+    // sims: 0 probe, 1 (a), 2 (b), 3 probe chunk (ok), 4 runChunks' chunk sim: Custom(21) on ix 2 (ix 0 budget, 1 ATA, 2 CloseResolved)
+    const c = mkConn([{ pubkey: pf, data: withOwner(Keypair.generate().publicKey) }], p3((t, n) => (n === 4 ? { err: E(21, 2) } : t.length === 2 && t[1] === 30 ? { err: null } : { err: E(61, t.indexOf(8) + 1) })), { ataExists: false });
+    const r = await run(c);
+    assert.equal(c.calls.sent.length, 0);
+    assert.equal(r.remaining[0].reason, "CloseResolved: CloseResolved Custom(21)");
+  });
+});
