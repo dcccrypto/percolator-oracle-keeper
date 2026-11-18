@@ -53,7 +53,8 @@ describe("stake-commit-target", () => {
     assert.equal(ix.data[0], 33);
     assert.equal(ix.keys.length, 3);
     assert.ok(ix.keys[0].pubkey.equals(caller) && ix.keys[0].isSigner);
-    assert.ok(ix.keys[1].pubkey.equals(poolKey) && ix.keys[1].isWritable);
+    assert.ok(ix.keys[1].pubkey.equals(poolKey) && ix.keys[1].isWritable && !ix.keys[1].isSigner);
+    assert.ok(!ix.keys[2].isWritable && !ix.keys[2].isSigner, "clock is read-only");
   });
 
   it("no pool account -> skipped, nothing simulated", async () => {
@@ -63,7 +64,7 @@ describe("stake-commit-target", () => {
     assert.equal(f.sims.length, 0);
   });
 
-  it("bytes that are not a v5 pool -> skipped with the decode reason (truncated to 80 chars), nothing simulated", async () => {
+  it("bytes that are not a v5 pool -> skipped with the decode reason (bounded to 80 chars), nothing simulated", async () => {
     const f = fakeExecConn();
     for (const bad of [new Uint8Array(0), new Uint8Array(10), new Uint8Array(STAKE_POOL_SIZE_V5)]) {
       const r = await stakeCommitTargetOnce(execCtx(f.conn), v22Ctx({ currentSlot: 400_000n }), bad, freshStakeCommitTargetState());
@@ -164,8 +165,10 @@ describe("stake-commit-target", () => {
     if (r.kind === "refused") assert.equal(r.outcome.kind, "refused");
     assert.equal(st.committed, 0);
     const q = fakeExecConn({ simErr: () => customAt(0, STAKE_NO_PENDING_DEPLOY_TARGET) });
-    const rq = await stakeCommitTargetOnce(execCtx(q.conn), late, pool(100_000n), freshStakeCommitTargetState());
+    const qst = freshStakeCommitTargetState();
+    const rq = await stakeCommitTargetOnce(execCtx(q.conn), late, pool(100_000n), qst);
     assert.deepEqual(rq, { kind: "quiet", code: 40 });
+    assert.equal([...qst.backoffUntil.values()][0], 400_000n + COMMIT_TARGET_BACKOFF_SLOTS);
     assert.equal(q.sent.length, 0);
   });
 
