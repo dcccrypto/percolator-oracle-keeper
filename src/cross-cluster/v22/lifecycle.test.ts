@@ -233,6 +233,19 @@ describe("stale resolve guards: the green input resolves", () => {
   });
 });
 
+describe("stale resolve guards: not-attempted survives a backwards wall-clock step", () => {
+  it("an unlanded attempt stamped in the 'future' (clock stepped back) does not hold the retry until the clock catches up", () => {
+    const retry = cfg().resolveRetryMs;
+    // attempt made at t=10_000_000; clock then steps back 2 hours, so now - atMs is hugely negative
+    const d = decideResolve(green({ attempt: { atMs: 10_000_000, landed: false }, nowMs: 10_000_000 - 7_200_000 }));
+    assert.deepEqual(d, { action: "resolve" }, `retry window is ${retry} ms; negative age must count as expired`);
+  });
+  it("a fresh unlanded attempt (age inside the window) still holds", () => {
+    const d = decideResolve(green({ attempt: { atMs: 9_999_000, landed: false }, nowMs: 10_000_000 }));
+    assert.equal(d.action, "hold");
+  });
+});
+
 describe("stale resolve guards: each blocks its unsafe input, and the test fails (the unsafe input resolves) if the guard is removed", () => {
   const cases: Array<{ guard: string; bad: ResolveInput; alsoRemove?: string[] }> = [
     { guard: "mode-enabled", bad: green({ mode: "off" }) },
