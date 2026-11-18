@@ -114,7 +114,7 @@ const withActiveId = (delta: number) => {
 const AT = 7;
 
 describe("observation error branches carry exact reasons (never numbers)", () => {
-  it("first read: pool account null -> missing/not-owned error, one RPC call", async () => {
+  it("first read: pool account null -> missing/not-owned error", async () => {
     const conn = scriptedConn([() => [null]]);
     const r = await observeDlmmDepth(conn, fx.pool, dec, undefined, AT);
     assert.deepEqual(r, { error: "pool account missing or not owned by the DLMM program", at: AT });
@@ -142,13 +142,13 @@ describe("observation error branches carry exact reasons (never numbers)", () =>
     assert.deepEqual(r, { error: "LbPair too short (want 904) (5)", at: AT });
   });
   it("second read: active bin moved a whole array -> 'active bin moved' retry error", async () => {
-    const bySlot = fakeConn();
+    const plain = fakeConn();
     // Second call: real arrays, but the pool account now has an active id 70 bins higher (one array further).
     let n = 0;
     const moving = {
       getMultipleAccountsInfo: async (keys: PublicKey[]) => {
         n++;
-        const infos = await bySlot.conn.getMultipleAccountsInfo(keys);
+        const infos = await plain.conn.getMultipleAccountsInfo(keys);
         if (n === 2) infos[0] = withActiveId(70);
         return infos;
       },
@@ -186,10 +186,7 @@ describe("observation error branches carry exact reasons (never numbers)", () =>
   });
   it("success values equal the exact depth the fixture produces and stay decimal strings", async () => {
     const a = await observeDlmmDepth(fakeConn().conn, fx.pool, dec, undefined, AT);
-    const b = await observeDlmmDepth(fakeConn().conn, fx.pool, dec, undefined, AT);
-    assert.deepEqual(a, b); // deterministic
-    assert.ok("minUsdE6" in a);
-    if ("minUsdE6" in a) assert.ok(BigInt(a.minUsdE6) > 0n);
+    assert.deepEqual(a, { bidUsdE6: "277415463261", askUsdE6: "405111879296", minUsdE6: "277415463261", binArrays: [-87, -86], at: AT });
   });
 });
 
