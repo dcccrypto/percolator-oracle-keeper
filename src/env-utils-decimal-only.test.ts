@@ -26,7 +26,7 @@ function withEnv<T>(value: string | undefined, fn: () => T): T {
 }
 
 describe("parsePositiveNumberEnv is decimal-only", () => {
-  const rejected = ["0x10", "0X1F", "0b11", "0o17", "1e3", "1E3", "1e-3", " 5 ", "\t7", "5_000", "+5", "5n", "Infinity", "1,000", "--1", "1.2.3", "."];
+  const rejected = ["0x10", "0X1F", "0b11", "0o17", "1e3", "1E3", "1e-3", " 5 ", "\t7", "5_000", "5\n", "-5", "-0", "+5", "5n", "Infinity", "1,000", "--1", "1.2.3", "."];
   for (const raw of rejected) {
     it(`rejects ${JSON.stringify(raw)}`, () => {
       withEnv(raw, () => assert.throws(() => parsePositiveNumberEnv(K, 9), /finite positive/));
@@ -83,6 +83,7 @@ describe("parsePositiveLamportsFromSolEnv same-class pins", () => {
     withEnv("0.05", () => assert.equal(parsePositiveLamportsFromSolEnv(K, 1), 50_000_000));
     withEnv("1.123456789", () => assert.equal(parsePositiveLamportsFromSolEnv(K, 1), 1_123_456_789));
     withEnv("1.1234567890", () => assert.equal(parsePositiveLamportsFromSolEnv(K, 1), 1_123_456_789));
+    withEnv(" 0.05 ", () => assert.equal(parsePositiveLamportsFromSolEnv(K, 1), 50_000_000));
     withEnv(undefined, () => assert.equal(parsePositiveLamportsFromSolEnv(K, 0.05), 50_000_000));
   });
 });
