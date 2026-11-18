@@ -80,6 +80,26 @@ export type StakeSyncResult =
   | { kind: "diverged"; outcome: ExecOutcome }
   | { kind: "sent" | "dry-run" | "refused" | "failed"; outcome: ExecOutcome };
 
+/** Bound on the pool PDA memo; far above any realistic market count, cleared wholesale if exceeded. */
+export const STAKE_POOL_MEMO_MAX = 1024;
+const poolMemo = new Map<string, { pool: PublicKey; key: string }>();
+/** Test hook: number of memoised pools. */
+export const stakePoolMemoSize = (): number => poolMemo.size;
+export const clearStakePoolMemo = (): void => poolMemo.clear();
+
+/** Memoised deriveStakePool(market, stakeProgramId)[0] and its base58, keyed by both addresses (pure function of them). */
+function stakePoolFor(market: PublicKey, stakeProgramId: PublicKey): { pool: PublicKey; key: string } {
+  const k = `${market.toBase58()}:${stakeProgramId.toBase58()}`;
+  let hit = poolMemo.get(k);
+  if (!hit) {
+    const [pool] = deriveStakePool(market, stakeProgramId);
+    hit = { pool, key: pool.toBase58() };
+    if (poolMemo.size >= STAKE_POOL_MEMO_MAX) poolMemo.clear();
+    poolMemo.set(k, hit);
+  }
+  return hit;
+}
+
 export async function stakeSyncOnce(
   exec: ExecContext,
   ctx: V22MarketCtx,
@@ -88,8 +108,7 @@ export async function stakeSyncOnce(
   p: { intervalMs: number; nowMs?: number; stakeProgramId?: PublicKey },
 ): Promise<StakeSyncResult> {
   const stakeProgramId = p.stakeProgramId ?? STAKE_PROGRAM_ID;
-  const [pool] = deriveStakePool(ctx.market, stakeProgramId);
-  const key = pool.toBase58();
+  const { pool, key } = stakePoolFor(ctx.market, stakeProgramId);
   if (!poolData) return { kind: "skipped", reason: "no stake pool for this market" };
   let decoded: StakePoolV5;
   try {

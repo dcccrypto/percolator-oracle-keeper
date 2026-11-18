@@ -254,3 +254,53 @@ describe("stake-sync: RPC errors, landing, dry-run", () => {
     assert.equal(r.kind, "waiting");
   });
 });
+
+describe("stake-sync: pool PDA memo", () => {
+  it("randomized states give identical results with a cold memo each call and a warm shared memo; skipped calls derive 0 times", async () => {
+    const { PublicKey } = await import("@solana/web3.js");
+    const { clearStakePoolMemo, stakePoolMemoSize, STAKE_POOL_MEMO_MAX } = await import("./stake-sync.ts");
+    let seed = 12345;
+    const rnd = (n: number) => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) % n);
+    const pools = [null, new Uint8Array(10), poolBytes({ riskMode: 0 }), poolBytes(), poolBytes({ lastSync: 4990n }), poolBytes({ lastSync: 1n, cooldown: 1n })];
+    const cases = Array.from({ length: 60 }, () => ({ pool: pools[rnd(pools.length)], nowMs: rnd(3) * 1000, interval: [0, 1500][rnd(2)] }));
+    const run = async (cold: boolean) => {
+      const st = freshStakeSyncState();
+      const out: unknown[] = [];
+      for (const c of cases) {
+        if (cold) clearStakePoolMemo();
+        const f = fakeExecConn();
+        out.push(await stakeSyncOnce(execCtx(f.conn, true), v22Ctx(), c.pool, st, { intervalMs: c.interval, nowMs: c.nowMs }));
+      }
+      return JSON.stringify(out, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+    };
+    const cold = await run(true);
+    clearStakePoolMemo();
+    assert.equal(await run(false), cold);
+
+    const orig = PublicKey.findProgramAddressSync;
+    let n = 0;
+    PublicKey.findProgramAddressSync = ((...a: Parameters<typeof orig>) => (n++, orig.apply(PublicKey, a))) as typeof orig;
+    try {
+      const ctx = v22Ctx();
+      const f = fakeExecConn();
+      const st = freshStakeSyncState();
+      await stakeSyncOnce(execCtx(f.conn, true), ctx, poolBytes(), st, { intervalMs: 1e9, nowMs: 1 }); // warm + attempt
+      n = 0;
+      for (let i = 0; i < 20; i++) {
+        const r = await stakeSyncOnce(execCtx(f.conn, true), ctx, poolBytes(), st, { intervalMs: 1e9, nowMs: 2 });
+        assert.deepEqual(r, { kind: "skipped", reason: "interval" });
+      }
+      assert.equal(n, 0);
+    } finally {
+      PublicKey.findProgramAddressSync = orig;
+    }
+    // bounded
+    clearStakePoolMemo();
+    const { Keypair } = await import("@solana/web3.js");
+    const base = v22Ctx();
+    for (let i = 0; i < STAKE_POOL_MEMO_MAX + 3; i++) {
+      await stakeSyncOnce(execCtx(fakeExecConn().conn, true), { ...base, market: Keypair.generate().publicKey }, null, freshStakeSyncState(), P);
+    }
+    assert.ok(stakePoolMemoSize() <= STAKE_POOL_MEMO_MAX);
+  });
+});
