@@ -47,9 +47,9 @@ test("a failed webhook delivery does not burn the alert window; retries are capp
   let t = 0;
   for (let i = 0; i < 4; i++) recordLaunch(p, (t += MIN), 5, 15 * MIN);
   assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, true);
-  assert.equal(recordAlertFailure(p), true); // delivery failed -> stamp rolled back
+  assert.equal(recordAlertFailure(p, t), true); // delivery failed -> stamp rolled back
   assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, true); // retried on next launch
-  for (let i = 0; i < MAX_ALERT_RETRIES - 1; i++) recordAlertFailure(p);
+  for (let i = 0; i < MAX_ALERT_RETRIES - 1; i++) recordAlertFailure(p, t);
   // cap reached: stamp stays, a dead endpoint is not retried again this window
   assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, false);
 });
@@ -162,4 +162,23 @@ test("clock step back: launches stamped in the 'future' still count, so a loop i
   const r = recordLaunch(p, 500_000, 3, 15 * MIN); // wall clock stepped back ~8min
   assert.equal(r.health.escalated, true);
   assert.equal(r.alertDue, true);
+});
+
+test("clock step back after an alert must not mute the next window's alert", () => {
+  const p = tmp();
+  const T = 10 * 60 * MIN;
+  for (const t of [T, T + 1, T + 2]) recordLaunch(p, t, 3, 15 * MIN); // alerts at T+2
+  // clock jumps back one hour; the loop continues
+  const back = T - 60 * MIN;
+  const seen: boolean[] = [];
+  for (let i = 0; i < 3; i++) seen.push(recordLaunch(p, back + i, 3, 15 * MIN).alertDue);
+  assert.ok(seen.includes(true), "a crash loop after a backwards clock step must still page");
+});
+
+test("non-numeric lastAlertAt in a corrupt file must not suppress alerts forever", () => {
+  for (const bad of ['"yesterday"', "null", '{"a":1}']) {
+    const p = tmp();
+    fs.writeFileSync(p, `{"launches":[1,2],"lastAlertAt":${bad}}`);
+    assert.equal(recordLaunch(p, 3, 3, MIN).alertDue, true, bad);
+  }
 });
