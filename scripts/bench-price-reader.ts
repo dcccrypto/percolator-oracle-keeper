@@ -112,8 +112,6 @@ function fakeConn(accts: Map<string, Acc>): Connection {
   } as unknown as Connection;
 }
 
-const quiet = (fn: () => Promise<void>) => fn();
-void quiet;
 
 async function runSize(n: number): Promise<void> {
   const { accts, entries, dec, ref } = build(n);
