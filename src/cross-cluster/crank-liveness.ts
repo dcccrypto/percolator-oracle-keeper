@@ -68,6 +68,13 @@ export function createCrankLiveness(opts: CrankLivenessOptions): CrankLiveness {
   const limit = enabled ? Math.max(intervals * opts.intervalMs, minSilenceMs) : null;
   let last = now();
   let stalled = false;
+  // A wall clock stepped backwards (NTP) would make now()-last negative and hide a hung loop until the
+  // clock caught up. Re-anchor to the new reading instead: detection is then at most one limit late.
+  const silence = (): number => {
+    const n = now();
+    if (n < last) last = n;
+    return n - last;
+  };
 
   const onStall =
     opts.onStall ??
@@ -85,14 +92,14 @@ export function createCrankLiveness(opts: CrankLivenessOptions): CrankLiveness {
       last = now();
     },
     silentMs() {
-      return now() - last;
+      return silence();
     },
     limitMs() {
       return limit;
     },
     check() {
       if (limit === null || stalled) return false;
-      const silent = now() - last;
+      const silent = silence();
       if (silent <= limit) return false;
       stalled = true; // fire once; the exit is already scheduled
       onStall(silent, limit);
