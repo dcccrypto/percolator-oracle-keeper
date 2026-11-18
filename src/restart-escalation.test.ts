@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { alertText, readHealth, recordLaunch, restartConfig, restartHealth } from "./restart-escalation.ts";
+import { alertText, readHealth, recordAlertFailure, recordLaunch, restartConfig, restartHealth } from "./restart-escalation.ts";
 
 const tmp = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), "rs-")), "r.json");
 const MIN = 60_000;
@@ -52,4 +52,44 @@ test("a failed webhook delivery does not burn the alert window; retries are capp
   for (let i = 0; i < MAX_ALERT_RETRIES - 1; i++) recordAlertFailure(p);
   // cap reached: stamp stays, a dead endpoint is not retried again this window
   assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, false);
+});
+
+test("future-stamped launches (clock stepped back / copied log) do not escalate or give negative ago", () => {
+  const p = tmp();
+  const now = 10_000_000;
+  fs.writeFileSync(p, JSON.stringify({ launches: Array.from({ length: 6 }, (_, i) => now + 3_600_000 + i) }));
+  const h = readHealth(p, now, 5, 15 * MIN);
+  assert.equal(h.escalated, false);
+  assert.equal(h.launchesInWindow, 0);
+  assert.equal(h.lastLaunchAgoSec, null);
+  const r = recordLaunch(p, now, 5, 15 * MIN);
+  assert.equal(r.health.launchesInWindow, 1);
+  assert.equal(r.alertDue, false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(p, "utf8")).launches, [now]);
+});
+
+test("readHealth survives a huge un-pruned launches array (no RangeError from Math.max spread)", () => {
+  const p = tmp();
+  const now = 10_000_000;
+  fs.writeFileSync(p, JSON.stringify({ launches: new Array(300_000).fill(now - 1000) }));
+  const h = readHealth(p, now, 5, 15 * MIN);
+  assert.equal(h.launchesInWindow, 300_000);
+  assert.equal(h.lastLaunchAgoSec, 1);
+});
+
+test("recordLaunch prunes expired launches from the file", () => {
+  const p = tmp();
+  fs.writeFileSync(p, JSON.stringify({ launches: [1, 2, 3] }));
+  recordLaunch(p, 100 * MIN, 5, 15 * MIN);
+  assert.deepEqual(JSON.parse(fs.readFileSync(p, "utf8")).launches, [100 * MIN]);
+});
+
+test("recordAlertFailure on a missing or corrupt log does not throw and keeps retry semantics", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rs-"));
+  assert.equal(recordAlertFailure(path.join(dir, "missing.json"), 5), true);
+  assert.equal(recordAlertFailure(path.join(dir, "nodir", "x.json"), 5), true);
+  const bad = path.join(dir, "bad.json");
+  fs.writeFileSync(bad, "{not json");
+  assert.equal(recordAlertFailure(bad, 5), true);
+  assert.equal(JSON.parse(fs.readFileSync(bad, "utf8")).alertFails, 1);
 });
