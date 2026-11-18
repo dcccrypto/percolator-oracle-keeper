@@ -39,21 +39,22 @@ function randomMarket(slots: number): Uint8Array {
 
 describe("liveness decode-once: differential vs frozen old code", () => {
   it("livenessRepairsFor: 600 random markets (1-8 slots, ctx.slots over/under the real count), deep-equal", () => {
-    let mismatches = 0;
+    let mismatches = 0, nonEmpty = 0;
     for (let n = 0; n < 600; n++) {
       const real = 1 + (rnd() % 8);
       let data = randomMarket(real);
       const mode = rnd() % 6;
       if (mode === 1) data = data.subarray(0, data.length - 1 - (rnd() % 3000)); // truncated -> unknown layout / short
       if (mode === 2) { const c = Buffer.from(data); c.writeUInt16LE(1 + (rnd() % 40), 8); data = new Uint8Array(c); } // random VERSION
-      if (mode === 3) { const c = Buffer.from(data); c.writeUInt32LE(rnd() % 12, 8 + 0 + 0 + 0 + 0) ; data = new Uint8Array(c); } // header noise
       if (mode === 4) data = new Uint8Array(Buffer.concat([Buffer.alloc(3), Buffer.from(data)])).subarray(3); // nonzero byteOffset
       const ctx = { data, readSlot: rnd() % 3 === 0 ? 50_000 : 49_000 + (rnd() % 3000), slots: Math.max(0, real + (rnd() % 5) - 2) };
       const a = outcome(() => livenessRepairsFor(ctx));
       const b = outcome(() => legacyLivenessRepairsFor(ctx));
-      try { assert.deepEqual(a, b); } catch { mismatches++; }
+      if (a.ok && (a.v as unknown[]).length > 0) nonEmpty++;
+      try { assert.deepEqual(a, b); } catch { mismatches++; console.error("MISMATCH case", n, a, b); }
     }
     assert.equal(mismatches, 0);
+    assert.ok(nonEmpty > 50, `generator produced only ${nonEmpty} non-empty plans`);
   });
   it("non-integer readSlot (BigInt throws) matches", () => {
     const ctx = { data: randomMarket(3), readSlot: 1.5, slots: 3 };
@@ -67,7 +68,7 @@ describe("liveness decode-once: differential vs frozen old code", () => {
       const idx = rnd() % 12;
       const a = outcome(() => decodeLivenessState(data, idx));
       const b = outcome(() => oldDecode(data, idx));
-      try { assert.deepEqual(a, b); } catch { mismatches++; }
+      try { assert.deepEqual(a, b); } catch { mismatches++; console.error("MISMATCH case", n, a, b); }
     }
     assert.equal(mismatches, 0);
   });
