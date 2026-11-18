@@ -50,7 +50,7 @@ describe("depth bracketing: untaken branches", () => {
       const d = postPushRereadDelayMs();
       assert.ok([1, 2, 3].includes(d / SLOT_MS));
     }
-    assert.equal(postPushRereadDelayMs((lo) => lo, 3, 1), 1 * SLOT_MS); // swapped: lo=1, hi=3
+    assert.equal(postPushRereadDelayMs((lo) => lo, 3, 1), 1 * SLOT_MS); // swapped: lo=1, hi=max(lo,maxSlots)=1
     assert.equal(postPushRereadDelayMs((_l, hi) => hi - 1, 3, 1), 1 * SLOT_MS); // swapped bounds collapse to maxSlots
     assert.equal(postPushRereadDelayMs((lo) => lo, -4, -2), 0);
     assert.equal(postPushRereadDelayMs(() => -99, 1, 3), 1 * SLOT_MS);
