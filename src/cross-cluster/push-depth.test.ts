@@ -34,6 +34,55 @@ describe("isqrt", () => {
   });
 });
 
+describe("isqrt exactness", () => {
+  const ok = (n: bigint) => {
+    const r = isqrt(n);
+    assert.ok(r * r <= n && (r + 1n) * (r + 1n) > n, `isqrt(${n}) = ${r}`);
+  };
+  it("small values 0..3 and 0..5000 exhaustive", () => {
+    assert.deepEqual([0n, 1n, 2n, 3n].map(isqrt), [0n, 1n, 1n, 1n]);
+    for (let n = 0n; n <= 5000n; n++) ok(n);
+  });
+  it("perfect squares and +/-1, across magnitudes incl. 2^64, 2^128, 2^200", () => {
+    for (const r of [2n, 3n, 10n ** 6n, 10n ** 15n, (1n << 32n) - 1n, 1n << 32n, (1n << 53n) + 1n, 1n << 64n, (1n << 64n) + 1n, 1n << 96n, 10n ** 40n + 7n, 1n << 100n, (1n << 512n) + 1n, 1n << 600n]) {
+      const sq = r * r;
+      assert.equal(isqrt(sq), r);
+      assert.equal(isqrt(sq + 1n), r);
+      assert.equal(isqrt(sq - 1n), r - 1n);
+      assert.equal(isqrt(sq + 2n * r), r);
+      assert.equal(isqrt(sq + 2n * r + 1n), r + 1n);
+    }
+    for (const e of [64n, 128n, 200n, 1023n, 1024n, 1025n, 2048n]) {
+      const n = 1n << e;
+      ok(n); ok(n - 1n); ok(n + 1n);
+    }
+  });
+  it("random values of many bit lengths", () => {
+    let s = 12345n;
+    const rnd = () => (s = (s * 6364136223846793005n + 1442695040888963407n) & ((1n << 64n) - 1n));
+    for (let i = 0; i < 3000; i++) {
+      let n = 0n;
+      for (let k = 0n, w = rnd() % 12n; k <= w; k++) n = (n << 64n) | rnd();
+      ok(n >> (rnd() % 64n));
+    }
+  });
+});
+
+describe("plus2PctDepthE6 exactness", () => {
+  const check = (r: bigint) => {
+    const m = r - plus2PctDepthE6(r);
+    assert.ok(51n * m * m >= 50n * r * r, `m too small R=${r}`);
+    assert.ok(m === 0n || 51n * (m - 1n) * (m - 1n) < 50n * r * r, `m not minimal R=${r}`);
+  };
+  it("R 0..20000 exhaustive", () => { for (let r = 0n; r <= 20000n; r++) check(r); });
+  it("R across 0..2^96 incl. powers of two and neighbours, and random", () => {
+    for (let e = 0n; e <= 96n; e++) for (const d of [-1n, 0n, 1n]) { const r = (1n << e) + d; if (r >= 0n && r < (1n << 96n)) check(r); }
+    let s = 777n;
+    const rnd = () => (s = (s * 6364136223846793005n + 1442695040888963407n) & ((1n << 64n) - 1n));
+    for (let i = 0; i < 5000; i++) check(((rnd() << 32n) | (rnd() >> 32n)) >> (rnd() % 96n));
+  });
+});
+
 describe("plus2PctDepthE6 = floor(R * (1 - 1/sqrt(1.02)))", () => {
   // Hand/high-precision vectors (Decimal, 60 digits): R * 0.00985245702332569...
   const VECTORS: Array<[bigint, bigint]> = [
