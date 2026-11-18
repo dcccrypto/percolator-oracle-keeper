@@ -58,14 +58,10 @@ export function depthCapacityThresholdsFromEnv(env: Env): DepthCapacityThreshold
     if (!Number.isInteger(n) || n < 1 || n > 64) throw new Error(`${name}=${JSON.stringify(raw)} must be a decimal integer in [1, 64]`);
     return n;
   };
-  const t = {
+  return {
     staleWarnEpochs: get("ALERT_DEPTH_STALE_WARN_EPOCHS", DEFAULT_DEPTH_CAPACITY_THRESHOLDS.staleWarnEpochs),
     criticalEpochs: get("ALERT_DEPTH_ZERO_CRITICAL_EPOCHS", DEFAULT_DEPTH_CAPACITY_THRESHOLDS.criticalEpochs),
   };
-  if (t.staleWarnEpochs >= t.criticalEpochs) {
-    throw new Error(`ALERT_DEPTH_STALE_WARN_EPOCHS (${t.staleWarnEpochs}) must be less than ALERT_DEPTH_ZERO_CRITICAL_EPOCHS (${t.criticalEpochs}): a warn that cannot precede the critical`);
-  }
-  return t;
 }
 
 function bitLength(n: bigint): number {

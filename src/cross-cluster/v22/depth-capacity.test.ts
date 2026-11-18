@@ -101,7 +101,7 @@ describe("#174 assessDepthCapacity", () => {
     assert.throws(() => depthCapacityThresholdsFromEnv({ ALERT_DEPTH_ZERO_CRITICAL_EPOCHS: "x" }));
   });
 
-  it("thresholds from env: decimal-only, [1, 64], warn < critical (table)", () => {
+  it("thresholds from env: decimal-only, [1, 64] (table)", () => {
     const WARN = "ALERT_DEPTH_STALE_WARN_EPOCHS";
     const CRIT = "ALERT_DEPTH_ZERO_CRITICAL_EPOCHS";
     const bad: Array<[string, string]> = [
@@ -115,10 +115,8 @@ describe("#174 assessDepthCapacity", () => {
     // bounds and blank-as-default stay
     assert.deepEqual(depthCapacityThresholdsFromEnv({ [WARN]: "1", [CRIT]: "64" }), { staleWarnEpochs: 1, criticalEpochs: 64 });
     assert.deepEqual(depthCapacityThresholdsFromEnv({ [WARN]: "  ", [CRIT]: "" }), T);
-    // warn must precede critical
-    assert.throws(() => depthCapacityThresholdsFromEnv({ [WARN]: "6" }), /must be less than/);
-    assert.throws(() => depthCapacityThresholdsFromEnv({ [WARN]: "7", [CRIT]: "7" }), /must be less than/);
-    assert.throws(() => depthCapacityThresholdsFromEnv({ [CRIT]: "2" }), /must be less than/);
+    // warn counts elapsed halvings, critical counts halvings remaining: different axes, so no ordering rule (warn 10 / crit 3 is valid)
+    assert.deepEqual(depthCapacityThresholdsFromEnv({ [WARN]: "10", [CRIT]: "3" }), { staleWarnEpochs: 10, criticalEpochs: 3 });
     assert.deepEqual(depthCapacityThresholdsFromEnv({ [WARN]: "5" }), { staleWarnEpochs: 5, criticalEpochs: 6 });
   });
 
