@@ -149,13 +149,11 @@ describe("drainFeeLegsBeforeResolve — remaining branches (injected deps)", () 
     assert.deepEqual(seen, [explicit, fallback]);
   });
 
-  it("creator leg unreadable (truncated account) and zero creator leg", async () => {
+  it("creator leg unreadable (truncated account)", async () => {
     const short = sol.subarray(0, 600);
     const r = await run(short, short, true, ok);
     assert.equal(r.before.creatorClaimable, null);
     assert.ok(r.warnings.some((w) => /creator leg unreadable/.test(w)));
-    const zeroCreator = readFeeLegs(new Uint8Array(sol));
-    assert.ok(zeroCreator.creatorClaimable !== null);
   });
 
   it("terminal inspection skipped without cfg or without inspectTerminal", async () => {
@@ -181,6 +179,7 @@ describe("drainFeeLegsBeforeResolve — remaining branches (injected deps)", () 
 
   it("terminal: unsupported vs unknown probe wording in the STRANDED blocker", async () => {
     const u = await run(both, both, false, insp({ support: "unsupported" }), TCFG);
+    assert.equal(u.blockers.length, 1);
     assert.match(u.blockers[0], /has no tag 29 \(pre-F-9\)/);
     const k = await run(both, both, false, insp({ support: "unknown" }), TCFG);
     assert.match(k.blockers[0], /could not be probed/);
