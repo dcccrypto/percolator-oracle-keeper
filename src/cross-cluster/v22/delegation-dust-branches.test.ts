@@ -1,4 +1,4 @@
-import { describe, it, beforeEach } from "node:test";
+import { describe, it, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import type { V22Positioned } from "./positioned.ts";
 import { DUST_COOLDOWN_SLOTS, dustCandidates, freshDustState, sweepDustOnce } from "./dust.ts";
@@ -21,12 +21,14 @@ function positioned(cps: ReturnType<typeof pf>[], minAbs: Record<number, bigint>
 const k = (n: number) => key(n).toBase58();
 
 describe("delegation switchboard: absent / installed / throwing", () => {
-  beforeEach(() => {
+  const reset = () => {
     setSweepDelegate(null);
     setBondFeeDelegated(false);
     setLoneLpCrankSuppressor(null);
     setProtectiveTrigger(null);
-  });
+  };
+  beforeEach(reset);
+  after(reset);
   it("nothing installed: every query answers 'do nothing'", () => {
     assert.equal(getSweepDelegate(), null);
     assert.equal(bondFeeDelegated(), false);
@@ -45,10 +47,13 @@ describe("delegation switchboard: absent / installed / throwing", () => {
     setProtectiveTrigger((m) => seen.push(m));
     triggerProtectiveRound("A");
     assert.deepEqual(seen, ["A"]);
+    let called = 0;
     setProtectiveTrigger(() => {
+      called++;
       throw new Error("boom");
     });
     assert.doesNotThrow(() => triggerProtectiveRound("A"));
+    assert.equal(called, 1);
   });
   it("sweep delegate and bond-fee flag round-trip", () => {
     const d = async () => true as const;
@@ -115,6 +120,8 @@ describe("sweepDustOnce decisions", () => {
     const st2 = freshDustState();
     const r2 = await sweepDustOnce(execCtx(good.conn), ctx, positioned([pf(1)], { 1: 5n }), st2);
     assert.equal(r2[0].outcome.kind, "sent");
+    assert.equal(good.sent.length, 1);
+    assert.equal(good.sent[0].tags[0], 118);
     assert.equal(st2.cooldownUntil.size, 0);
   });
   it("maxPerTick caps how many portfolios are simulated", async () => {
