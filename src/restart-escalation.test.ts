@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { alertText, readHealth, recordLaunch, restartConfig, restartHealth } from "./restart-escalation.ts";
+import { MAX_ALERT_RETRIES, alertText, readHealth, recordAlertFailure, recordLaunch, restartConfig, restartHealth } from "./restart-escalation.ts";
 
 const tmp = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), "rs-")), "r.json");
 const MIN = 60_000;
@@ -42,7 +42,6 @@ test("a corrupt file or unwritable path never throws", () => {
 });
 
 test("a failed webhook delivery does not burn the alert window; retries are capped", async () => {
-  const { MAX_ALERT_RETRIES, recordAlertFailure } = await import("./restart-escalation.ts");
   const p = tmp();
   let t = 0;
   for (let i = 0; i < 4; i++) recordLaunch(p, (t += MIN), 5, 15 * MIN);
@@ -53,8 +52,6 @@ test("a failed webhook delivery does not burn the alert window; retries are capp
   // cap reached: stamp stays, a dead endpoint is not retried again this window
   assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, false);
 });
-
-import { MAX_ALERT_RETRIES, recordAlertFailure } from "./restart-escalation.ts";
 
 const read = (p: string) => JSON.parse(fs.readFileSync(p, "utf8"));
 
@@ -84,7 +81,6 @@ test("alert window boundary: re-alert is due exactly windowMs after the last ale
 
 test("a new alert window resets the failed-delivery budget (rec.alertFails -> 0)", () => {
   const p = tmp();
-  fs.writeFileSync(p, JSON.stringify({ launches: [], lastAlertAt: 0, alertFails: MAX_ALERT_RETRIES - 1 }));
   const now = 20 * MIN;
   fs.writeFileSync(p, JSON.stringify({ launches: [now - 2, now - 1], lastAlertAt: 0, alertFails: MAX_ALERT_RETRIES - 1 }));
   assert.equal(recordLaunch(p, now, 3, 15 * MIN).alertDue, true);
