@@ -109,13 +109,14 @@ describe("pushDepthOnchainEnabled default env", () => {
 });
 
 describe("DepthSourceCache: accessors and refresh edge paths", () => {
-  const acct = (owner: PublicKey, len = 165) => ({ data: Buffer.alloc(len), owner, lamports: 1, executable: false });
+  type Acct = { data: Buffer; owner: PublicKey; lamports: number; executable: boolean };
+  const acct = (owner: PublicKey, len = 165): Acct => ({ data: Buffer.alloc(len), owner, lamports: 1, executable: false });
   const market = k();
   const pda = deriveDepthSource(WRAPPER_PROGRAM_ID, market);
   const pool = k(), bv = k(), qv = k();
   const record = () => valid((_b, o) => { pool.toBuffer().copy(o, 64); bv.toBuffer().copy(o, 96); qv.toBuffer().copy(o, 128); });
-  const world = (over: Record<string, ReturnType<typeof acct> | null> = {}) => {
-    const m = new Map<string, ReturnType<typeof acct> | null>([
+  const world = (over: Record<string, Acct | null> = {}) => {
+    const m = new Map<string, Acct | null>([
       [pda.toBase58(), { ...acct(WRAPPER_PROGRAM_ID), data: record() }],
       [pool.toBase58(), acct(PUMP, 301)],
       [bv.toBase58(), acct(TOKEN)],
@@ -125,7 +126,7 @@ describe("DepthSourceCache: accessors and refresh edge paths", () => {
     return m;
   };
   /** failOn(n): the n-th RPC call (1-based) throws. */
-  const conn = (m: Map<string, ReturnType<typeof acct> | null>, failOn = 0) => {
+  const conn = (m: Map<string, Acct | null>, failOn = 0) => {
     let n = 0;
     return { async getMultipleAccountsInfo(keys: PublicKey[]) { if (++n === failOn) throw new Error("rpc"); return keys.map((x) => m.get(x.toBase58()) ?? null); } };
   };
