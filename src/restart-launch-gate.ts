@@ -3,6 +3,6 @@
  * Used by cross-cluster.ts at startup.
  */
 export function shouldRecordLaunch(lastLaunchAgoSec: number | null): boolean {
-  // A negative age means the wall clock stepped back past the stored stamp: treat as expired and record.
-  return lastLaunchAgoSec === null || lastLaunchAgoSec < 0 || lastLaunchAgoSec > 120;
+  // view() never yields a negative age (future stamps are excluded from "last"), so a backwards clock step reads as null/old.
+  return lastLaunchAgoSec === null || lastLaunchAgoSec > 120;
 }

@@ -99,7 +99,10 @@ export function readHealth(path: string, now: number, threshold: number, windowM
 }
 
 function view(launches: number[], now: number, threshold: number, windowMs: number): RestartHealth {
-  const last = launches.length ? Math.max(...launches) : null;
+  // Stamps later than `now` (clock stepped back) still count toward escalation but are not "the last launch":
+  // otherwise lastLaunchAgoSec goes negative and the boot gate mistakes it for a launch it must not re-count.
+  const past = launches.filter((t) => t <= now);
+  const last = past.length ? Math.max(...past) : null;
   return {
     launchesInWindow: launches.length,
     threshold,
