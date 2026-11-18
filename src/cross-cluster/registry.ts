@@ -220,6 +220,10 @@ export function saveRegistry(registry: Registry, registryPath: string): void {
 // addr -> first index, keyed by the markets ARRAY (removeMarket / reload swap the
 // array, which drops the index for free). Trusted only while the array length is
 // unchanged and a hit still points at the same address; otherwise rebuilt.
+// CONTRACT: callers that edit registry.markets directly must keep the length
+// changing (push/splice) or write the SAME address back at an index; overwriting
+// an index with a DIFFERENT address at constant length is not detected. All
+// in-repo mutators (reconcileMarkets, reload, removeMarket) honour this.
 const addIndex = new WeakMap<object, { len: number; map: Map<string, number> }>();
 
 function indexFor(markets: MarketEntry[]): Map<string, number> {
@@ -243,7 +247,7 @@ export function addMarket(
   let map = indexFor(markets);
   let idx = map.get(entry.marketAddress) ?? -1;
   if (idx >= 0 && markets[idx]?.marketAddress !== entry.marketAddress) {
-    // Stale (array edited in place behind our back): rebuild and retry.
+    // Stale: rebuild and retry.
     addIndex.delete(markets);
     map = indexFor(markets);
     idx = map.get(entry.marketAddress) ?? -1;
