@@ -64,7 +64,8 @@ export function planRentSettles(ctx: V22MarketCtx, positioned: V22Positioned, st
     }
     const key = `${ctx.marketAddress}|${p.pubkey.toBase58()}`;
     const last = st.last.get(key);
-    const age = last === undefined ? null : now - last;
+    // a stamp ahead of the read slot (RPC failover to a lagging node, or a bad far-future slot) is untrustworthy: treat as never settled
+    const age = last === undefined || last > now ? null : now - last;
     if (age === null || age >= BigInt(cadenceSlots)) rows.push({ portfolio: p.pubkey.toBase58(), weight: portfolioWeight(p), ageSlots: age });
   }
   rows.sort((a, b) => {
