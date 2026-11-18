@@ -27,7 +27,7 @@ import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { devnetConnectionConfig } from "./rpc-headers.ts";
 import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
 import { failoverFromEnv, parseFallbackUrls } from "./rpc-failover.ts";
-import { markCadenceCheck } from "./cross-cluster/mark-smoother.ts";
+import { resolvePusherCadence } from "./pusher-cadence.ts";
 import { dryRunDecision } from "./dry-run-switch.ts";
 import { setHealthExtension, startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { startRegistryReloadLoop } from "./cross-cluster/registry-reload.ts";
@@ -67,11 +67,7 @@ try {
 const DRY_RUN_DECISION = dryRunDecision(process.env, process.argv);
 for (const w of DRY_RUN_DECISION.warnings) console.warn(w);
 const DRY_RUN = DRY_RUN_DECISION.dryRun;
-const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "3000", 10);
-{
-  const c = markCadenceCheck(CC_INTERVAL_MS, Number(process.env.CC_MARK_WINDOW_MS ?? 15_000));
-  if (c.verdict === "never" && !DRY_RUN) fatal(`this cadence can never publish a mark. ${c.detail}`);
-}
+const { intervalMs: CC_INTERVAL_MS } = resolvePusherCadence(DRY_RUN, fatal);
 
 function loadKeypair(): Keypair {
   if (process.env.KEEPER_KEYPAIR) return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(process.env.KEEPER_KEYPAIR) as number[]));
