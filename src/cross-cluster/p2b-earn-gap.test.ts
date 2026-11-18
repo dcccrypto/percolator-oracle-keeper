@@ -259,6 +259,17 @@ describe("untaken paths: sibling ledger, non-Error rejection, default logger, u6
     assert.deepEqual([m.health()[0].parMinusE3Atoms, m.health()[0].parMinusE3Bps], ["1", 9]);
   });
 
+  it("with feeShareBps 5000 the earnings term is identical on entry and exit, so the gap is unchanged (1 atom)", async () => {
+    const base = vault({ principal: 1_033 });
+    const s = { ...base.s, registry: { ...base.s.registry!, feeShareBps: 5_000 } };
+    const m = mon();
+    await m.run(base.c.conn as never, [s]);
+    const h = m.health()[0];
+    assert.equal(h.parMinusE3Atoms, "1");
+    assert.equal(BigInt(h.entryNavAtoms) - BigInt(h.exitNavAtoms), 1n);
+    assert.equal(h.parMinusE3Bps, Number(10_000n / BigInt(h.entryNavAtoms)));
+  });
+
   it("a non-Error rejection is stringified into the once-only log line", async () => {
     const { s } = vault();
     const logs: string[] = [];
