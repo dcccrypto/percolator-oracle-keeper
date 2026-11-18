@@ -114,6 +114,109 @@ describe("#174 assessDepthCapacity", () => {
   });
 });
 
+describe("depth-capacity: untaken branches", () => {
+  it("env: blank/whitespace falls back, out-of-range / fractional / non-finite throw", () => {
+    assert.deepEqual(depthCapacityThresholdsFromEnv({ ALERT_DEPTH_STALE_WARN_EPOCHS: "   ", ALERT_DEPTH_ZERO_CRITICAL_EPOCHS: "" }), T);
+    assert.deepEqual(depthCapacityThresholdsFromEnv({ ALERT_DEPTH_STALE_WARN_EPOCHS: "64", ALERT_DEPTH_ZERO_CRITICAL_EPOCHS: "1" }), { staleWarnEpochs: 64, criticalEpochs: 1 });
+    for (const bad of ["65", "-1", "1.5", "NaN", "Infinity", "1e3"]) {
+      assert.throws(() => depthCapacityThresholdsFromEnv({ ALERT_DEPTH_STALE_WARN_EPOCHS: bad }), /must be an integer in \[1, 64\]/, bad);
+    }
+  });
+
+  it("closed with no last-good slot, or now <= last-good slot, reports 0 sticky epochs; depthAge null when never pushed", () => {
+    const noSlot = assessDepthCapacity(record({ lastGoodE6: 0n, lastGoodSlot: 0n }), 0, BAND, at(10n));
+    assert.deepEqual([noSlot.status, noSlot.stickyEpochs, noSlot.epochsToZero, noSlot.depthAgeSlots], ["closed", 0, 0, null]);
+    const a = depthCapacityAlert("M", "m", noSlot, T, { venue: null, keeperAttestsVenue: true });
+    assert.match(a?.message ?? "", /last depth push never/);
+    assert.equal(a?.data.venue, null);
+    const ahead = assessDepthCapacity(record({ lastGoodE6: 0n, lastGoodSlot: at(50n) }), 0, BAND, at(10n));
+    assert.deepEqual([ahead.status, ahead.stickyEpochs], ["closed", 0]);
+  });
+
+  it("stale cap with now behind the last-good slot has k=0 and bitLength(0)=0 floors epochsToZero at 0", () => {
+    const behind = assessDepthCapacity(record({ lastGoodSlot: at(50n) }), 0, BAND, at(10n));
+    assert.equal(behind.stickyEpochs, 0);
+    assert.equal(behind.epochsToZero, 31);
+    assert.equal(behind.status, "stale");
+    const huge = assessDepthCapacity(record({ lastGoodE6: (1n << 63n) + 1n }), 0, BAND, at(1n));
+    assert.equal(huge.epochsToZero, 63);
+    const tiny = assessDepthCapacity(record({ lastGoodE6: 1n }), 0, BAND, at(0n, 1n));
+    assert.deepEqual([tiny.status, tiny.epochsToZero], ["decaying", 1]);
+  });
+
+  it("a depth slot in the future gives null age; an aged depth push is not fresh", () => {
+    const future = assessDepthCapacity(record({ depthE6: 5_000_000_000n, depthSlot: at(20n) }), 0, BAND, at(1n));
+    assert.equal(future.depthAgeSlots, null);
+    assert.notEqual(future.status, "fresh");
+  });
+
+  it("alert: pinned note, venue named, null-capDepth data, decaying warn vs critical boundary", () => {
+    const pinned = { ...assessDepthCapacity(record(), 0, BAND, at(131n)), depthDexPinned: true };
+    const a = depthCapacityAlert("M", "m", pinned, T, { venue: "pumpswap", keeperAttestsVenue: true });
+    assert.match(a?.message ?? "", /DEX-pinned/);
+    assert.match(a?.message ?? "", /\(venue pumpswap\)/);
+    assert.equal(a?.data.capDepthE6, "0");
+    const nullCap = depthCapacityAlert("M", "m", { ...pinned, capDepthE6: null }, T, { keeperAttestsVenue: false });
+    assert.equal(nullCap?.data.capDepthE6, null);
+    const dec = assessDepthCapacity(record(), 0, BAND, at(3n));
+    assert.equal(depthCapacityAlert("M", "m", { ...dec, epochsToZero: T.criticalEpochs }, T, { keeperAttestsVenue: true })?.severity, "critical");
+    assert.equal(depthCapacityAlert("M", "m", { ...dec, epochsToZero: T.criticalEpochs + 1 }, T, { keeperAttestsVenue: true })?.severity, "warn");
+    assert.equal(depthCapacityAlert("M", "m", { ...dec, epochsToZero: null }, T, { keeperAttestsVenue: true })?.severity, "warn");
+    for (const status of ["stale", "fresh", "uncapped", "no-clamp"] as const) assert.equal(depthCapacityAlert("M", "m", { ...dec, status }, T, { keeperAttestsVenue: true }), null);
+  });
+
+  it("explicit thresholds override the defaults: a strict warn epoch of 1 flags a 1-halving cap", () => {
+    const strict = { staleWarnEpochs: 1, criticalEpochs: 1 };
+    assert.equal(assessDepthCapacity(record(), 0, BAND, at(1n), strict).status, "decaying");
+    assert.equal(assessDepthCapacity(record(), 0, BAND, at(1n)).status, "stale");
+  });
+
+  it("closed alert names how many slots ago the last depth push was when one exists", () => {
+    const d = assessDepthCapacity(record({ depthE6: 0n, depthSlot: at(1n) - 5n }), 0, BAND, at(1n));
+    assert.equal(d.depthAgeSlots, 5n);
+    assert.match(depthCapacityAlert("M", "m", d, T, { keeperAttestsVenue: true })?.message ?? "", /last depth push 5 slots ago/);
+  });
+
+  it("seeded reference model: halving floor and reset on a fresh reading over a good/bad reading sequence", () => {
+    let seed = 0x174;
+    const rnd = (n: number) => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) % n);
+    let lastGood = 0n;
+    let lastGoodSlot = 0n;
+    let now = 1_000_000n;
+    let everGood = false;
+    for (let i = 0; i < 300; i++) {
+      now += BigInt(rnd(5) * 4_000 + rnd(3));
+      if (rnd(3) === 0) {
+        // good reading: resets the decay
+        lastGood = BigInt(1 + rnd(2_000_000_000));
+        lastGoodSlot = now;
+        everGood = true;
+      } // else: bad reading, nothing pushed
+      const d = assessDepthCapacity(record({ ever: everGood, lastGoodE6: lastGood, lastGoodSlot, depthE6: lastGood, depthSlot: lastGoodSlot, source: everGood ? DEPTH_SOURCE.Attested : 0 }), 0, BAND, now);
+      if (!everGood) {
+        assert.equal(d.status, "uncapped");
+        continue;
+      }
+      const k = Number((now - lastGoodSlot) / EPOCH);
+      if (now - lastGoodSlot === 0n) {
+        assert.equal(d.status, "fresh");
+        assert.equal(d.stickyEpochs, 0);
+        assert.equal(d.capDepthE6, lastGood);
+        continue;
+      }
+      if (d.status === "fresh") continue; // within the SDK freshness window: cap is the live reading
+      const expectCap = k >= 64 ? 0n : lastGood >> BigInt(k);
+      assert.equal(d.capDepthE6, expectCap, `i=${i} k=${k}`);
+      if (expectCap === 0n) assert.equal(d.status, "closed");
+      else assert.equal(d.epochsToZero, Math.max(0, bitLen(lastGood) - k));
+    }
+  });
+});
+
+function bitLen(n: bigint): number {
+  return n <= 0n ? 0 : n.toString(2).length;
+}
+
 // ── V22Loop wiring ───────────────────────────────────────────────────────────
 
 const L = layoutById("v2.2-b");
