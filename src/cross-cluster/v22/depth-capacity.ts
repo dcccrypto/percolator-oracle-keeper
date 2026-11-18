@@ -53,14 +53,19 @@ export function depthCapacityThresholdsFromEnv(env: Env): DepthCapacityThreshold
   const get = (name: string, fallback: number): number => {
     const raw = env[name];
     if (raw === undefined || raw.trim() === "") return fallback;
-    const n = Number(raw);
-    if (!Number.isInteger(n) || n < 1 || n > 64) throw new Error(`${name}="${raw}" must be an integer in [1, 64]`);
+    // Decimal digits only: Number() would take "0x10", "1e1", "0b11", " 2 " as 16, 10, 3, 2.
+    const n = /^[0-9]{1,3}$/.test(raw) ? Number(raw) : NaN;
+    if (!Number.isInteger(n) || n < 1 || n > 64) throw new Error(`${name}=${JSON.stringify(raw)} must be a decimal integer in [1, 64]`);
     return n;
   };
-  return {
+  const t = {
     staleWarnEpochs: get("ALERT_DEPTH_STALE_WARN_EPOCHS", DEFAULT_DEPTH_CAPACITY_THRESHOLDS.staleWarnEpochs),
     criticalEpochs: get("ALERT_DEPTH_ZERO_CRITICAL_EPOCHS", DEFAULT_DEPTH_CAPACITY_THRESHOLDS.criticalEpochs),
   };
+  if (t.staleWarnEpochs >= t.criticalEpochs) {
+    throw new Error(`ALERT_DEPTH_STALE_WARN_EPOCHS (${t.staleWarnEpochs}) must be less than ALERT_DEPTH_ZERO_CRITICAL_EPOCHS (${t.criticalEpochs}): a warn that cannot precede the critical`);
+  }
+  return t;
 }
 
 function bitLength(n: bigint): number {
