@@ -31,6 +31,12 @@ describe("classifyProbeError (probe classification)", () => {
     assert.equal(classifyProbeError(ie({ Custom: 21 })), "supported");
     assert.equal(classifyProbeError(ie({ Custom: 0 })), "supported");
   });
+  it("undefined err -> supported; an object without InstructionError, or a non-array one -> unknown", () => {
+    assert.equal(classifyProbeError(undefined), "supported");
+    assert.equal(classifyProbeError({ Other: 1 }), "unknown");
+    assert.equal(classifyProbeError({ InstructionError: "x" }), "unknown");
+    assert.equal(classifyProbeError("BlockhashNotFound"), "unknown");
+  });
   it("simulation ok -> supported", () => {
     assert.equal(classifyProbeError(null), "supported");
   });
@@ -118,6 +124,64 @@ describe("P2bFeatureGate", () => {
     assert.equal(g.gate.isSupported(), false);
   });
 
+  it("a backwards clock step re-probes instead of serving the cached answer past its TTL", async () => {
+    const g = gateWith(["unsupported", "supported"]);
+    assert.equal(await g.gate.ensure(), false);
+    g.advance(-60_000); // NTP step back: age is now negative
+    assert.equal(await g.gate.ensure(), true, "negative age re-probes");
+    assert.equal(g.probes(), 2);
+    g.advance(-60_000);
+    assert.equal(await g.gate.ensure(), true);
+    assert.equal(g.probes(), 3, "a supported answer is re-probed after a step back too");
+  });
+
+  it("reportUnsupported is a no-op outside auto mode", () => {
+    const on = gateWith(["supported"], 0, { ...DEFAULT_P2B_GATE_CONFIG, mode: "on" });
+    on.gate.reportUnsupported();
+    assert.equal(on.gate.isSupported(), true);
+    assert.equal(on.gate.snapshot().supported, true);
+    assert.equal(on.gate.snapshot().lastProbe, null);
+    const off = gateWith(["supported"], 0, { ...DEFAULT_P2B_GATE_CONFIG, mode: "off" });
+    assert.equal(off.gate.snapshot().supported, false);
+  });
+
+  it("supported -> supported does not log twice; unsupported -> supported logs ON", async () => {
+    const g = gateWith(["supported", "supported", "unsupported", "supported"]);
+    await g.gate.ensure();
+    g.advance(DEFAULT_P2B_GATE_CONFIG.supportedTtlMs);
+    await g.gate.ensure();
+    assert.equal(g.logs.filter((l) => /supports P2b/.test(l)).length, 1);
+    g.advance(DEFAULT_P2B_GATE_CONFIG.supportedTtlMs);
+    await g.gate.ensure();
+    g.advance(DEFAULT_P2B_GATE_CONFIG.unsupportedTtlMs);
+    await g.gate.ensure();
+    assert.equal(g.logs.filter((l) => /supports P2b/.test(l)).length, 2);
+  });
+
+  it("uses Date.now and console.log by default", async () => {
+    const orig = console.log;
+    const lines: string[] = [];
+    console.log = (l: string) => { lines.push(l); };
+    try {
+      const gate = new P2bFeatureGate(DEFAULT_P2B_GATE_CONFIG, async () => "unsupported");
+      await gate.ensure();
+      assert.ok(gate.snapshot().lastProbeAt! > 1_000_000_000_000);
+      assert.equal(lines.length, 1);
+    } finally {
+      console.log = orig;
+    }
+  });
+
+  it("no-candidate retries at the unknown interval", async () => {
+    const g = gateWith(["no-candidate", "supported"]);
+    await g.gate.ensure();
+    g.advance(DEFAULT_P2B_GATE_CONFIG.unknownRetryMs - 1);
+    await g.gate.ensure();
+    assert.equal(g.probes(), 1);
+    g.advance(1);
+    assert.equal(await g.gate.ensure(), true);
+  });
+
   it("concurrent ensure() calls share one probe", async () => {
     const g = gateWith(["supported"]);
     await Promise.all([g.gate.ensure(), g.gate.ensure(), g.gate.ensure()]);
@@ -146,6 +210,12 @@ describe("p2bGateConfigFromEnv", () => {
     assert.equal(p2bGateConfigFromEnv({ P2B_FEATURES: "on" }).mode, "on");
     assert.throws(() => p2bGateConfigFromEnv({ P2B_FEATURES: "maybe" }), /auto\|on\|off/);
     assert.throws(() => p2bGateConfigFromEnv({ P2B_PROBE_RETRY_MS: "-5" }), /positive integer/);
+    assert.throws(() => p2bGateConfigFromEnv({ P2B_PROBE_RETRY_MS: "1.5" }), /positive integer/);
+    assert.throws(() => p2bGateConfigFromEnv({ P2B_PROBE_RETRY_MS: "abc" }), /positive integer/);
+    const c = p2bGateConfigFromEnv({ P2B_PROBE_SUPPORTED_TTL_MS: "5", P2B_PROBE_UNSUPPORTED_TTL_MS: "6", P2B_PROBE_RETRY_MS: " " });
+    assert.equal(c.supportedTtlMs, 5);
+    assert.equal(c.unsupportedTtlMs, 6);
+    assert.equal(c.unknownRetryMs, DEFAULT_P2B_GATE_CONFIG.unknownRetryMs);
   });
 });
 
@@ -178,6 +248,25 @@ describe("makeTag103Probe: simulate only, on a BOUND market", () => {
     assert.ok(ix.keys[0].pubkey.equals(KEEPER.publicKey));
   });
 
+  it("skips markets with a missing / garbage registry or an undecodable vault state, and probes the first good one", async () => {
+    const markets = [mk(), mk(), mk(), mk(), mk()];
+    const accounts = new Map<string, Uint8Array>();
+    const reg = (m: typeof markets[number]) => deriveLpVaultRegistry(PROGRAM, m)[0].toBase58();
+    const st = (m: typeof markets[number]) => deriveVaultLpState(PROGRAM, m).toBase58();
+    // 0: nothing on chain; 1: garbage registry; 2: bound registry but garbage state; 3: unbound; 4: good
+    accounts.set(reg(markets[1]), new Uint8Array(3));
+    accounts.set(st(markets[1]), vaultLpStateBytes({ lp: mk() }));
+    accounts.set(reg(markets[2]), registryBytes({ bound: true }));
+    accounts.set(st(markets[2]), new Uint8Array(3));
+    accounts.set(reg(markets[3]), registryBytes({ bound: false }));
+    accounts.set(st(markets[3]), vaultLpStateBytes({ lp: mk() }));
+    accounts.set(reg(markets[4]), registryBytes({ bound: true }));
+    accounts.set(st(markets[4]), vaultLpStateBytes({ lp: mk() }));
+    const c = fakeConn({ accounts, sims: [{ err: ie({ Custom: 1 }) }] });
+    const probe = makeTag103Probe({ conn: c.conn as never, keeper: KEEPER, programId: PROGRAM, markets: () => markets.map((m) => ({ marketAddress: m.toBase58() })) });
+    assert.equal(await probe(), "supported");
+    assert.ok(c.simulated[0].instructions[1].keys[1].pubkey.equals(markets[4]));
+  });
   it("InvalidInstructionData from the simulation -> unsupported", async () => {
     assert.equal(await world(0, { err: ie("InvalidInstructionData") }).probe(), "unsupported");
   });

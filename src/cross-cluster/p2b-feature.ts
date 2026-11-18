@@ -150,7 +150,9 @@ export class P2bFeatureGate {
     if (this.lastProbeAt !== null) {
       const ttl =
         this.lastProbe === "supported" ? this.cfg.supportedTtlMs : this.lastProbe === "unsupported" ? this.cfg.unsupportedTtlMs : this.cfg.unknownRetryMs;
-      if (now - this.lastProbeAt < ttl) return this.isSupported();
+      const age = now - this.lastProbeAt;
+      // a negative age (clock stepped backwards) is not "fresh": re-probe instead of serving a stale answer until the clock catches up
+      if (age >= 0 && age < ttl) return this.isSupported();
     }
     if (this.inflight) return this.inflight;
     this.inflight = (async () => {
