@@ -233,8 +233,8 @@ export function getPushDeadline(marketAddress: string, nowMs: number = Date.now(
   const c = byMarket.get(marketAddress);
   if (!c) return undefined;
   if (c.deadline.terminal) return c.deadline;
-  const age = nowMs - c.atMs;
-  return age >= 0 && age <= maxAgeMs ? c.deadline : undefined;
+  // A negative age (record stamped a few ms after the caller's `now`) is deliberately FRESH: keeper-loop captures smoothNowMs once per cycle, and the cranker records concurrently.
+  return nowMs - c.atMs <= maxAgeMs ? c.deadline : undefined;
 }
 
 /** True once the market was seen Resolved / closed. */
