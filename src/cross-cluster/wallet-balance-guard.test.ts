@@ -79,6 +79,24 @@ describe("#71 wallet-balance guard logic", () => {
     assert.equal(shouldRefreshBalance(s, 5_001, 30_000), false);
   });
 
+  it("refreshes after a backwards wall-clock step (NTP), not only once the clock catches up", () => {
+    const s = createWalletBalanceState();
+    s.lastCheckAt = 1_000_000;
+    assert.equal(shouldRefreshBalance(s, 1_000_000 - 60_000, 30_000), true);
+  });
+
+  it("a non-finite reading fails closed: keeps a low verdict and never reports recovered", () => {
+    const s = createWalletBalanceState();
+    applyBalanceReading(s, 1, 100, 1_000);
+    assert.equal(s.low, true);
+    for (const bad of [NaN, undefined as unknown as number, Infinity, -1]) {
+      assert.equal(applyBalanceReading(s, bad, 100, 2_000), null);
+      assert.equal(s.low, true);
+      assert.equal(s.balanceLamports, 1);
+      assert.equal(s.lastCheckAt, 2_000);
+    }
+  });
+
   it("formatSol is null-safe", () => {
     assert.equal(formatSol(null), "??");
     assert.equal(formatSol(50_000_000), "0.0500");
