@@ -132,7 +132,7 @@ describe("confirmBySignature wall-clock steps (NTP / VM resume)", () => {
       assert.equal(r.status, "landed");
     } finally { restore(); }
   });
-  it("wall clock jumps -1 h: the 300 ms deadline still holds", async () => {
+  it("wall clock jumps -1 h: the 300 ms deadline still holds", { timeout: 6_000 }, async () => {
     const k = conn({ statuses: [null], height: 1 });
     const restore = stepWallClock(k, -3_600_000);
     const t0 = performance.now();
