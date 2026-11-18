@@ -178,3 +178,85 @@ describe("duplicate pushes from two pushers are harmless", () => {
     assert.ok(!getQuarantinedMarkets().includes(market));
   });
 });
+
+// ── K-BUG-PUSHERROLEASSETGAP: per-asset clock, >100 markets, clock step back ────────────────────────────────────
+import { MARKET_GEOMETRY_BY_VERSION, VERSION_19, assetSlotOffset } from "../wrapper-market-group-offset.ts";
+
+const GEO19 = { ok: true as const, version: VERSION_19, ...MARKET_GEOMETRY_BY_VERSION[VERSION_19] };
+/** A VERSION-19 market account: cfg.last_good_oracle_slot @168 and asset k's profile.last_good_oracle_slot @ slot k + 216. */
+function v19Market(cfgLastGood: bigint, assetLastGood: Record<number, bigint> = {}): Buffer {
+  const b = Buffer.alloc(assetSlotOffset(GEO19, 6));
+  b.writeBigUInt64LE(V17_MAGIC, 0);
+  b.writeUInt16LE(VERSION_19, 8);
+  b.writeBigUInt64LE(cfgLastGood, 168);
+  for (const [k, v] of Object.entries(assetLastGood)) b.writeBigUInt64LE(v, assetSlotOffset(GEO19, Number(k)) + 216);
+  return b;
+}
+/** RPC fake: honours dataSlice, rejects > 100 keys like a real node. */
+function fakeRpc(accounts: Map<string, Buffer>, slot = 10_000) {
+  const calls: number[] = [];
+  return {
+    calls,
+    async getSlot() { return slot; },
+    async getMultipleAccountsInfo(keys: Array<{ toBase58(): string }>, cfg: { dataSlice?: { offset: number; length: number } }) {
+      calls.push(keys.length);
+      if (keys.length > 100) throw new Error("Too many accounts requested (max 100)");
+      return keys.map((k) => {
+        const d = accounts.get(k.toBase58());
+        if (!d) return null;
+        const s = cfg.dataSlice;
+        return { data: s ? d.subarray(s.offset, s.offset + s.length) : d };
+      });
+    },
+  };
+}
+
+describe("lead 1: per-asset takeover clock (profile.last_good_oracle_slot, prog global_or_profile_resolve_matured_at_slot)", () => {
+  it("asset 0 fresh but asset 2 stale: asset 0 stays standby, asset 2 is NOT standby (takeover)", async () => {
+    const rpc = fakeRpc(new Map([[M, v19Market(9_995n, { 0: 9_995n, 1: 9_990n, 2: 100n })]]));
+    const g = new TakeoverGate(CFG, () => 0);
+    await refreshTakeoverGate(rpc as never, g, [M], 0, new Map([[M, [0, 1, 2]]]));
+    assert.equal(g.isStandby(M, 0, 0), true);
+    assert.equal(g.isStandby(M, 0, 1), true);
+    assert.equal(g.isStandby(M, 0, 2), false, "asset 2 has been silent for 9,900 slots; the primary's asset-0 pushes must not hold the gate");
+    assert.equal(g.gapSlots(M, 0, 2), 9_900n);
+  });
+  it("an unreadable asset profile fails open (push), it does not borrow asset 0's clock", async () => {
+    const g = new TakeoverGate(CFG, () => 0);
+    g.update(M, 9_995n, 10_000n, 0);
+    assert.equal(g.isStandby(M, 0, 3), false);
+  });
+});
+
+describe("lead 2: more than 100 markets in one refresh", () => {
+  it("every market is read (chunked at 100 keys per RPC); one failing chunk only opens its own markets", async () => {
+    const keys = Array.from({ length: 230 }, () => Keypair.generate().publicKey.toBase58());
+    const accts = new Map(keys.map((k) => [k, v19Market(9_995n)]));
+    const rpc = fakeRpc(accts);
+    const g = new TakeoverGate(CFG, () => 0);
+    await refreshTakeoverGate(rpc as never, g, keys, 0);
+    assert.ok(rpc.calls.every((n) => n <= 100), `calls: ${rpc.calls}`);
+    assert.equal(keys.filter((k) => g.isStandby(k, 0)).length, 230, "all 230 markets must be on standby while the primary is healthy");
+  });
+  it("a chunk that throws leaves only that chunk's markets without state", async () => {
+    const keys = Array.from({ length: 150 }, () => Keypair.generate().publicKey.toBase58());
+    const accts = new Map(keys.map((k) => [k, v19Market(9_995n)]));
+    const rpc = fakeRpc(accts);
+    const real = rpc.getMultipleAccountsInfo.bind(rpc);
+    let n = 0;
+    rpc.getMultipleAccountsInfo = async (k: never, c: never) => { if (n++ === 1) throw new Error("429"); return real(k, c); };
+    const g = new TakeoverGate(CFG, () => 0);
+    await refreshTakeoverGate(rpc as never, g, keys, 0);
+    assert.equal(keys.slice(0, 100).every((k) => g.isStandby(k, 0)), true);
+    assert.equal(keys.slice(100).some((k) => g.isStandby(k, 0)), false);
+  });
+});
+
+describe("lead 3: wall clock steps backwards", () => {
+  it("a state stamped in the 'future' is unknown (push), not fresh forever", () => {
+    const g = new TakeoverGate(CFG, () => 0);
+    g.update(M, 100n, 110n, 3_600_000); // stamped at t=1h, then the clock steps back to t=0
+    assert.equal(g.gapSlots(M, 0), null);
+    assert.equal(g.isStandby(M, 0), false);
+  });
+});

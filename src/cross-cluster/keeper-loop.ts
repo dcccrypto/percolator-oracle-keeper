@@ -83,7 +83,7 @@ export interface LoopConfig {
    * alive). A standby market is still read and smoothed (so the mark is warm at takeover) but never pushed, and it is
    * counted as healthy for the no-push / zero-push alerts. Absent = every market is pushed (the primary keeper).
    */
-  standby?: (marketAddress: string) => boolean;
+  standby?: (marketAddress: string, assetIndex?: number) => boolean;
   /** Milliseconds between cycle starts. */
   intervalMs: number;
   /** HTTP health server port. */
@@ -1424,7 +1424,7 @@ export async function runCycle(
         stat.lastErrorMsg = "fixed source without a valid fixedPriceE6";
         continue;
       }
-      if (config.standby?.(entry.marketAddress)) {
+      if (config.standby?.(entry.marketAddress, entry.assetIndex)) {
         (state.standbyThisCycle ??= new Set()).add(entry.key);
         state.landedThisCycle.add(entry.key);
         stat.sourcePriceE6 = fixed;
@@ -1471,7 +1471,7 @@ export async function runCycle(
       console.warn(`[loop] ${entry.label}: smoother still priming but ${bypass.reason} — publishing the window median now (R3.24 deadline bypass)`);
     }
     // F2: standby (the primary is alive). The smoother above is already warm; do not touch the breaker or push.
-    if (config.standby?.(entry.marketAddress)) {
+    if (config.standby?.(entry.marketAddress, entry.assetIndex)) {
       (state.standbyThisCycle ??= new Set()).add(entry.key);
       state.landedThisCycle.add(entry.key);
       stat.sourcePriceE6 = priceE6;
