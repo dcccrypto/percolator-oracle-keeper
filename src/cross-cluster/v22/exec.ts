@@ -80,7 +80,7 @@ export interface ExecOptions {
   extend?: (post: ReadonlyArray<Uint8Array | null>) => readonly TransactionInstruction[] | null;
   /**
    * F1: called with the post-simulation accounts of the EXTENDED (second) simulation, when it was clean. Returning a reason rejects the
-   * extension: the original list (already simulated clean) is sent instead. Must not throw (a throw rejects nothing).
+   * extension: the original list (already simulated clean) is sent instead. A throw rejects the extension (fail closed).
    */
   verifyExtended?: (post: ReadonlyArray<Uint8Array | null>) => string | null;
 }
