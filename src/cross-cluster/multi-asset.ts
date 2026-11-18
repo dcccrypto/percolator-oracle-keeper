@@ -385,16 +385,21 @@ export interface MarketAccrualSample {
   readSlot: bigint;
   atMs: number;
   assets: AssetAccrualSample[];
+  /** Observed assets this read could NOT decode (out of range for the account, or the whole account unreadable): state UNKNOWN, never healthy. */
+  unreadable: number[];
 }
 
 const accrualByMarket = new Map<string, MarketAccrualSample>();
 
 /** Per-asset accrual of `data` at `readSlot` over `assets`. Pure. */
 export function sampleAssetAccrual(data: Uint8Array, assets: ReadonlyArray<number>, readSlot: bigint, atMs: number): MarketAccrualSample {
+  const decoded = decodeAssetRefreshStates(data, assets);
+  const seen = new Set(decoded.map((d) => d.assetIndex));
   return {
     readSlot,
     atMs,
-    assets: decodeAssetRefreshStates(data, assets).map(({ assetIndex, state }) => ({
+    unreadable: assets.filter((a) => !seen.has(a)),
+    assets: decoded.map(({ assetIndex, state }) => ({
       assetIndex,
       lifecycle: state.lifecycle,
       slotLast: state.slotLast,
@@ -410,7 +415,13 @@ export function recordMarketAccrual(marketAddress: string, data: Uint8Array, rea
     if (!isMultiAssetMarket(marketAddress)) return;
     accrualByMarket.set(marketAddress, sampleAssetAccrual(data, observationAssetsFor(marketAddress), readSlot, atMs));
   } catch {
-    // health only
+    // Health only, never throws into the crank loop. But do NOT keep the previous sample: it would read as the
+    // current state. Record every observed asset as unreadable (unknown) instead.
+    try {
+      accrualByMarket.set(marketAddress, { readSlot, atMs, assets: [], unreadable: [...observationAssetsFor(marketAddress)] });
+    } catch {
+      accrualByMarket.delete(marketAddress);
+    }
   }
 }
 

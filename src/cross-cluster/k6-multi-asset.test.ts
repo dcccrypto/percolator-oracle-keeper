@@ -481,6 +481,36 @@ describe("K-6 health: per-asset staleness, one stale asset degrades the market",
     assert.deepEqual(sampleAssetAccrual(market, [1], s1 + 10n, 0).assets[0].lagSlots, 1_010);
   });
 
+  it("silent-read: a registered asset the account cannot decode is accrual-unknown, never 'ok' (real bytes, asset 7 of a 5-slot account)", () => {
+    const rowWith7 = row2xhs();
+    rowWith7.assets = [...rowWith7.assets!, { assetIndex: 7, source: "fixed", fixedPriceE6: "1000000" } as never];
+    bindObservationRegistry(() => [rowWith7]);
+    const market = new Uint8Array(fx("k6-2xhs-market-v22"));
+    const s = sampleAssetAccrual(market, [0, 1, 2, 3, 4, 7], 600_000_000n, 0);
+    assert.deepEqual(s.unreadable, [7]);
+    recordMarketAccrual(M2XHS, market, 600_000_000n, Date.now());
+    const stats = priceUnitsOf(rowWith7).map((u) => {
+      const st = newMarketStat(u);
+      st.lastPushAt = Date.now();
+      st.totalPushes = 10;
+      return st;
+    });
+    const h = multiAssetMarketHealth(M2XHS, "2xhs", stats, { terminal: false, thresholds, nowMs: Date.now(), accrualLagWarnSlots: 300 });
+    assert.notEqual(h.row.status, "ok");
+    assert.ok((h.row.staleAssets as number[]).includes(7));
+  });
+
+  it("silent-read: a failed re-read (undecodable bytes) replaces the earlier healthy sample with an unknown one", () => {
+    bindObservationRegistry(() => [row2xhs()]);
+    const market = new Uint8Array(fx("k6-2xhs-market-v22"));
+    recordMarketAccrual(M2XHS, market, FIXTURE_SLOT, Date.now());
+    assert.deepEqual(getMarketAccrual(M2XHS)?.unreadable, []);
+    recordMarketAccrual(M2XHS, new Uint8Array(64), FIXTURE_SLOT + 100n, Date.now());
+    assert.deepEqual(getMarketAccrual(M2XHS)?.unreadable, [0, 1, 2, 3, 4]);
+    const h = multiAssetMarketHealth(M2XHS, "2xhs", statsFor(), { terminal: false, thresholds, nowMs: Date.now(), accrualLagWarnSlots: 300 });
+    assert.notEqual(h.row.status, "ok");
+  });
+
   it("/health: one stale asset -> keeper status degraded-markets, ONE row for the market with its assets", () => {
     const stats = new Map(statsFor().map((s) => [s.key, s]));
     stats.get(`${M2XHS}#2`)!.noPushCycles = thresholds.marketNoPushCycles + 1;
