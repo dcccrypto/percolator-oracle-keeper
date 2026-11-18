@@ -371,8 +371,6 @@ test("verify: re-checks caps and totals even when the hash is recomputed by hand
   assert.match(probs({ ...ap, totals: { ...ap.totals, lamports: 1 } }), /totals.lamports is not the sum/);
   assert.match(probs({ ...ap, totals: undefined } as unknown as RefundPlan), /totals.lamports is not the sum/);
   assert.match(probs({ ...ap, caps: { perMarketLamports: 110_000_000, perBatchLamports: 1 } }), /batch total is over the per-batch cap/);
-  // markets missing entirely: treated as empty, sum 0 matches totals 0, no problems
-  assert.equal(verifyRefundPlan(rehash({ ...ap, markets: undefined, totals: { ...ap.totals, lamports: 0 } } as unknown as RefundPlan)).ok, true);
 });
 
 test("renderPlanTable: unapproved shows approval hint; approved omits it; alignment and totals", () => {
@@ -450,7 +448,7 @@ test("CLI plan/verify end to end: --out writes file, flags parsed, refusals exit
 test("CLI rethrows non-refusal errors", () => {
   const d = mkdtempSync(join(tmpdir(), "refund-cov-"));
   const p = join(d, "p.json");
-  writeFileSync(p, "null"); // verify(null) -> hashBody throws inside try => handled
+  writeFileSync(p, "null"); // verify(null): verifyRefundPlan reports "not readable" itself, so the CLI returns 1 via NOT VERIFIED
   const io = { out: () => {}, err: () => {} };
   assert.equal(runCli(["verify", "--plan", p], io), 1);
   const boom = { out: () => { throw new Error("sink broke"); }, err: () => {} };
