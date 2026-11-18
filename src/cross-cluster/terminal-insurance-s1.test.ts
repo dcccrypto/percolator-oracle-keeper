@@ -413,3 +413,53 @@ describe("windDownOnce v5 pool: failure edges (K-COV)", () => {
     assert.match((r.outcome as { error: string }).error, /Custom.*77.*Error: weird/);
   });
 });
+
+describe("windDownOnce: RPC error text is redacted before it reaches outcomes (SECRET never appears)", () => {
+  type Over = Record<string, unknown>;
+  const withOver = (s: ReturnType<typeof stubV5>, o: Over): TerminalConnection => ({ ...(s.conn as unknown as Over), ...o }) as unknown as TerminalConnection;
+  const URLERR = "429 Too Many Requests from https://x.example/?api-key=SECRET";
+  const OK_SIM = { context: { slot: 1 }, value: { err: null, logs: [] } };
+  const dump = (r: unknown) => JSON.stringify(r, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+
+  it("account read failure (:383)", async () => {
+    const boom = { async getMultipleAccountsInfo() { throw new Error(URLERR); } } as unknown as TerminalConnection;
+    const r = await windDownOnce(boom, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "failed");
+    assert.ok(!dump(r).includes("SECRET"), dump(r));
+  });
+
+  it("send throws (:630)", async () => {
+    const s = stubV5(2, { deployedIsUpgraded: true });
+    const conn = withOver(s, { async simulateTransaction() { return OK_SIM; }, async sendRawTransaction() { throw new Error(URLERR); } });
+    const r = await windDownOnce(conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "failed");
+    assert.ok(!dump(r).includes("SECRET"), dump(r));
+  });
+
+  it("simulation error text and logs (:620)", async () => {
+    const s = stubV5(2, { deployedIsUpgraded: true });
+    const real = s.conn.simulateTransaction.bind(s.conn);
+    let n = 0;
+    const conn = withOver(s, { async simulateTransaction(tx: VersionedTransaction) {
+      if (n++ < 2) return real(tx); // support probe + shape probe
+      return { context: { slot: 1 }, value: { err: { InstructionError: [1, { Custom: 99 }], note: URLERR }, logs: [`Program failed: ${URLERR}`] } };
+    } });
+    const r = await windDownOnce(conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "failed");
+    assert.ok(!dump(r).includes("SECRET"), dump(r));
+  });
+
+  it("a BigInt-carrying sim.err does not throw JSON.stringify (#392) and keeps the real detail", async () => {
+    const s = stubV5(2, { deployedIsUpgraded: true });
+    const real = s.conn.simulateTransaction.bind(s.conn);
+    let n = 0;
+    const conn = withOver(s, { async simulateTransaction(tx: VersionedTransaction) {
+      if (n++ < 2) return real(tx); // support probe + shape probe
+      return { context: { slot: 1 }, value: { err: { InstructionError: [1, { Custom: 99 }], units: 5n }, logs: [] } };
+    } });
+    const r = await windDownOnce(conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+    assert.equal(r.outcome.kind, "failed");
+    assert.match((r.outcome as { error: string }).error, /Custom/);
+    assert.doesNotMatch((r.outcome as { error: string }).error, /BigInt/);
+  });
+});
