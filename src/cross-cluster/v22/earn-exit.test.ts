@@ -187,6 +187,47 @@ describe("earn-exit: executeKeeperExits", () => {
     assert.equal(c.expected, 0);
     assert.equal(st.cooldownUntil.has(key(1).toBase58()), true);
   });
+  it("a tx that simulated clean but LANDED FAILED cools down: the next tick skips it and serves the next request", async () => {
+    const ctx = v22Ctx();
+    const reg = regOf(ctx);
+    const reqs = [
+      { pubkey: key(1), data: request(reg, { slot: 10n }) },
+      { pubkey: key(2), data: request(reg, { slot: 20n }) },
+    ];
+    const f = fakeExecConn({ confirmFail: (i) => (i === 0 ? 117 : null) });
+    const st = freshEarnExitState();
+    const t1 = await executeKeeperExits(execCtx(f.conn), ctx, reqs, 1, st);
+    const o1 = t1.outcomes[0].outcome;
+    assert.equal(o1.kind, "sent");
+    assert.equal(o1.kind === "sent" && o1.landed, "failed");
+    assert.equal(st.cooldownUntil.get(key(1).toBase58()), BigInt(ctx.readSlot) + EARN_EXIT_COOLDOWN_SLOTS);
+    const t2 = await executeKeeperExits(execCtx(f.conn), ctx, reqs, 1, st);
+    assert.deepEqual(t2.outcomes.map((o) => o.redemption), [key(2).toBase58()]);
+    // the clean landed one (account closes on chain) is not cooled
+    assert.equal(st.cooldownUntil.has(key(2).toBase58()), false);
+  });
+  it("a sent tx that never landed also cools down", async () => {
+    const ctx = v22Ctx();
+    const f = fakeExecConn();
+    const conn = f.conn as unknown as { getSignatureStatuses: () => Promise<unknown> };
+    conn.getSignatureStatuses = async () => ({ context: { slot: 1 }, value: [null] });
+    (f.conn as unknown as { getBlockHeight: () => Promise<number> }).getBlockHeight = async () => 1_000_001;
+    const st = freshEarnExitState();
+    const r = await executeKeeperExits(execCtx(f.conn), ctx, [{ pubkey: key(1), data: request(regOf(ctx)) }], 2, st);
+    const o = r.outcomes[0].outcome;
+    assert.equal(o.kind === "sent" && o.landed, "not-landed");
+    assert.equal(st.cooldownUntil.has(key(1).toBase58()), true);
+  });
+  it("cooldownUntil entries for redemptions no longer in `requests` (closed accounts) are pruned", async () => {
+    const ctx = v22Ctx();
+    const reg = regOf(ctx);
+    const st = freshEarnExitState();
+    st.cooldownUntil.set(key(1).toBase58(), 10n ** 12n);
+    st.cooldownUntil.set(key(2).toBase58(), 10n ** 12n);
+    await executeKeeperExits(execCtx(fakeExecConn().conn), ctx, [{ pubkey: key(2), data: request(reg) }], 1, st);
+    assert.equal(st.cooldownUntil.has(key(1).toBase58()), false);
+    assert.equal(st.cooldownUntil.has(key(2).toBase58()), true);
+  });
   it("dry-run: simulated, nothing sent, and NO cooldown set (the request stays eligible)", async () => {
     const ctx = v22Ctx();
     const f = fakeExecConn();

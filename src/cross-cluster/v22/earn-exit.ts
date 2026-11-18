@@ -101,6 +101,9 @@ export async function executeKeeperExits(
   if (!gate.ok) return { gate, outcomes: [] };
   const [registry] = deriveLpVaultRegistry(ctx.programId, ctx.market);
   const now = BigInt(ctx.readSlot);
+  // Prune cooldowns of redemptions no longer on chain (closed after a paid exit / cancel) so the map stays bounded.
+  const live = new Set(requests.map((r) => r.pubkey.toBase58()));
+  for (const k of st.cooldownUntil.keys()) if (!live.has(k)) st.cooldownUntil.delete(k);
   const todo = selectKeeperRequests(requests, registry, (pk) => (st.cooldownUntil.get(pk.toBase58()) ?? 0n) > now).slice(0, maxPerTick);
   const mint = parseWrapperConfigV17(ctx.data).collateralMint;
   const vaultToken = deriveMarketVaultAccounts(ctx.programId, ctx.market, mint).vaultToken;
@@ -114,8 +117,10 @@ export async function executeKeeperExits(
     });
     const outcome = await simulateAndSend(exec, [ix], { job: "earn-exit-77", label: `${ctx.label} ${pubkey.toBase58().slice(0, 6)}`, units: EARN_EXIT_UNITS, expected: EARN_EXIT_EXPECTED });
     outcomes.push({ redemption: pubkey.toBase58(), outcome });
-    // Rotate past a request the program refused (117 floor unreachable, 118, anything else) instead of re-trying it every tick.
-    if (outcome.kind !== "sent" && outcome.kind !== "dry-run") st.cooldownUntil.set(pubkey.toBase58(), now + EARN_EXIT_COOLDOWN_SLOTS);
+    // Rotate past a request the program refused (117 floor unreachable, 118, anything else) instead of re-trying it every
+    // tick; a tx that simulated clean but landed FAILED (or never landed) is the same case and would otherwise pay fees
+    // every tick and starve the rest of the list. A landed success closes the account, so it needs no cooldown.
+    if (outcome.kind === "sent" ? outcome.landed !== "landed" : outcome.kind !== "dry-run") st.cooldownUntil.set(pubkey.toBase58(), now + EARN_EXIT_COOLDOWN_SLOTS);
   }
   return { gate, outcomes };
 }
