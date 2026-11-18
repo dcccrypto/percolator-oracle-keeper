@@ -313,6 +313,8 @@ export class LevGuardKeeper {
     this.stakeProgramId = d.stakeProgramId ?? STAKE_PROGRAM_ID;
   }
 
+  private readonly badHolderKeys = new Set<string>();
+
   private m(market: string): MarketState {
     let s = this.st.get(market);
     if (!s) {
@@ -461,7 +463,18 @@ export class LevGuardKeeper {
       if (s.holderInflight) continue;
       if (s.nextHolderAtMs === 0) {
         // stagger: spread first runs across the interval by the key's first bytes
-        const off = Number(new PublicKey(mk.marketAddress).toBytes()[1]) / 256;
+        let first: number;
+        try {
+          first = new PublicKey(mk.marketAddress).toBytes()[1];
+        } catch {
+          // a malformed address must not stop the markets after it; skip it, log once per bad address
+          if (!this.badHolderKeys.has(mk.marketAddress)) {
+            this.badHolderKeys.add(mk.marketAddress);
+            this.log(`[lev-guard][holder] ${mk.label}: bad market address, skipped`);
+          }
+          continue;
+        }
+        const off = Number(first) / 256;
         s.nextHolderAtMs = t + Math.floor(off * Math.min(this.d.config.holderIntervalMs, 600_000));
       }
       if (t < s.nextHolderAtMs) continue;
@@ -492,10 +505,11 @@ export class LevGuardKeeper {
     const market = new PublicKey(marketAddress);
     const gs = await this.readGuard(marketAddress);
     if (!gs) return "guard unreadable";
-    const pdaInfo = await this.d.conn.getAccountInfo(deriveDepthSourceV22(this.d.programId, market)[0], "confirmed");
+    const depthSrc = deriveDepthSourceV22(this.d.programId, market)[0];
+    const pdaInfo = await this.d.conn.getAccountInfo(depthSrc, "confirmed");
     if (!pdaInfo || !pdaInfo.owner.equals(this.d.programId)) return "no depth-source pin";
     const pdaData = new Uint8Array(pdaInfo.data);
-    const pin = decodeActiveDepthSource(pdaData, deriveDepthSourceV22(this.d.programId, market)[0]);
+    const pin = decodeActiveDepthSource(pdaData, depthSrc);
     if (!pin) return "depth-source pin inactive or invalid";
     const baseMint = new PublicKey(pdaData.subarray(16 + 160, 16 + 192));
     this.stats.holderRuns++;

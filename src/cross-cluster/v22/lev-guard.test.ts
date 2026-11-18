@@ -867,6 +867,27 @@ describe("HOLDER JOB (KEEPER_LEV_HOLDER_JOB)", () => {
     assert.equal(h.k.stats.holderRuns, 2);
   });
 
+  it("holderTick: a malformed marketAddress in the middle is skipped with one log line; the markets after it still run", async () => {
+    const g = holderWorld();
+    const c = levConn({ accounts: g.accounts, largest: g.largest, supply: SUPPLY });
+    let now = 1_000;
+    const { k, logs } = keeperOf(c.conn, cfg({ holderJob: true, holderIntervalMs: 3_600_000 }), { now: () => now });
+    const good = g.market.toBase58();
+    const mk = [
+      { marketAddress: good, label: "G1" },
+      { marketAddress: "not-a-base58-key!!", label: "BAD" },
+      { marketAddress: good, label: "G3" },
+    ];
+    await k.holderTick(mk); // first sight: staggers
+    now += 600_001;
+    await k.holderTick(mk);
+    assert.ok(k.stats.holderRuns >= 1, "the market after the bad one still ran");
+    assert.equal(logs.filter((l) => l.includes("BAD") && l.includes("bad market address")).length, 1);
+    now += 600_001;
+    await k.holderTick(mk);
+    assert.equal(logs.filter((l) => l.includes("BAD") && l.includes("bad market address")).length, 1, "logged once per bad address, not every tick");
+  });
+
   it("no individual holder after filtering: the plain tighten still runs, no holder tx, no report figures beyond a zero m_ind", async () => {
     const w = holderWorld();
     const c = levConn({ accounts: w.accounts, largest: [{ address: poolVault, amount: String(R) }], supply: SUPPLY });
