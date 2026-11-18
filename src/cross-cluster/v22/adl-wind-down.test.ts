@@ -304,7 +304,7 @@ describe("windDownV22Once: mint, close order, send outcomes", () => {
     });
   }
 
-  it("a thrown send is contained: skipped with its message, short backoff, next asset/turn unaffected", async () => {
+  it("a thrown send (test seam only; real simulateAndSend never throws) is contained by the outer catch: whole asset result becomes skipped, earlier outcomes dropped, 150-slot backoff (current behaviour, pinned)", async () => {
     const rec = sendRecorder((i) => (i === 1 ? new Error("rpc exploded") : sentOutcome(closed(1n, false, 1n))));
     const st = freshWindDownV22State();
     const ctx = latchedCtx();
@@ -317,7 +317,7 @@ describe("windDownV22Once: mint, close order, send outcomes", () => {
     assert.deepEqual(r2[0].action, { kind: "skipped", reason: "plain string" });
   });
 
-  it("arming outcome: a landed arm sleeps to since+bound, a non-landed one backs off", async () => {
+  it("arming outcome: a non-landed or refused arm backs off (landed case is in the arming test above)", async () => {
     const now = 519_085_747n;
     const mk = (o: ExecOutcome) => sendRecorder(() => o);
     const ctx1 = latchedCtx({ slot: now });
@@ -348,7 +348,7 @@ describe("windDownV22Once: mint, close order, send outcomes", () => {
     assert.equal(st2.nextSlot.get(`${ctx2.marketAddress}|0`), now + 1n);
   });
 
-  it("holders are fetched once per turn and cached across assets; the fetch receives the market and portfolio length", async () => {
+  it("holders are fetched once per turn; the fetch receives the market and portfolio length", async () => {
     const ctx = latchedCtx();
     let args: unknown[] = [];
     let n = 0;
