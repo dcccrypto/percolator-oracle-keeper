@@ -159,6 +159,8 @@ export type LoserForceCloseConnection = Pick<
 
 interface Candidate {
   pubkey: PublicKey;
+  /** `pubkey.toBase58()`, encoded once per call (the sort key and every report string). */
+  key: string;
   owner: PublicKey;
   data: Uint8Array;
   pda: boolean;
@@ -230,9 +232,11 @@ export async function forceCloseResolvedLosers(
       const owner = parsePortfolioV17(d).owner;
       const kind = pdaOwnerKind(owner, market, cfg);
       if (kind === "lp-registry" || !hasClaim(d)) continue;
-      all.push({ pubkey: a.pubkey, owner, data: d, pda: kind !== null });
+      all.push({ pubkey: a.pubkey, key: a.pubkey.toBase58(), owner, data: d, pda: kind !== null });
     }
-    all.sort((x, y) => x.pubkey.toBase58().localeCompare(y.pubkey.toBase58()));
+    // Base58 string order (NOT raw byte order), on the cached key. Collator.compare == String.prototype.localeCompare.
+    const cmp = new Intl.Collator().compare;
+    all.sort((x, y) => cmp(x.key, y.key));
     if (all.length === 0) {
       st.waitingSeen.delete(mkt);
       out.outcome = "no-candidates";
@@ -289,7 +293,7 @@ export async function forceCloseResolvedLosers(
       }
       if (!r.err) {
         if (r.post && !Buffer.from(r.post).equals(Buffer.from(c.data))) closable.push({ c, pre: [] });
-        else out.skipped.push({ portfolio: c.pubkey.toBase58(), reason: "CloseResolved would make no progress" });
+        else out.skipped.push({ portfolio: c.key, reason: "CloseResolved would make no progress" });
         continue;
       }
       // A payout needs the owner's token account: create it (bounded) and re-simulate. Never for a PDA owner.
@@ -297,9 +301,9 @@ export async function forceCloseResolvedLosers(
         if (!ataExists) {
           const keys = window.map((q) => ownerAta(q.owner, cfgW.collateralMint));
           const infos = await conn.getMultipleAccountsInfo(keys, "confirmed");
-          ataExists = new Map(window.map((q, i) => [q.pubkey.toBase58(), infos[i] != null]));
+          ataExists = new Map(window.map((q, i) => [q.key, infos[i] != null]));
         }
-        if (ataExists.get(c.pubkey.toBase58()) === false) {
+        if (ataExists.get(c.key) === false) {
           const pre = [buildCreateAtaIdempotentIx(keeper.publicKey, c.owner, cfgW.collateralMint)];
           const r2 = await simWatch(mkTx([...pre, closeIx(c)], 0), c.pubkey);
           if (!r2.err && r2.post && !Buffer.from(r2.post).equals(Buffer.from(c.data))) {
@@ -309,9 +313,9 @@ export async function forceCloseResolvedLosers(
           }
         }
       }
-      out.skipped.push({ portfolio: c.pubkey.toBase58(), reason: `CloseResolved refused: ${errText(r.err)}` });
+      out.skipped.push({ portfolio: c.key, reason: `CloseResolved refused: ${errText(r.err)}` });
     }
-    out.waiting = waiting.map((c) => c.pubkey.toBase58());
+    out.waiting = waiting.map((c) => c.key);
     if (waiting.length > 0) st.waitingSeen.add(mkt);
     else if (!truncated) st.waitingSeen.delete(mkt);
     if (waiting.length === 0 && !st.waitingSeen.has(mkt)) {
@@ -319,11 +323,11 @@ export async function forceCloseResolvedLosers(
       out.detail = `no claimant waiting on the loss side (${window.length} scanned): nothing to release`;
       return out;
     }
-    ev("wait_detected", { waiting: out.waiting, closable: closable.map((x) => x.c.pubkey.toBase58()), opensAtSlot: w.opensAtSlot, nowSlot });
+    ev("wait_detected", { waiting: out.waiting, closable: closable.map((x) => x.c.key), opensAtSlot: w.opensAtSlot, nowSlot });
 
     // Close the closable portfolios (the loss side), bounded; each chunk sent only if it changes the portfolio.
     for (const [k, { c, pre }] of closable.entries()) {
-      const key = c.pubkey.toBase58();
+      const key = c.key;
       if (k >= cfg.maxClosesPerCycle) {
         out.skipped.push({ portfolio: key, reason: `over the ${cfg.maxClosesPerCycle}-per-cycle bound; next cycle` });
         continue;
@@ -372,7 +376,7 @@ export async function forceCloseResolvedLosers(
       for (const c of waiting) {
         const r = await simWatch(mkTx([closeIx(c)], 0), c.pubkey);
         const ie = parseInstructionError(r.err);
-        if (!(r.err && ie?.custom === WRAPPER_ERR_ENGINE_LOCK_ACTIVE)) out.released.push(c.pubkey.toBase58());
+        if (!(r.err && ie?.custom === WRAPPER_ERR_ENGINE_LOCK_ACTIVE)) out.released.push(c.key);
       }
       if (out.released.length > 0) ev("winners_released", { released: out.released });
     }
