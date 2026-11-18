@@ -84,6 +84,21 @@ describe("redactErrorText: realistic RPC URL forms", () => {
   });
 });
 
+describe("redactErrorText: quoted / colon / spaced credential forms (JSON bodies, util.inspect headers)", () => {
+  const forms: Array<[string, string]> = [
+    ["JSON header", `{"headers":{"x-api-key":"${K}"}}`],
+    ["util.inspect header", `{ headers: { 'x-api-key': '${K}' } }`],
+    ["JSON api_key", `{"api_key":"${K}"}`],
+    ["inspect apiKey", `{ apiKey: '${K}' }`],
+    ["token colon", `token: ${K}`],
+    ["password colon", `password: ${K}`],
+    ["spaced equals", `key = ${K}`],
+  ];
+  for (const [name, s] of forms) {
+    it(`redacts ${name}`, () => noLeak(redactErrorText(s, 4000)));
+  }
+});
+
 describe("redactErrorText: non-string errors (callers pass String(err))", () => {
   it("Error instance via String() is redacted", () => {
     const e = new Error(`fetch failed https://rpc.example.com/?api-key=${K}`);
