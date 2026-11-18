@@ -37,7 +37,7 @@ import type { V22MarketCtx, V22MarketLoad } from "./market.ts";
 import { loadV22Positioned, parseAccrueAnchors } from "./positioned.ts";
 import { simulateAndSend, simulateOnly } from "./exec.ts";
 import { buildObservationCrankIx } from "../positioned-refresh.ts";
-import { buildLivenessRepairIx, decodeLivenessState, describeRepair, planLivenessRepairs } from "../liveness-repair.ts";
+import { buildLivenessRepairIx, decodeLivenessState, describeRepair, livenessLayoutOf, livenessOffsetsFor, planLivenessRepairs } from "../liveness-repair.ts";
 import type { LivenessRepair } from "../liveness-repair.ts";
 import { parseSeniorDrawLogs } from "../vault-lp-crank.ts";
 import type { V22Positioned } from "./positioned.ts";
@@ -983,9 +983,14 @@ export async function startV22Loop(loop: V22Loop, tickMs: number): Promise<void>
  */
 export function livenessRepairsFor(ctx: Pick<V22MarketCtx, "data" | "readSlot" | "slots">): LivenessRepair[] {
   const out: LivenessRepair[] = [];
+  // One layout detection per market (identical for every slot); an undecodable layout throws for every slot, so it plans nothing.
+  const layout = livenessLayoutOf(ctx.data);
+  if (!layout) return out;
   for (let i = 0; i < ctx.slots; i++) {
     try {
-      out.push(...planLivenessRepairs(decodeLivenessState(ctx.data, i), BigInt(ctx.readSlot)));
+      const offsets = livenessOffsetsFor(layout, i);
+      if (!offsets) continue;
+      out.push(...planLivenessRepairs(decodeLivenessState(ctx.data, i, offsets), BigInt(ctx.readSlot)));
     } catch {
       // unreadable slot: no repair planned for it
     }
