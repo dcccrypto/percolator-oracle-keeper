@@ -5,7 +5,9 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Keypair, PublicKey } from "@solana/web3.js";
-import { drainFeeLegsBeforeResolve } from "./pre-resolve.ts";
+import { drainFeeLegsBeforeResolve, windDownAfterResolve } from "./pre-resolve.ts";
+import type { ConfirmOptions } from "./tx-confirm.ts";
+import type { TerminalInsuranceConfig } from "./terminal-insurance.ts";
 import type { PreResolveConnection, PreResolveDeps } from "./pre-resolve.ts";
 import { readFeeLegs } from "./fee-legs.ts";
 
@@ -109,5 +111,95 @@ describe("drainFeeLegsBeforeResolve (SOL real bytes: lp 13,690,922 / stake 4,563
     const r = await drainFeeLegsBeforeResolve(k.c, Keypair.generate(), SOL, true, CFG, undefined, deps);
     assert.equal(k.reads(), 1, "no after-read in dry-run");
     assert.equal(r.safeToResolve, false);
+  });
+});
+
+describe("drainFeeLegsBeforeResolve — remaining branches (injected deps)", () => {
+  const sol = fx("sol-market-v18-fees");
+  const both = drained(sol, { lp: true, stake: true });
+  const TCFG = { wrapperProgramId: CFG.wrapperProgramId, stakeProgramId: CFG.stakeProgramId } as unknown as TerminalInsuranceConfig;
+  const ok: PreResolveDeps = { crankLp: async () => "cranked", pushStake: async () => ({ kind: "done", detail: "ok" }) };
+  const run = (first: Buffer, after: Buffer, dryRun: boolean, deps: PreResolveDeps, t?: TerminalInsuranceConfig, confirm?: ConfirmOptions) =>
+    drainFeeLegsBeforeResolve(conn(first, after).c, Keypair.generate(), SOL, dryRun, CFG, confirm, deps, t);
+  const insp = (r: Partial<Awaited<ReturnType<NonNullable<PreResolveDeps["inspectTerminal"]>>>>): PreResolveDeps => ({
+    ...ok,
+    inspectTerminal: (async () => ({ stakeBound: true, budget: 10n, support: "supported", state: null, ...r })) as never,
+  });
+
+  it("market not found throws", async () => {
+    const c = { async getAccountInfo() { return null; } } as unknown as PreResolveConnection;
+    await assert.rejects(drainFeeLegsBeforeResolve(c, Keypair.generate(), SOL, false, CFG, undefined, ok), /not found/);
+  });
+
+  it("LP crank error object and stake failed/other kinds surface in blockers", async () => {
+    const r = await run(sol, sol, false, { crankLp: async () => ({ error: "boom" }), pushStake: async () => ({ kind: "failed", error: "rpc down" }) });
+    assert.match(r.blockers[0], /error: boom/);
+    assert.match(r.blockers[1], /rpc down/);
+    const r2 = await run(sol, sol, false, { crankLp: async () => "cranked", pushStake: async () => ({ kind: "waiting", reason: "w" }) });
+    assert.match(r2.blockers[1], /tag 87: waiting\)/);
+  });
+
+  it("confirm options: explicit ones win, stakeCfg.confirm is the fallback", async () => {
+    const seen: unknown[] = [];
+    const deps: PreResolveDeps = { crankLp: async () => "cranked", pushStake: async (_c, _k, _m, _d, cfg) => { seen.push(cfg.confirm); return { kind: "done", detail: "" }; } };
+    const explicit = { commitment: "finalized" } as unknown as ConfirmOptions;
+    const fallback = { commitment: "processed" } as unknown as ConfirmOptions;
+    await drainFeeLegsBeforeResolve(conn(sol, both).c, Keypair.generate(), SOL, false, { ...CFG, confirm: fallback }, explicit, deps);
+    await drainFeeLegsBeforeResolve(conn(sol, both).c, Keypair.generate(), SOL, false, { ...CFG, confirm: fallback }, undefined, deps);
+    assert.deepEqual(seen, [explicit, fallback]);
+  });
+
+  it("creator leg unreadable (truncated account) and zero creator leg", async () => {
+    const short = sol.subarray(0, 600);
+    const r = await run(short, short, true, ok);
+    assert.equal(r.before.creatorClaimable, null);
+    assert.ok(r.warnings.some((w) => /creator leg unreadable/.test(w)));
+    const zeroCreator = readFeeLegs(new Uint8Array(sol));
+    assert.ok(zeroCreator.creatorClaimable !== null);
+  });
+
+  it("terminal inspection skipped without cfg or without inspectTerminal", async () => {
+    assert.equal((await run(both, both, false, insp({}))).terminal, undefined);
+    assert.equal((await run(both, both, false, ok, TCFG)).terminal, undefined);
+  });
+
+  it("terminal: not stake-bound, null budget and zero budget add nothing", async () => {
+    for (const o of [{ stakeBound: false }, { budget: null }, { budget: 0n }] as const) {
+      const r = await run(both, both, false, insp(o), TCFG);
+      assert.deepEqual(r.terminal, { stakeBound: o.stakeBound ?? true, budget: "budget" in o ? o.budget : 10n, support: "supported" });
+      assert.ok(!r.warnings.some((w) => /stake-bound/.test(w)));
+      assert.deepEqual(r.blockers, []);
+    }
+  });
+
+  it("terminal: portfolio heads-up only when state is non-closed with materialized portfolios", async () => {
+    const has = (r: { warnings: string[] }) => r.warnings.some((w) => /materialized portfolio/.test(w));
+    assert.equal(has(await run(both, both, false, insp({ state: { kind: "resolved", materializedPortfolios: 3n } as never }), TCFG)), true);
+    assert.equal(has(await run(both, both, false, insp({ state: { kind: "closed", materializedPortfolios: 3n } as never }), TCFG)), false);
+    assert.equal(has(await run(both, both, false, insp({ state: { kind: "resolved", materializedPortfolios: 0n } as never }), TCFG)), false);
+  });
+
+  it("terminal: unsupported vs unknown probe wording in the STRANDED blocker", async () => {
+    const u = await run(both, both, false, insp({ support: "unsupported" }), TCFG);
+    assert.match(u.blockers[0], /has no tag 29 \(pre-F-9\)/);
+    const k = await run(both, both, false, insp({ support: "unknown" }), TCFG);
+    assert.match(k.blockers[0], /could not be probed/);
+    assert.equal(k.safeToResolve, false);
+  });
+});
+
+describe("windDownAfterResolve — injected runner", () => {
+  const base = { steps: [], state: null, budget: 5n, stakeBound: true, support: "supported" as const };
+  const w = (r: object) => windDownAfterResolve({} as never, Keypair.generate(), SOL, false, {} as never, (async () => ({ ...base, ...r })) as never);
+  it("done -> complete; failed/other with budget -> incomplete; no budget -> complete unless failed", async () => {
+    assert.equal((await w({ outcome: { kind: "done", detail: "" } })).complete, true);
+    assert.equal((await w({ outcome: { kind: "waiting", reason: "x" } })).complete, false);
+    assert.equal((await w({ outcome: { kind: "nothing" }, budget: 0n })).complete, true);
+    assert.equal((await w({ outcome: { kind: "nothing" }, budget: null })).complete, true);
+    assert.equal((await w({ outcome: { kind: "nothing" }, stakeBound: false })).complete, true);
+    const f = await w({ outcome: { kind: "failed", error: "e" }, budget: 0n, state: { kind: "resolved" } });
+    assert.equal(f.complete, false);
+    assert.equal(f.state, "resolved");
+    assert.equal((await w({ outcome: { kind: "nothing" } })).state, "unknown");
   });
 });
