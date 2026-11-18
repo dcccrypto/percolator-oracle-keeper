@@ -54,7 +54,7 @@ describe("openInterestIsZero", () => {
     assert.equal(openInterestIsZero(market({ lifecycle: 3, oi: 4n })), false);
     assert.equal(openInterestIsZero(market({ lifecycle: 5, oi: 4n })), false);
     assert.equal(openInterestIsZero(market({ lifecycle: 3 })), true);
-    assert.equal(openInterestIsZero(market({ lifecycle: 0, oi: 4n })), null, "no Active asset: unknown, not zero");
+    assert.equal(openInterestIsZero(market({ lifecycle: 0, oi: 4n })), null, "lifecycle 0 is not Active/DrainOnly/Recovery, so skipped: unknown, not zero");
     assert.equal(openInterestIsZero(market({ lifecycle: 4 })), null);
   });
   it("a disabled asset's OI is ignored when a later asset is Active and flat", () => {
@@ -62,7 +62,7 @@ describe("openInterestIsZero", () => {
     b[engineSlotBase(L, 1) + L.asset.lifecycle] = 2;
     assert.equal(openInterestIsZero(new Uint8Array(b)), true);
   });
-  it("unknown layout, non-market bytes and a truncated asset all give null (catch path)", () => {
+  it("unknown layout, non-market bytes and a truncated asset all give null (guards, not the catch)", () => {
     assert.equal(openInterestIsZero(new Uint8Array(0)), null);
     assert.equal(openInterestIsZero(new Uint8Array(64)), null);
     const full = market();
@@ -78,7 +78,7 @@ describe("tradeFeeAccrualSum", () => {
     assert.equal(tradeFeeAccrualSum(market()), 0n);
     assert.equal(tradeFeeAccrualSum(market({ feeAt: [[16 + 464, 42n]] })), 42n);
   });
-  it("null for unreadable bytes (catch path)", () => {
+  it("null for unreadable bytes (the catch)", () => {
     assert.equal(tradeFeeAccrualSum(new Uint8Array(8)), null);
     assert.equal(tradeFeeAccrualSum(market().slice(0, 100)), null);
   });
@@ -88,7 +88,7 @@ describe("assetZeroOracleAuthority", () => {
   it("returns asset 0's oracle authority key", () => {
     assert.equal(assetZeroOracleAuthority(market({ authority: OTHER }))?.equals(OTHER), true);
   });
-  it("null for an unknown layout and for a truncated account (catch path)", () => {
+  it("null for an unknown layout and for a truncated account (guard)", () => {
     assert.equal(assetZeroOracleAuthority(new Uint8Array(16)), null);
     assert.equal(assetZeroOracleAuthority(market().slice(0, assetSlotsOff(L) + 10)), null);
   });
