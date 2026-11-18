@@ -14,6 +14,7 @@ import {
   makeLpFeeJob,
   resolvedHarvestChangesState,
 } from "./lp-fee-cranker.ts";
+import { nonComputeBudget } from "./test-ix.ts";
 import { setBondFeeDelegated } from "./v22/delegation.ts";
 import { P2bFeatureGate, DEFAULT_P2B_GATE_CONFIG, setP2bGate } from "./p2b-feature.ts";
 
@@ -359,7 +360,7 @@ describe("crankLpFeesOnce — P2b ext tail", () => {
   const stateInfo: Info = { data: vaultLpStateBuf(lp) };
 
   /** Account keys of the sent tag-78 instruction. */
-  const sentKeys = (raw: Buffer | null): number => Transaction.from(raw!).instructions.at(-1)!.keys.length;
+  const sentKeys = (raw: Buffer | null): number => nonComputeBudget(Transaction.from(raw!).instructions).at(-1)!.keys.length;
 
   it("appends the ext + vault LP tail ([7],[8]) when the ext flag is set", async () => {
     const { c, calls } = conn({ reads: [[regExt, mkt()], [stateInfo]] });
@@ -412,15 +413,20 @@ describe("crankLpFeesOnce — P2b ext tail", () => {
 
     it("keeps the first outcome when the fresh registry has no flag, the tail fails, or the re-read throws", async () => {
       gateOn();
+      const expectReads = [2, 3, 2];
+      let k = 0;
       for (const second of [[bound], [regExt], new Error("rpc down")]) {
         const { c, calls } = conn({ reads: [[bound, mkt()], second as Info[], [null]], sendError: new Error("custom program error: 0x29") });
         const r = await crank(c);
         assert.ok(typeof r === "object" && "error" in r, JSON.stringify(r));
         assert.equal(calls.sends, 1);
+        assert.equal(calls.reads, expectReads[k++]);
       }
       // fresh registry missing entirely
-      const { c } = conn({ reads: [[bound, mkt()], [null]], sendError: new Error("custom program error: 0x29") });
-      assert.ok(typeof (await crank(c)) === "object");
+      const m = conn({ reads: [[bound, mkt()], [null]], sendError: new Error("custom program error: 0x29") });
+      assert.ok(typeof (await crank(m.c)) === "object");
+      assert.equal(m.calls.reads, 2);
+      assert.equal(m.calls.sends, 1);
     });
 
     it("does not re-read when the P2b gate is off", async () => {
