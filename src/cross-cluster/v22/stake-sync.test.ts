@@ -73,6 +73,19 @@ describe("stake-sync: skips before any RPC", () => {
     const c = await stakeSyncOnce(execCtx(f.conn), v22Ctx(), poolBytes(), st, { intervalMs: 1000, nowMs: 11_000 });
     assert.equal(c.kind, "sent");
   });
+  it("a backwards wall-clock step (negative age) does not stall the interval gate: attempt proceeds and is re-stamped", async () => {
+    const f = fakeExecConn();
+    const st = freshStakeSyncState();
+    const a = await stakeSyncOnce(execCtx(f.conn), v22Ctx(), poolBytes(), st, { intervalMs: 1000, nowMs: 1_000_000 });
+    assert.equal(a.kind, "sent");
+    // NTP steps the clock back an hour
+    const b = await stakeSyncOnce(execCtx(f.conn), v22Ctx(), poolBytes(), st, { intervalMs: 1000, nowMs: 1_000_000 - 3_600_000 });
+    assert.equal(b.kind, "sent");
+    assert.equal([...st.lastAttemptMs.values()][0], 1_000_000 - 3_600_000);
+    // and the gate works normally on the new timeline
+    const c = await stakeSyncOnce(execCtx(f.conn), v22Ctx(), poolBytes(), st, { intervalMs: 1000, nowMs: 1_000_000 - 3_600_000 + 500 });
+    assert.deepEqual(c, { kind: "skipped", reason: "interval" });
+  });
   it("nowMs defaults to the wall clock (interval gate still records an attempt)", async () => {
     const f = fakeExecConn();
     const st = freshStakeSyncState();
