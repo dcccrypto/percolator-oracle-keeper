@@ -178,3 +178,49 @@ describe("duplicate pushes from two pushers are harmless", () => {
     assert.ok(!getQuarantinedMarkets().includes(market));
   });
 });
+
+describe("TakeoverGate clock skew + pruning", () => {
+  it("clock stepped backwards: state is stale, not forever-fresh (push, not standby)", () => {
+    let t = 10_000_000;
+    const g = new TakeoverGate(CFG, () => t);
+    g.update(M, 1000n, 1010n); // gap 10 < 60 -> standby while fresh
+    assert.equal(g.isStandby(M), true);
+    t -= 3_600_000; // wall clock stepped back 1h; primary died meanwhile
+    assert.equal(g.gapSlots(M), null);
+    assert.equal(g.isStandby(M), false);
+  });
+  it("future-stamped state is stale; small backwards jitter tolerated", () => {
+    const g = new TakeoverGate(CFG, () => 1_000_000);
+    g.update(M, 1000n, 1010n, 1_000_000 + 3_600_000);
+    assert.equal(g.gapSlots(M), null);
+    g.update(M, 1000n, 1010n, 1_000_000 + 500);
+    assert.equal(g.gapSlots(M), 10n);
+  });
+  it("future-stamped takeoverAt does not pin the critical page", () => {
+    let t = 10_000_000;
+    const g = new TakeoverGate(CFG, () => t);
+    g.recordPush(M);
+    assert.equal(g.activeAlerts().length, 1);
+    t -= 3_600_000;
+    assert.equal(g.activeAlerts().length, 0);
+    t = 10_000_000 + 119_000;
+    assert.equal(g.activeAlerts().length, 1);
+    t = 10_000_000 + 121_000;
+    assert.equal(g.activeAlerts().length, 0);
+  });
+  it("prune drops state for markets that left the registry; refresh prunes", async () => {
+    const g = new TakeoverGate(CFG, () => 1000);
+    const other = Keypair.generate().publicKey.toBase58();
+    for (const m of [M, other]) {
+      g.update(m, 1n, 2n);
+      g.setLabel(m, "x");
+      g.recordPush(m);
+    }
+    g.prune([M]);
+    assert.equal(g.health([other], 1000)[other].lastGoodSlot, null);
+    assert.equal(g.health([other], 1000)[other].takeoverPushes, 0);
+    assert.equal(g.activeAlerts().length, 1);
+    await refreshTakeoverGate({ getSlot: async () => 1, getMultipleAccountsInfo: async () => [] } as never, g, [], 1000);
+    assert.equal(g.activeAlerts().length, 0);
+  });
+});

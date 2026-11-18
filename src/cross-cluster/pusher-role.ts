@@ -102,6 +102,18 @@ export class TakeoverGate {
   update(market: string, lastGood: bigint, clusterSlot: bigint, atMs = this.now()): void {
     this.state.set(market, { lastGood, clusterSlot, at: atMs });
   }
+  /** Drop per-market state for markets no longer in the registry. */
+  prune(markets: readonly string[]): void {
+    const keep = new Set(markets);
+    for (const m of [...this.state.keys(), ...this.takeoverAt.keys(), ...this.takeoverCount.keys(), ...this.labels.keys()]) {
+      if (!keep.has(m)) {
+        this.state.delete(m);
+        this.takeoverAt.delete(m);
+        this.takeoverCount.delete(m);
+        this.labels.delete(m);
+      }
+    }
+  }
   setLabel(market: string, label: string): void {
     this.labels.set(market, label);
   }
@@ -109,7 +121,8 @@ export class TakeoverGate {
   /** Slots since the on-chain price was last good, or null when unknown / stale. */
   gapSlots(market: string, nowMs = this.now()): bigint | null {
     const s = this.state.get(market);
-    if (!s || nowMs - s.at > this.cfg.staleStateMs) return null;
+    // Math.abs: a wall clock stepped backwards (or a future-stamped state) must read as stale, not forever-fresh.
+    if (!s || Math.abs(nowMs - s.at) > this.cfg.staleStateMs) return null;
     const est = s.clusterSlot + BigInt(Math.max(0, Math.floor((nowMs - s.at) / SLOT_MS)));
     return est > s.lastGood ? est - s.lastGood : 0n;
   }
@@ -130,7 +143,8 @@ export class TakeoverGate {
   activeAlerts(nowMs = this.now()): Alert[] {
     const out: Alert[] = [];
     for (const [market, at] of this.takeoverAt) {
-      if (nowMs - at > this.cfg.alertHoldMs) continue;
+      // Math.abs: a future-stamped takeoverAt (clock stepped back) must not pin the page.
+      if (Math.abs(nowMs - at) > this.cfg.alertHoldMs) continue;
       const label = this.labels.get(market) ?? market;
       out.push({
         kind: "pusher-takeover",
@@ -175,6 +189,7 @@ export async function refreshTakeoverGate(
   nowMs: number = Date.now(),
 ): Promise<void> {
   try {
+    gate.prune(markets);
     if (markets.length === 0) return;
     const keys = markets.map((m) => new PublicKey(m));
     const [slot, infos] = await Promise.all([
