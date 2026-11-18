@@ -188,6 +188,7 @@ describe("DepthSourceCache: accessors and refresh edge paths", () => {
     }
     const c = await run(conn(world({ [qv.toBase58()]: null })));
     assert.equal(c.get(market.toBase58()), null);
+    assert.equal(c.why(market.toBase58()), "pinned pool/vaults not on the push cluster");
   });
   it("mixed batch: one good, one missing PDA, one failing second read are decided independently", async () => {
     const m2 = k(), m3 = k();
