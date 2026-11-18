@@ -409,16 +409,18 @@ describe("lp-cert-liveness: clamps and ordering", () => {
   });
   it("evaluate: a warn asset after a critical one never replaces it", () => {
     const crit = lpCertStalenessOf(asset({ assetIndex: 1, anchorSlot: 7_000n }), 12_500n);
-    const warn = lpCertStalenessOf(asset({ assetIndex: 2 }), 12_500n);
+    // short horizon (E 600 + Pmax 3,400 = 4,000): 37% used -> warn, yet only 2,500 slots left (< the critical asset's 4,100)
+    const warn = lpCertStalenessOf(asset({ assetIndex: 2, anchorSlot: 11_000n, maxPinSlots: 3_400n }), 12_500n);
     assert.ok(crit && warn);
+    assert.ok(warn.remainingSlots < crit.remainingSlots);
     const [a] = evaluateVaultLpCrankStaleness({ label: "B", market: "M", terminal: false, nowSlot: 12_500n, assets: [crit, warn] }, T);
     assert.equal(a.severity, "critical");
     assert.equal(a.data?.assetIndex, 1);
   });
   it("evaluate: among equal levels the fewest remaining slots wins, in either input order", () => {
-    // both warn (stale 2,500 / 2,900 of 9,600); asset 6 anchored earlier -> nearer deadline
+    // both warn (2,900 stale of 9,600 / 9,100); asset 6 has an edge pin -> nearer deadline
     const late = lpCertStalenessOf(asset({ assetIndex: 5, anchorSlot: 10_000n }), 12_900n);
-    const near = lpCertStalenessOf(asset({ assetIndex: 6, anchorSlot: 10_000n - 0n, pinSinceSlot: 10_100n }), 12_900n);
+    const near = lpCertStalenessOf(asset({ assetIndex: 6, pinSinceSlot: 10_100n }), 12_900n);
     assert.ok(late && near);
     assert.ok(near.remainingSlots < late.remainingSlots);
     for (const assets of [[late, near], [near, late]]) {
@@ -429,7 +431,7 @@ describe("lp-cert-liveness: clamps and ordering", () => {
 });
 
 describe("lp-cert-liveness: env thresholds, extra edges", () => {
-  it("whitespace-only and non-integer values; boundaries 1 and 99 accepted, 0 and 100 rejected", () => {
+  it("whitespace-only and non-integer values; boundaries 1 and 99 accepted, 0 rejected", () => {
     const errs: string[] = [];
     const f = (e: Record<string, string>) => lpCertThresholdsFromEnv(e, (l) => errs.push(l));
     assert.deepEqual(f({ ALERT_VAULT_LP_CRANK_WARN_PCT: "   " }), { warnPct: 25, criticalPct: 50 });
