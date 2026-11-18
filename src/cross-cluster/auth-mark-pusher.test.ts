@@ -394,6 +394,8 @@ describe("auth-mark-pusher clock step-back", () => {
       for (let i = 0; i < 3; i++) await pushAuthMarkBatch(conn as never, keeper, pushes, 100n, BLOCKHASH, false);
       assert.ok(getQuarantinedMarkets().includes(bad));
       now.mock.mockImplementation(() => T - HOUR); // step back 1h: hold would be 70 min
+      assert.ok(getQuarantinedMarkets().includes(bad), "still held right after the step");
+      now.mock.mockImplementation(() => T - HOUR + 10 * 60_000 + 1);
       assert.ok(!getQuarantinedMarkets().includes(bad), "hold must not outlive its 10 min duration");
       const { conn: healthy, sent } = fakeConn(new Set());
       const res = await pushAuthMarkBatch(healthy as never, keeper, pushes, 100n, BLOCKHASH, false);
@@ -403,25 +405,22 @@ describe("auth-mark-pusher clock step-back", () => {
     }
   });
 
-  it("solo hold is capped at SOLO_MS after a step-back", () => {
+  it("solo hold is capped at SOLO_MS after a step-back (held, not stretched, not lifted)", () => {
     const m = "SoloStep1111111111111111111111111111111111";
     noteLandedRevert(m, T);
     noteLandedRevert(m, T + 1);
     assert.ok(getSoloMarkets(T + 2).includes(m));
-    assert.ok(!getSoloMarkets(T - HOUR).includes(m), "solo hold must not stretch by the step");
-    assert.ok(SOLO_MS < HOUR);
+    assert.ok(getSoloMarkets(T - HOUR).includes(m), "still held right after the step");
+    assert.ok(getSoloMarkets(T - HOUR + SOLO_MS - 1).includes(m));
+    assert.ok(!getSoloMarkets(T - HOUR + SOLO_MS + 1).includes(m), "solo hold must not stretch by the step");
     resetPushLandingState();
   });
 
-  it("future-stamped landed reverts do not count toward solo", () => {
+  it("out-of-order (overlapping reconcile / stepped-back) landed reverts both still count", () => {
     const m = "SoloFuture11111111111111111111111111111111";
-    noteLandedRevert(m, T);
-    noteLandedRevert(m, T + 1); // solo'd; let it lapse
-    resetPushLandingState();
-    noteLandedRevert(m, T + 5 * HOUR); // stamped in the future
-    // clock now back at T: this is the first revert in-window, must not solo
-    noteLandedRevert(m, T);
-    assert.ok(!getSoloMarkets(T + 1).includes(m), "one real revert + a future-stamped one must not solo");
+    noteLandedRevert(m, T + 10);
+    noteLandedRevert(m, T); // earlier stamp arrives second: must not be discarded
+    assert.ok(getSoloMarkets(T + 1).includes(m));
     resetPushLandingState();
   });
 
