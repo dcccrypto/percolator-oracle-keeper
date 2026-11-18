@@ -1,5 +1,5 @@
 /** F6: the signature status decides whether a transaction landed. A7-1: it is polled over HTTP, never via the primary's websocket. */
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
@@ -228,5 +228,51 @@ describe("customCodeOf", () => {
     assert.equal(customCodeOf({ InstructionError: [1, { Custom: 56 }] }), 56);
     assert.equal(customCodeOf("custom program error: 0x26"), 38);
     assert.equal(customCodeOf("nope"), null);
+  });
+  describe("wall-clock steps during a confirm (deadline is monotonic)", () => {
+    // Fake connection: confirms on poll N; `onPoll` fires on each status read (used to step Date.now).
+    function steppedConn(confirmOn: number, onPoll: (n: number) => void, height = 0) {
+      let reads = 0;
+      const c = {
+        async getSignatureStatuses() {
+          reads++;
+          onPoll(reads);
+          const hit = reads >= confirmOn;
+          return { context: { slot: 1 }, value: [hit ? { slot: 1, confirmations: 1, err: null, confirmationStatus: "confirmed" } : null] };
+        },
+        async getBlockHeight() {
+          return height;
+        },
+      };
+      return { c: c as unknown as ConfirmConnection, reads: () => reads };
+    }
+    const realNow = Date.now.bind(Date);
+
+    it("forward wall-clock jump mid-wait does not end the wait early: tx confirming on poll 4 is still landed", async () => {
+      let offset = 0;
+      const m = mock.method(Date, "now", () => realNow() + offset);
+      try {
+        const k = steppedConn(4, (n) => { if (n === 2) offset += 3_600_000; });
+        const r = await confirmBySignature(k.c, "s", "b", 1_000, { deadlineMs: 5_000, statusRetries: 0, statusRetryDelayMs: 10 });
+        assert.equal(r.status, "landed");
+        assert.equal(k.reads(), 4);
+      } finally {
+        m.mock.restore();
+      }
+    });
+
+    it("backward wall-clock jump mid-wait does not stretch the wait past deadlineMs", async () => {
+      let offset = 0;
+      const m = mock.method(Date, "now", () => realNow() + offset);
+      const started = performance.now();
+      try {
+        const k = steppedConn(Infinity, (n) => { if (n === 2) offset -= 6_000; });
+        const r = await confirmBySignature(k.c, "s", "b", 1_000_000, { deadlineMs: 300, statusRetries: 0, statusRetryDelayMs: 20 });
+        assert.equal(r.status, "not-landed");
+        assert.ok(performance.now() - started < 2_000, `waited ${Math.round(performance.now() - started)} ms against a 300 ms deadline`);
+      } finally {
+        m.mock.restore();
+      }
+    });
   });
 });
