@@ -191,3 +191,270 @@ test("DRY-RUN GUARD: the tool sources contain no signing, key, tx-building, send
     for (const re of forbidden) assert.doesNotMatch(src, re, `${f} must not match ${re}`);
   }
 });
+
+// ── branch coverage: malformed / partial data, caps, priors, verify, render, CLI ─────────────────────────────────────
+import { isPubkey, canonicalJson } from "./refund-plan.ts";
+import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+
+const refuses = (fn: () => unknown, re: RegExp): void => {
+  assert.throws(fn, (e: unknown) => e instanceof RefundRefusal && re.test(e.message));
+};
+const approve = (p: RefundPlan): RefundPlan => ({ ...p, status: "APPROVED", approval: { approver: "ops", date: "2026-10-30", planHash: p.planHash } });
+const good = (): RefundPlan => buildRefundPlan({ markets: [entry(0), entry(1, { multiAsset: true })] }, { now });
+
+test("isPubkey: rejects non-strings, bad length, bad alphabet, wrong decoded size, accepts leading-1 keys", () => {
+  assert.equal(isPubkey(42), false);
+  assert.equal(isPubkey("short"), false);
+  assert.equal(isPubkey("1".repeat(45)), false);
+  assert.equal(isPubkey("0".repeat(40)), false); // '0' not in base58
+  assert.equal(isPubkey("z".repeat(44)), false); // decodes to > 32 bytes
+  assert.equal(isPubkey("1".repeat(32)), true); // 32 zero bytes (system program)
+  assert.equal(isPubkey(C1), true);
+});
+
+test("canonicalJson sorts keys and handles arrays/primitives", () => {
+  assert.equal(canonicalJson({ b: [1, { z: 1, a: null }], a: "x" }), '{"a":"x","b":[1,{"a":null,"z":1}]}');
+});
+
+test("input shape: non-object, bad markets type, row that is not a record", () => {
+  refuses(() => buildRefundPlan(null), /JSON object/);
+  refuses(() => buildRefundPlan([]), /JSON object/);
+  refuses(() => buildRefundPlan({ markets: 5 }), /array or a map/);
+  refuses(() => buildRefundPlan({ markets: ["x"] }), /not a valid address/);
+});
+
+test("map input keeps only never-connected rows and takes creator from the creators map", () => {
+  const p = buildRefundPlan(
+    { creators: { [M(0)]: C2 }, markets: { [M(0)]: { neverConnected: "no-accepted-push" }, [M(1)]: { neverConnected: null }, [M(2)]: { neverConnected: undefined }, [M(3)]: "junk" } },
+    { now },
+  );
+  assert.equal(p.markets.length, 1);
+  assert.equal(p.markets[0]!.creator, C2);
+  assert.equal(p.markets[0]!.evidence.neverConnected, "no-accepted-push");
+});
+
+test("array row: non-record market refused; creators map ignored when not a record; reason fallback field used", () => {
+  refuses(() => buildRefundPlan({ markets: [null] }), /not a valid address/);
+  refuses(() => buildRefundPlan({ creators: [C1], markets: [{ market: M(0), neverConnected: "no-registry-row" }] }), /no creator wallet/);
+  const p = buildRefundPlan({ markets: [{ market: M(0), creator: C1, reason: "no-registry-row" }] }, { now });
+  assert.equal(p.markets[0]!.evidence.neverConnected, "no-registry-row");
+});
+
+test("refusals: unclassified, null creator, invalid creator, non-numeric/negative/fractional amounts", () => {
+  refuses(() => buildRefundPlan({ markets: [entry(0, { neverConnected: "healthy" })] }), /not classified never-connected/);
+  refuses(() => buildRefundPlan({ markets: [entry(0, { creator: null })] }), /no creator wallet/);
+  refuses(() => buildRefundPlan({ markets: [entry(0, { creator: "nope" })] }), /creator "nope" is not a valid/);
+  refuses(() => buildRefundPlan({ markets: [entry(0, { slabRentLamports: "5" })] }), /slabRentLamports: must be a non-negative integer/);
+  refuses(() => buildRefundPlan({ markets: [entry(0, { slabRentLamports: -1 })] }), /non-negative integer/);
+  refuses(() => buildRefundPlan({ markets: [entry(0, { stakeRentLamports: 1.5 })] }), /stakeRentLamports/);
+  refuses(() => buildRefundPlan({ markets: [entry(0, { stakeRentLamports: Number.MAX_SAFE_INTEGER + 1 })] }), /stakeRentLamports/);
+});
+
+test("amount edges: zero amounts allowed; exactly-at-cap passes; one over refuses", () => {
+  const z = buildRefundPlan({ markets: [entry(0, { slabRentLamports: 0, stakeRentLamports: 0 })] }, { now });
+  assert.equal(z.markets[0]!.totalLamports, 0);
+  assert.equal(z.totals.sol, "0.0");
+  const at = buildRefundPlan({ markets: [entry(0, { slabRentLamports: MAX_PER_MARKET_LAMPORTS - 1, stakeRentLamports: 1 })] }, { now });
+  assert.equal(at.markets[0]!.totalLamports, MAX_PER_MARKET_LAMPORTS);
+  refuses(() => buildRefundPlan({ markets: [entry(0, { slabRentLamports: MAX_PER_MARKET_LAMPORTS, stakeRentLamports: 1 })] }), /exceeds the per-market cap/);
+  refuses(() => buildRefundPlan({ markets: [entry(0, { slabRentLamports: Number.MAX_SAFE_INTEGER })] }), /exceeds the per-market cap/);
+});
+
+test("evidence: registered boolean and ageSlots string/number carried, other types become null", () => {
+  const p = buildRefundPlan({ markets: [entry(0, { registered: false, ageSlots: "123" }), entry(1, { registered: "yes", ageSlots: 77 }), entry(2, { ageSlots: {} })] }, { now });
+  const by = Object.fromEntries(p.markets.map((m) => [m.market, m.evidence]));
+  assert.deepEqual(by[M(0)], { neverConnected: "no-registry-row", registered: false, ageSlots: "123" });
+  assert.deepEqual(by[M(1)], { neverConnected: "no-registry-row", registered: null, ageSlots: "77" });
+  assert.deepEqual(by[M(2)], { neverConnected: "no-registry-row", registered: null, ageSlots: null });
+});
+
+test("duplicates: identical repeat dropped and counted; conflicting creator or amount refuses", () => {
+  const p = buildRefundPlan({ markets: [entry(0), entry(0), entry(0)] }, { now });
+  assert.equal(p.markets.length, 1);
+  assert.equal(p.totals.duplicatesDropped, 2);
+  refuses(() => buildRefundPlan({ markets: [entry(0), entry(0, { creator: C2 })] }), /conflicting creator wallets/);
+  refuses(() => buildRefundPlan({ markets: [entry(0), entry(0, { multiAsset: true })] }), /repeated with conflicting amounts/);
+});
+
+test("same creator owning several markets is fine; plan is sorted by market address", () => {
+  const p = buildRefundPlan({ markets: [entry(2), entry(0), entry(1)] }, { now });
+  assert.deepEqual(p.markets.map((m) => m.market), [M(0), M(1), M(2)].sort());
+  assert.ok(p.markets.every((m) => m.creator === C1));
+});
+
+test("cap options: lower-only and integer-only; batch cap enforced with nothing truncated", () => {
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { perMarketCapLamports: MAX_PER_MARKET_LAMPORTS + 1 }), /never raised/);
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { perMarketCapLamports: -1 }), /never raised/);
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { perMarketCapLamports: 1.5 }), /never raised/);
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { batchCapLamports: MAX_PER_BATCH_LAMPORTS + 1 }), /never raised/);
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { batchCapLamports: -5 }), /never raised/);
+  refuses(() => buildRefundPlan({ markets: [entry(0), entry(1)] }, { batchCapLamports: 2 * 36_000_000 - 1 }), /per-batch cap/);
+  const ok = buildRefundPlan({ markets: [entry(0), entry(1)] }, { batchCapLamports: 2 * 36_000_000, now });
+  assert.equal(ok.caps.perBatchLamports, 72_000_000);
+  assert.equal(ok.totals.lamports, 72_000_000);
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { perMarketCapLamports: 35_999_999 }), /per-market cap/);
+});
+
+test("empty / no eligible markets refused", () => {
+  refuses(() => buildRefundPlan({ markets: [] }), /nothing to plan/);
+  refuses(() => buildRefundPlan({ markets: { [M(0)]: { neverConnected: null } } }), /nothing to plan/);
+});
+
+test("prior: plan object, refunded list, bare array of strings/objects all block; malformed priors refuse", () => {
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { prior: [{ markets: [{ market: M(0) }] }] }), /already refunded/);
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { prior: [{ refunded: [M(0)] }] }), /already refunded/);
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { prior: [[M(0)]] }), /already refunded/);
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { prior: [[{ market: M(0) }]] }), /already refunded/);
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { prior: ["str"] }), /not a plan/);
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { prior: [{}] }), /not a plan/);
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { prior: [[5]] }), /no market address/);
+  refuses(() => buildRefundPlan({ markets: [entry(0)] }, { prior: [[{ market: 5 }]] }), /no market address/);
+  const p = buildRefundPlan({ markets: [entry(0)] }, { prior: [[M(1)], { refunded: [] }], now });
+  assert.equal(p.markets.length, 1);
+});
+
+test("default clock is used when none supplied", () => {
+  const p = buildRefundPlan({ markets: [entry(0)] });
+  assert.ok(Math.abs(Date.parse(p.generatedAt) - Date.now()) < 60_000);
+});
+
+test("verify: good approved plan passes; hash is stable", () => {
+  const p = approve(good());
+  const r = verifyRefundPlan(p);
+  assert.deepEqual(r.problems, []);
+  assert.equal(r.ok, true);
+  assert.equal(r.computedHash, p.planHash);
+});
+
+test("verify: unreadable doc, wrong kind/version, unapproved, edited, bad approval fields", () => {
+  const bad = verifyRefundPlan(null as unknown as RefundPlan);
+  assert.equal(bad.ok, false);
+  assert.deepEqual(bad.problems, ["plan is not a readable plan document"]);
+  const p = good();
+  assert.match(verifyRefundPlan(p).problems.join("|"), /status is "UNAPPROVED"/);
+  assert.match(verifyRefundPlan({ ...approve(p), kind: "x" } as unknown as RefundPlan).problems.join("|"), /not a version-1/);
+  assert.match(verifyRefundPlan({ ...approve(p), version: 2 } as unknown as RefundPlan).problems.join("|"), /not a version-1/);
+  const ap = approve(p);
+  assert.match(verifyRefundPlan({ ...ap, approval: { approver: "  ", date: "2026-10-30", planHash: p.planHash } }).problems.join("|"), /approver is empty/);
+  assert.match(verifyRefundPlan({ ...ap, approval: { approver: "a", date: "30/10/2026", planHash: p.planHash } }).problems.join("|"), /not an ISO date/);
+  assert.match(verifyRefundPlan({ ...ap, approval: { approver: "a", date: "2026-13-45", planHash: p.planHash } }).problems.join("|"), /not an ISO date/);
+  assert.equal(verifyRefundPlan({ ...ap, approval: { approver: "a", date: "2026-10-30T10:00:00.000Z", planHash: p.planHash } }).ok, true);
+  assert.match(verifyRefundPlan({ ...ap, approval: { approver: "a", date: "2026-10-30", planHash: "0".repeat(64) } }).problems.join("|"), /approval.planHash does not match/);
+  const noApproval = verifyRefundPlan({ ...ap, approval: undefined } as unknown as RefundPlan);
+  assert.match(noApproval.problems.join("|"), /approver is empty/);
+  assert.match(noApproval.problems.join("|"), /not an ISO date/);
+  assert.match(noApproval.problems.join("|"), /approval.planHash does not match/);
+  const edited = { ...ap, markets: [{ ...ap.markets[0]!, reason: "tampered" }, ap.markets[1]!] };
+  assert.match(verifyRefundPlan(edited).problems.join("|"), /planHash does not match the plan contents/);
+});
+
+test("verify: re-checks caps and totals even when the hash is recomputed by hand", () => {
+  const rehash = (p: RefundPlan): RefundPlan => {
+    const { status: _s, approval: _a, planHash: _h, ...body } = p;
+    const h = createHash("sha256").update(canonicalJson(body)).digest("hex");
+    return { ...p, planHash: h, approval: { ...p.approval, planHash: h } };
+  };
+  const ap = approve(good());
+  const probs = (p: RefundPlan): string => verifyRefundPlan(rehash(p)).problems.join("|");
+  assert.equal(verifyRefundPlan(rehash(ap)).ok, true);
+  assert.match(probs({ ...ap, caps: { ...ap.caps, perMarketLamports: MAX_PER_MARKET_LAMPORTS + 1 } }), /per-market cap missing or above/);
+  assert.match(probs({ ...ap, caps: { ...ap.caps, perBatchLamports: MAX_PER_BATCH_LAMPORTS + 1 } }), /per-batch cap missing or above/);
+  assert.match(probs({ ...ap, caps: undefined } as unknown as RefundPlan), /per-market cap missing/);
+  const m0 = ap.markets[0]!;
+  assert.match(probs({ ...ap, markets: [{ ...m0, totalLamports: m0.totalLamports + 1 }, ap.markets[1]!] }), /total is not the sum of its components/);
+  const over = { ...m0, components: { slabRentLamports: MAX_PER_MARKET_LAMPORTS + 1, stakeRentLamports: 0 }, totalLamports: MAX_PER_MARKET_LAMPORTS + 1 };
+  assert.match(probs({ ...ap, markets: [over] }), /over the per-market cap/);
+  assert.match(probs({ ...ap, markets: [{ ...m0, creator: "bad" }, ap.markets[1]!] }), /invalid address/);
+  assert.match(probs({ ...ap, markets: [{ ...m0, market: "bad" }, ap.markets[1]!] }), /invalid address/);
+  assert.match(probs({ ...ap, markets: [m0, m0] }), /duplicate market/);
+  assert.match(probs({ ...ap, totals: { ...ap.totals, lamports: 1 } }), /totals.lamports is not the sum/);
+  assert.match(probs({ ...ap, totals: undefined } as unknown as RefundPlan), /totals.lamports is not the sum/);
+  assert.match(probs({ ...ap, caps: { perMarketLamports: 110_000_000, perBatchLamports: 1 } }), /batch total is over the per-batch cap/);
+  // markets missing entirely: treated as empty, sum 0 matches totals 0, no problems
+  assert.equal(verifyRefundPlan(rehash({ ...ap, markets: undefined, totals: { ...ap.totals, lamports: 0 } } as unknown as RefundPlan)).ok, true);
+});
+
+test("renderPlanTable: unapproved shows approval hint; approved omits it; alignment and totals", () => {
+  const p = good();
+  const t = renderPlanTable(p);
+  assert.match(t, /status=UNAPPROVED/);
+  assert.match(t, /To approve:/);
+  assert.match(t, new RegExp(`planHash  ${p.planHash}`));
+  assert.match(t, /TOTAL  2 markets  142000000 lamports  0.142 SOL   caps: 0.11 SOL\/market, 1.0 SOL\/batch/);
+  assert.ok(t.split("\n").every((l) => l === l.trimEnd()));
+  const t2 = renderPlanTable(approve(p));
+  assert.match(t2, /status=APPROVED/);
+  assert.doesNotMatch(t2, /To approve:/);
+});
+
+test("CLI: usage errors exit 2 and write nothing", () => {
+  const cap = () => { const o: string[] = [], e: string[] = []; return { o, e, io: { out: (s: string) => void o.push(s), err: (s: string) => void e.push(s) } }; };
+  for (const argv of [[], ["bogus"], ["plan", "--input"], ["plan", "input"], ["plan"], ["verify"], ["plan", "--input", "a", "stray"]]) {
+    const c = cap();
+    assert.equal(runCli(argv, c.io, now), 2, JSON.stringify(argv));
+    assert.match(c.e.join("\n"), /usage:/);
+    assert.deepEqual(c.o, []);
+  }
+});
+
+test("CLI plan/verify end to end: --out writes file, flags parsed, refusals exit 1, no stdout JSON when --out", () => {
+  const d = mkdtempSync(join(tmpdir(), "refund-cov-"));
+  const input = join(d, "in.json");
+  const out = join(d, "plan.json");
+  writeFileSync(input, JSON.stringify({ markets: [entry(0), entry(1)] }));
+  const o: string[] = [], e: string[] = [];
+  const io = { out: (s: string) => void o.push(s), err: (s: string) => void e.push(s) };
+  assert.equal(runCli(["plan", "--input", input, "--out", out, "--per-market-cap-lamports", "50000000", "--batch-cap-lamports", "100000000"], io, now), 0);
+  assert.equal(o.length, 1); // table only
+  const plan = JSON.parse(readFileSync(out, "utf8")) as RefundPlan;
+  assert.deepEqual(plan.caps, { perMarketLamports: 50_000_000, perBatchLamports: 100_000_000 });
+  assert.equal(plan.generatedAt, "2026-10-29T00:00:00.000Z");
+  // without --out: JSON then table on stdout, plan not written elsewhere
+  o.length = 0;
+  assert.equal(runCli(["plan", "--input", input], io, now), 0);
+  assert.equal(o.length, 2);
+  assert.equal((JSON.parse(o[0]!) as RefundPlan).kind, "never-connected-rent-refund-plan");
+  // real clock when `now` omitted
+  o.length = 0;
+  assert.equal(runCli(["plan", "--input", input], io), 0);
+  // prior file blocks, as does bad int flag and missing file / bad JSON
+  const prior = join(d, "prior.json");
+  writeFileSync(prior, JSON.stringify({ refunded: [M(0)] }));
+  e.length = 0;
+  assert.equal(runCli(["plan", "--input", input, "--prior", prior, "--out", join(d, "nope.json")], io, now), 1);
+  assert.match(e[0]!, /^REFUSED: .*already refunded/);
+  assert.equal(existsSync(join(d, "nope.json")), false);
+  e.length = 0;
+  assert.equal(runCli(["plan", "--input", input, "--batch-cap-lamports", "12x"], io, now), 1);
+  assert.match(e[0]!, /not a lamport integer/);
+  e.length = 0;
+  assert.equal(runCli(["plan", "--input", join(d, "missing.json")], io, now), 1);
+  assert.match(e[0]!, /cannot read .* as JSON/);
+  const junk = join(d, "junk.json");
+  writeFileSync(junk, "{not json");
+  e.length = 0;
+  assert.equal(runCli(["verify", "--plan", junk], io, now), 1);
+  assert.match(e[0]!, /cannot read/);
+  // verify: unapproved fails, approved passes
+  e.length = 0;
+  assert.equal(runCli(["verify", "--plan", out], io, now), 1);
+  assert.match(e[0]!, /^NOT VERIFIED:\n- /);
+  const apPath = join(d, "approved.json");
+  writeFileSync(apPath, JSON.stringify(approve(plan)));
+  o.length = 0;
+  assert.equal(runCli(["verify", "--plan", apPath], io, now), 0);
+  assert.equal(o[0], `OK: approved plan matches its hash ${plan.planHash}`);
+});
+
+test("CLI rethrows non-refusal errors", () => {
+  const d = mkdtempSync(join(tmpdir(), "refund-cov-"));
+  const p = join(d, "p.json");
+  writeFileSync(p, "null"); // verify(null) -> hashBody throws inside try => handled
+  const io = { out: () => {}, err: () => {} };
+  assert.equal(runCli(["verify", "--plan", p], io), 1);
+  const boom = { out: () => { throw new Error("sink broke"); }, err: () => {} };
+  const input = join(d, "i.json");
+  writeFileSync(input, JSON.stringify({ markets: [entry(0)] }));
+  assert.throws(() => runCli(["plan", "--input", input], boom, now), /sink broke/);
+});
