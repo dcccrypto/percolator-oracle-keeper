@@ -48,7 +48,9 @@ export interface RegistrationStreamConfig {
    */
   supabaseAnonKey: string;
   /** Runs on every observed change. Should be cheap and idempotent. */
-  onChange: (event: { type: string; slabAddress: string | null }) => void;
+  onChange: (event: { type: string; slabAddress: string | null }) => void | Promise<unknown>;
+  /** Test seam: defaults to supabase-js createClient. */
+  createClient?: typeof createClient;
 }
 
 /**
@@ -75,7 +77,7 @@ export function startRegistrationStream(
 ): RegistrationStream | null {
   let client: SupabaseClient;
   try {
-    client = createClient(config.supabaseUrl, config.supabaseAnonKey, {
+    client = (config.createClient ?? createClient)(config.supabaseUrl, config.supabaseAnonKey, {
       auth: { persistSession: false, autoRefreshToken: false },
       realtime: { params: { eventsPerSecond: 10 } },
     });
@@ -91,20 +93,31 @@ export function startRegistrationStream(
   let timer: ReturnType<typeof setTimeout> | null = null;
   let pending: { type: string; slabAddress: string | null } | null = null;
 
+  // Set by stop(). Events delivered while removeChannel is awaited must not
+  // re-arm the timer and call onChange after shutdown.
+  let stopped = false;
+
+  const warnThrew = (err: unknown) =>
+    console.warn(
+      `[registration-stream] onChange threw: ${err instanceof Error ? err.message : String(err)}`,
+    );
+
   const fire = (event: { type: string; slabAddress: string | null }) => {
+    if (stopped) return;
     pending = event;
     if (timer) return;
     timer = setTimeout(() => {
       timer = null;
       const ev = pending;
       pending = null;
-      if (!ev) return;
+      if (!ev || stopped) return;
       try {
-        config.onChange(ev);
+        const r = config.onChange(ev);
+        if (r && typeof (r as Promise<unknown>).catch === "function") {
+          (r as Promise<unknown>).catch(warnThrew);
+        }
       } catch (err) {
-        console.warn(
-          `[registration-stream] onChange threw: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        warnThrew(err);
       }
     }, COALESCE_MS);
   };
@@ -136,6 +149,10 @@ export function startRegistrationStream(
         } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
           // supabase-js reconnects on its own; the periodic poll covers the gap.
           console.warn(`[registration-stream] channel ${status} — periodic poll still active`);
+        } else if (status === "CLOSED") {
+          if (!stopped) {
+            console.warn("[registration-stream] channel CLOSED — periodic poll still active");
+          }
         }
       });
   } catch (err) {
@@ -149,7 +166,12 @@ export function startRegistrationStream(
 
   return {
     stop: async () => {
-      if (timer) clearTimeout(timer);
+      stopped = true;
+      pending = null;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
       try {
         await client.removeChannel(channel);
       } catch {
