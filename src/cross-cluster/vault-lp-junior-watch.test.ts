@@ -179,4 +179,18 @@ describe("vault-LP junior-release watch: edge branches", () => {
       assert.throws(() => juniorWatchConfigFromEnv({ ALERT_JUNIOR_RELEASE_CYCLES: bad }, WRAPPER), /positive integer/);
     }
   });
+  it("juniorWatchConfigFromEnv: decimal digits only, capped (hex / exponent / huge values are typos, not config)", () => {
+    for (const bad of ["0x3", "1e1", "1e9", "+3", "3.0", "1_0", "Infinity", "1001", "99999999999"]) {
+      assert.throws(() => juniorWatchConfigFromEnv({ ALERT_JUNIOR_RELEASE_CYCLES: bad }, WRAPPER), /ALERT_JUNIOR_RELEASE_CYCLES/, bad);
+    }
+    assert.equal(juniorWatchConfigFromEnv({ ALERT_JUNIOR_RELEASE_CYCLES: " 1000 " }, WRAPPER).alertCycles, 1000);
+    assert.equal(juniorWatchConfigFromEnv({ ALERT_JUNIOR_RELEASE_CYCLES: "010" }, WRAPPER).alertCycles, 10);
+  });
+
+  it("a failed read keeps the streak (neither fires nor resets it)", async () => {
+    const streaks = new Map<string, number>([[MKT.toBase58(), 2]]);
+    const o = await watchJuniorRelease({ async getMultipleAccountsInfo() { throw new Error("rpc down"); } } as never, MKT.toBase58(), CFG, streaks);
+    assert.equal(o.kind, "failed");
+    assert.equal(streaks.get(MKT.toBase58()), 2);
+  });
 });

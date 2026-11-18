@@ -124,9 +124,19 @@ export function makeJuniorWatchJob(cfg: JuniorWatchConfig, streaks = new Map<str
   };
 }
 
+/** Upper bound on the cycle threshold; above this the alert is effectively disabled. */
+export const MAX_ALERT_CYCLES = 1000;
+
 export function juniorWatchConfigFromEnv(env: Readonly<Record<string, string | undefined>>, wrapperProgramId: PublicKey): JuniorWatchConfig {
   const raw = env.ALERT_JUNIOR_RELEASE_CYCLES;
-  const n = raw === undefined || raw.trim() === "" ? 3 : Number(raw);
-  if (!Number.isInteger(n) || n <= 0) throw new Error(`ALERT_JUNIOR_RELEASE_CYCLES="${raw}" must be a positive integer`);
+  const text = raw === undefined ? "" : raw.trim();
+  // Decimal digits only: Number() would accept "0x3" (3), "1e1" (10) and "1e9", and a huge value never alerts.
+  if (text !== "" && !/^\d+$/.test(text)) {
+    throw new Error(`ALERT_JUNIOR_RELEASE_CYCLES="${raw}" must be a positive integer in plain decimal digits (no hex, exponent or sign)`);
+  }
+  const n = text === "" ? 3 : Number(text);
+  if (!Number.isSafeInteger(n) || n <= 0 || n > MAX_ALERT_CYCLES) {
+    throw new Error(`ALERT_JUNIOR_RELEASE_CYCLES="${raw}" must be a positive integer <= ${MAX_ALERT_CYCLES} (a larger value would silently delay the alert)`);
+  }
   return { wrapperProgramId, alertCycles: n };
 }
