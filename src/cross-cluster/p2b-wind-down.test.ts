@@ -452,7 +452,7 @@ describe("windDownConfigFromEnv", () => {
   });
 
   it("decimal only: hex, binary, octal and exponent spellings are rejected, surrounding whitespace is tolerated", () => {
-    for (const raw of ["0x10", "0X10", "0b11", "0o7", "1e2", "1E2", "+5e0", "5.0", "0x0", "1_0"]) {
+    for (const raw of ["0x10", "0X10", "0b11", "0o7", "1e2", "1E2", "+5", "+5e0", "5.0", "0x0", "1_0"]) {
       assert.throws(() => windDownConfigFromEnv({ P2B_WIND_DOWN_MAX_PER_CYCLE: raw }, false), /P2B_WIND_DOWN_MAX_PER_CYCLE/, raw);
     }
     assert.equal(windDownConfigFromEnv({ P2B_WIND_DOWN_MAX_PER_CYCLE: " 7 " }, false).maxSendsPerCycle, 7);
@@ -569,7 +569,7 @@ describe("runner: default log and clock", () => {
 });
 
 describe("runner: capped turn does not set the cooldown", () => {
-  it("per-market send cap reached with holders left -> skippedCap, no cooldown, next tick runs again", async () => {
+  it("per-market send cap reached with holders left -> skippedCap counted, and a sending turn leaves no cooldown", async () => {
     let now = 1_000_000;
     const c = fakeConn({ sims: [{ err: null, logs: [CLOSED_LOG] }] });
     let fetches = 0;
@@ -606,11 +606,11 @@ describe("runner: capped turn does not set the cooldown", () => {
     assert.equal(r.stats.skippedCooldown, 0);
   });
 
-  it("a stale cooldown entry clears once it expires and a capped turn deletes it", async () => {
+  it("a capped turn after an expired cooldown does not set a new one", async () => {
     let now = 1_000_000;
     const c = fakeConn({ sims: [{ err: ie({ Custom: 21 }) }] });
     let capNow = false;
-    const r = new AdlWindDownRunner({ ...DEFAULT_WIND_DOWN_CONFIG, cooldownMs: 60_000 }, {
+    const r = new AdlWindDownRunner({ ...DEFAULT_WIND_DOWN_CONFIG, cooldownMs: 60_000, maxSimsPerMarket: 1 }, {
       programId: PROGRAM, conn: c.conn as never, keeper: KEEPER,
       fetchHolders: async () => (capNow ? [holder(1, "short"), holder(2, "short")] : [holder(1, "short")]),
       mintDecimals: async () => 6, now: () => now, log: () => undefined,
@@ -619,7 +619,6 @@ describe("runner: capped turn does not set the cooldown", () => {
     await r.runMarket(s); // all refused -> cooldown set
     now += 60_001;
     capNow = true;
-    (r as unknown as { cfg: WindDownConfig }).cfg.maxSimsPerMarket = 1; // cooldown expired; this turn is capped
     const out = await r.runMarket(s);
     assert.equal(out.kind, "acted");
     now += 1;
