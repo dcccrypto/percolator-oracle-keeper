@@ -108,12 +108,12 @@ describe("cpmmDumpBps edges", () => {
   });
   it("rounding is UP: r == q keeps 25 %, one unit of drift rounds the dump up", () => {
     assert.equal(cpmmDumpBps(1000n, 1000n), 7500);
-    // ratio = floor(3e9/4) exact; r=1,q=2: ratio = 333333333, kept = floor(1.111e17/1e14)=1111 -> 8889
+    // r=1,q=2: ratio = 333333333, kept = floor(1.111e17/1e14)=1111 -> 8889
     assert.equal(cpmmDumpBps(1n, 2n), 8889);
     // never below the real-valued dump
     for (const [r, q] of [[1n, 3n], [7n, 11n], [999n, 1n], [123456789n, 987654321n]] as Array<[bigint, bigint]>) {
       const exact = 1 - (Number(r) / Number(r + q)) ** 2;
-      assert.ok(cpmmDumpBps(r, q) >= Math.floor(exact * BPS_MAX));
+      assert.ok(cpmmDumpBps(r, q) >= Math.ceil(exact * BPS_MAX - 1e-6));
       assert.ok(cpmmDumpBps(r, q) <= BPS_MAX);
     }
   });
@@ -161,7 +161,7 @@ describe("buildReport edges", () => {
   });
   it("u64-max reserve/supply: finite, clamped", () => {
     const r = buildReport({ reserve: U64_MAX, supply: U64_MAX, ownerTotals: [{ owner: "a", total: U64_MAX }], ageDays: 0 })!;
-    assert.ok(r.jDumpBps >= 0 && r.jDumpBps <= BPS_MAX);
+    assert.equal(r.jDumpBps, 139);
     assert.equal(r.mIndBps, 7500);
   });
   it("a non-finite J (xFrac overflow to Infinity) -> null", () => {
