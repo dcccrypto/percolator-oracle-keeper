@@ -133,7 +133,7 @@ describe("depth-capacity: untaken branches", () => {
     assert.deepEqual([ahead.status, ahead.stickyEpochs], ["closed", 0]);
   });
 
-  it("stale cap with now behind the last-good slot has k=0 and bitLength(0)=0 floors epochsToZero at 0", () => {
+  it("stale cap with now behind the last-good slot has k=0; epochsToZero tracks bitLength (31, 63, 1)", () => {
     const behind = assessDepthCapacity(record({ lastGoodSlot: at(50n) }), 0, BAND, at(10n));
     assert.equal(behind.stickyEpochs, 0);
     assert.equal(behind.epochsToZero, 31);
@@ -147,7 +147,7 @@ describe("depth-capacity: untaken branches", () => {
   it("a depth slot in the future gives null age; an aged depth push is not fresh", () => {
     const future = assessDepthCapacity(record({ depthE6: 5_000_000_000n, depthSlot: at(20n) }), 0, BAND, at(1n));
     assert.equal(future.depthAgeSlots, null);
-    assert.notEqual(future.status, "fresh");
+    assert.equal(future.status, "stale");
   });
 
   it("alert: pinned note, venue named, null-capDepth data, decaying warn vs critical boundary", () => {
@@ -185,7 +185,7 @@ describe("depth-capacity: untaken branches", () => {
     let now = 1_000_000n;
     let everGood = false;
     for (let i = 0; i < 300; i++) {
-      now += BigInt(rnd(5) * 4_000 + rnd(3));
+      now += BigInt((rnd(4) === 0 ? rnd(40) * 9_000 : rnd(5) * 4_000) + rnd(3));
       if (rnd(3) === 0) {
         // good reading: resets the decay
         lastGood = BigInt(1 + rnd(2_000_000_000));
@@ -204,6 +204,7 @@ describe("depth-capacity: untaken branches", () => {
         assert.equal(d.capDepthE6, lastGood);
         continue;
       }
+      assert.equal(d.status === "fresh", now - lastGoodSlot <= 150n, `i=${i} freshness`); // 150 = SDK DEPTH_MAX_AGE_SLOTS
       if (d.status === "fresh") continue; // within the SDK freshness window: cap is the live reading
       const expectCap = k >= 64 ? 0n : lastGood >> BigInt(k);
       assert.equal(d.capDepthE6, expectCap, `i=${i} k=${k}`);
