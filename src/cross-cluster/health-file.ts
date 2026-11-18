@@ -14,6 +14,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
+const MAX_INTERVAL_MS = 2 ** 31 - 1;
+
 export interface HealthFileConfig {
   file: string;
   intervalMs: number;
@@ -26,7 +28,10 @@ export function healthFileConfigFromEnv(env: Readonly<Record<string, string | un
   if (!path.isAbsolute(file)) throw new Error(`KEEPER_HEALTH_FILE must be an absolute path, got "${file}"`);
   const raw = env.KEEPER_HEALTH_FILE_MS?.trim();
   if (raw !== undefined && raw !== "" && !/^\d+$/.test(raw)) throw new Error(`KEEPER_HEALTH_FILE_MS="${raw}" must be a positive integer`);
-  return { file, intervalMs: Math.max(5_000, raw ? Number(raw) : 30_000) };
+  const intervalMs = Math.max(5_000, raw ? Number(raw) : 30_000);
+  // setInterval clamps anything above 2^31-1 ms to 1 ms (hot write loop), so refuse it loudly.
+  if (intervalMs > MAX_INTERVAL_MS) throw new Error(`KEEPER_HEALTH_FILE_MS="${raw}" exceeds the maximum ${MAX_INTERVAL_MS}`);
+  return { file, intervalMs };
 }
 
 /** Write one snapshot. Returns true when the file was replaced. Never throws. */
@@ -34,9 +39,14 @@ export async function writeHealthSnapshot(readHealth: () => Promise<string>, fil
   try {
     const health: unknown = JSON.parse(await readHealth());
     const tmp = `${file}.tmp-${process.pid}`;
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(tmp, JSON.stringify({ writtenAt: now().toISOString(), source, health }, null, 1));
-    fs.renameSync(tmp, file);
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(tmp, JSON.stringify({ writtenAt: now().toISOString(), source, health }, null, 1));
+      fs.renameSync(tmp, file);
+    } catch (e) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+      throw e;
+    }
     return true;
   } catch {
     return false;
@@ -55,6 +65,10 @@ export function startHealthFileMirror(cfg: HealthFileConfig, readHealth: () => P
   };
   const t = setInterval(tick, cfg.intervalMs);
   t.unref?.();
-  setTimeout(tick, 5_000).unref?.();
-  return () => clearInterval(t);
+  const first = setTimeout(tick, 5_000);
+  first.unref?.();
+  return () => {
+    clearInterval(t);
+    clearTimeout(first);
+  };
 }
