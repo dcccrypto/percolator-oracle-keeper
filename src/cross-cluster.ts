@@ -127,6 +127,7 @@ import { setLevGuardHealthProvider } from "./cross-cluster/v22/health.ts";
 import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
 import { failoverFromEnv, parseFallbackUrls } from "./rpc-failover.ts";
 import { readHealth, recordLaunch, restartConfig } from "./restart-escalation.ts";
+import { shouldRecordLaunch } from "./restart-launch-gate.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -402,7 +403,7 @@ if (registry.markets.length === 0) {
   const c = restartConfig(process.env);
   if (c.path) {
     const h = readHealth(c.path, Date.now(), c.threshold, c.windowMs);
-    if (h.lastLaunchAgoSec === null || h.lastLaunchAgoSec > 120) recordLaunch(c.path, Date.now(), c.threshold, c.windowMs);
+    if (shouldRecordLaunch(h.lastLaunchAgoSec)) recordLaunch(c.path, Date.now(), c.threshold, c.windowMs);
   }
 }
 
