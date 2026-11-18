@@ -47,16 +47,15 @@ export async function getCachedBlockhash(
   // Stamp BEFORE the RPC: the hash is at least this old when it returns, never younger.
   const startedAt = now;
   const p: Promise<CachedBlockhash> = (async () => {
-    try {
-      const v = await conn.getLatestBlockhash(commitment);
-      const value = { blockhash: v.blockhash, lastValidBlockHeight: v.lastValidBlockHeight };
-      if ((generations.get(conn.rpcEndpoint) ?? 0) === gen) entries.set(key, { value, at: startedAt });
-      return value;
-    } finally {
-      if (inflight.get(key) === p) inflight.delete(key);
-    }
+    const v = await conn.getLatestBlockhash(commitment);
+    const value = { blockhash: v.blockhash, lastValidBlockHeight: v.lastValidBlockHeight };
+    if ((generations.get(conn.rpcEndpoint) ?? 0) === gen) entries.set(key, { value, at: startedAt });
+    return value;
   })();
   inflight.set(key, p);
+  // Cleanup outside the async body: `p` is assigned here, even if the RPC throws synchronously.
+  const clear = () => { if (inflight.get(key) === p) inflight.delete(key); };
+  p.then(clear, clear);
   return p;
 }
 
