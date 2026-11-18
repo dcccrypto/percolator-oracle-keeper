@@ -28,6 +28,7 @@ import type { SweepDeps } from "./sweep.ts";
 import type { V22Positioned } from "./positioned.ts";
 import { portfolioWeight } from "./settle-pairing.ts";
 import type { PlannedTx } from "./settle-pairing.ts";
+import { redactErrorText } from "./redact.ts";
 import type { PairingMode } from "./flags.ts";
 
 /** Engine "no new fees to distribute": healthy no-op. */
@@ -150,6 +151,6 @@ export async function crankBondFee(
     if (plan.shape === "after-round") pairingStats.feeAfterRound++;
     return { kind: out.kind === "sent" ? "sent" : "dry-run", shape: plan.shape, outcome: out };
   } catch (err) {
-    return { kind: "failed", error: err instanceof Error ? err.message : String(err) };
+    return { kind: "failed", error: redactErrorText(err instanceof Error ? err.message : String(err)) };
   }
 }
