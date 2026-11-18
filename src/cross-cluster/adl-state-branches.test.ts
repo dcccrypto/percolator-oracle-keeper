@@ -107,7 +107,7 @@ describe("decodeAdlState guards", () => {
     const d = copy(JUP);
     const det = known(d);
     // find max_market_slots absolute offset the same way the detector does: it is the u32 the detector reads
-    const { ABS_MAX_MARKET_SLOTS } = { ABS_MAX_MARKET_SLOTS: det.layout.groupOff + det.layout.header.maxMarketSlots };
+    const ABS_MAX_MARKET_SLOTS = det.layout.groupOff + det.layout.header.maxMarketSlots;
     new DataView(d.buffer).setUint32(ABS_MAX_MARKET_SLOTS, 0, true);
     assert.throws(() => decodeAdlState(d), /max_market_slots is 0/);
   });
@@ -205,14 +205,14 @@ describe("adlHealthOf", () => {
     assert.equal(a.adl!.oiEffLong, "16511677058");
     assert.equal(a.adlAssets![13].oiEffLong, "0");
   });
-  it("5-slot market (max in the fixtures): adlAssets lists all 5 in order, adl is the requested asset", () => {
+  it("5-slot market: adlAssets lists all 5 in order, adl is the requested asset", () => {
     const h = adlHealthOf(FIVE, 2);
     assert.equal(h.adlAssets!.length, 5);
     assert.deepEqual(h.adlAssets!.map((x) => x.asset), [0, 1, 2, 3, 4]);
     assert.deepEqual(h.adl, adlHealth(decodeAdlState(FIVE, 2)!));
     assert.ok(h.adlAssets!.every((x) => !x.reduceOnly));
   });
-  it("a Disabled slot (lifecycle 0) is skipped; the other four stay", () => {
+  it("a Disabled slot (lifecycle 0) is skipped; the other three stay", () => {
     const d = copy(FIVE);
     d[slotBase(d, 1) + AS_LIFECYCLE] = 0;
     d[slotBase(d, 4) + AS_LIFECYCLE] = 0;
