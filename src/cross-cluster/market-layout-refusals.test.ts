@@ -58,6 +58,16 @@ describe("detectLayout refusals", () => {
     assert.equal(snap.byVersion[String(l.wrapperVersion)], 1);
   });
 
+  it("UNKNOWN_VERSION reason names the sdk guard, not 'ambiguous', when exactly one row matches", () => {
+    const l = layoutById("v2.2-b");
+    const det = detectLayout(slab(l), new Map());
+    assert.equal(det.known, false);
+    if (!det.known) {
+      assert.match(det.reason, /\[sdk-guard: UNKNOWN_VERSION\]/);
+      assert.doesNotMatch(det.reason, /ambiguous/);
+    }
+  });
+
   it("UNKNOWN_VERSION: an unregistered header VERSION (e.g. 4242) is refused on the real registry", () => {
     const b = slab(layoutById("v2.1-drift"));
     b.writeUInt16LE(4242, ABS_WRAPPER_VERSION);
