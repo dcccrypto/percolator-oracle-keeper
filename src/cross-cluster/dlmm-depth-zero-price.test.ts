@@ -37,7 +37,7 @@ function runChild(env: Record<string, string>, callBudgetMs: number): Promise<Ch
       }
     };
     // Outer guard for start-up itself (tsx cold start), separate from the 5s budget for the call under test.
-    const startTimer = setTimeout(killGroup, 90_000);
+    const startTimer = setTimeout(killGroup, 240_000);
     c.stdout.on("data", (d) => {
       out += d;
       if (!callTimer && out.includes("READY")) {
@@ -62,13 +62,13 @@ describe("planDlmmBinArrays zero price", () => {
     assert.equal(priceQ64(-3000, 10_000), 0n);
   });
 
-  it("refuses a pool whose active price underflows to 0 instead of looping forever", { timeout: 120_000 }, async () => {
+  it("refuses a pool whose active price underflows to 0 instead of looping forever", { timeout: 300_000 }, async () => {
     const r = await runChild({ ZP_ACTIVE_ID: "-3000", ZP_BIN_STEP: "10000" }, 5000);
     assert.equal(r.hung, false, "planDlmmBinArrays hung (child killed 5s after READY)");
     assert.deepEqual(r.result, { ok: false }, r.out);
   });
 
-  it("harness control: a normal pool returns promptly, so the 5s budget does not misfire", { timeout: 120_000 }, async () => {
+  it("harness control: a normal pool returns promptly, so the 5s budget does not misfire", { timeout: 300_000 }, async () => {
     const r = await runChild({ ZP_ACTIVE_ID: "0", ZP_BIN_STEP: "25" }, 5000);
     assert.equal(r.hung, false);
     assert.deepEqual(r.result, { ok: true }, r.out);
