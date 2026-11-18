@@ -47,6 +47,19 @@ describe("crank-liveness units", () => {
     assert.equal(calls.length, 1);
   });
 
+  it("LIVENESS: a clock stepped backwards must not make a hung loop look never-overdue", () => {
+    let t = 1_000_000;
+    let fired = 0;
+    const lv = createCrankLiveness({ intervalMs: 10, intervals: 2, minSilenceMs: 5, now: () => t, onStall: () => fired++ });
+    lv.beat(); // last = 1_000_000
+    t = 0; // NTP step back 1000 s; the loop is now hung
+    assert.equal(lv.check(), false); // silence is unknowable at this instant
+    assert.ok(lv.silentMs() >= 0, "silence is never negative");
+    t = 21; // 21 ms after the step, > limit(20)
+    assert.equal(lv.check(), true, "stall detected one limit after the step, not 1000 s later");
+    assert.equal(fired, 1);
+  });
+
   it("disabled watchdog: limit null, check never fires, start is a no-op stop", () => {
     let t = 0;
     let fired = 0;
