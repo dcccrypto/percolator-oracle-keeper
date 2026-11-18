@@ -86,10 +86,10 @@ test("recordLaunch prunes expired launches from the file", () => {
 
 test("recordAlertFailure on a missing or corrupt log does not throw and keeps retry semantics", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rs-"));
-  assert.equal(recordAlertFailure(path.join(dir, "missing.json"), 5), true);
-  assert.equal(recordAlertFailure(path.join(dir, "nodir", "x.json"), 5), true);
+  assert.equal(recordAlertFailure(path.join(dir, "missing.json"), 1000), true);
+  assert.equal(recordAlertFailure(path.join(dir, "nodir", "x.json"), 1000), true);
   const bad = path.join(dir, "bad.json");
   fs.writeFileSync(bad, "{not json");
-  assert.equal(recordAlertFailure(bad, 5), true);
+  assert.equal(recordAlertFailure(bad, 1000), true);
   assert.equal(JSON.parse(fs.readFileSync(bad, "utf8")).alertFails, 1);
 });
