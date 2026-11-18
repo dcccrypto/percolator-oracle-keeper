@@ -161,8 +161,8 @@ export function atOrBelowMaintenance(m: MarginState, padBps: number): boolean {
 
 /**
  * No-progress guard. After a LANDED liquidation crank on an account the keeper remembers the margin it measured; while the next
- * measurement shows the same state (notional and requirement each within one atom: the position did not move; equity drifts
- * with funding so it is not compared) it does not crank that account again. Any other state clears the entry. Process-lifetime, bounded.
+ * measurement shows the same state (notional and requirement each within one atom: the position did not move; per-round equity
+ * drift (funding) is tolerated, but a cumulative fall of MIN_PROGRESS_BPS of notional re-opens it) it does not crank that account again. Any other state clears the entry. Process-lifetime, bounded.
  */
 const liqGuard = new Map<string, MarginState>();
 const LIQ_GUARD_MAX = 4_096;
