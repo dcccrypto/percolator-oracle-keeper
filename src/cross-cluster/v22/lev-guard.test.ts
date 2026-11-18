@@ -11,6 +11,7 @@ import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ComputeBudgetProgram, Keypair, PublicKey, Transaction } from "@solana/web3.js";
+import * as SDK from "@percolatorct/sdk";
 import { WRAPPER_ACCOUNT_MAGIC, LAYOUT_V22, deriveDepthSourceV22 } from "@percolatorct/sdk";
 import { WRAPPER_PROGRAM_ID } from "../../program-ids.ts";
 import {
@@ -70,11 +71,13 @@ interface GuardOpts {
   navPeakCur?: bigint;
   navRef?: bigint;
   touched?: PublicKey[];
+  /** v2 sliding-window record (prog#721 / SDK#491): 488 B record, version 2, 4600 B account, touched tags from record offset 488. */
+  v2?: boolean;
 }
 
 /** A 4,456 B guard account (header kind 17) with the fields the keeper reads. */
 function guardBytes(o: GuardOpts): Uint8Array {
-  const data = new Uint8Array(4456);
+  const data = new Uint8Array(o.v2 ? 4600 : 4456);
   const v = new DataView(data.buffer);
   v.setBigUint64(0, WRAPPER_ACCOUNT_MAGIC, true);
   v.setUint16(8, LAYOUT_V22.version, true);
@@ -84,7 +87,7 @@ function guardBytes(o: GuardOpts): Uint8Array {
   data.set((o.riskKey ?? new PublicKey(new Uint8Array(32))).toBytes(), r + 32);
   v.setBigUint64(r + 64, o.t0 ?? 0n, true);
   v.setUint16(r + 72, o.assetIndex ?? 0, true);
-  data[r + 74] = 1;
+  data[r + 74] = o.v2 ? 2 : 1;
   data[r + 77] = o.roundActive ? 1 : 0;
   data[r + 78] = o.roundLpLong ? 1 : 0;
   const u128 = (off: number, x: bigint): void => {
@@ -100,7 +103,7 @@ function guardBytes(o: GuardOpts): Uint8Array {
   v.setBigUint64(r + 336, o.roundOpenSlot ?? 0n, true);
   const touched = o.touched ?? [];
   v.setUint16(r + 100, touched.length, true);
-  touched.forEach((k, i) => { const t = keyTagOf(k); v.setBigUint64(r + 344 + KEY_TAG_LEN * i, t & ((1n << 64n) - 1n), true); v.setBigUint64(r + 344 + KEY_TAG_LEN * i + 8, t >> 64n, true); });
+  touched.forEach((k, i) => { const t = keyTagOf(k); const to = r + (o.v2 ? 488 : 344) + KEY_TAG_LEN * i; v.setBigUint64(to, t & ((1n << 64n) - 1n), true); v.setBigUint64(to + 8, t >> 64n, true); });
   return data;
 }
 
@@ -490,8 +493,8 @@ describe("guard account length (K-2)", () => {
     w.accounts.set(w.guardKey.toBase58(), { owner, data: d });
     return w;
   };
-  it("4456 B and the burst-memory 4472 B are both a guard: poke is built for both", async () => {
-    for (const len of [4456, 4472]) {
+  it("4456 B, the burst-memory 4472 B and the v2 sliding-window 4600 B are all a guard: poke is built for each", async () => {
+    for (const len of [4456, 4472, 4600]) {
       const w = withLen(len);
       const c = levConn({ accounts: w.accounts });
       const { k } = keeperOf(c.conn, cfg({ poke: true }));
@@ -515,6 +518,44 @@ describe("guard account length (K-2)", () => {
       assert.equal(await k.hasGuard(w.market.toBase58()), false);
       assert.equal(logs.length, 0);
     }
+  });
+  // The SDK decoder for v2 lands with SDK#491 (LEV_GUARD_ACCOUNT_LEN_V2_V22); the keeper's pin predates it, so this runs once the pin moves.
+  const sdkHasV2 = "LEV_GUARD_ACCOUNT_LEN_V2_V22" in (SDK as Record<string, unknown>);
+  it("a real 4600 B v2 guard (record 488 B, version 2) is accepted, decodes through the SDK, and W1 reads it", { skip: !sdkHasV2 && "pinned SDK predates #491" }, async () => {
+    const w = world(TRIG_LEN);
+    const t = key(42);
+    w.accounts.set(w.guardKey.toBase58(), { owner: PROGRAM, data: guardBytes({ market: w.market, ...TRIG_LEN, v2: true, touched: [t] }) });
+    const c = levConn({ accounts: w.accounts });
+    const { k } = keeperOf(c.conn, cfg({ w1: true }), { loadPortfolios: async () => [] });
+    assert.equal(await k.hasGuard(w.market.toBase58()), true);
+    const g = await k.readGuard(w.market.toBase58());
+    assert.ok(g, "4600 B guard must decode");
+    assert.equal(g!.guard.version, 2);
+    assert.equal(g!.guard.touchedTags[0], keyTagOf(t));
+    assert.notEqual(await k.w1Once(w.market.toBase58(), "T"), "guard unreadable");
+  });
+  it("on a pin that predates SDK#491 a 4600 B guard is a guard but readGuard is null (W1 reports guard unreadable)", { skip: sdkHasV2 && "pin has the v2 decoder" }, async () => {
+    const w = world(TRIG_LEN);
+    w.accounts.set(w.guardKey.toBase58(), { owner: PROGRAM, data: guardBytes({ market: w.market, ...TRIG_LEN, v2: true }) });
+    const { k } = keeperOf(levConn({ accounts: w.accounts }).conn, cfg({ w1: true }), { loadPortfolios: async () => [] });
+    assert.equal(await k.hasGuard(w.market.toBase58()), true);
+    assert.equal(await k.readGuard(w.market.toBase58()), null);
+    assert.equal(await k.w1Once(w.market.toBase58(), "T"), "guard unreadable");
+  });
+  it("lengths 4599 / 4601 are refused (no guard); a 4600 B record with version 1 does not decode", async () => {
+    for (const len of [4599, 4601]) {
+      const w = world();
+      const d = new Uint8Array(len); d.set(guardBytes({ market: w.market, v2: true }).subarray(0, Math.min(len, 4600)));
+      w.accounts.set(w.guardKey.toBase58(), { owner: PROGRAM, data: d });
+      const { k } = keeperOf(levConn({ accounts: w.accounts }).conn, cfg({ poke: true }));
+      assert.equal(await k.hasGuard(w.market.toBase58()), false, `len ${len}`);
+    }
+    if (!sdkHasV2) return; // the decode half needs the SDK#491 decoder
+    const w = world();
+    const d = guardBytes({ market: w.market, v2: true }); d[16 + 74] = 1;
+    w.accounts.set(w.guardKey.toBase58(), { owner: PROGRAM, data: d });
+    const { k } = keeperOf(levConn({ accounts: w.accounts }).conn, cfg({ poke: true }));
+    assert.equal(await k.readGuard(w.market.toBase58()), null);
   });
   it("a real 4472 B guard (record 360 B) decodes through the SDK and W1 reads it", async () => {
     const w = world(TRIG_LEN);
