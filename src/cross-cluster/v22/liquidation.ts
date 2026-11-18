@@ -175,7 +175,11 @@ export function noteLiquidationLanded(key: string, m: MarginState): void {
 export function liquidationMadeNoProgress(key: string, m: MarginState): boolean {
   const prev = liqGuard.get(key);
   if (!prev) return false;
-  if (near1(prev.requirement, m.requirement) && near1(prev.notional, m.notional)) return true;
+  // equity is not compared per round (funding drift), but a CUMULATIVE deficit growth of MIN_PROGRESS_BPS of notional since the
+  // remembered state re-opens the crank: an account still below maintenance whose equity keeps falling must not be skipped forever.
+  const deficitGrowth = prev.equity - m.equity;
+  const equityFell = deficitGrowth * 10_000n >= prev.notional * BigInt(MIN_PROGRESS_BPS);
+  if (!equityFell && near1(prev.requirement, m.requirement) && near1(prev.notional, m.notional)) return true;
   liqGuard.delete(key);
   return false;
 }
@@ -241,7 +245,7 @@ export function fitLiquidations(i: FitInput): FitResult {
   const cap = (i.maxCu ?? LIQ_TX_MAX_CU) - LIQ_TX_HEADROOM_CU;
   const order = i.flagged
     .map((f) => ({ f, k: f.portfolio.pubkey.toBase58() }))
-    .sort((a, b) => (a.f.ratioBps < b.f.ratioBps ? -1 : a.f.ratioBps > b.f.ratioBps ? 1 : a.k < b.k ? -1 : 1))
+    .sort((a, b) => (a.f.ratioBps < b.f.ratioBps ? -1 : a.f.ratioBps > b.f.ratioBps ? 1 : a.k < b.k ? -1 : a.k > b.k ? 1 : 0))
     .map((e) => e.f);
   const chosen: FlaggedAccount[] = [];
   const deferred: FitResult["deferred"] = [];
