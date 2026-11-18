@@ -187,8 +187,7 @@ describe("classifyMarket", () => {
     assert.equal(classifyMarket(cin(market({ lastGood: agedBy(1_500n), authority: OTHER }))).neverConnected, "not-oracle-authority");
     assert.equal(classifyMarket(cin(market({ lastGood: agedBy(1_499n), authority: OTHER }))).neverConnected, null);
   });
-  it("unreadable authority (truncated bytes can't reach here, zero key is a real key) never claims not-oracle-authority for a null authority", () => {
-    // all-zero authority is a decodable key that is not the keeper
+  it("an all-zero authority is a decodable key that is not the keeper: not-oracle-authority", () => {
     const lc = classifyMarket(cin(market({ lastGood: old, oi: 1n })));
     assert.equal(lc.neverConnected, "not-oracle-authority");
     assert.equal(lc.keeperIsAuthority, false);
@@ -212,7 +211,7 @@ describe("classifyMarket", () => {
     assert.equal(unknown.deadInterest, false);
     assert.deepEqual(unknown.classes, ["healthy"]);
   });
-  it("dead-interest sits with never-connected when both hold (price fresh is impossible there, so grace 0 forces it)", () => {
+  it("dead-interest sits with never-connected when both hold (grace 0 forces never-connected on a fresh price)", () => {
     const lc = classifyMarket(cin(market({ lastGood: agedBy(100n), authority: OTHER }), { quietMs: 99 * 86_400_000, neverConnectedGraceSlots: 0n }));
     assert.deepEqual(lc.classes, ["never-connected", "dead-interest"]);
   });
