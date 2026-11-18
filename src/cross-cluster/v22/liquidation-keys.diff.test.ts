@@ -55,7 +55,7 @@ describe("liquidation candidate keys: identical to old code", () => {
     const rng = rngOf(20261118);
     const pool: Uint8Array[] = Array.from({ length: 40 }, () => Uint8Array.from({ length: 32 }, () => Math.floor(rng() * 256)));
     for (let iter = 0; iter < 10_000; iter++) {
-      const n = Math.floor(rng() * 12);
+      const n = Math.floor(rng() * (iter % 50 === 0 ? 120 : 12));
       const ps: PositionedPortfolio[] = Array.from({ length: n }, () => {
         // draw from a small pool so duplicate pubkeys (equal keys) occur too
         const pk = new PublicKey(pool[Math.floor(rng() * pool.length)]);
@@ -85,6 +85,19 @@ describe("liquidation candidate keys: identical to old code", () => {
         maxCu: rng() < 0.5 ? undefined : 300_000 + Math.floor(rng() * 1_500_000),
         extraCuPerLiquidation: rng() < 0.5 ? undefined : Math.floor(rng() * 50_000),
       };
+      // also: flagged straight from the inputs, with duplicate pubkeys, fresh same-bytes objects (cache miss) and ties
+      const rawFlagged: FlaggedAccount[] = ps.map((p) => ({ portfolio: rng() < 0.5 ? { ...p, pubkey: new PublicKey(p.pubkey.toBytes()) } : p, ratioBps: BigInt(Math.floor(rng() * 3)) }));
+      for (const input of [fi, { ...fi, flagged: rawFlagged }]) {
+        const x = fitLiquidations(input);
+        const y = oldFitReal(input);
+        assert.equal(x.chosen.length, y.chosen.length);
+        x.chosen.forEach((c, j) => assert.equal(c, y.chosen[j]));
+        assert.equal(x.deferred.length, y.deferred.length);
+        x.deferred.forEach((d, j) => {
+          assert.equal(d.account, y.deferred[j].account);
+          assert.equal(d.why, y.deferred[j].why);
+        });
+      }
       const fa = fitLiquidations(fi);
       const fb = oldFitReal(fi);
       assert.equal(fa.chosen.length, fb.chosen.length);
