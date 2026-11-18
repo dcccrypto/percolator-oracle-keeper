@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { PublicKey } from "@solana/web3.js";
 import {
   ACCRUE_CRANK_CU,
+  CATCHUP_CRANK_CU,
   ACCRUAL_TX_CU_HEADROOM,
   FOLLOWUP_CU_HEADROOM,
   LIQUIDATE_CRANK_CU,
@@ -144,7 +145,8 @@ describe("decodeMarketRefreshState: v2.2 market and error paths", () => {
     const data = fx("k6-2xhs-market-v22");
     const s = decodeMarketRefreshState(data);
     assert.equal(typeof s.maxAccrualDtSlots, "bigint");
-    assert.equal(marketHasPositions(s), s.storedPosLong !== 0n || s.storedPosShort !== 0n);
+    assert.equal(marketHasPositions(s), true);
+    assert.equal(marketHasPositions({ ...s, storedPosLong: 0n, storedPosShort: 0n }), false);
     const off = staleCountOffsets(0, layoutById("v2.2-b"));
     assert.ok(off.short > off.long);
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
@@ -215,7 +217,7 @@ describe("legCostModelFor / V22_LEG_COST", () => {
     assert.equal(V22_LEG_COST.refreshCu(one, 145_000), 145_000);
     assert.equal(V22_LEG_COST.refreshCu(four, 145_000), 35_000 * 7);
     assert.equal(V22_LEG_COST.liquidateCu(one, 250_000), 250_000);
-    assert.equal(V22_LEG_COST.liquidateCu(four, 250_000), 728_649 > 0 ? Math.ceil(728_649 / 1000) * 1000 : 0);
+    assert.equal(V22_LEG_COST.liquidateCu(four, 250_000), 729_000);
     assert.equal(V22_LEG_COST.worstRefreshCu(four), V22_WORST_SETTLE_CU_AT_CAP);
     assert.ok(V22_LEG_COST.worstRefreshCu(one) >= REFRESH_CRANK_CU);
     assert.equal(V22_LEG_COST.isSolo(pp(2)), false);
@@ -240,7 +242,7 @@ describe("planCrankTx: catch-up sizing and options", () => {
     assert.equal(plan.cranks.length, 11);
     assert.ok(plan.cranks.every((c) => c.kind === "catchup"));
     assert.deepEqual(plan.overflow, []);
-    assert.equal(plan.computeUnits, 11 * 45_000 + ACCRUAL_TX_CU_HEADROOM);
+    assert.equal(plan.computeUnits, 11 * CATCHUP_CRANK_CU + ACCRUAL_TX_CU_HEADROOM);
   });
   it("catch-up of exactly the allowance still accrues and refreshes", () => {
     const plan = planCrankTx({ owner, market, lpPortfolio: lp, catchup: 10, refreshTargets: [pp(1)] });
@@ -254,13 +256,15 @@ describe("planCrankTx: catch-up sizing and options", () => {
     assert.deepEqual(plan.cranks.map((c) => c.kind), ["repair", "repair", "catchup", "catchup"]);
     assert.equal(plan.cranks[0].repair?.kind, "expire");
     assert.ok(plan.cranks[0].portfolio.equals(market));
-    assert.equal(plan.computeUnits, 2 * REPAIR_CU + 2 * 45_000 + ACCRUAL_TX_CU_HEADROOM);
+    assert.equal(plan.computeUnits, 2 * REPAIR_CU + 2 * CATCHUP_CRANK_CU + ACCRUAL_TX_CU_HEADROOM);
   });
-  it("catch-up count is clamped by the CU budget left after repairs", () => {
-    const plan = planCrankTx({ owner, market, lpPortfolio: lp, catchup: 5, refreshTargets: [], repairs: Array.from({ length: 5 }, () => ({ kind: "expire" as const, domain: 1 })) });
-    // catchupN < catchup is false here (5 fits), so this accrues.
-    assert.equal(plan.cranks.filter((c) => c.kind === "repair").length, 5);
-    assert.equal(plan.cranks.at(-1)!.kind, "accrue");
+  it("catch-up count is clamped by the CU budget left after repairs: catch-up only, no accrual", () => {
+    const repairs = Array.from({ length: 30 }, () => ({ kind: "expire" as const, domain: 1 }));
+    const plan = planCrankTx({ owner, market, lpPortfolio: lp, catchup: 10, refreshTargets: [pp(1)], repairs });
+    const catchups = plan.cranks.filter((c) => c.kind === "catchup").length;
+    assert.ok(catchups < 10, `clamped (${catchups})`);
+    assert.ok(plan.cranks.every((c) => c.kind === "repair" || c.kind === "catchup"));
+    assert.deepEqual(plan.overflow, []);
   });
   it("liquidate targets get a second crank right after the refresh, never for the LP", () => {
     const trader = pp(1);
@@ -272,10 +276,9 @@ describe("planCrankTx: catch-up sizing and options", () => {
     const targets = Array.from({ length: 5 }, () => pp(1));
     const plan = planCrankTx({ owner, market, lpPortfolio: lp, catchup: 0, refreshTargets: targets, liquidateTargets: targets.map((t) => t.pubkey) });
     const kinds = plan.cranks.map((c) => c.kind);
-    assert.ok(kinds.includes("liquidate"));
+    assert.deepEqual(kinds, ["accrue", "refresh", "liquidate", "refresh", "liquidate", "refresh", "refresh"]);
+    assert.equal(plan.overflow.length, 1);
     assert.ok(plan.computeUnits <= MAX_TX_CU);
-    const refreshes = kinds.filter((k) => k === "refresh").length;
-    assert.equal(refreshes + plan.overflow.length, 5);
   });
   it("leg-aware model: a solo (3+ leg) target is never packed beside the accrual", () => {
     const solo = pp(0, false, { activeLegs: 4 });
@@ -284,13 +287,13 @@ describe("planCrankTx: catch-up sizing and options", () => {
     assert.deepEqual(plan.cranks.map((c) => c.kind), ["accrue", "refresh"]);
     assert.deepEqual(plan.overflow, [solo]);
   });
-  it("leg-aware model: a heavy LP makes the accrual its own worst-settle cost; liquidation is leg-priced", () => {
+  it("leg-aware model: a heavy LP makes the accrual its own worst-settle cost", () => {
     const heavyLp = pp(0, true, { activeLegs: 4 });
     const trader = pp(2, false, { activeLegs: 2 });
     const plan = planCrankTx({ owner, market, lpPortfolio: lp, catchup: 0, refreshTargets: [trader], cost: V22_LEG_COST, lp: heavyLp, liquidateTargets: [trader.pubkey] });
-    assert.equal(plan.cranks[0].kind, "accrue");
-    assert.ok(plan.computeUnits > V22_WORST_SETTLE_CU_AT_CAP);
-    assert.ok(plan.computeUnits <= MAX_TX_CU);
+    // the liquidation (leg-priced) does not fit beside the heavy accrual, so it is skipped
+    assert.deepEqual(plan.cranks.map((c) => c.kind), ["accrue", "refresh"]);
+    assert.equal(plan.computeUnits, 1_288_864);
   });
 });
 
@@ -340,9 +343,8 @@ describe("chunkOverflowTargets", () => {
     const g = chunkOverflowTargets([twoLeg[0], solo, ...twoLeg.slice(1)], 0, V22_LEG_COST);
     assert.deepEqual(g[0], [twoLeg[0]]);
     assert.deepEqual(g[1], [solo]);
-    assert.deepEqual(g.flat().length, 9);
-    assert.ok(g.slice(2).every((x) => x.length >= 1));
-    assert.ok(g.length >= 3, "the 7 two-leg targets split across groups");
+    assert.equal(g.flat().length, 9);
+    assert.deepEqual(g.map((x) => x.length), [1, 1, 5, 2], "the 7 two-leg targets split across groups");
     assert.deepEqual(chunkOverflowTargets([], 0, V22_LEG_COST), []);
   });
   it("leg-aware single-leg targets pack like the legacy count", () => {
