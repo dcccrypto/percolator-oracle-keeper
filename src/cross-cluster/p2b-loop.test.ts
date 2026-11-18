@@ -328,7 +328,7 @@ describe("p2bLoopConfigFromEnv decimal-only (hex/exponent/padded)", () => {
   it("still accepts surrounding whitespace around a plain decimal", () => {
     assert.equal(p2bLoopConfigFromEnv({ P2B_TICK_MS: " 5000 " }, 1, 2).tickMs, 5000);
   });
-  it("rejects tickMs above 2^31-1 (setTimeout overflow)", () => {
+  it("rejects tickMs above 2^31-1 (pinned by the 86400000 range bound)", () => {
     assert.throws(() => p2bLoopConfigFromEnv({ P2B_TICK_MS: "2147483648" }, 1, 2), /P2B_TICK_MS/);
     assert.throws(() => p2bLoopConfigFromEnv({ P2B_TICK_MS: "99999999999999999999" }, 1, 2), /P2B_TICK_MS/);
   });

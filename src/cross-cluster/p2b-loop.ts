@@ -234,7 +234,7 @@ export async function startP2bLoop(loop: P2bLoop, cfg: Pick<P2bLoopConfig, "tick
     await loop.tick();
     // Clamp: a backwards clock step makes elapsed negative (sleep > tickMs); setTimeout fires immediately above 2^31-1 ms.
     const elapsed = Math.max(0, Date.now() - start);
-    const sleepMs = Math.min(MAX_TIMEOUT_MS, Math.max(1000, Math.min(cfg.tickMs, cfg.tickMs - elapsed)));
+    const sleepMs = Math.min(MAX_TIMEOUT_MS, Math.max(1000, Number.isFinite(cfg.tickMs) ? cfg.tickMs - elapsed : 1000));
     await new Promise((r) => setTimeout(r, sleepMs));
   }
 }
