@@ -23,7 +23,7 @@ function once(old: boolean): { ms: number; checksum: number } {
   let checksum = 0;
   let now = 1_700_000_000_000;
   const cfg = { maxMovePct: 50, confirmTrips: 3, now: () => now, log: () => {} };
-  const t0 = performance.now();
+  const c0 = process.cpuUsage(); const t0 = performance.now();
   for (let k = 0; k < N; k++) {
     now += 1000;
     for (let m = 0; m < MARKETS; m++) {
@@ -34,7 +34,7 @@ function once(old: boolean): { ms: number; checksum: number } {
       else states[m] = cand;
     }
   }
-  return { ms: performance.now() - t0, checksum };
+  const c1 = process.cpuUsage(c0); return { ms: process.env.BENCH_CPU ? (c1.user + c1.system) / 1000 : performance.now() - t0, checksum };
 }
 for (const old of [true, false]) {
   once(old);
