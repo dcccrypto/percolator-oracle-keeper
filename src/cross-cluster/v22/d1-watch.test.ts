@@ -89,7 +89,9 @@ describe("d1-watch: episode tracker", () => {
   it("a one-tick gap in the readings does not restart the episode: still overdue with the original start slot", () => {
     const tr = new AdlEpisodeTracker(T);
     tr.observe([reading(true)], 1_000n);
-    assert.deepEqual(tr.observe([], 6_000n), []);
+    const [held] = tr.observe([], 6_000n); // still reported during the gap, so the alert set does not flap
+    assert.equal(held.observedSinceSlot, 1_000n);
+    assert.equal(held.ageSlots, 5_000n);
     const [e] = tr.observe([reading(true)], 12_000n);
     assert.equal(e.observedSinceSlot, 1_000n);
     assert.equal(e.ageSlots, 11_000n);
@@ -109,8 +111,11 @@ describe("d1-watch: episode tracker", () => {
     const tr = new AdlEpisodeTracker(T);
     tr.observe([reading(true)], 1_000n);
     tr.observe([], 2_000n);
-    tr.observe([], 11_001n);
-    assert.equal(tr.summary([]).endedEpisodes, 1);
+    assert.deepEqual(tr.observe([], 11_001n), []);
+    const sm = tr.summary([]);
+    assert.equal(sm.endedEpisodes, 1);
+    assert.equal(sm.longestEndedSlots, "1000"); // age at last sighting
+    assert.equal(sm.endedPastBound, 0);
   });
   it("assets are independent; reset() (terminal market) ends every episode", () => {
     const tr = new AdlEpisodeTracker(T);

@@ -138,15 +138,7 @@ export class AdlEpisodeTracker {
         s = { slot: nowSlot, sinceBoot: first };
         this.since.set(r.assetIndex, s);
       }
-      const age = nowSlot > s.slot ? nowSlot - s.slot : 0n;
-      out.push({
-        assetIndex: r.assetIndex,
-        observedSinceSlot: s.slot,
-        ageSlots: age,
-        sinceBoot: s.sinceBoot,
-        level: adlEpisodeLevel(age, this.t),
-        slotsToBound: age >= this.t.boundSlots ? 0n : this.t.boundSlots - age,
-      });
+      out.push(this.episode(r.assetIndex, s, nowSlot));
     }
     // An asset missing from the readings (loop.ts skips a non-active lifecycle byte; observationAssetsFor can briefly drop it) is
     // NOT a positive exit: keep its episode (original start slot) so the overdue alert is not reset. Only a reading with
@@ -157,9 +149,26 @@ export class AdlEpisodeTracker {
         continue;
       }
       s.missingSince ??= nowSlot;
-      if (nowSlot - s.missingSince > this.t.boundSlots) this.close(k, nowSlot);
+      if (nowSlot - s.missingSince > this.t.boundSlots) {
+        this.close(k, s.missingSince); // age as of the last sighting, not padded by the absence
+        continue;
+      }
+      // still held: report it so the alert set (and AlertSink.reconcile) does not resolve/re-fire across the gap
+      out.push(this.episode(k, s, nowSlot));
     }
-    return out;
+    return out.sort((a, b) => a.assetIndex - b.assetIndex);
+  }
+
+  private episode(assetIndex: number, s: { slot: bigint; sinceBoot: boolean }, nowSlot: bigint): AdlEpisode {
+    const age = nowSlot > s.slot ? nowSlot - s.slot : 0n;
+    return {
+      assetIndex,
+      observedSinceSlot: s.slot,
+      ageSlots: age,
+      sinceBoot: s.sinceBoot,
+      level: adlEpisodeLevel(age, this.t),
+      slotsToBound: age >= this.t.boundSlots ? 0n : this.t.boundSlots - age,
+    };
   }
 
   /** The market is terminal / not a band market: every episode is over. */
