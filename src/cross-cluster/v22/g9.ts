@@ -114,8 +114,14 @@ export async function g9Once(
     // profit) first. It can REVERT where mode 1 would succeed (the capacity read errors on an inconsistent source ledger), so a
     // simulation that REFUSES it falls back to mode 1 (capital) in the SAME sweep. Nothing is sent for the refused attempt.
     const pnl = await attempt(BackstopMode.RestoreFromPnl, "g9-restore-pnl");
-    if (pnl.kind !== "refused") return { action, outcome: pnl };
-    return { action, outcome: await attempt(BackstopMode.Restore, "g9-restore") };
+    // A transport failure ("failed": RPC / send error) says nothing about eligibility, and mode 1 is the capital-only subset of
+    // mode 3 (program p4_rescue_ins.rs backstop_restore_split: PnL first, then capital; capacity 0 "falls back to the capital-only
+    // mode-1 behaviour"), so it falls through too. The simulation runs first, so a mode 3 that did land is re-read, not repeated.
+    if (pnl.kind !== "refused" && pnl.kind !== "failed") return { action, outcome: pnl };
+    const outcome = await attempt(BackstopMode.Restore, "g9-restore");
+    // Nothing reached the chain: do not burn the 1,500-slot restore spacing, retry on the next sweep.
+    if (outcome.kind === "failed") st.lastAttempt.delete(`${ctx.marketAddress}|restore`);
+    return { action, outcome };
   }
   const outcome = await attempt(action.kind === "propose" ? BackstopMode.Propose : BackstopMode.Draw, `g9-${action.kind}`);
   return { action, outcome };
