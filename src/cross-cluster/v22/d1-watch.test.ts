@@ -90,9 +90,9 @@ describe("d1-watch: episode tracker", () => {
     const tr = new AdlEpisodeTracker(T);
     tr.observe([reading(true)], 1_000n);
     assert.deepEqual(tr.observe([], 6_000n), []);
-    const [e] = tr.observe([reading(true)], 11_000n);
+    const [e] = tr.observe([reading(true)], 12_000n);
     assert.equal(e.observedSinceSlot, 1_000n);
-    assert.equal(e.ageSlots, 10_000n);
+    assert.equal(e.ageSlots, 11_000n);
     assert.equal(e.level, "overdue");
     assert.equal(tr.summary([]).endedEpisodes, 0);
   });
