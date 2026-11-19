@@ -95,7 +95,37 @@ export function isCreatorTokenAccount(ai: { owner: PublicKey; data: Uint8Array }
 const ATA_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 /** pool.admin's classic-token collateral ATA (SDK `creatorCollateralAtaV5`). */
 export function creatorCollateralAta(admin: PublicKey, collateralMint: PublicKey): PublicKey {
-  return PublicKey.findProgramAddressSync([admin.toBuffer(), TOKEN_PROGRAM.toBuffer(), collateralMint.toBuffer()], ATA_PROGRAM)[0];
+  const key = admin.toBase58() + collateralMint.toBase58();
+  const hit = ataCache.get(key);
+  if (hit) return hit;
+  const ata = PublicKey.findProgramAddressSync([admin.toBuffer(), TOKEN_PROGRAM.toBuffer(), collateralMint.toBuffer()], ATA_PROGRAM)[0];
+  boundedSet(ataCache, key, ata);
+  return ata;
+}
+/** Derivations cost ~6-12 ms each in pure JS (bump search), and the same markets recur every cycle: memoise, bounded. */
+const DERIVE_CACHE_MAX = 4096;
+const ataCache = new Map<string, PublicKey>();
+const marketKeyCache = new Map<string, PublicKey>();
+const stakePoolCache = new Map<string, PublicKey>();
+function boundedSet<V>(m: Map<string, V>, k: string, v: V): void {
+  if (m.size >= DERIVE_CACHE_MAX) m.delete(m.keys().next().value as string); // FIFO eviction
+  m.set(k, v);
+}
+/** `new PublicKey(addr)` memoised (throws on an unparseable address exactly like the constructor; failures are not cached). */
+function marketKey(addr: string): PublicKey {
+  const hit = marketKeyCache.get(addr);
+  if (hit) return hit;
+  const pk = new PublicKey(addr);
+  boundedSet(marketKeyCache, addr, pk);
+  return pk;
+}
+function stakePoolFor(market: PublicKey, stakeProgramId: PublicKey): PublicKey {
+  const key = market.toBase58() + stakeProgramId.toBase58();
+  const hit = stakePoolCache.get(key);
+  if (hit) return hit;
+  const pool = deriveStakePool(market, stakeProgramId)[0];
+  boundedSet(stakePoolCache, key, pool);
+  return pool;
 }
 /**
  * Associated-token-account program `CreateIdempotent` (data `[1]`): creates `pool.admin`'s collateral ATA when it is missing
@@ -365,11 +395,11 @@ export async function windDownOnce(
 
   let market: PublicKey;
   try {
-    market = new PublicKey(marketAddress);
+    market = marketKey(marketAddress);
   } catch {
     return res({ kind: "failed", error: "unparseable market address" });
   }
-  const [pool] = deriveStakePool(market, cfg.stakeProgramId);
+  const pool = stakePoolFor(market, cfg.stakeProgramId);
 
   let data: Uint8Array;
   let poolState: StakePoolView | null = null;
@@ -737,8 +767,8 @@ export async function inspectStakeBoundBudget(
   st: TerminalInsuranceState,
 ): Promise<{ state: TerminalState | null; stakeBound: boolean; budget: bigint | null; support: Tag29Support | null }> {
   try {
-    const market = new PublicKey(marketAddress);
-    const [pool] = deriveStakePool(market, cfg.stakeProgramId);
+    const market = marketKey(marketAddress);
+    const pool = stakePoolFor(market, cfg.stakeProgramId);
     const [mi, pi] = await conn.getMultipleAccountsInfo([market, pool], "confirmed");
     if (!mi) return { state: null, stakeBound: false, budget: null, support: null };
     const data = new Uint8Array(mi.data);
