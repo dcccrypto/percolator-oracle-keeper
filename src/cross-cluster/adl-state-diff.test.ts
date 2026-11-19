@@ -77,13 +77,13 @@ function sdkRef(d: Uint8Array): Ref {
 function compare(name: string, d: Uint8Array): number {
   const ref = sdkRef(d);
   if (ref === "throws") {
-    assert.throws(() => decodeAdlState(d), undefined, `${name}: SDK refuses, keeper must too`);
+    assert.throws(() => decodeAdlState(d), /./, `${name}: SDK refuses, keeper must too`);
     return 0;
   }
   let n = 0;
-  const expectAssets = [];
+  const expectAssets: Array<Record<string, unknown>> = [];
   for (let i = 0; i < ref.slots; i++) {
-    const a = ref.assets[i];
+    const a: { lifecycle: number; aLong: bigint; aShort: bigint; oiLong: bigint; oiShort: bigint } = ref.assets[i]!;
     const k = decodeAdlState(d, i)!;
     assert.deepEqual(
       [k.aLong, k.aShort, k.oiEffLong, k.oiEffShort, k.reduceOnly],
