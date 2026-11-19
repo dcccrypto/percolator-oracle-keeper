@@ -45,6 +45,7 @@ describe("g9 restore: a transport-failed mode 3 must not strand the repayment fo
     const r = await g9Once(execCtx(f.conn), ctx, acct, st, args);
     assert.equal(r.outcome?.kind, "failed");
     const units = { g9PendingSlot: 0n, backstopReceivableAtoms: 10n };
-    assert.equal(decideG9(ctx, units, BigInt(ctx.readSlot) + 1n, false, st).kind, "restore");
+    assert.equal(decideG9(ctx, units, BigInt(ctx.readSlot) + 5n, false, st).kind, "propose", "20-slot backoff");
+    assert.equal(decideG9(ctx, units, BigInt(ctx.readSlot) + 20n, false, st).kind, "restore");
   });
 });
