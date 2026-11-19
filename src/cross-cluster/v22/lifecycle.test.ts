@@ -5,7 +5,7 @@
  *
  * Nothing here touches a network: every connection is a recording fake.
  */
-import { describe, it, beforeEach } from "node:test";
+import { describe, it, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import { WRAPPER_PROGRAM_ID } from "../../program-ids.ts";
@@ -21,7 +21,10 @@ import type { ClassifyInput, MarketLifecycle } from "./lifecycle-classify.ts";
 import { ObservationLedger } from "./lifecycle-ledger.ts";
 import { PRE_SEND_CHECKS, RESOLVE_GUARDS, buildStaleResolveIx, decideResolve, preSendVerdict, resolveStaleOnce } from "./lifecycle-resolve.ts";
 import type { PreSendInput, ResolveInput } from "./lifecycle-resolve.ts";
-import { MARKET_HEADER_V22, LifecycleEngine } from "./lifecycle.ts";
+import { MARKET_HEADER_V22, LifecycleEngine, fileStore } from "./lifecycle.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { Alert } from "../alerting.ts";
 import { fakeExecConn, key, v22MarketBytes } from "./test-helpers.ts";
 
@@ -1087,6 +1090,324 @@ describe("flags", () => {
 });
 
 beforeEach(() => resetPushDeadlines());
+
+describe("fileStore (quiet-clock persistence; reached via cfg.stateFile in the V22Loop-built engine)", () => {
+  const dirs: string[] = [];
+  after(() => dirs.forEach((d) => fs.rmSync(d, { recursive: true, force: true })));
+  const tmp = () => (dirs.push(fs.mkdtempSync(path.join(os.tmpdir(), "lc-store-"))), dirs[dirs.length - 1]);
+  it("round-trips, drops malformed entries, and never throws on a missing, corrupt or wrong-version file", () => {
+    const dir = tmp();
+    const file = path.join(dir, "nested", "quiet.json");
+    const st = fileStore(file);
+    assert.deepEqual(st.load(), {}, "missing file");
+    st.save({ A: { quietSinceMs: 5, feeSum: "7" } });
+    assert.deepEqual(st.load(), { A: { quietSinceMs: 5, feeSum: "7" } });
+    fs.writeFileSync(file, JSON.stringify({ version: 1, markets: { A: { quietSinceMs: 5, feeSum: "7" }, B: { quietSinceMs: "x", feeSum: "1" }, C: null, D: { quietSinceMs: 1, feeSum: 2 } } }));
+    assert.deepEqual(st.load(), { A: { quietSinceMs: 5, feeSum: "7" } }, "only well-typed entries survive");
+    fs.writeFileSync(file, JSON.stringify({ version: 2, markets: { A: { quietSinceMs: 5, feeSum: "7" } } }));
+    assert.deepEqual(st.load(), {}, "wrong version");
+    fs.writeFileSync(file, JSON.stringify({ version: 1 }));
+    assert.deepEqual(st.load(), {}, "no markets");
+    fs.writeFileSync(file, "{not json");
+    assert.deepEqual(st.load(), {}, "corrupt");
+  });
+  it("a failed save is swallowed and does not throw", () => {
+    const dir = tmp();
+    const blocker = path.join(dir, "file");
+    fs.writeFileSync(blocker, "x");
+    const st = fileStore(path.join(blocker, "sub", "quiet.json")); // parent is a file: mkdir fails
+    assert.doesNotThrow(() => st.save({ A: { quietSinceMs: 1, feeSum: "1" } }));
+    assert.deepEqual(st.load(), {});
+  });
+  it("the engine restores the quiet clock from cfg.stateFile and saves it (at most every 5 minutes) after a tick", async () => {
+    const dir = tmp();
+    const file = path.join(dir, "quiet.json");
+    const w = world();
+    const { addr, ctx } = addMarket(w, market({ lastGood: ageToLastGood(100n), authority: keeper.publicKey }));
+    const mk = () => new LifecycleEngine({ conn: w.conn as never, keeper, programId: WRAPPER_PROGRAM_ID, cfg: cfg({ discoveryMs: 0, stateFile: file }), dryRun: false, registered: (m) => w.registered.has(m), sink: new FakeSink(), ledger: new ObservationLedger(120_000), now: () => w.now, log: () => {} });
+    const a = mk();
+    await runTick(a, w, [ctx]);
+    const saved = JSON.parse(fs.readFileSync(file, "utf8")) as { version: number; markets: Record<string, { quietSinceMs: number }> };
+    assert.equal(saved.version, 1);
+    assert.equal(saved.markets[addr].quietSinceMs, w.now);
+    w.now += 3 * 86_400_000;
+    const b = mk(); // a restart: the clock continues from the saved start instead of from zero
+    await runTick(b, w, [ctx]);
+    assert.equal(b.view(addr)?.quietDays, 3);
+  });
+});
+
+describe("engine: discovery edge branches (an unregistered market is dropped, never mis-tracked)", () => {
+  /** Put `data` (or a foreign owner / null) behind the market address for every read after this call. */
+  function override(w: World, addr: string, v: "gone" | "foreign" | Uint8Array): void {
+    const orig = w.conn.getMultipleAccountsInfoAndContext as (pks: PublicKey[], c?: string) => Promise<{ context: { slot: number }; value: Array<unknown> }>;
+    (w.conn as unknown as Record<string, unknown>).getMultipleAccountsInfoAndContext = async (pks: PublicKey[], c?: string) => {
+      const r = await orig(pks, c);
+      pks.forEach((pk, i) => {
+        if (pk.toBase58() !== addr) return;
+        r.value[i] = v === "gone" ? null : v === "foreign" ? { data: Buffer.from(w.markets.get(addr) as Uint8Array), owner: OTHER, lamports: 1, executable: false } : { data: Buffer.from(v), owner: WRAPPER_PROGRAM_ID, lamports: 1, executable: false };
+      });
+      return r;
+    };
+  }
+  const GARBAGE = new Uint8Array(10);
+
+  it("first scan: a market that is gone, foreign-owned, or does not decode is not tracked; a healthy one still is", async () => {
+    const w = world();
+    const ok = addMarket(w, matured({ authority: OTHER }), false);
+    const gone = addMarket(w, matured({ authority: OTHER }), false);
+    const foreign = addMarket(w, matured({ authority: OTHER }), false);
+    const bad = addMarket(w, matured({ authority: OTHER }), false);
+    override(w, gone.addr, "gone");
+    override(w, foreign.addr, "foreign");
+    override(w, bad.addr, GARBAGE);
+    const { e } = engineFor(w, { discoveryMs: 600_000 });
+    await runTick(e, w, []);
+    assert.notEqual(e.view(ok.addr), null);
+    assert.equal(e.view(gone.addr), null);
+    assert.equal(e.view(foreign.addr), null);
+    assert.equal(e.view(bad.addr), null, "undecodable layout is dropped, not classified");
+  });
+
+  it("between scans (resolve dry): a market that vanishes, changes owner, stops decoding, or turns Resolved is dropped; a Recovery one is dropped but re-scanned; a live one stays", async () => {
+    const w = world();
+    const names = ["stay", "gone", "foreign", "bad", "resolved", "recovery"] as const;
+    const m = {} as Record<(typeof names)[number], { addr: string }>;
+    for (const n of names) m[n] = addMarket(w, matured({ authority: OTHER }), false);
+    const sizes: number[] = [];
+    const { e } = engineFor(w, { discoveryMs: 600_000, staleResolve: "dry" });
+    await runTick(e, w, []); // the scan loads all six
+    for (const n of names) assert.notEqual(e.view(m[n].addr), null, `${n} tracked after the scan`);
+    const orig0 = w.conn.getMultipleAccountsInfoAndContext as (pks: PublicKey[]) => Promise<unknown>;
+    (w.conn as unknown as Record<string, unknown>).getMultipleAccountsInfoAndContext = async (pks: PublicKey[]) => (sizes.push(pks.length), orig0(pks));
+    override(w, m.gone.addr, "gone");
+    override(w, m.foreign.addr, "foreign");
+    override(w, m.bad.addr, GARBAGE);
+    override(w, m.resolved.addr, matured({ authority: OTHER, resolved: true }));
+    override(w, m.recovery.addr, matured({ authority: OTHER, recovery: true }));
+    w.now += 20_000; // inside discoveryMs: the between-scans re-read
+    await runTick(e, w, []);
+    assert.deepEqual(sizes, [6], "one batched read of the six re-read markets");
+    assert.notEqual(e.view(m.stay.addr), null);
+    for (const n of ["gone", "foreign", "bad", "resolved", "recovery"] as const) assert.equal(e.view(m[n].addr), null, `${n} dropped`);
+    // Resolved is cached terminal (never re-read by the next scan); Recovery is not.
+    sizes.length = 0;
+    w.now += 600_000;
+    await runTick(e, w, []);
+    const full = sizes.reduce((a, b) => a + b, 0);
+    assert.equal(full, 5 * 3, "next scan reads stay + gone + foreign + bad + recovery (3 accounts each), not the cached-terminal Resolved one");
+  });
+
+  it("a discovery RPC failure is logged and does not stop the tick", async () => {
+    const w = world();
+    const reg = addMarket(w, matured({ authority: OTHER }));
+    (w.conn as unknown as Record<string, unknown>).getProgramAccounts = async () => {
+      throw new Error("gpa down");
+    };
+    const { e, logs, sink } = engineFor(w, { discoveryMs: 600_000 });
+    await runTick(e, w, [reg.ctx]);
+    assert.equal(logs.some((l) => l.includes("discovery failed")), true);
+    assert.equal(sink.active("v22-lifecycle:dead-price-matured").length, 1, "the registered market is still alerted");
+  });
+});
+
+describe("engine: failure isolation and send outcomes (each reachable from V22Loop.tick -> observe / endTick)", () => {
+  it("classify off: observe returns null and endTick makes no RPC at all", async () => {
+    const w = world();
+    const { ctx } = addMarket(w, matured({ authority: OTHER }));
+    const { e } = engineFor(w, { classify: false, discoveryMs: 600_000 });
+    e.beginTick();
+    assert.equal(e.observe(ctx), null);
+    await e.endTick();
+    assert.equal(w.gpaCalls.length, 0);
+    assert.equal(w.exec.sims.length, 0);
+  });
+
+  it("observe never throws: a failing registered() lookup is logged and the market is simply not tracked", () => {
+    const w = world();
+    const { ctx, addr } = addMarket(w, matured({ authority: OTHER }));
+    (w as { registered: unknown }).registered = {
+      has() {
+        throw new Error("registry lookup exploded");
+      },
+    };
+    const { e, logs } = engineFor(w);
+    e.beginTick();
+    assert.equal(e.observe(ctx), null);
+    assert.equal(logs.some((l) => l.includes("classify failed") && l.includes("registry lookup exploded")), true);
+    assert.equal(e.view(addr), null);
+  });
+
+  it("with only the required deps (as V22Loop passes them) the engine defaults to Date.now, console.log, the shared ledger and no store", (t) => {
+    const w = world();
+    const { ctx } = addMarket(w, matured({ authority: OTHER }));
+    const lines: string[] = [];
+    t.mock.method(console, "log", (s: string) => lines.push(String(s)));
+    const e = new LifecycleEngine({
+      conn: w.conn as never,
+      keeper,
+      programId: WRAPPER_PROGRAM_ID,
+      cfg: cfg({ discoveryMs: 0 }),
+      dryRun: false,
+      registered: () => {
+        throw new Error("boom");
+      },
+      sink: new FakeSink(),
+    });
+    e.beginTick();
+    assert.equal(e.observe(ctx), null);
+    assert.equal(lines.some((l) => l.includes("classify failed")), true, "default logger is console.log");
+  });
+
+  it("view(): a Resolved market has no age / window, a stale_slots=0 market has an age but no window, and a sent / dry-run decision is reported as such", async () => {
+    const w = world();
+    const done = addMarket(w, matured({ authority: OTHER, resolved: true }));
+    const nowin = addMarket(w, market({ staleSlots: 0n, lastGood: ageToLastGood(900_000n), authority: OTHER }));
+    const sendable = addMarket(w, matured({ authority: OTHER }));
+    const { e, ledger } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [done.ctx, nowin.ctx, sendable.ctx]);
+    const vDone = e.view(done.addr);
+    assert.equal(vDone?.ageSlots, null);
+    assert.equal(vDone?.staleSlots, null);
+    assert.equal(vDone?.pctOfWindow, null);
+    const vNo = e.view(nowin.addr);
+    assert.notEqual(vNo?.ageSlots, null);
+    assert.equal(vNo?.staleSlots, null);
+    assert.equal(vNo?.pctOfWindow, null);
+    assert.equal(e.view(sendable.addr)?.resolve?.decision, "sent");
+    const w2 = world();
+    const d = addMarket(w2, matured({ authority: OTHER }));
+    const dry = engineFor(w2, { staleResolve: "dry" });
+    primeLedger(dry.ledger, w2, 3_600_000);
+    await runTick(dry.e, w2, [d.ctx]);
+    assert.equal(dry.e.view(d.addr)?.resolve?.decision, "dry-run");
+    assert.equal(dry.e.view("nope"), null);
+  });
+
+  it("an alert sink that throws is logged and does not stop the fee / resolve work of the same tick", async () => {
+    const w = world();
+    const { ctx } = addMarket(w, matured({ authority: OTHER }));
+    const { e, ledger, sink, logs } = engineFor(w, { staleResolve: "on" });
+    sink.reconcile = async () => {
+      throw new Error("alert backend down");
+    };
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [ctx]);
+    assert.equal(logs.some((l) => l.includes("alert delivery failed") && l.includes("alert backend down")), true);
+    assert.equal(w.exec.sent.length, 1, "the resolve still went out");
+  });
+
+  it("a failing 'resolved' alert does not undo the resolve (the market stays terminal and is never resolved again)", async () => {
+    const w = world();
+    const { addr, ctx } = addMarket(w, matured({ authority: OTHER }));
+    resetPushDeadlines();
+    const { e, ledger, sink } = engineFor(w, { staleResolve: "on" });
+    let fired = 0;
+    sink.fire = async () => {
+      fired++;
+      throw new Error("pager down");
+    };
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length, 1);
+    assert.equal(isKnownTerminal(addr), true);
+    assert.equal(fired, 1, "the alert was attempted");
+    w.now += cfg().resolveRetryMs + 1; // past the retry window: only the landed flag keeps it from re-sending
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length, 1, "never again");
+  });
+
+  it("a warn-band fee round that throws is recorded as failed (visible on the view) and logged; the tick continues", async () => {
+    const w = world();
+    const { addr, ctx } = addMarket(w, market({ lastGood: ageToLastGood(12_000n), authority: OTHER }));
+    const { e, logs } = engineFor(w, { warnBandFees: true }, {
+      forceFees: async () => {
+        throw new Error("fee rpc 500");
+      },
+    });
+    await runTick(e, w, [ctx]);
+    assert.match(e.view(addr)?.fees ?? "", /^failed: .*fee rpc 500/);
+    assert.equal(logs.some((l) => l.includes("warn-band fee round failed")), true);
+  });
+
+  it("the program refusing the simulation (not matured) is recorded as an error decision, nothing is sent, and it is not retried before resolveRetryMs", async () => {
+    const w = world();
+    const { addr, ctx } = addMarket(w, matured({ authority: OTHER }));
+    const orig = w.conn.simulateTransaction as (...a: unknown[]) => Promise<{ context: unknown; value: Record<string, unknown> }>;
+    (w.conn as unknown as Record<string, unknown>).simulateTransaction = async (...a: unknown[]) => {
+      const r = await orig(...a);
+      return { ...r, value: { ...r.value, err: { InstructionError: [2, { Custom: 27 }] } } };
+    };
+    const { e, ledger, logs } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length, 0);
+    assert.equal(e.view(addr)?.resolve?.decision, "error");
+    assert.equal(logs.some((l) => l.includes("refused by the program")), true);
+    const sims = w.exec.sims.length;
+    w.now += 20_000;
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sims.length, sims, "one attempt per window");
+  });
+
+  it("a simulation RPC that throws is recorded as a failed attempt, nothing is sent", async () => {
+    const w = world();
+    const { addr, ctx } = addMarket(w, matured({ authority: OTHER }));
+    (w.conn as unknown as Record<string, unknown>).simulateTransaction = async () => {
+      throw new Error("sim rpc timeout");
+    };
+    const { e, ledger, logs } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length, 0);
+    assert.equal(e.view(addr)?.resolve?.decision, "error");
+    assert.equal(logs.some((l) => l.includes("tag 39 failed")), true);
+  });
+
+  it("a tx that was sent but did not confirm is an error decision (no markTerminal, no 'resolved' alert) and is not retried inside resolveRetryMs", async () => {
+    const w = world();
+    const { addr, ctx } = addMarket(w, matured({ authority: OTHER }));
+    resetPushDeadlines();
+    (w.conn as unknown as Record<string, unknown>).confirmTransaction = async () => ({ context: { slot: 1 }, value: { err: { InstructionError: [0, "Custom"] } } });
+    (w.conn as unknown as Record<string, unknown>).getSignatureStatuses = async () => ({ context: { slot: 1 }, value: [{ slot: 1, confirmations: 0, err: { InstructionError: [0, "Custom"] }, confirmationStatus: "confirmed" }] });
+    const { e, ledger, sink, logs } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length, 1);
+    assert.equal(e.view(addr)?.resolve?.decision, "error");
+    assert.equal(isKnownTerminal(addr), false);
+    assert.equal(sink.fired.length, 0);
+    assert.equal(logs.some((l) => /tag 39 (failed|not-landed) /.test(l)), true);
+    w.now += 20_000;
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length, 1, "retry only after resolveRetryMs");
+  });
+
+  it("noteReadFailure (called by V22Loop for a registry read that failed for an RPC reason) makes the tick not-clean for the ledger and restarts the observation clock; beginTick resets it", async () => {
+    const w = world();
+    const { ctx } = addMarket(w, matured({ authority: OTHER }));
+    const { e, ledger } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    e.beginTick();
+    e.noteReadFailure();
+    e.observe(ctx);
+    await e.endTick();
+    assert.equal(w.exec.sent.length, 0, "a tick with a read failure is not a clean observation: no resolve");
+    assert.equal(ledger.continuousMs(w.now) < 3_600_000, true, "the ledger saw a failed tick");
+  });
+
+  it("a getSlot failure marks the tick not-clean: classification and alerts still run, but no fee round or resolve is attempted", async () => {
+    const w = world();
+    const { ctx } = addMarket(w, matured({ authority: OTHER }));
+    w.slotFails = true;
+    const { e, ledger, sink } = engineFor(w, { staleResolve: "on" });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [ctx]);
+    assert.equal(w.exec.sent.length + w.exec.sims.length, 0);
+    assert.equal(sink.active("v22-lifecycle:dead-price-matured").length, 1);
+  });
+});
 
 describe("V22Loop wiring", () => {
   it("tick feeds the engine: /health gains v22.lifecycle (additive), nothing is sent with the defaults", async () => {
