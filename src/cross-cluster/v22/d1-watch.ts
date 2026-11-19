@@ -114,7 +114,7 @@ export interface AdlD1Summary {
  * observed has no episodes. State is in memory (see the header: a restart makes ages lower bounds).
  */
 export class AdlEpisodeTracker {
-  private readonly since = new Map<number, { slot: bigint; sinceBoot: boolean }>();
+  private readonly since = new Map<number, { slot: bigint; sinceBoot: boolean; missingSince?: bigint }>();
   private observedOnce = false;
   private ended = 0;
   private longest = 0n;
@@ -148,8 +148,17 @@ export class AdlEpisodeTracker {
         slotsToBound: age >= this.t.boundSlots ? 0n : this.t.boundSlots - age,
       });
     }
-    // an asset that vanished from the readings (retired / not in the account) ends its episode
-    for (const k of [...this.since.keys()]) if (!seen.has(k)) this.close(k, nowSlot);
+    // An asset missing from the readings (loop.ts skips a non-active lifecycle byte; observationAssetsFor can briefly drop it) is
+    // NOT a positive exit: keep its episode (original start slot) so the overdue alert is not reset. Only a reading with
+    // closeOnly=false ends an episode, or an absence longer than the wind-down bound (treated as retired).
+    for (const [k, s] of [...this.since.entries()]) {
+      if (seen.has(k)) {
+        s.missingSince = undefined;
+        continue;
+      }
+      s.missingSince ??= nowSlot;
+      if (nowSlot - s.missingSince > this.t.boundSlots) this.close(k, nowSlot);
+    }
     return out;
   }
 
