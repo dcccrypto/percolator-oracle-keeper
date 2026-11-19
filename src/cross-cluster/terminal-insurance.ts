@@ -95,7 +95,7 @@ export function isCreatorTokenAccount(ai: { owner: PublicKey; data: Uint8Array }
 const ATA_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 /** pool.admin's classic-token collateral ATA (SDK `creatorCollateralAtaV5`). */
 export function creatorCollateralAta(admin: PublicKey, collateralMint: PublicKey): PublicKey {
-  const key = admin.toBase58() + collateralMint.toBase58();
+  const key = `${admin.toBase58()}:${collateralMint.toBase58()}`; // ':' is not base58: no ambiguous concatenation
   const hit = ataCache.get(key);
   if (hit) return hit;
   const ata = PublicKey.findProgramAddressSync([admin.toBuffer(), TOKEN_PROGRAM.toBuffer(), collateralMint.toBuffer()], ATA_PROGRAM)[0];
@@ -120,7 +120,7 @@ function marketKey(addr: string): PublicKey {
   return pk;
 }
 function stakePoolFor(market: PublicKey, stakeProgramId: PublicKey): PublicKey {
-  const key = market.toBase58() + stakeProgramId.toBase58();
+  const key = `${market.toBase58()}:${stakeProgramId.toBase58()}`;
   const hit = stakePoolCache.get(key);
   if (hit) return hit;
   const pool = deriveStakePool(market, stakeProgramId)[0];

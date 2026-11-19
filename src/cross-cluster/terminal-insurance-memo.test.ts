@@ -45,6 +45,18 @@ describe("creator ATA memo differential", () => {
     }
     assert.equal(mismatches, 0);
   });
+  it("concatenation-ambiguous pairs (admin A1+c vs mint c+M) do not share a cache entry", { timeout: 120_000 }, () => {
+    // Find a 44-char admin and a 43-char mint so that moving one char across the boundary gives another valid pair.
+    let a2: PublicKey, m2: PublicKey;
+    do { a2 = key(); } while (a2.toBase58().length !== 44);
+    do { m2 = key(); } while (m2.toBase58().length !== 43);
+    const s1 = a2.toBase58().slice(0, 43), s2 = a2.toBase58().slice(43) + m2.toBase58();
+    let a1: PublicKey, m1: PublicKey;
+    try { a1 = new PublicKey(s1); m1 = new PublicKey(s2); } catch { return; } // not decodable to 32 bytes: nothing to collide
+    if (a1.toBuffer().length !== 32 || m1.toBuffer().length !== 32) return;
+    assert.ok(creatorCollateralAta(a1, m1).equals(refAta(a1, m1)));
+    assert.ok(creatorCollateralAta(a2, m2).equals(refAta(a2, m2)));
+  });
   it("swapped admin/mint do not collide", () => {
     const a = key(), m = key();
     assert.ok(creatorCollateralAta(a, m).equals(refAta(a, m)));
