@@ -86,6 +86,32 @@ describe("d1-watch: episode tracker", () => {
     tr.observe([reading(false)], 10_500n);
     assert.equal(tr.summary([]).endedPastBound, 1);
   });
+  it("a one-tick gap in the readings does not restart the episode: still overdue with the original start slot", () => {
+    const tr = new AdlEpisodeTracker(T);
+    tr.observe([reading(true)], 1_000n);
+    assert.deepEqual(tr.observe([], 6_000n), []);
+    const [e] = tr.observe([reading(true)], 11_000n);
+    assert.equal(e.observedSinceSlot, 1_000n);
+    assert.equal(e.ageSlots, 10_000n);
+    assert.equal(e.level, "overdue");
+    assert.equal(tr.summary([]).endedEpisodes, 0);
+  });
+  it("a real exit (asset reported active) still ends the episode, gap or not", () => {
+    const tr = new AdlEpisodeTracker(T);
+    tr.observe([reading(true)], 1_000n);
+    tr.observe([], 6_000n);
+    assert.deepEqual(tr.observe([reading(false)], 7_000n), []);
+    assert.equal(tr.summary([]).endedEpisodes, 1);
+    const [e] = tr.observe([reading(true)], 8_000n);
+    assert.equal(e.observedSinceSlot, 8_000n);
+  });
+  it("an asset absent for longer than the bound is treated as retired and its episode ends", () => {
+    const tr = new AdlEpisodeTracker(T);
+    tr.observe([reading(true)], 1_000n);
+    tr.observe([], 2_000n);
+    tr.observe([], 11_001n);
+    assert.equal(tr.summary([]).endedEpisodes, 1);
+  });
   it("assets are independent; reset() (terminal market) ends every episode", () => {
     const tr = new AdlEpisodeTracker(T);
     const eps = tr.observe([reading(true, 0), reading(false, 1), reading(true, 2)], 1_000n);
