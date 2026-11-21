@@ -103,6 +103,44 @@ describe("onPushLanded control flow", () => {
     assert.equal(k.stats.cranked, 1);
   });
 
+  it("busy push's price is not recorded: the next push at that price still cranks", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let first = true;
+    const cn = conn({ sim: async () => { if (first) { first = false; await gate; } return { value: { err: null, logs: [] } }; } });
+    const k = mk(cn);
+    const p1 = k.onPushLanded(MK, 1n);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(await k.onPushLanded(MK, 2n), "busy");
+    release();
+    assert.equal(await p1, "cranked");
+    assert.equal(await k.onPushLanded(MK, 2n), "cranked");
+    assert.equal(cn.c.sent, 2);
+  });
+
+  it("A->B(busy)->A: the return to A after a busy push still cranks", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let first = true;
+    const cn = conn({ sim: async () => { if (first) { first = false; await gate; } return { value: { err: null, logs: [] } }; } });
+    const k = mk(cn);
+    const p1 = k.onPushLanded(MK, 1n);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(await k.onPushLanded(MK, 2n), "busy");
+    release();
+    await p1;
+    assert.equal(await k.onPushLanded(MK, 1n), "cranked");
+  });
+
+  it("failed simulation clears lastMark so the same price retries", async () => {
+    let bad = true;
+    const cn = conn({ sim: async () => (bad ? { value: { err: { InstructionError: [0, { Custom: 1 }] }, logs: [] } } : { value: { err: null, logs: [] } }) });
+    const k = mk(cn);
+    assert.equal(await k.onPushLanded(MK, 7n), "failed");
+    bad = false;
+    assert.equal(await k.onPushLanded(MK, 7n), "cranked");
+  });
+
   it("thrown RPC error: failed, lastMark cleared so the same mark retries", async () => {
     let fail = true;
     const cn = conn({ blockhash: async () => { if (fail) throw new Error("rpc boom"); return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 }; } });
