@@ -40,23 +40,36 @@ export async function getCachedBlockhash(
   if (hit && now - hit.at <= maxAge) return hit.value;
   const pending = inflight.get(key);
   if (pending) return pending;
-  const p = (async () => {
+  // Start the RPC call outside the IIFE so a synchronous throw becomes a rejection awaited below,
+  // i.e. `finally` can never run before `p` is assigned.
+  let started: Promise<{ blockhash: string; lastValidBlockHeight: number }>;
+  try {
+    started = Promise.resolve(conn.getLatestBlockhash(commitment));
+  } catch (e) {
+    started = Promise.reject(e);
+  }
+  const self: { p?: Promise<CachedBlockhash> } = {};
+  const p: Promise<CachedBlockhash> = (self.p = (async () => {
     try {
-      const v = await conn.getLatestBlockhash(commitment);
+      const v = await started;
       const value = { blockhash: v.blockhash, lastValidBlockHeight: v.lastValidBlockHeight };
-      entries.set(key, { value, at: (opts.now ?? Date.now)() });
+      // Superseded by an invalidate while in flight: hand the value to its own callers but do not cache it.
+      // `at` is the fetch START: the hash is at least that old by the time a slow RPC returns.
+      if (inflight.get(key) === self.p) entries.set(key, { value, at: now });
       return value;
     } finally {
-      inflight.delete(key);
+      if (inflight.get(key) === self.p) inflight.delete(key);
     }
-  })();
+  })());
   inflight.set(key, p);
   return p;
 }
 
-/** Drop the cached blockhash (all commitments of this endpoint). */
+/** Drop the cached blockhash and detach any in-flight fetch (all commitments of this endpoint). */
 export function invalidateBlockhash(conn: Pick<Connection, "rpcEndpoint">): void {
-  for (const k of [...entries.keys()]) if (k.startsWith(`${conn.rpcEndpoint}|`)) entries.delete(k);
+  const prefix = `${conn.rpcEndpoint}|`;
+  for (const k of [...entries.keys()]) if (k.startsWith(prefix)) entries.delete(k);
+  for (const k of [...inflight.keys()]) if (k.startsWith(prefix)) inflight.delete(k);
 }
 
 /** Test hook. */
