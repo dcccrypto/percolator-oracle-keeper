@@ -410,4 +410,218 @@ describe("windDownConfigFromEnv", () => {
     assert.throws(() => windDownConfigFromEnv({ P2B_WIND_DOWN_MAX_PER_CYCLE: "0" }, false), /P2B_WIND_DOWN_MAX_PER_CYCLE/);
     assert.equal(windDownConfigFromEnv({ P2B_WIND_DOWN_MAX_PER_CYCLE: "2" }, true).dryRun, true);
   });
+
+  it("unset / empty / whitespace-only values fall back to the default", () => {
+    const c = windDownConfigFromEnv({ P2B_WIND_DOWN_MAX_PER_MARKET: "", P2B_WIND_DOWN_MAX_PER_CYCLE: "   ", P2B_WIND_DOWN_MAX_SIMS: undefined }, false);
+    assert.deepEqual([c.maxSendsPerMarket, c.maxSendsPerCycle, c.maxSimsPerMarket], [3, 8, 6]);
+  });
+
+  it("every knob is read from its env name", () => {
+    const c = windDownConfigFromEnv({
+      P2B_WIND_DOWN_MAX_PER_MARKET: "5", P2B_WIND_DOWN_MAX_PER_CYCLE: "9", P2B_WIND_DOWN_MAX_SIMS: "11",
+      P2B_WIND_DOWN_MAX_MARK_AGE_SLOTS: "100", P2B_WIND_DOWN_CU: "300000", P2B_WIND_DOWN_COOLDOWN_MS: "1234",
+    }, false);
+    assert.deepEqual([c.maxSendsPerMarket, c.maxSendsPerCycle, c.maxSimsPerMarket, c.maxMarkAgeSlots, c.computeUnits, c.cooldownMs], [5, 9, 11, 100, 300_000, 1234]);
+  });
+
+  it("min / max boundaries are inclusive; one past either side throws", () => {
+    const ok = (name: string, v: number) => windDownConfigFromEnv({ [name]: String(v) }, false);
+    const bad = (name: string, v: number) => assert.throws(() => ok(name, v), new RegExp(name));
+    assert.equal(ok("P2B_WIND_DOWN_MAX_PER_MARKET", 1).maxSendsPerMarket, 1);
+    assert.equal(ok("P2B_WIND_DOWN_MAX_PER_MARKET", 64).maxSendsPerMarket, 64);
+    bad("P2B_WIND_DOWN_MAX_PER_MARKET", 0); bad("P2B_WIND_DOWN_MAX_PER_MARKET", 65);
+    assert.equal(ok("P2B_WIND_DOWN_MAX_PER_CYCLE", 256).maxSendsPerCycle, 256);
+    bad("P2B_WIND_DOWN_MAX_PER_CYCLE", 257);
+    assert.equal(ok("P2B_WIND_DOWN_MAX_SIMS", 1).maxSimsPerMarket, 1);
+    assert.equal(ok("P2B_WIND_DOWN_MAX_SIMS", 256).maxSimsPerMarket, 256);
+    bad("P2B_WIND_DOWN_MAX_SIMS", 0); bad("P2B_WIND_DOWN_MAX_SIMS", 257);
+    assert.equal(ok("P2B_WIND_DOWN_MAX_MARK_AGE_SLOTS", 1).maxMarkAgeSlots, 1);
+    bad("P2B_WIND_DOWN_MAX_MARK_AGE_SLOTS", 0);
+    assert.equal(ok("P2B_WIND_DOWN_CU", 50_000).computeUnits, 50_000);
+    assert.equal(ok("P2B_WIND_DOWN_CU", 1_400_000).computeUnits, 1_400_000);
+    bad("P2B_WIND_DOWN_CU", 49_999); bad("P2B_WIND_DOWN_CU", 1_400_001);
+    assert.equal(ok("P2B_WIND_DOWN_COOLDOWN_MS", 0).cooldownMs, 0);
+    assert.equal(ok("P2B_WIND_DOWN_COOLDOWN_MS", 3_600_000).cooldownMs, 3_600_000);
+    bad("P2B_WIND_DOWN_COOLDOWN_MS", -1); bad("P2B_WIND_DOWN_COOLDOWN_MS", 3_600_001);
+  });
+
+  it("non-numeric and fractional values are rejected (the error names the knob and the raw value)", () => {
+    for (const raw of ["abc", "1.5", "NaN", "Infinity", "-Infinity", "3 4"]) {
+      assert.throws(() => windDownConfigFromEnv({ P2B_WIND_DOWN_COOLDOWN_MS: raw }, false), (e: Error) => e.message.includes("P2B_WIND_DOWN_COOLDOWN_MS") && e.message.includes(`"${raw}"`));
+    }
+  });
+
+  it("decimal only: hex, binary, octal and exponent spellings are rejected, surrounding whitespace is tolerated", () => {
+    for (const raw of ["0x10", "0X10", "0b11", "0o7", "1e2", "1E2", "+5", "+5e0", "5.0", "0x0", "1_0"]) {
+      assert.throws(() => windDownConfigFromEnv({ P2B_WIND_DOWN_MAX_PER_CYCLE: raw }, false), /P2B_WIND_DOWN_MAX_PER_CYCLE/, raw);
+    }
+    assert.equal(windDownConfigFromEnv({ P2B_WIND_DOWN_MAX_PER_CYCLE: " 7 " }, false).maxSendsPerCycle, 7);
+  });
+});
+
+describe("readWindDownView: boundaries", () => {
+  it("a future mark slot clamps the age to 0", () => {
+    const m = roMarket({ episodeSince: BigInt(NOW - 9000), markSlot: BigInt(NOW + 500) });
+    assert.equal(readWindDownView(m, 0, BigInt(NOW))!.markAgeSlots, 0n);
+  });
+
+  it("a truncated or out-of-range read throws (decodeAdlState) and the runner contains it as unreadable", async () => {
+    const m = roMarket();
+    assert.throws(() => readWindDownView(m.subarray(0, 100), 0, BigInt(NOW)));
+    assert.throws(() => readWindDownView(m, 200, BigInt(NOW)));
+    const g = rig({ holders: [holder(1, "short")] });
+    assert.deepEqual(await g.r.runMarket(snap(m.subarray(0, 100))), { kind: "skipped", why: "unreadable" });
+  });
+});
+
+describe("runner: edge turns", () => {
+  it("long-side wind-down winds down the long holders", async () => {
+    const g = rig({ holders: [holder(1, "short"), holder(2, "long")], sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    const out = await g.r.runMarket(snap(patchedMarket({ aLong: RO_SHORT, oiEffLong: BIG_OI, oiEffShort: BIG_OI, episodeSince: BigInt(NOW - 9000) })));
+    assert.equal(out.kind, "acted");
+    assert.equal(g.c.sent.length, 1);
+  });
+
+  it("no market data -> none; a non-Error throw is stringified into the log and contained", async () => {
+    const g = rig({ holders: [holder(1, "short")] });
+    assert.deepEqual(await g.r.runMarket(snapshot({ marketData: null, slot: NOW, label: "PERC" })), { kind: "none" });
+    const lines: string[] = [];
+    const r = new AdlWindDownRunner(DEFAULT_WIND_DOWN_CONFIG, {
+      programId: PROGRAM, conn: fakeConn().conn as never, keeper: KEEPER,
+      fetchHolders: async () => { throw "boom-string"; },
+      mintDecimals: async () => 6, now: () => 1, log: (l) => lines.push(l),
+    });
+    assert.deepEqual(await r.runMarket(snap(roMarket({ episodeSince: BigInt(NOW - 9000) }))), { kind: "skipped", why: "unreadable" });
+    assert.match(lines[0], /PERC: boom-string/);
+  });
+
+  it("the reduce-only side has no holder -> falls back to all holders (a long-only book on a short-side wind-down)", async () => {
+    const g = rig({ holders: [holder(1, "long")], sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    const out = await g.r.runMarket(snap(roMarket({ episodeSince: BigInt(NOW - 9000) })));
+    assert.equal(out.kind, "acted");
+    assert.equal(g.c.sent.length, 1);
+  });
+});
+
+describe("runner: a send that does not land counts nothing", () => {
+  const run = async (c: ReturnType<typeof fakeConn>) => {
+    const lines: string[] = [];
+    const r = new AdlWindDownRunner(DEFAULT_WIND_DOWN_CONFIG, {
+      programId: PROGRAM, conn: c.conn as never, keeper: KEEPER,
+      fetchHolders: async () => [holder(1, "short")],
+      mintDecimals: async () => 6, now: () => 1, log: (l) => lines.push(l), confirm: { statusRetries: 0, statusRetryDelayMs: 1 },
+    });
+    const out = await r.runMarket(snap(roMarket({ episodeSince: BigInt(NOW - 9000) })));
+    return { r, out, lines };
+  };
+
+  it("landed but failed on chain -> logged, not counted as sent", async () => {
+    const c = fakeConn({ sims: [{ err: null, logs: [CLOSED_LOG] }], confirmErr: { InstructionError: [0, { Custom: 5 }] } });
+    const { r, out, lines } = await run(c);
+    assert.deepEqual(out, { kind: "acted", armed: 0, closed: 0, sims: 1, sent: 0 });
+    assert.equal(r.stats.sent, 0);
+    assert.ok(lines.some((l) => /landed but failed on chain sig=/.test(l)));
+  });
+
+  it("a landed send whose simulation reported no CU figure logs '?' and counts as sent", async () => {
+    const c = fakeConn({ sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    const base = c.conn.simulateTransaction.bind(c.conn);
+    (c.conn as Record<string, unknown>).simulateTransaction = async (...a: Parameters<typeof base>) => {
+      const r = await base(...a);
+      return { ...r, value: { ...r.value, unitsConsumed: undefined } };
+    };
+    const { r, out, lines } = await run(c);
+    assert.equal((out as { sent: number }).sent, 1);
+    assert.equal(r.stats.sent, 1);
+    assert.ok(lines.some((l) => /simulated \? CU of/.test(l)));
+  });
+
+  it("never lands (status unknown, blockhash expired) -> 'not landed'", async () => {
+    const c = fakeConn({ sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    (c.conn as Record<string, unknown>).getSignatureStatuses = async () => ({ context: { slot: 1 }, value: [null] });
+    (c.conn as Record<string, unknown>).getBlockHeight = async () => 1_000_000;
+    const { r, out, lines } = await run(c);
+    assert.equal((out as { sent: number }).sent, 0);
+    assert.equal(r.stats.sent, 0);
+    assert.ok(lines.some((l) => /not landed sig=/.test(l)));
+  });
+});
+
+describe("runner: default log and clock", () => {
+  it("without deps.log the line goes to console.log; without deps.now Date.now drives the cooldown", async () => {
+    const lines: string[] = [];
+    const orig = console.log;
+    console.log = (l: string) => { lines.push(String(l)); };
+    try {
+      const c = fakeConn({ sims: [{ err: ie({ Custom: 21 }) }] });
+      let fetches = 0;
+      const r = new AdlWindDownRunner(DEFAULT_WIND_DOWN_CONFIG, { programId: PROGRAM, conn: c.conn as never, keeper: KEEPER, fetchHolders: async () => { fetches++; return [holder(1, "short")]; }, mintDecimals: async () => 6 });
+      await r.runMarket(snap(roMarket({ episodeSince: BigInt(NOW - 9000), markSlot: BigInt(NOW - 200) })));
+      assert.match(lines.join("\n"), /\[p2b-wind-down\] PERC: .*skipped until a push lands/);
+      const s = snap(roMarket({ episodeSince: BigInt(NOW - 9000) }));
+      await r.runMarket(s);
+      assert.deepEqual(await r.runMarket(s), { kind: "skipped", why: "cooldown" });
+      assert.equal(fetches, 1);
+    } finally {
+      console.log = orig;
+    }
+  });
+});
+
+describe("runner: capped turn does not set the cooldown", () => {
+  it("per-market send cap reached with holders left -> skippedCap counted, and a sending turn leaves no cooldown", async () => {
+    let now = 1_000_000;
+    const c = fakeConn({ sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    let fetches = 0;
+    const r = new AdlWindDownRunner({ ...DEFAULT_WIND_DOWN_CONFIG, cooldownMs: 60_000, maxSendsPerMarket: 1 }, {
+      programId: PROGRAM, conn: c.conn as never, keeper: KEEPER,
+      fetchHolders: async () => { fetches++; return [holder(1, "short"), holder(2, "short")]; },
+      mintDecimals: async () => 6, now: () => now, log: () => undefined, confirm: { statusRetries: 0, statusRetryDelayMs: 1 },
+    });
+    const s = snap(roMarket({ episodeSince: BigInt(NOW - 9000) }));
+    assert.deepEqual(await r.runMarket(s), { kind: "acted", armed: 0, closed: 1, sims: 1, sent: 1 });
+    assert.equal(r.stats.skippedCap, 1);
+    now += 1;
+    assert.equal((await r.runMarket(s)).kind, "acted", "not in cooldown");
+    assert.equal(fetches, 2);
+    assert.equal(r.stats.skippedCooldown, 0);
+  });
+
+  it("sim cap reached with only refusals: capped, so NO cooldown is set (unlike an exhausted all-refused turn)", async () => {
+    let now = 1_000_000;
+    const c = fakeConn({ sims: [{ err: ie({ Custom: 21 }) }] });
+    let fetches = 0;
+    const r = new AdlWindDownRunner({ ...DEFAULT_WIND_DOWN_CONFIG, cooldownMs: 60_000, maxSimsPerMarket: 1 }, {
+      programId: PROGRAM, conn: c.conn as never, keeper: KEEPER,
+      fetchHolders: async () => { fetches++; return [holder(1, "short"), holder(2, "short")]; },
+      mintDecimals: async () => 6, now: () => now, log: () => undefined,
+    });
+    const s = snap(roMarket({ episodeSince: BigInt(NOW - 9000) }));
+    await r.runMarket(s);
+    now += 1;
+    const out = await r.runMarket(s);
+    assert.equal(out.kind, "acted");
+    assert.equal(fetches, 2);
+    assert.equal(r.stats.skippedCap, 2);
+    assert.equal(r.stats.skippedCooldown, 0);
+  });
+
+  it("a capped turn after an expired cooldown does not set a new one", async () => {
+    let now = 1_000_000;
+    const c = fakeConn({ sims: [{ err: ie({ Custom: 21 }) }] });
+    let capNow = false;
+    const r = new AdlWindDownRunner({ ...DEFAULT_WIND_DOWN_CONFIG, cooldownMs: 60_000, maxSimsPerMarket: 1 }, {
+      programId: PROGRAM, conn: c.conn as never, keeper: KEEPER,
+      fetchHolders: async () => (capNow ? [holder(1, "short"), holder(2, "short")] : [holder(1, "short")]),
+      mintDecimals: async () => 6, now: () => now, log: () => undefined,
+    });
+    const s = snap(roMarket({ episodeSince: BigInt(NOW - 9000) }));
+    await r.runMarket(s); // all refused -> cooldown set
+    now += 60_001;
+    capNow = true;
+    const out = await r.runMarket(s);
+    assert.equal(out.kind, "acted");
+    now += 1;
+    assert.equal((await r.runMarket(s)).kind, "acted", "capped turn removed the cooldown entry");
+  });
 });
