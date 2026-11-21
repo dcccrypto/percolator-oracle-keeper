@@ -46,6 +46,9 @@ export interface RegistryReloadConfig {
   registryPath: string;
   /** Milliseconds between reload checks (default 15_000). */
   intervalMs?: number;
+  /** Test seams (default Date.now / setTimeout). */
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 const DEFAULT_RELOAD_INTERVAL_MS = 15_000;
@@ -144,7 +147,15 @@ export async function startRegistryReloadLoop(
   registry: Registry,
   config: RegistryReloadConfig,
 ): Promise<void> {
-  const intervalMs = config.intervalMs ?? DEFAULT_RELOAD_INTERVAL_MS;
+  // A non-finite or non-positive interval (pusher.ts parseInt of a bad env -> NaN/0)
+  // would skip the sleep and spin this synchronous loop forever, starving the event loop.
+  const rawInterval = config.intervalMs ?? DEFAULT_RELOAD_INTERVAL_MS;
+  const intervalMs = Number.isFinite(rawInterval) && rawInterval > 0 ? rawInterval : DEFAULT_RELOAD_INTERVAL_MS;
+  if (intervalMs !== rawInterval) {
+    console.warn(`[registry-reload] invalid intervalMs=${String(rawInterval)} — using ${DEFAULT_RELOAD_INTERVAL_MS}ms`);
+  }
+  const now = config.now ?? Date.now;
+  const sleep = config.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   console.log(`[registry-reload] starting: path=${config.registryPath} interval=${intervalMs}ms`);
 
   let stopping = false;
@@ -156,7 +167,7 @@ export async function startRegistryReloadLoop(
   });
 
   while (!stopping) {
-    const cycleStart = Date.now();
+    const cycleStart = now();
     try {
       reloadRegistryOnce(registry, config.registryPath);
     } catch (err) {
@@ -164,11 +175,11 @@ export async function startRegistryReloadLoop(
       // mode internally, but never let an unexpected throw kill this loop.
       console.error(`[registry-reload] unexpected error: ${err instanceof Error ? err.message : String(err)}`);
     }
-    const elapsed = Date.now() - cycleStart;
-    const remaining = intervalMs - elapsed;
-    if (remaining > 0 && !stopping) {
-      await new Promise((r) => setTimeout(r, remaining));
-    }
+    const elapsed = now() - cycleStart;
+    // Floor 1ms (always yield to the event loop, so signals/other loops run even if the
+    // cycle overran); cap at intervalMs (a backwards clock step makes elapsed negative).
+    const remaining = Math.min(intervalMs, Math.max(1, intervalMs - elapsed));
+    if (!stopping) await sleep(remaining);
   }
   console.log("[registry-reload] stopped.");
 }
