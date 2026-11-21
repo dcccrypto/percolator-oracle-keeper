@@ -132,3 +132,43 @@ test("publisher: a non-https url fails closed at startup (throws), and the messa
   assert.equal(createTickPublisher({ url: "http://localhost:8787/y", key }).enabled, true);
   assert.equal(createTickPublisher({ url: "", key }).enabled, false);
 });
+
+test("publisher: every input tick is accounted for when a batch fails midway (500 on first of 3 bodies)", async () => {
+  let calls = 0;
+  const p = createTickPublisher({ url: "https://u.example/t", key: "k", fetchImpl: (async () => { calls++; return new Response("no", { status: 500 }); }) as unknown as typeof fetch });
+  const inputs = Array.from({ length: 450 }, (_, i) => inp(i + 1));
+  p.publish(inputs, 1, 1);
+  await tick();
+  const c = p.counters();
+  assert.equal(calls, 1);
+  assert.equal(c.failed, 1);
+  assert.equal(c.sent + c.dropped, 450);
+});
+
+test("publisher: failure on 2nd body and thrown fetch both account every tick", async () => {
+  let calls = 0;
+  const p = createTickPublisher({ url: "https://u.example/t", key: "k", fetchImpl: (async () => { calls++; if (calls === 2) throw new Error("x"); return new Response("ok"); }) as unknown as typeof fetch });
+  p.publish(Array.from({ length: 450 }, (_, i) => inp(i + 1)), 1, 1);
+  await tick();
+  const c = p.counters();
+  assert.equal(c.sent, 200);
+  assert.equal(c.sent + c.dropped, 450);
+});
+
+test("publisher: successful multi-body batch payload bytes unchanged and response body is cancelled", async () => {
+  const bodies: string[] = [];
+  let cancelled = 0;
+  const p = createTickPublisher({ url: "https://u.example/t", key: "k", now: () => 42, fetchImpl: (async (_u: string, init: RequestInit) => {
+    bodies.push(init.body as string);
+    const res = new Response(new ReadableStream({ cancel() { cancelled++; } }));
+    return res;
+  }) as unknown as typeof fetch });
+  const inputs = Array.from({ length: 250 }, (_, i) => inp(i + 1));
+  p.publish(inputs, 9, 5);
+  await tick();
+  const expected = buildTickBodies(inputs, 9, 5, 42).map((b) => JSON.stringify({ ...b, sentMs: 42 }));
+  assert.deepEqual(bodies, expected);
+  assert.equal(p.counters().sent, 250);
+  assert.equal(p.counters().dropped, 0);
+  assert.equal(cancelled, 2);
+});

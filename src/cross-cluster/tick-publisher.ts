@@ -134,16 +134,25 @@ export function createTickPublisher(opts: TickPublisherOptions = {}): TickPublis
     }
   };
 
+  // Count every tick in bodies[from..] as dropped so sent + dropped covers all input.
   const send = async (bodies: TickBody[]): Promise<void> => {
+    const lose = (from: number): void => {
+      for (let j = from; j < bodies.length; j++) c.dropped += bodies[j]!.ticks.length;
+    };
+    let i = 0;
     try {
-      for (const body of bodies) {
+      for (; i < bodies.length; i++) {
+        const body = bodies[i]!;
         const res = await doFetch(url, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
           body: JSON.stringify({ ...body, sentMs: now() }),
           signal: AbortSignal.timeout(timeoutMs),
         });
+        // Release the socket now rather than at the abort timer / GC.
+        void res.body?.cancel().catch(() => {});
         if (!res.ok) {
+          lose(i);
           noteFailure(`HTTP ${res.status}`);
           return;
         }
@@ -151,6 +160,7 @@ export function createTickPublisher(opts: TickPublisherOptions = {}): TickPublis
         c.lastOkMs = now();
       }
     } catch (err) {
+      lose(i);
       noteFailure(err instanceof Error ? err.name : "error");
     } finally {
       inFlight = false;
