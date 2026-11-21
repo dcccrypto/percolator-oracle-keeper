@@ -31,7 +31,16 @@ export function pushDepthEnabled(env: Record<string, string | undefined> = proce
 export function isqrt(n: bigint): bigint {
   if (n < 0n) throw new RangeError("isqrt: negative input");
   if (n < 2n) return n;
-  let x = 1n << BigInt((n.toString(2).length + 1) >> 1); // >= sqrt(n)
+  // Seed >= sqrt(n): float sqrt (rel. error ~2^-52) padded by 2^-40 relative + 2. Falls back to the bit-length seed
+  // when n does not fit a double. Newton from any seed >= floor(sqrt(n)) is exact, only the step count differs.
+  const f = Number(n);
+  let x: bigint;
+  if (f < 1e300) {
+    const g = BigInt(Math.floor(Math.sqrt(f)));
+    x = g + (g >> 40n) + 2n;
+  } else {
+    x = 1n << BigInt((n.toString(2).length + 1) >> 1);
+  }
   for (;;) {
     const y = (x + n / x) >> 1n;
     if (y >= x) return x;
@@ -88,11 +97,38 @@ export function resolvePushDepth(
 export type PushAuthMarkArgs = Parameters<typeof encodePushAuthMark>[0];
 
 /**
+ * The SDK's 35 B encoding, written straight into one buffer. Only the plain valid shape (integer u16 asset, bigint u64s,
+ * markE6 > 0, no SDK `depth`) takes this path; anything else (strings, numbers, out-of-range, `depth`) goes to the SDK
+ * so every error and coercion stays the SDK's.
+ */
+function encodeBase(args: PushAuthMarkArgs): Uint8Array {
+  const { assetIndex: a, marketId: m, nowSlot: n, markE6: k, observationSequence: o } = args;
+  if (
+    args.depth === undefined &&
+    typeof m === "bigint" && typeof n === "bigint" && typeof k === "bigint" && typeof o === "bigint" &&
+    Number.isInteger(a) && a >= 0 && a <= 0xffff &&
+    k > 0n && k <= U64_MAX && m >= 0n && m <= U64_MAX && n >= 0n && n <= U64_MAX && o >= 0n && o <= U64_MAX
+  ) {
+    const out = new Uint8Array(PUSH_AUTH_MARK_LEN);
+    out[0] = PUSH_AUTH_MARK_TAG;
+    const dv = new DataView(out.buffer);
+    dv.setUint16(1, a, true);
+    dv.setBigUint64(3, m, true);
+    dv.setBigUint64(11, n, true);
+    dv.setBigUint64(19, k, true);
+    dv.setBigUint64(27, o, true);
+    return out;
+  }
+  return encodePushAuthMark(args);
+}
+const PUSH_AUTH_MARK_TAG = 63;
+
+/**
  * PushAuthMark data. No depth (or undefined) = exactly the SDK's 35 B bytes. With depth = the same 35 B plus
  * `[mode u8 = 1][depth_e6 u64 LE]` (44 B).
  */
 export function encodePushAuthMarkMaybeDepth(args: PushAuthMarkArgs, depth?: PushDepth | null): Uint8Array {
-  const base = encodePushAuthMark(args);
+  const base = encodeBase(args);
   if (!depth) return base;
   if (depth.depthE6 <= 0n || depth.depthE6 > U64_MAX) throw new RangeError("depth_e6 out of u64 range or zero");
   const out = new Uint8Array(PUSH_AUTH_MARK_WITH_DEPTH_LEN);
@@ -108,7 +144,7 @@ export function encodePushAuthMarkMaybeDepth(args: PushAuthMarkArgs, depth?: Pus
  * mode-1 encoder above refuses a zero depth, so an attested push can never go out with depth 0 by accident.
  */
 export function encodePushAuthMarkDexMode(args: PushAuthMarkArgs): Uint8Array {
-  const base = encodePushAuthMark(args);
+  const base = encodeBase(args);
   const out = new Uint8Array(PUSH_AUTH_MARK_WITH_DEPTH_LEN);
   out.set(base, 0);
   out[PUSH_AUTH_MARK_LEN] = 2;
