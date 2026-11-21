@@ -185,14 +185,24 @@ export function makeExhaustedResolveJob(cfg: ExhaustedJobConfig): FeeJob {
         }
         return { kind: "nothing" };
       }
-      if (!reg.has(m.marketAddress)) {
+      const known = reg.has(m.marketAddress);
+      if (!known || cfg.vaultLpFor) {
+        // Re-simulate on EVERY run, not only for unknown markets: once the pots are refilled the entry must
+        // drop, else shouldWithholdPush starves a healthy market of mark pushes until it leaves Live.
         if (!cfg.vaultLpFor) return { kind: "nothing" };
         const vaultLp = await cfg.vaultLpFor(market);
         if (!vaultLp) return { kind: "nothing" };
         const sim = await simulate(conn, ctx.keeper, buildObservationCrankIx(ctx.keeper.publicKey, market, vaultLp));
         const hit = unfundedFromLogs(sim.logs);
-        if (!hit) return { kind: "nothing" };
-        reg.mark(m.marketAddress, hit.deficit, hit.unfunded);
+        if (hit) {
+          reg.mark(m.marketAddress, hit.deficit, hit.unfunded);
+        } else if (known && !sim.err && sim.logs) {
+          // A clean simulation with no unfunded draw: recovered. A failed sim proves nothing, so the entry stays.
+          reg.clear(m.marketAddress);
+          return { kind: "done", detail: "senior backing no longer exhausted; push withholding lifted" };
+        } else if (!known) {
+          return { kind: "nothing" };
+        }
       }
       const e = reg.get(m.marketAddress)!;
       const slot = BigInt(await conn.getSlot("confirmed"));
