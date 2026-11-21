@@ -207,7 +207,8 @@ export async function evaluateHedgedLockouts(
   conn: HedgedLockoutConnection,
   snaps: Iterable<VaultMarketSnapshot>,
   t: HedgedLockoutThresholds,
-): Promise<{ alerts: Alert[]; records: HedgedLockoutRecord[] }> {
+): Promise<{ alerts: Alert[]; records: HedgedLockoutRecord[]; errored: string[] }> {
+  const errored: string[] = [];
   const alerts: Alert[] = [];
   const records: HedgedLockoutRecord[] = [];
   for (const s of snaps) {
@@ -243,11 +244,13 @@ export async function evaluateHedgedLockouts(
         console.warn(`[hedged-lockout] ${s.ref.label} (${s.ref.marketAddress}): controller (R3) growth record, lambda_bps is not the effective N_cap; hedged-lockout decision SKIPPED (fail closed)`);
       }
       if (verdict.status === "alert") alerts.push(hedgedLockoutAlert(s.ref.marketAddress, s.ref.label, verdict, t));
-    } catch {
-      // a market that cannot be read this tick is simply not evaluated
+    } catch (err) {
+      // a market that cannot be read this tick is not evaluated; the caller must not treat that as "alert cleared"
+      errored.push(s.ref.label);
+      console.warn(`[hedged-lockout] ${s.ref.label} (${s.ref.marketAddress}): read failed, not evaluated this tick: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`);
     }
   }
-  return { alerts, records };
+  return { alerts, records, errored };
 }
 
 function pct(bps: bigint | null): string {

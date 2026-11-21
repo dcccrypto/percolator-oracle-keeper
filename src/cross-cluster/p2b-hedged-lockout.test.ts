@@ -325,7 +325,7 @@ describe("monitor over snapshots", () => {
   it("no growth block: NO-OP, and not even an LP read (today's programs)", async () => {
     const { s, c } = world({ growth: false });
     const r = await evaluateHedgedLockouts(c.conn as never, [s], T);
-    assert.deepEqual(r, { alerts: [], records: [] });
+    assert.deepEqual(r, { alerts: [], records: [], errored: [] });
     assert.equal(c.calls.length, 0);
   });
 
@@ -344,7 +344,9 @@ describe("monitor over snapshots", () => {
   it("a market account that is not a market at all does not throw", async () => {
     const lp = Keypair.generate().publicKey;
     const s = snapshot({ marketData: new Uint8Array(50), registryData: registryBytes({ bound: true }), vaultLpData: vaultLpStateBytes({ lp }) });
-    assert.deepEqual(await evaluateHedgedLockouts(fakeConn().conn as never, [s], T), { alerts: [], records: [] });
+    const r = await evaluateHedgedLockouts(fakeConn().conn as never, [s], T);
+    assert.deepEqual([r.alerts, r.records], [[], []]);
+    assert.deepEqual(r.errored, ["TST"], "the unreadable market is reported so its alert is held, not resolved");
   });
 
   it("decodeAssetGrowthV19 is null on today's real v18 market bytes (the no-op precondition)", () => {

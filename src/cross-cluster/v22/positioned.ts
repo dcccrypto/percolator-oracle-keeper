@@ -111,6 +111,7 @@ export function analysePortfolios(
   if (!lp && p.lpPortfolio) lp = { pubkey: p.lpPortfolio, longLegs: 0, shortLegs: 0, isLp: true, lossWeight: 0n };
   if (p.anchorOverride && !overrideSeen) overrideWhy = `override ${p.anchorOverride.toBase58()} is not a decodable portfolio of this market`;
   // a passing override wins; a failing one is IGNORED (discovery of the keeper's own flat portfolio stays)
+  if (undecodable > 0) console.warn(`[v22] ${undecodable} portfolio account(s) of the expected length failed to decode and were skipped (not settled or screened this round)`);
   return { all, counterparties: all.filter((x) => !x.isLp), lp, minLegAbs, flatAnchor: overrideAnchor ?? flatAnchor, lpData, anchorOverrideRejected: overrideWhy, undecodable };
 }
 

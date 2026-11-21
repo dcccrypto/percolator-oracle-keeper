@@ -503,7 +503,9 @@ export function isBankruptPortfolio(data: Uint8Array): boolean {
   try {
     const p = parsePortfolioV17(data);
     return p.activeBitmap !== 0n && !p.matcherEnabled && p.capital + p.pnl <= 0n;
-  } catch {
+  } catch (err) {
+    // behaviour unchanged (false), but a layout change that hides every portfolio must not be silent
+    console.warn(`[bankrupt-check] portfolio decode failed, treated as not bankrupt: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`);
     return false;
   }
 }

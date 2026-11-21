@@ -25,6 +25,7 @@ import type { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import type { AlertSink } from "./alerting.ts";
 import type { MarketEntry, Registry } from "./registry.ts";
 import { readVaultMarketSnapshots } from "./p2b-markets.ts";
+import { snapshotGapAlert } from "./alerting.ts";
 import type { MarketRef, SnapshotConnection, VaultMarketSnapshot } from "./p2b-markets.ts";
 import type { P2bFeatureGate } from "./p2b-feature.ts";
 import { VaultLpAllocator } from "./p2b-allocate.ts";
@@ -105,6 +106,7 @@ export class P2bLoop {
   private readonly wallet: WalletBalanceState = createWalletBalanceState();
   private lastHedgedAt = 0;
   private hedgedRecords: HedgedLockoutRecord[] = [];
+  private gapActive = false;
   private ticks = 0;
 
   constructor(
@@ -144,8 +146,18 @@ export class P2bLoop {
       summary.markets = refs.length;
       if (refs.length === 0) return summary;
       await this.refreshWallet();
-      const snaps = await readVaultMarketSnapshots(this.deps.conn, this.deps.programId, refs);
+      const chunkStats = { droppedChunks: 0, droppedMarkets: 0 };
+      const snaps = await readVaultMarketSnapshots(this.deps.conn, this.deps.programId, refs, chunkStats);
       summary.snapshots = snaps.size;
+      // Markets with no snapshot this tick (failed chunk read): not evaluated, so their alerts must neither resolve nor reset.
+      const missing = new Set(refs.filter((r) => !snaps.has(r.marketAddress)).map((r) => r.label));
+      const missingAddrs = new Set(refs.filter((r) => !snaps.has(r.marketAddress)).map((r) => r.marketAddress));
+      if (missing.size > 0) {
+        console.warn(`[p2b] snapshots ${snaps.size}/${refs.length}: ${missing.size} markets have no snapshot this tick (tags 103/104, hedged-lockout and earn-gap skip them)`);
+      }
+      // only touches the sink while a gap exists or just closed: a fully-read tick behaves exactly as before
+      if (missing.size > 0 || this.gapActive) await this.deps.sink.reconcile("p2b:snapshot-gap", missing.size > 0 ? [snapshotGapAlert(refs.length, snaps.size, chunkStats.droppedChunks)] : []);
+      this.gapActive = missing.size > 0;
       const list: VaultMarketSnapshot[] = [...snaps.values()];
 
       // 1. tag 104: every tick, close-only markets only
@@ -167,14 +179,14 @@ export class P2bLoop {
         this.lastHedgedAt = this.now();
         const h = await evaluateHedgedLockouts(this.deps.conn, list, this.deps.hedged);
         this.hedgedRecords = h.records;
-        await this.deps.sink.reconcile("p2b:hedged-lockout", h.alerts);
+        await this.deps.sink.reconcile("p2b:hedged-lockout", h.alerts, new Set([...missing, ...h.errored]));
         summary.hedgedEvaluated = true;
       }
 
       // 4. Earn par-E3 gap
       if (this.deps.earnGap.isDue()) {
-        const alerts = await this.deps.earnGap.run(this.deps.conn, list);
-        await this.deps.sink.reconcile("p2b:earn-gap", alerts);
+        const alerts = await this.deps.earnGap.run(this.deps.conn, list, missingAddrs);
+        await this.deps.sink.reconcile("p2b:earn-gap", alerts, missing);
         summary.earnEvaluated = true;
       }
 
