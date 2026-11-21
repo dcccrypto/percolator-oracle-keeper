@@ -230,3 +230,54 @@ describe("customCodeOf", () => {
     assert.equal(customCodeOf("nope"), null);
   });
 });
+
+describe("customCodeOf differential vs the original implementation", () => {
+  const original = (err: unknown): number | null => {
+    const text = typeof err === "string" ? err : JSON.stringify(err ?? "");
+    const dec = text.match(/"Custom"\s*:\s*(\d+)/);
+    if (dec) return Number(dec[1]);
+    const hex = text.match(/custom program error:\s*0x([0-9a-fA-F]+)/);
+    return hex ? parseInt(hex[1], 16) : null;
+  };
+  it("20k generated inputs give identical results", () => {
+    let seed = 12345;
+    const rnd = (n: number) => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return seed % n; };
+    const nums = [0, -0, 1, 6021, 2 ** 31, Number.MAX_SAFE_INTEGER, 2 ** 53, 1e21, -5, 1.5, NaN, Infinity];
+    const gen = (d: number): unknown => {
+      switch (rnd(d > 2 ? 6 : 12)) {
+        case 0: return null;
+        case 1: return nums[rnd(nums.length)];
+        case 2: return ["", "nope", "custom program error: 0x1785", `x "Custom": ${rnd(999)} y`, "custom program error:0xZZ", "Custom"][rnd(6)];
+        case 3: return undefined;
+        case 4: return rnd(2) === 0;
+        case 5: return "InstructionError";
+        case 6: case 7: return { InstructionError: [rnd(3) === 0 ? gen(d + 1) : rnd(10), { Custom: rnd(2) ? nums[rnd(nums.length)] : gen(d + 1) }] };
+        case 8: return { InstructionError: [rnd(5), gen(d + 1)] };
+        case 9: return { [["InstructionError", "Other", "Custom"][rnd(3)]]: gen(d + 1), ...(rnd(2) ? { extra: gen(d + 1) } : {}) };
+        case 10: return [gen(d + 1), gen(d + 1)];
+        default: return { InstructionError: [1, { Custom: nums[rnd(nums.length)], ...(rnd(2) ? { Custom2: gen(d + 1) } : {}) }], ...(rnd(3) === 0 ? { note: "custom program error: 0x10" } : {}) };
+      }
+    };
+    let mismatches = 0;
+    for (let i = 0; i < 20_000; i++) {
+      const v = gen(0);
+      if (!Object.is(customCodeOf(v), original(v))) mismatches++;
+    }
+    assert.equal(mismatches, 0);
+  });
+  it("toJSON / subclass shapes fall back to the original path", () => {
+    const a: any = [1, { Custom: 5 }]; a.toJSON = () => [1, { Custom: 7 }];
+    const b: any = { InstructionError: [1, { Custom: 5 }] }; Object.defineProperty(b, "toJSON", { value: () => "x", enumerable: false });
+    const c: any = { Custom: 5 }; Object.defineProperty(c, "toJSON", { value: () => ({ Custom: 9 }), enumerable: false });
+    class A extends Array { toJSON() { return "custom program error: 0x10"; } }
+    const d = A.from([1, { Custom: 5 }]);
+    for (const v of [{ InstructionError: a }, b, { InstructionError: [1, c] }, { InstructionError: d }]) {
+      assert.ok(Object.is(customCodeOf(v), original(v)));
+    }
+  });
+  it("edge shapes", () => {
+    for (const v of [new Error("x"), { toJSON: () => "custom program error: 0x5" }, Object.create({ InstructionError: 1 }), [], {}]) {
+      assert.ok(Object.is(customCodeOf(v), original(v)));
+    }
+  });
+});
