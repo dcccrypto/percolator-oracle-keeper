@@ -80,7 +80,8 @@ export function resolvePushDepth(
   cpmmQuoteReserveUsdE6: bigint | undefined,
 ): PushDepth | null {
   if (!enabled || cpmmQuoteReserveUsdE6 === undefined || cpmmQuoteReserveUsdE6 <= 0n) return null;
-  const depthE6 = plus2PctDepthE6(cpmmQuoteReserveUsdE6);
+  // The program's reserve_value_e6 caps R at u64::MAX (a cap only lowers depth); do the same so mode-1 == mode-2.
+  const depthE6 = plus2PctDepthE6(cpmmQuoteReserveUsdE6 > U64_MAX ? U64_MAX : cpmmQuoteReserveUsdE6);
   if (depthE6 <= 0n || depthE6 > U64_MAX) return null;
   return { depthE6, source: DEPTH_SOURCE_PUMPSWAP_CPMM };
 }
