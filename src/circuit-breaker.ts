@@ -208,14 +208,25 @@ function lastAt(dq: readonly MarkObservation[] | undefined): number {
   return dq && dq.length > 0 ? dq[dq.length - 1].at : Number.NEGATIVE_INFINITY;
 }
 
+/**
+ * Copy-on-write push: find how many tail entries survive first, then build the
+ * result in one exact-size allocation (no slice-then-pop-then-push growth).
+ * `isMax` selects the dominance rule: max deque drops tail <= new, min drops >= new.
+ */
 function pushDominating(
   dq: readonly MarkObservation[] | undefined,
   obs: MarkObservation,
-  dominates: (newer: number, older: number) => boolean,
+  isMax: boolean,
 ): MarkObservation[] {
-  const out = dq ? dq.slice() : [];
-  while (out.length > 0 && dominates(obs.price, out[out.length - 1].price)) out.pop();
-  out.push(obs);
+  let n = dq ? dq.length : 0;
+  const p = obs.price;
+  if (dq) {
+    if (isMax) while (n > 0 && p >= dq[n - 1].price) n--;
+    else while (n > 0 && p <= dq[n - 1].price) n--;
+  }
+  const out: MarkObservation[] = new Array(n + 1);
+  for (let i = 0; i < n; i++) out[i] = (dq as readonly MarkObservation[])[i];
+  out[n] = obs;
   return out;
 }
 
@@ -236,21 +247,25 @@ export function recordMarkInForce(
   if (!(price > 0) || !Number.isFinite(price)) return;
   const at = Math.max(atMs, lastAt(state.cbWindowMax), lastAt(state.cbWindowMin));
   const obs: MarkObservation = { price, at };
-  state.cbWindowMax = pushDominating(state.cbWindowMax, obs, (n, o) => n >= o);
-  state.cbWindowMin = pushDominating(state.cbWindowMin, obs, (n, o) => n <= o);
+  state.cbWindowMax = pushDominating(state.cbWindowMax, obs, true);
+  state.cbWindowMin = pushDominating(state.cbWindowMin, obs, false);
+}
+
+function pruneDeque(
+  dq: readonly MarkObservation[] | undefined,
+  cutoff: number,
+): readonly MarkObservation[] | undefined {
+  if (!dq) return dq;
+  let i = 0;
+  while (i < dq.length && dq[i].at < cutoff) i++;
+  return i === 0 ? dq : dq.slice(i);
 }
 
 /** Drop observations that left the trailing window. `at` exactly at the cutoff stays in. */
 function pruneWindow(state: CircuitBreakerState, nowMs: number, windowMs: number): void {
   const cutoff = nowMs - windowMs;
-  const prune = (dq: readonly MarkObservation[] | undefined) => {
-    if (!dq) return dq;
-    let i = 0;
-    while (i < dq.length && dq[i].at < cutoff) i++;
-    return i === 0 ? dq : dq.slice(i);
-  };
-  state.cbWindowMax = prune(state.cbWindowMax);
-  state.cbWindowMin = prune(state.cbWindowMin);
+  state.cbWindowMax = pruneDeque(state.cbWindowMax, cutoff);
+  state.cbWindowMin = pruneDeque(state.cbWindowMin, cutoff);
 }
 
 /**
@@ -416,6 +431,10 @@ export function checkCircuitBreaker(
   return newPrice;
 }
 
+function retryInS(band: { hiFreesAt: number; loFreesAt: number }, up: boolean, nowMs: number): number {
+  return Math.max(0, Math.round(((up ? band.hiFreesAt : band.loFreesAt) - nowMs) / 1000));
+}
+
 /** The pre-K-3 breaker: single-step threshold, confirmation run, trailing band. */
 function checkBand(
   state: CircuitBreakerState,
@@ -435,8 +454,6 @@ function checkBand(
   recordMarkInForce(state, state.lastPrice, nowMs);
   const band = markWindowBand(state, maxCumulative, windowMs);
   if (!band) return null; // unreachable: lastPrice was just recorded. Fail closed.
-  const retryInS = (up: boolean) =>
-    Math.max(0, Math.round(((up ? band.hiFreesAt : band.loFreesAt) - nowMs) / 1000));
 
   const movePct =
     Math.abs((newPrice - state.lastPrice) / state.lastPrice) * 100;
@@ -473,7 +490,7 @@ function checkBand(
           `${fmtPrice(state.lastPrice)} (price ${fmtPrice(newPrice)}, trailing ` +
           `band ${fmtPrice(band.lo)}–${fmtPrice(band.hi)} = ±${maxCumulative}% ` +
           `over ${Math.round(windowMs / 1000)}s); next step in ~` +
-          `${retryInS(newPrice > band.hi)}s.`,
+          `${retryInS(band, newPrice > band.hi, nowMs)}s.`,
       );
       return holdMark(state);
     }
@@ -513,7 +530,7 @@ function checkBand(
           `${fmtPrice(state.lastPrice)} (target ${fmtPrice(newPrice)}); ` +
           `trailing band ${fmtPrice(band.lo)}–${fmtPrice(band.hi)} ` +
           `(±${maxCumulative}% over ${Math.round(windowMs / 1000)}s) is spent, ` +
-          `next step in ~${retryInS(up)}s.`,
+          `next step in ~${retryInS(band, up, nowMs)}s.`,
       );
       return holdMark(state);
     }
@@ -526,7 +543,7 @@ function checkBand(
           `relocation ${fmtPrice(state.lastPrice)} → ${fmtPrice(newPrice)} ` +
           `to the band edge ${fmtPrice(t.edge)} (trailing band ` +
           `${fmtPrice(band.lo)}–${fmtPrice(band.hi)}, ±${maxCumulative}%). ` +
-          `Next step in ~${retryInS(up)}s.`,
+          `Next step in ~${retryInS(band, up, nowMs)}s.`,
       );
       accepted = t.edge;
     } else {
