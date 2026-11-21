@@ -25,7 +25,7 @@ import { isSolUsdEntry, readAllPoolPricesE6 } from "./price-reader.ts";
 import { createMarkSmoother } from "./mark-smoother.ts";
 import type { MarkSmoother } from "./mark-smoother.ts";
 import { createTickPublisher, type TickPublisher, type TickInput } from "./tick-publisher.ts";
-import { checkCircuitBreaker, markGap, recordMarkInForce } from "../circuit-breaker.ts";
+import { checkCircuitBreaker, markGap, ownDeque, recordMarkInForce } from "../circuit-breaker.ts";
 import type { CircuitBreakerState } from "../circuit-breaker.ts";
 import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets, pruneAuthMarkPusherState } from "./auth-mark-pusher.ts";
 import { evaluateBandPinExpiry, evaluateMarketPush, evaluatePushCycle, getAlertSink } from "./alerting.ts";
@@ -1224,14 +1224,15 @@ export function commitPublishedBreakerState(
  * when #104 (for #82) added cbDriftAnchorPrice/cbDriftAnchorAt, so the anchor was
  * dropped on every cycle and the cumulative bound degenerated to a per-step
  * bound. A shallow spread cannot fall behind the interface again. The #125
- * window deques are arrays, but circuit-breaker.ts never mutates them in place
- * (every update assigns a fresh array); they are copied here anyway so a future
- * in-place edit cannot alias the persisted state through a candidate.
+ * window deques are copied once here and the copy is marked as owned by the
+ * returned state: circuit-breaker.ts mutates an owned deque in place and copies
+ * any deque it does not own. Do not spread an owned state to snapshot it and
+ * then keep writing to the original; snapshot with this function instead.
  */
 export function cloneCircuitBreakerState(state: CircuitBreakerState): CircuitBreakerState {
   const copy: CircuitBreakerState = { ...state };
-  if (state.cbWindowMax) copy.cbWindowMax = state.cbWindowMax.slice();
-  if (state.cbWindowMin) copy.cbWindowMin = state.cbWindowMin.slice();
+  if (state.cbWindowMax) copy.cbWindowMax = ownDeque(copy, state.cbWindowMax);
+  if (state.cbWindowMin) copy.cbWindowMin = ownDeque(copy, state.cbWindowMin);
   return copy;
 }
 

@@ -208,12 +208,46 @@ function lastAt(dq: readonly MarkObservation[] | undefined): number {
   return dq && dq.length > 0 ? dq[dq.length - 1].at : Number.NEGATIVE_INFINITY;
 }
 
+/**
+ * Copy-on-write ownership. A window deque is mutated in place only by the
+ * state object that owns it, and only cloneCircuitBreakerState grants
+ * ownership (of a private copy). Every other state copies before writing.
+ * cloneCircuitBreakerState copies once and registers the copy, so the check that
+ * follows pays no further allocation.
+ */
+const OWNER = Symbol("cbDequeOwner");
+type OwnedDeque = MarkObservation[] & { [OWNER]?: object };
+
+function setOwner(dq: MarkObservation[], state: object): void {
+  // Non-enumerable so deep-equality and JSON never see it.
+  Object.defineProperty(dq, OWNER, { value: state, writable: true, configurable: true, enumerable: false });
+}
+
+export function ownDeque(
+  state: object,
+  dq: readonly MarkObservation[] | undefined,
+): MarkObservation[] | undefined {
+  if (!dq) return undefined;
+  const copy = dq.slice();
+  setOwner(copy, state);
+  return copy;
+}
+
+function writable(state: object, dq: readonly MarkObservation[] | undefined): MarkObservation[] {
+  if (dq && (dq as OwnedDeque)[OWNER] === state) return dq as MarkObservation[];
+  // Not owned: copy, and leave the copy unowned. Only cloneCircuitBreakerState
+  // hands out owned arrays, so a state built any other way keeps the "every
+  // update assigns a fresh array" contract.
+  return dq ? dq.slice() : [];
+}
+
 function pushDominating(
+  state: object,
   dq: readonly MarkObservation[] | undefined,
   obs: MarkObservation,
   dominates: (newer: number, older: number) => boolean,
 ): MarkObservation[] {
-  const out = dq ? dq.slice() : [];
+  const out = writable(state, dq);
   while (out.length > 0 && dominates(obs.price, out[out.length - 1].price)) out.pop();
   out.push(obs);
   return out;
@@ -236,8 +270,8 @@ export function recordMarkInForce(
   if (!(price > 0) || !Number.isFinite(price)) return;
   const at = Math.max(atMs, lastAt(state.cbWindowMax), lastAt(state.cbWindowMin));
   const obs: MarkObservation = { price, at };
-  state.cbWindowMax = pushDominating(state.cbWindowMax, obs, (n, o) => n >= o);
-  state.cbWindowMin = pushDominating(state.cbWindowMin, obs, (n, o) => n <= o);
+  state.cbWindowMax = pushDominating(state, state.cbWindowMax, obs, (n, o) => n >= o);
+  state.cbWindowMin = pushDominating(state, state.cbWindowMin, obs, (n, o) => n <= o);
 }
 
 /** Drop observations that left the trailing window. `at` exactly at the cutoff stays in. */
@@ -247,7 +281,10 @@ function pruneWindow(state: CircuitBreakerState, nowMs: number, windowMs: number
     if (!dq) return dq;
     let i = 0;
     while (i < dq.length && dq[i].at < cutoff) i++;
-    return i === 0 ? dq : dq.slice(i);
+    if (i === 0) return dq;
+    const w = writable(state, dq);
+    w.splice(0, i);
+    return w;
   };
   state.cbWindowMax = prune(state.cbWindowMax);
   state.cbWindowMin = prune(state.cbWindowMin);
