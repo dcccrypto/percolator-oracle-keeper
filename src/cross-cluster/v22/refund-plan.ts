@@ -296,8 +296,13 @@ export function verifyRefundPlan(plan: RefundPlan): VerifyResult {
   let sum = 0;
   const seen = new Set<string>();
   for (const m of plan.markets ?? []) {
+    const nonNegInt = (n: unknown): boolean => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+    // Amounts must be non-negative safe integers: a negative row could otherwise offset an over-cap batch in the sums below.
+    if (!nonNegInt(m.totalLamports) || !nonNegInt(m.components?.slabRentLamports) || !nonNegInt(m.components?.stakeRentLamports)) {
+      problems.push(`${m.market}: amounts must be non-negative integer lamports`);
+    }
     sum += m.totalLamports;
-    if (m.totalLamports !== m.components.slabRentLamports + m.components.stakeRentLamports) problems.push(`${m.market}: total is not the sum of its components`);
+    if (m.totalLamports !== m.components?.slabRentLamports + m.components?.stakeRentLamports) problems.push(`${m.market}: total is not the sum of its components`);
     if (m.totalLamports > MAX_PER_MARKET_LAMPORTS || m.totalLamports > (perMarket ?? 0)) problems.push(`${m.market}: over the per-market cap`);
     if (!isPubkey(m.creator) || !isPubkey(m.market)) problems.push(`${m.market}: invalid address`);
     if (seen.has(m.market)) problems.push(`${m.market}: duplicate market`);
