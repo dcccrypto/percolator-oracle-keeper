@@ -35,7 +35,6 @@ import { PublicKey } from "@solana/web3.js";
 import type { Connection } from "@solana/web3.js";
 import { decodeTerminalState, marketMode, staleResolveWindow } from "./market-state.ts";
 import { detectLayout, engineSlotBase } from "./market-layout.ts";
-import { decodeMarketRefreshState } from "./positioned-refresh.ts";
 import { V22_ASSET_BAND_OFF, V22_CONFIG_OFF } from "./v22/market.ts";
 import { parsePushAuthMarkGenerationFields } from "./auth-mark-pusher.ts";
 
@@ -75,6 +74,11 @@ function u64(d: Uint8Array, off: number): bigint {
   return new DataView(d.buffer, d.byteOffset, d.byteLength).getBigUint64(off, true);
 }
 
+/** One DataView per buffer for a loop of reads (`u64` above builds one per call). */
+function viewOf(d: Uint8Array): DataView {
+  return new DataView(d.buffer, d.byteOffset, d.byteLength);
+}
+
 function closeTo(remaining: bigint, budget: bigint): boolean {
   if (budget <= 0n) return false;
   // remaining <= budget * (1 - num/den)  <=>  elapsed >= budget * num/den
@@ -90,16 +94,20 @@ export function decodeBandPins(d: Uint8Array, readSlot: bigint): Array<NonNullab
   if (!det.known || det.layout.id !== "v2.2-b") return [];
   const layout = det.layout;
   const g = layout.groupOff;
-  const bandBps = u64(d, g + V22_CONFIG_OFF.bandBps);
+  const v = viewOf(d);
+  const bandBps = v.getBigUint64(g + V22_CONFIG_OFF.bandBps, true);
   if (bandBps === 0n) return [];
-  const maxPinSlots = u64(d, g + V22_CONFIG_OFF.bandMaxPinSlots);
+  const maxPinSlots = v.getBigUint64(g + V22_CONFIG_OFF.bandMaxPinSlots, true);
+  const lifecycleOff = layout.asset.lifecycle;
   const out: Array<NonNullable<PushDeadline["pin"]>> = [];
   for (let i = 0; i < det.slots; i++) {
-    const lifecycle = decodeMarketRefreshState(d, i).lifecycle;
-    if (lifecycle !== LIFECYCLE_ACTIVE && lifecycle !== LIFECYCLE_DRAIN_ONLY) continue;
+    // detectLayout already vouched for the exact length and slot count, so the lifecycle byte is read directly
+    // (decodeMarketRefreshState re-ran detectLayout and decoded ~15 unused fields per slot).
     const e = engineSlotBase(layout, i);
-    if (u64(d, e + V22_ASSET_BAND_OFF.epoch) === 0n) continue;
-    const sinceSlot = u64(d, e + V22_ASSET_BAND_OFF.pinSinceSlot);
+    const lifecycle = d[e + lifecycleOff];
+    if (lifecycle !== LIFECYCLE_ACTIVE && lifecycle !== LIFECYCLE_DRAIN_ONLY) continue;
+    if (v.getBigUint64(e + V22_ASSET_BAND_OFF.epoch, true) === 0n) continue;
+    const sinceSlot = v.getBigUint64(e + V22_ASSET_BAND_OFF.pinSinceSlot, true);
     if (sinceSlot === 0n) continue;
     const durationSlots = readSlot > sinceSlot ? readSlot - sinceSlot : 0n;
     // engine: expired iff now - since > max_pin
