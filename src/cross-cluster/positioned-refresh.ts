@@ -561,6 +561,24 @@ export function catchupAllowsRefresh(catchup: number): boolean {
   return catchup <= MAX_CATCHUP_WITH_REFRESH;
 }
 
+/** Byte-exact key of a PublicKey (what `equals` compares), without BN arithmetic. */
+const keyOf = (k: PublicKey): string => Buffer.from(k.toBytes()).toString("latin1");
+/**
+ * Membership set for the liquidation targets: O(1) per lookup instead of a BN-compare scan per target. Cached per
+ * array (the follow-up planner is called once per overflow group with the SAME list; rebuilding per call was slower
+ * than the scan). Callers replace the list rather than mutate it; the length check guards a push / pop.
+ */
+const liqSetCache = new WeakMap<object, { n: number; set: Set<string> }>();
+const liquidateKeySet = (ts: ReadonlyArray<PublicKey> | undefined): Set<string> => {
+  if (!ts || ts.length === 0) return EMPTY_KEYS;
+  const hit = liqSetCache.get(ts);
+  if (hit && hit.n === ts.length) return hit.set;
+  const set = new Set(ts.map(keyOf));
+  liqSetCache.set(ts, { n: ts.length, set });
+  return set;
+};
+const EMPTY_KEYS: Set<string> = new Set();
+
 /**
  * Build the per-market crank sequence:
  *   [catch-up x n] -> accrue(LP, observation) -> refresh(p) for each positioned p
@@ -630,6 +648,7 @@ export function planCrankTx(params: {
   /** Packing ceiling: the headroom is reserved, never spent on another refresh. */
   const packCap = MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM;
 
+  const liqSet = liquidateKeySet(params.liquidateTargets);
   const ordered = [...refreshTargets].sort((x, y) => Number(x.isLp) - Number(y.isLp));
   const overflow: PositionedPortfolio[] = [];
   for (const p of ordered) {
@@ -641,7 +660,7 @@ export function planCrankTx(params: {
     cranks.push({ kind: "refresh", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
     cu += refreshCu;
     const liquidateCu = cost ? cost.liquidateCu(p, LIQUIDATE_CRANK_CU) : LIQUIDATE_CRANK_CU;
-    if (!p.isLp && (params.liquidateTargets ?? []).some((t) => t.equals(p.pubkey)) && cu + liquidateCu <= packCap) {
+    if (!p.isLp && liqSet.has(keyOf(p.pubkey)) && cu + liquidateCu <= packCap) {
       cranks.push({ kind: "liquidate", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
       cu += liquidateCu;
     }
@@ -670,7 +689,7 @@ export function planRefreshTx(params: {
 }): CrankPlan {
   const { owner, market, targets } = params;
   const cost = params.cost;
-  const liq = params.liquidateTargets ?? [];
+  const liqSet = liquidateKeySet(params.liquidateTargets);
   const cranks: PlannedCrank[] = [];
   let cu = 0;
   /** Largest worst-case settle among solo targets in this transaction: its limit must absorb it. */
@@ -680,7 +699,7 @@ export function planRefreshTx(params: {
     cu += cost ? cost.refreshCu(p, REFRESH_CRANK_CU) : REFRESH_CRANK_CU;
     if (cost && cost.isSolo(p)) soloWorst = Math.max(soloWorst, cost.worstRefreshCu(p));
     const liquidateCu = cost ? cost.liquidateCu(p, LIQUIDATE_CRANK_CU) : LIQUIDATE_CRANK_CU;
-    if (!p.isLp && liq.some((t) => t.equals(p.pubkey)) && cu + liquidateCu <= MAX_TX_CU) {
+    if (!p.isLp && liqSet.has(keyOf(p.pubkey)) && cu + liquidateCu <= MAX_TX_CU) {
       cranks.push({ kind: "liquidate", portfolio: p.pubkey, ix: buildRefreshCrankIx(owner, market, p.pubkey) });
       cu += liquidateCu;
     }
