@@ -29,6 +29,15 @@ export interface ChunkedAccountsResult {
 }
 
 /**
+ * Finite integer >= 1, else `fallback`. NaN/0/negative/±Infinity/undefined must not reach the
+ * loop: NaN concurrency starts zero workers and NaN chunkSize slices empty, both leaving every
+ * info `undefined` with failedKeys=0 (indistinguishable from a clean read of missing accounts).
+ */
+function positiveIntOr(v: number | undefined, fallback: number): number {
+  return typeof v === "number" && Number.isFinite(v) && v >= 1 ? Math.floor(v) : fallback;
+}
+
+/**
  * Fetch `keys` in chunks of at most `chunkSize` (default 100), at most `concurrency`
  * chunks in flight, preserving input order. A chunk that throws is isolated: its
  * keys come back `undefined`, every other chunk is unaffected, and nothing throws.
@@ -39,8 +48,8 @@ export async function getMultipleAccountsInfoChunked(
   commitment: Commitment,
   opts: { chunkSize?: number; concurrency?: number } = {},
 ): Promise<ChunkedAccountsResult> {
-  const chunkSize = Math.min(Math.max(1, opts.chunkSize ?? MAX_ACCOUNTS_PER_RPC), MAX_ACCOUNTS_PER_RPC);
-  const concurrency = Math.max(1, opts.concurrency ?? DEFAULT_CHUNK_CONCURRENCY);
+  const chunkSize = Math.min(positiveIntOr(opts.chunkSize, MAX_ACCOUNTS_PER_RPC), MAX_ACCOUNTS_PER_RPC);
+  const concurrency = positiveIntOr(opts.concurrency, DEFAULT_CHUNK_CONCURRENCY);
   const infos: ChunkedAccountsResult["infos"] = new Array(keys.length).fill(undefined);
   const starts: number[] = [];
   for (let i = 0; i < keys.length; i += chunkSize) starts.push(i);
