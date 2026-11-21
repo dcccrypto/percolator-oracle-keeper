@@ -36,27 +36,39 @@ const METHOD_RE = /"method"\s*:\s*"([A-Za-z0-9_]+)"/g;
 export function methodsOfBody(body: unknown): string[] {
   if (typeof body !== "string") return ["<non-string-body>"];
   const out: string[] = [];
-  METHOD_RE.lastIndex = 0;
+  // Every match starts with the literal `"method"`; a body without it (or the tail after the last
+  // hit) is rejected by indexOf without running the regex engine over a large payload.
+  const first = body.indexOf('"method"');
+  if (first < 0) return ["<unknown>"];
+  const batch = body.charCodeAt(0) === 91;
+  METHOD_RE.lastIndex = first;
   let m: RegExpExecArray | null;
   while ((m = METHOD_RE.exec(body)) !== null) {
     out.push(m[1]);
     // A single request names its method once, before `params`; stop so a base64 payload can never
     // produce a phantom match. Only a batch (leading "[") has several.
-    if (body.charCodeAt(0) !== 91) break;
+    if (!batch) break;
   }
   return out.length > 0 ? out : ["<unknown>"];
 }
 
 export class RpcMetrics {
-  private readonly windows = new Map<string, MethodWindow>();
+  private readonly windows = new Map<RpcEndpointLabel, Map<string, MethodWindow>>();
+  /** Insertion order across endpoints, so snapshot() key order matches the old flat `ep:method` map. */
+  private readonly ordered: { ep: RpcEndpointLabel; method: string; w: MethodWindow }[] = [];
   constructor(private readonly now: () => number = Date.now) {}
 
   private win(endpoint: RpcEndpointLabel, method: string): MethodWindow {
-    const key = `${endpoint}:${method}`;
-    let w = this.windows.get(key);
+    let byMethod = this.windows.get(endpoint);
+    if (!byMethod) {
+      byMethod = new Map();
+      this.windows.set(endpoint, byMethod);
+    }
+    let w = byMethod.get(method);
     if (!w) {
       w = newWindow();
-      this.windows.set(key, w);
+      byMethod.set(method, w);
+      this.ordered.push({ ep: endpoint, method, w });
     }
     return w;
   }
@@ -76,14 +88,24 @@ export class RpcMetrics {
     if (status === 0) w.failed++;
   }
 
-  private sumLast(w: MethodWindow, seconds: number): number {
-    const nowSec = Math.floor(this.now() / 1000);
-    let n = 0;
-    for (let s = nowSec - seconds + 1; s <= nowSec; s++) {
-      const i = ((s % WINDOW_SECONDS) + WINDOW_SECONDS) % WINDOW_SECONDS;
-      if (w.stamps[i] === s) n += w.buckets[i];
+  /**
+   * Calls in the trailing 60 s and 300 s in one pass over the ring. Each slot maps to exactly one
+   * absolute second in the 300 s range, so `stamp > nowSec - N` (and <= nowSec) is the same test as
+   * the per-second walk it replaces.
+   */
+  private sums(w: MethodWindow, nowSec: number): [number, number] {
+    const { stamps, buckets } = w;
+    const lo60 = nowSec - 59;
+    const lo300 = nowSec - WINDOW_SECONDS + 1;
+    let n60 = 0;
+    let n300 = 0;
+    for (let i = 0; i < WINDOW_SECONDS; i++) {
+      const s = stamps[i];
+      if (s < lo300 || s > nowSec) continue;
+      n300 += buckets[i];
+      if (s >= lo60) n60 += buckets[i];
     }
-    return n;
+    return [n60, n300];
   }
 
   snapshot(): {
@@ -105,12 +127,9 @@ export class RpcMetrics {
     const put = (bucket: Record<string, Record<string, number>>, ep: string, method: string, v: number): void => {
       (bucket[ep] ??= {})[method] = v;
     };
-    for (const [key, w] of this.windows) {
-      const at = key.indexOf(":");
-      const ep = key.slice(0, at);
-      const method = key.slice(at + 1);
-      const last60 = this.sumLast(w, 60);
-      const last300 = this.sumLast(w, WINDOW_SECONDS);
+    const nowSec = Math.floor(this.now() / 1000);
+    for (const { ep, method, w } of this.ordered) {
+      const [last60, last300] = this.sums(w, nowSec);
       put(out.perMinute, ep, method, last60);
       put(out.perSecond5m, ep, method, Math.round((last300 / WINDOW_SECONDS) * 100) / 100);
       put(out.totals, ep, method, w.total);
