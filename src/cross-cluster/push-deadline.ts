@@ -234,7 +234,11 @@ export function getPushDeadline(marketAddress: string, nowMs: number = Date.now(
   const c = byMarket.get(marketAddress);
   if (!c) return undefined;
   if (c.deadline.terminal) return c.deadline;
-  return nowMs - c.atMs <= maxAgeMs ? c.deadline : undefined;
+  const age = nowMs - c.atMs;
+  // A finite bound must also reject a negative age (wall clock stepped back) and a non-finite one: an entry stamped in
+  // the "future" must not read as fresh and keep withholding pushes. Unbounded reads keep their old meaning.
+  if (Number.isFinite(maxAgeMs) && !(age >= 0)) return undefined;
+  return age <= maxAgeMs ? c.deadline : undefined;
 }
 
 /** True once the market was seen Resolved / closed. */

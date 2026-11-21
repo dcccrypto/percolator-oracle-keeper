@@ -408,3 +408,29 @@ describe("R3.24 (c) band-pin-expiring alert", () => {
     assert.equal(thresholdsFromEnv({ ALERT_BAND_PIN_EXPIRY_SLOTS: "6000" }).bandPinExpirySlots, 6_000);
   });
 });
+
+describe("getPushDeadline wall-clock step", () => {
+  afterEach(() => resetPushDeadlines());
+  const live = (): Uint8Array => c4AtBoot();
+
+  it("a backwards clock step makes a finite-maxAge LIVE entry stale (negative age)", () => {
+    const t = 1_700_000_000_000;
+    recordPushDeadline(C4, live(), 511_176_335n, t);
+    assert.ok(getPushDeadline(C4, t + 1_000, DEADLINE_FRESH_MS));
+    assert.equal(getPushDeadline(C4, t - 60_000, DEADLINE_FRESH_MS), undefined);
+  });
+
+  it("a NaN atMs is stale under a finite maxAge", () => {
+    recordPushDeadline(C4, live(), 511_176_335n, Number.NaN);
+    assert.equal(getPushDeadline(C4, 1_700_000_000_000, DEADLINE_FRESH_MS), undefined);
+  });
+
+  it("terminal entries never age, even across a backwards step; unbounded reads unchanged", () => {
+    const t = 1_700_000_000_000;
+    markTerminal(C4, "resolved", t);
+    assert.equal(getPushDeadline(C4, t - 60_000, DEADLINE_FRESH_MS)?.terminal, "resolved");
+    resetPushDeadlines();
+    recordPushDeadline(C4, live(), 511_176_335n, t);
+    assert.ok(getPushDeadline(C4, t - 60_000)); // default maxAge = any age (terminalHealthStatus caller)
+  });
+});
