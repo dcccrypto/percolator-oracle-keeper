@@ -111,6 +111,25 @@ const USD_STABLE_MINTS: ReadonlySet<string> = new Set([
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
 ]);
+/** The same set as raw 32-byte keys, so the per-pool guard compares bytes instead of base58-encoding the mint. */
+const USD_STABLE_KEYS: readonly PublicKey[] = [...USD_STABLE_MINTS].map((m) => new PublicKey(m));
+
+/**
+ * PublicKey memo by address string. Registry pool addresses are static, so the batch read used to re-decode every
+ * one each cycle. Only successes are cached: a malformed address throws on every call, exactly as before.
+ * Bounded so a churning registry cannot grow it without limit.
+ */
+const PK_CACHE_MAX = 20_000;
+const pkCache = new Map<string, PublicKey>();
+function pkOf(address: string): PublicKey {
+  let pk = pkCache.get(address);
+  if (pk === undefined) {
+    pk = new PublicKey(address);
+    if (pkCache.size >= PK_CACHE_MAX) pkCache.clear();
+    pkCache.set(address, pk);
+  }
+  return pk;
+}
 
 /**
  * True when a raydium-clmm pool's price cannot be trusted as USD.
@@ -129,7 +148,8 @@ const USD_STABLE_MINTS: ReadonlySet<string> = new Set([
  * pumpswap and WSOL-quoted-Meteora conversion depends on.
  */
 export function raydiumPriceIsNotUsd(quoteMint: PublicKey): boolean {
-  return !USD_STABLE_MINTS.has(quoteMint.toBase58());
+  for (const k of USD_STABLE_KEYS) if (k.equals(quoteMint)) return false;
+  return true;
 }
 
 /**
@@ -419,6 +439,12 @@ export function checkMintBinding(
   quoteMint: PublicKey,
 ): { ok: true } | { ok: false; reason: string } {
   if (!mainnetCa) return { ok: true };
+  // Fast path: a bound token is the common case; compare bytes and skip both base58 encodes.
+  try {
+    if (pkOf(mainnetCa).equals(baseMint)) return { ok: true };
+  } catch {
+    /* malformed mainnet_ca: cannot equal any base58 mint, fall through to the refusal */
+  }
   const base = baseMint.toBase58();
   const quote = quoteMint.toBase58();
   // S3-B2 (audit 2026-10-17): the token must be the BASE, i.e. the side the published price is for. Every reader
@@ -550,7 +576,7 @@ export async function readPoolPriceE6(
   decimalsCache: DecimalsCache,
   solPriceE6?: bigint,
 ): Promise<PriceReadResult> {
-  const poolPk = new PublicKey(entry.poolAddress);
+  const poolPk = pkOf(entry.poolAddress);
   const shortPool = entry.poolAddress.slice(0, 8) + "…";
   const source = `${entry.dexType}:${shortPool}`;
 
@@ -983,7 +1009,7 @@ export async function readAllPoolPricesE6(
   const valid: Array<{ entry: (typeof entries)[number]; pubkey: PublicKey }> = [];
   for (const e of entries) {
     try {
-      valid.push({ entry: e, pubkey: new PublicKey(e.poolAddress) });
+      valid.push({ entry: e, pubkey: pkOf(e.poolAddress) });
     } catch {
       console.warn(`[price-reader] skipping ${e.label}: malformed poolAddress ${e.poolAddress}`);
     }
@@ -998,7 +1024,7 @@ export async function readAllPoolPricesE6(
   let refKeyIdx = -1;
   if (solUsdReferencePool && !entries.some((e) => isSolUsdEntry(e))) {
     try {
-      pubkeys.push(new PublicKey(solUsdReferencePool));
+      pubkeys.push(pkOf(solUsdReferencePool));
       refKeyIdx = pubkeys.length - 1;
     } catch {
       /* malformed reference pool: the standalone read below reports it as before */
@@ -1143,7 +1169,7 @@ export async function readAllPoolPricesE6(
   // Without this every WSOL-quoted (pumpswap) market is skipped.
   if (solPriceE6 === undefined && solUsdReferencePool) {
     try {
-      const refPk = new PublicKey(solUsdReferencePool);
+      const refPk = pkOf(solUsdReferencePool);
       const refInfo = refBatchInfo
         ? refBatchInfo
         : await withRpcBackoff(() =>
