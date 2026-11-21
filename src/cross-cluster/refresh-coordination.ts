@@ -25,7 +25,10 @@ const holds = new Map<string, number>();
 
 /** Hold pushes for `market` for `ms` (capped at MAX_PUSH_HOLD_MS). */
 export function holdPushes(market: string, ms: number, nowMs: number = Date.now()): void {
-  holds.set(market, nowMs + Math.max(0, Math.min(ms, MAX_PUSH_HOLD_MS)));
+  // A NaN or undefined ms (failed read, bad config) must not yield a NaN expiry: `nowMs >= NaN` is
+  // never true, so the hold would never expire. NaN counts as no hold.
+  const span = typeof ms !== "number" || Number.isNaN(ms) ? 0 : Math.max(0, Math.min(ms, MAX_PUSH_HOLD_MS));
+  holds.set(market, nowMs + span);
 }
 
 export function releasePushes(market: string): void {
