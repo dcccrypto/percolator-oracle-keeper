@@ -128,8 +128,44 @@ const USD_STABLE_MINTS: ReadonlySet<string> = new Set([
  * (WSOL=mint0, USDC=mint1 -> USDC per SOL = a real USD price), which every
  * pumpswap and WSOL-quoted-Meteora conversion depends on.
  */
+/**
+ * Registry strings decode to the same PublicKey every cycle; decoding base58 per pool per cycle was ~13% of the
+ * read path. Keys are immutable here, malformed strings still throw (and are never cached), size is bounded.
+ */
+const PK_CACHE_MAX = 4096;
+const pkCache = new Map<string, PublicKey>();
+function cachedPublicKey(s: string): PublicKey {
+  const hit = pkCache.get(s);
+  if (hit) return hit;
+  const pk = new PublicKey(s); // throws exactly as before on a malformed string
+  if (pkCache.size >= PK_CACHE_MAX) pkCache.clear();
+  pkCache.set(s, pk);
+  return pk;
+}
+
+/** mainnetCa -> its key, ONLY when the string is the canonical base58 of that key (else null): see checkMintBinding. */
+const caKeyCache = new Map<string, PublicKey | null>();
+function canonicalCaKey(ca: string): PublicKey | null {
+  let v = caKeyCache.get(ca);
+  if (v === undefined) {
+    try {
+      const pk = new PublicKey(ca);
+      v = pk.toBase58() === ca ? pk : null;
+    } catch {
+      v = null;
+    }
+    if (caKeyCache.size >= PK_CACHE_MAX) caKeyCache.clear();
+    caKeyCache.set(ca, v);
+  }
+  return v;
+}
+
+const USD_STABLE_KEYS: readonly PublicKey[] = [...USD_STABLE_MINTS].map((m) => new PublicKey(m));
+
 export function raydiumPriceIsNotUsd(quoteMint: PublicKey): boolean {
-  return !USD_STABLE_MINTS.has(quoteMint.toBase58());
+  // Byte compare instead of a base58 encode per call (same answer: base58 is a bijection on 32-byte keys).
+  for (const k of USD_STABLE_KEYS) if (quoteMint.equals(k)) return false;
+  return true;
 }
 
 /**
@@ -419,13 +455,17 @@ export function checkMintBinding(
   quoteMint: PublicKey,
 ): { ok: true } | { ok: false; reason: string } {
   if (!mainnetCa) return { ok: true };
+  // Fast path with an identical answer: `mainnetCa === baseMint.toBase58()` holds iff the string is the canonical
+  // encoding of baseMint's bytes. Skips a base58 encode per pool per cycle.
+  const caKey = canonicalCaKey(mainnetCa);
+  if (caKey !== null && caKey.equals(baseMint)) return { ok: true };
   const base = baseMint.toBase58();
-  const quote = quoteMint.toBase58();
   // S3-B2 (audit 2026-10-17): the token must be the BASE, i.e. the side the published price is for. Every reader
   // here publishes quote-per-base and only accepts a WSOL / USD-stable quote, so a quote-side match only ever passed
   // when the market is FOR WSOL (or a stable) and the pool prices a DIFFERENT token (a "SOL" market on a MEME/WSOL
   // pool published MEME's price).
   if (mainnetCa === base) return { ok: true };
+  const quote = quoteMint.toBase58(); // only the refusal message needs the quote
   return {
     ok: false,
     reason:
@@ -983,7 +1023,7 @@ export async function readAllPoolPricesE6(
   const valid: Array<{ entry: (typeof entries)[number]; pubkey: PublicKey }> = [];
   for (const e of entries) {
     try {
-      valid.push({ entry: e, pubkey: new PublicKey(e.poolAddress) });
+      valid.push({ entry: e, pubkey: cachedPublicKey(e.poolAddress) });
     } catch {
       console.warn(`[price-reader] skipping ${e.label}: malformed poolAddress ${e.poolAddress}`);
     }
@@ -998,7 +1038,7 @@ export async function readAllPoolPricesE6(
   let refKeyIdx = -1;
   if (solUsdReferencePool && !entries.some((e) => isSolUsdEntry(e))) {
     try {
-      pubkeys.push(new PublicKey(solUsdReferencePool));
+      pubkeys.push(cachedPublicKey(solUsdReferencePool));
       refKeyIdx = pubkeys.length - 1;
     } catch {
       /* malformed reference pool: the standalone read below reports it as before */
@@ -1032,7 +1072,7 @@ export async function readAllPoolPricesE6(
     const info = infos[i];
     if (!info || info.data.length === 0) continue;
     if (detectDexType(info.owner) !== entry.dexType) continue;
-    const data = new Uint8Array(info.data);
+    const data = new Uint8Array(info.data.buffer, info.data.byteOffset, info.data.byteLength);
     try {
       if (entry.dexType === "raydium-clmm") {
         // Only USD-quoted Raydium pools are publishable — see
@@ -1143,7 +1183,7 @@ export async function readAllPoolPricesE6(
   // Without this every WSOL-quoted (pumpswap) market is skipped.
   if (solPriceE6 === undefined && solUsdReferencePool) {
     try {
-      const refPk = new PublicKey(solUsdReferencePool);
+      const refPk = cachedPublicKey(solUsdReferencePool);
       const refInfo = refBatchInfo
         ? refBatchInfo
         : await withRpcBackoff(() =>
@@ -1185,11 +1225,16 @@ export async function readAllPoolPricesE6(
         const dec = decimalsCache.get(entry.poolAddress);
         if (!dec) continue;
         try {
-          const usdE6 = meteoraWsolPriceToUsdE6(poolData, dec, solPriceE6);
+          // One decode feeds both: e6 and e12 are the same nativeE12 x SOL/USD with different divisors.
+          const nativeE12 = computeDexSpotPriceE6("meteora-dlmm", poolData, undefined, {
+            base: dec.base + 6,
+            quote: dec.quote,
+          });
+          const usdE6 = nativeE12 <= 0n ? 0n : (nativeE12 * solPriceE6) / 1_000_000_000_000n;
           if (usdE6 > 0n) {
             out.set(entry.poolAddress, usdE6);
             if (pricesE12) {
-              const usdE12 = meteoraWsolPriceToUsdE12(poolData, dec, solPriceE6);
+              const usdE12 = (nativeE12 * solPriceE6) / 1_000_000n;
               if (usdE12 > 0n) pricesE12.set(entry.poolAddress, usdE12);
             }
           }
@@ -1267,13 +1312,16 @@ export async function readAllPoolPricesE6(
       // #100 — minimum-liquidity floor. Checked on THIS path because this is the
       // one the keeper loop calls; the binding fix had to be corrected for
       // exactly that reason (see #110).
+      const baseVaultData = new Uint8Array(baseVaultInfo.data.buffer, baseVaultInfo.data.byteOffset, baseVaultInfo.data.byteLength);
+      const quoteVaultData = new Uint8Array(quoteVaultInfo.data.buffer, quoteVaultInfo.data.byteOffset, quoteVaultInfo.data.byteLength);
+      // Same inputs for the floor check and the depth sink below: measure once.
+      let quoteDepth: bigint | null | undefined;
+      const measureDepth = (): bigint | null =>
+        quoteDepth !== undefined
+          ? quoteDepth
+          : (quoteDepth = pumpswapQuoteDepthUsdE6(quoteVaultData, dec.quote, pumpswapCandidates[c].quoteMint, solPriceE6));
       if (MIN_POOL_LIQUIDITY_USD_E6 > 0n) {
-        const depth = pumpswapQuoteDepthUsdE6(
-          new Uint8Array(quoteVaultInfo.data),
-          dec.quote,
-          pumpswapCandidates[c].quoteMint,
-          solPriceE6,
-        );
+        const depth = measureDepth();
         // null means the depth could NOT be established. Skip — a floor that
         // passes when it cannot measure is not a floor.
         if (depth === null || depth < MIN_POOL_LIQUIDITY_USD_E6) {
@@ -1290,7 +1338,7 @@ export async function readAllPoolPricesE6(
         const priceE12 = computeDexSpotPriceE6(
           "pumpswap",
           poolData,
-          { base: new Uint8Array(baseVaultInfo.data), quote: new Uint8Array(quoteVaultInfo.data) },
+          { base: baseVaultData, quote: quoteVaultData },
           pumpswapE12Decimals(dec),
           solPriceE6,
         );
@@ -1299,12 +1347,7 @@ export async function readAllPoolPricesE6(
           out.set(entry.poolAddress, priceE6);
           pricesE12?.set(entry.poolAddress, priceE12);
           if (quoteReservesUsdE6) {
-            const reserve = pumpswapQuoteDepthUsdE6(
-              new Uint8Array(quoteVaultInfo.data),
-              dec.quote,
-              pumpswapCandidates[c].quoteMint,
-              solPriceE6,
-            );
+            const reserve = measureDepth();
             if (reserve !== null && reserve > 0n) quoteReservesUsdE6.set(entry.poolAddress, reserve);
           }
         }
