@@ -220,3 +220,70 @@ describe("#174 V22Loop: the closed market pages, the decaying one warns first, a
     assert.match(h.alerts()[0], /meteora-dlmm/);
   });
 });
+
+describe("#174 depth-capacity remaining branches", () => {
+  it("env: blank is the default; fractional, >64 and negative values throw; 1 and 64 are accepted", () => {
+    assert.deepEqual(depthCapacityThresholdsFromEnv({ ALERT_DEPTH_STALE_WARN_EPOCHS: "   " }), T);
+    assert.throws(() => depthCapacityThresholdsFromEnv({ ALERT_DEPTH_STALE_WARN_EPOCHS: "1.5" }));
+    assert.throws(() => depthCapacityThresholdsFromEnv({ ALERT_DEPTH_STALE_WARN_EPOCHS: "65" }));
+    assert.throws(() => depthCapacityThresholdsFromEnv({ ALERT_DEPTH_ZERO_CRITICAL_EPOCHS: "-1" }));
+    assert.deepEqual(depthCapacityThresholdsFromEnv({ ALERT_DEPTH_STALE_WARN_EPOCHS: "1", ALERT_DEPTH_ZERO_CRITICAL_EPOCHS: "64" }), { staleWarnEpochs: 1, criticalEpochs: 64 });
+  });
+
+  it("a depth push dated in the future has unknown age; a never-pushed asset has null age", () => {
+    const future = assessDepthCapacity(record({ depthE6: 5_000_000_000n, depthSlot: at(5n) }), 0, BAND, at(1n));
+    assert.equal(future.depthAgeSlots, null);
+    assert.equal(assessDepthCapacity(record(), 0, BAND, at(1n)).depthAgeSlots, null);
+  });
+
+  it("closed with no usable last-good slot reports 0 sticky epochs", () => {
+    const noSlot = assessDepthCapacity(record({ depthE6: 0n, depthSlot: at(1n) - 5n, lastGoodSlot: 0n }), 0, BAND, at(1n));
+    assert.deepEqual([noSlot.status, noSlot.stickyEpochs, noSlot.epochsToZero], ["closed", 0, 0]);
+  });
+
+  it("stale with now at/before the last-good slot has 0 sticky epochs", () => {
+    const d = assessDepthCapacity(record(), 0, BAND, LAST_GOOD_SLOT);
+    assert.equal(d.stickyEpochs, 0);
+    assert.equal(d.status, "stale");
+  });
+
+  it("a stale-but-not-fresh reading (older than the max age) decays on the sticky cap", () => {
+    const d = assessDepthCapacity(record({ depthE6: 5_000_000_000n, depthSlot: at(1n) }), 0, BAND, at(10n));
+    assert.equal(d.status, "decaying");
+    assert.equal(d.depthAgeSlots, 81_000n);
+    assert.equal(d.stickyEpochs, 10);
+    assert.equal(d.capDepthE6, 1_839_741_426n >> 10n);
+  });
+
+  it("critical via epochsToZero alone while the age is under staleWarnEpochs", () => {
+    const th = { staleWarnEpochs: 64, criticalEpochs: 64 };
+    const d = assessDepthCapacity(record(), 0, BAND, at(1n), th);
+    assert.equal(d.status, "decaying");
+    assert.equal(d.stickyEpochs, 1);
+    assert.equal(depthCapacityAlert("M", "mk", d, th, { keeperAttestsVenue: true })?.severity, "critical");
+  });
+
+  it("alert message variants: DEX-pinned, no venue, never-pushed, null cap, decaying critical boundary", () => {
+    const base = assessDepthCapacity(record(), 0, BAND, at(131n));
+    const pinned = depthCapacityAlert("M", "mk", { ...base, depthDexPinned: true, depthAgeSlots: null }, T, { venue: null, keeperAttestsVenue: true });
+    assert.match(pinned?.message ?? "", /DEX-pinned/);
+    assert.match(pinned?.message ?? "", /last depth push never/);
+    assert.doesNotMatch(pinned?.message ?? "", /venue \w/);
+    assert.equal(pinned?.data?.venue, null);
+    const aged = depthCapacityAlert("M", "mk", { ...base, depthAgeSlots: 42n }, T, { keeperAttestsVenue: true });
+    assert.match(aged?.message ?? "", /42 slots ago/);
+    const nullCap = depthCapacityAlert("M", "mk", { ...base, capDepthE6: null }, T, { keeperAttestsVenue: true });
+    assert.equal(nullCap?.data?.capDepthE6, null);
+    assert.equal(aged?.data?.capDepthE6, "0");
+    const decaying = { ...base, status: "decaying" as const, epochsToZero: 7, stickyEpochs: 2 };
+    assert.equal(depthCapacityAlert("M", "mk", decaying, T, { keeperAttestsVenue: true })?.severity, "warn");
+    assert.equal(depthCapacityAlert("M", "mk", { ...decaying, epochsToZero: 6 }, T, { keeperAttestsVenue: true })?.severity, "critical");
+    assert.equal(depthCapacityAlert("M", "mk", { ...decaying, epochsToZero: null }, T, { keeperAttestsVenue: true })?.severity, "warn");
+    assert.equal(depthCapacityAlert("M", "mk", { ...base, status: "stale" }, T, { keeperAttestsVenue: true }), null);
+  });
+
+  it("a last-good value of 0 is a closed cap (the bitLength(0) branch is unreachable: a non-zero sticky cap needs a non-zero last-good)", () => {
+    const d = assessDepthCapacity(record({ lastGoodE6: 0n }), 0, BAND, at(3n));
+    assert.deepEqual([d.status, d.stickyEpochs, d.epochsToZero], ["closed", 3, 0]);
+  });
+});
