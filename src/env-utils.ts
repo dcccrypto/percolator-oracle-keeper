@@ -1,3 +1,4 @@
+import { readFileSync } from "fs";
 /**
  * Shared environment-variable parsing utilities.
  *
@@ -186,4 +187,14 @@ export function parseSecretKeyJson(text: string, source: string): Uint8Array {
     );
   }
   return Uint8Array.from(parsed as number[]);
+}
+
+/**
+ * The secret-key bytes a keeper entry point should sign with: the inline KEEPER_KEYPAIR JSON when set, else the file at
+ * `keypairPath`. Errors name only the variable or the path (see parseSecretKeyJson). The entry points keep their own
+ * default path and missing-file handling; this is the shared branch they all had.
+ */
+export function loadSecretKey(inline: string | undefined, keypairPath: string): Uint8Array {
+  if (inline) return parseSecretKeyJson(inline, "KEEPER_KEYPAIR");
+  return parseSecretKeyJson(readFileSync(keypairPath, "utf8"), `keypair file ${keypairPath}`);
 }

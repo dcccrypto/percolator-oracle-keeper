@@ -145,6 +145,45 @@ describe("parseSecretKeyJson", async () => {
   });
 });
 
+describe("loadSecretKey (the loader every entry point shares), in process", async () => {
+  const { loadSecretKey } = await import("./env-utils.ts");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "keypair-load-"));
+  after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const kp = Keypair.generate();
+  const text = JSON.stringify(Array.from(kp.secretKey));
+
+  it("inline KEEPER_KEYPAIR wins over the file, and the file is never read", () => {
+    assert.deepEqual(loadSecretKey(text, path.join(dir, "does-not-exist.json")), kp.secretKey);
+  });
+  it("falls back to the file when the inline value is unset or empty", () => {
+    const f = path.join(dir, "ok.json");
+    fs.writeFileSync(f, text, { mode: 0o600 });
+    assert.deepEqual(loadSecretKey(undefined, f), kp.secretKey);
+    assert.deepEqual(loadSecretKey("", f), kp.secretKey);
+  });
+  it("a malformed inline value names KEEPER_KEYPAIR and carries no key bytes", () => {
+    assert.throws(() => loadSecretKey(text.slice(0, -1), "/unused"), (e: Error) => {
+      assert.ok(e instanceof SyntaxError);
+      assert.match(e.message, /^KEEPER_KEYPAIR is not valid JSON/);
+      assert.equal(keyLeak(`${e.message}\n${e.stack}`, kp.secretKey), null);
+      return true;
+    });
+  });
+  it("a malformed file names the path and carries no key bytes", () => {
+    const f = path.join(dir, "bad.json");
+    fs.writeFileSync(f, text.slice(0, -1), { mode: 0o600 });
+    assert.throws(() => loadSecretKey(undefined, f), (e: Error) => {
+      assert.ok(e instanceof SyntaxError);
+      assert.ok(e.message.startsWith(`keypair file ${f} is not valid JSON`));
+      assert.equal(keyLeak(`${e.message}\n${e.stack}`, kp.secretKey), null);
+      return true;
+    });
+  });
+  it("a missing file is the plain ENOENT, not a parse error", () => {
+    assert.throws(() => loadSecretKey(undefined, path.join(dir, "nope.json")), /ENOENT/);
+  });
+});
+
 // ── Part 2: every entry point, whole stdout+stderr ─────────────────────────────────────────────────────────────────
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "keypair-leak-"));
 after(() => fs.rmSync(TMP, { recursive: true, force: true }));
