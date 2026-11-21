@@ -148,6 +148,10 @@ export function v22MarketBytes(o: { slots?: number; version?: number; band?: boo
 
 export function registryBytes(o: { bound?: boolean; ext?: boolean; bond?: boolean } = {}): Uint8Array {
   const b = Buffer.alloc(176);
+  // real SDK header so parseLpVaultRegistry accepts it: magic, VERSION 19, kind 5 (LpVaultRegistry)
+  b.writeBigUInt64LE(WRAPPER_ACCOUNT_MAGIC, 0);
+  b.writeUInt16LE(19, 8);
+  b[10] = 5;
   b[160] = o.bound ? 1 : 0;
   b[161] = o.ext ? 1 : 0;
   b[162] = o.bond ? 1 : 0;

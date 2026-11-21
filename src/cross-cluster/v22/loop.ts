@@ -828,7 +828,7 @@ export class V22Loop {
       try {
         const load = await loadV22Market(this.d.conn, entry, this.d.programId);
         // An RPC failure (not "the account is gone") makes this tick an unclean observation for the lifecycle guards.
-        if (!load.ok && load.reason === "unreadable" && load.detail !== "market account not found") this.lifecycle?.noteReadFailure();
+        if (!load.ok && load.reason === "unreadable" && load.detail !== "market account not found" && !load.detail.startsWith("LP-vault registry unreadable")) this.lifecycle?.noteReadFailure();
         const ctx = this.noteLoad(entry, load);
         if (!ctx) continue;
         const r = this.rtFor(entry.marketAddress);
