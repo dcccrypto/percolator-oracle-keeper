@@ -188,6 +188,17 @@ export function liqExtraWeight(p: Pick<PositionedPortfolio, "longLegs" | "shortL
   return Math.ceil(V22_LEG_COST.liquidateCu(p, LIQUIDATE_CRANK_CU) / V22_CU_PER_WEIGHT);
 }
 
+/** base58 of a pubkey, encoded once per PublicKey object (the encode dominates a liquidation round) and shared by Stage A and B. */
+const b58Cache = new WeakMap<PublicKey, string>();
+function b58(pk: PublicKey): string {
+  let k = b58Cache.get(pk);
+  if (k === undefined) {
+    k = pk.toBase58();
+    b58Cache.set(pk, k);
+  }
+  return k;
+}
+
 export interface StageAConfig {
   params: MarginParams;
   padBps: number;
@@ -207,7 +218,7 @@ export function markLiquidationCandidates(
     if (p.isLp || !p.risk) return p;
     if (!atOrBelowMaintenance(marginOf(p.risk, cfg.params), cfg.padBps)) return p;
     const m = { ...p, liqWeight: liqExtraWeight(p) };
-    candidates.set(p.pubkey.toBase58(), m);
+    candidates.set(b58(p.pubkey), m);
     return m;
   });
   return { marked, candidates };
@@ -239,10 +250,10 @@ export interface FitResult {
 /** Worst first (lowest ratio), then take while count and compute fit. Pure; the size bound is applied by `fitSize`. */
 export function fitLiquidations(i: FitInput): FitResult {
   const cap = (i.maxCu ?? LIQ_TX_MAX_CU) - LIQ_TX_HEADROOM_CU;
-  const order = i.flagged
-    .map((f) => ({ f, k: f.portfolio.pubkey.toBase58() }))
-    .sort((a, b) => (a.f.ratioBps < b.f.ratioBps ? -1 : a.f.ratioBps > b.f.ratioBps ? 1 : a.k < b.k ? -1 : 1))
-    .map((e) => e.f);
+  // The tie-break key is only needed when two ratios are equal, and is the same string Stage A already encoded (cached).
+  const order = [...i.flagged].sort((a, b) =>
+    a.ratioBps < b.ratioBps ? -1 : a.ratioBps > b.ratioBps ? 1 : b58(a.portfolio.pubkey) < b58(b.portfolio.pubkey) ? -1 : 1,
+  );
   const chosen: FlaggedAccount[] = [];
   const deferred: FitResult["deferred"] = [];
   let cu = i.baseCu;
