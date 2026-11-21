@@ -1452,3 +1452,56 @@ describe("V22Loop wiring", () => {
     assert.equal(f.sims.length + f.sent.length, 0);
   });
 });
+
+describe("engine: per-market state is pruned when a market leaves the registry and discovery", () => {
+  function engineWithStore(w: World) {
+    const saved: Array<Record<string, unknown>> = [];
+    const store = { load: () => ({}), save: (r: Record<string, unknown>) => void saved.push(r) };
+    const sink = new FakeSink();
+    const e = new LifecycleEngine({ conn: w.conn as never, keeper, programId: WRAPPER_PROGRAM_ID, cfg: cfg({ discoveryMs: 0, staleResolve: "on" }), dryRun: true, registered: (m) => w.registered.has(m), sink, ledger: new ObservationLedger(120_000), store: store as never, now: () => w.now, log: () => {} });
+    return { e, saved };
+  }
+  const sizes = (e: LifecycleEngine) => ["quiet", "attempts", "lastFeeAt", "lastFee", "decisions"].map((n) => (e as unknown as Record<string, Map<string, unknown>>)[n].size);
+
+  it("N=500 then 1: saved state and maps shrink; a re-appearing market starts fresh", async () => {
+    const w = world();
+    const { e, saved } = engineWithStore(w);
+    const ms = Array.from({ length: 500 }, () => addMarket(w, matured()));
+    // seed bookkeeping that only exists after a resolve / fee round
+    for (const m of ms) {
+      (e as never as { attempts: Map<string, unknown> }).attempts.set(m.addr, { atMs: 1, landed: false });
+      (e as never as { lastFee: Map<string, string> }).lastFee.set(m.addr, "x");
+      (e as never as { lastFeeAt: Map<string, number> }).lastFeeAt.set(m.addr, 1);
+      (e as never as { decisions: Map<string, unknown> }).decisions.set(m.addr, { action: "hold", guard: "x", reason: "y" });
+    }
+    await runTick(e, w, ms.map((m) => m.ctx));
+    w.now += 400_000; await runTick(e, w, ms.map((m) => m.ctx));
+    const full = Object.keys(saved.at(-1) as object).length;
+    assert.equal(full, 500);
+    const keepAddr = ms[0].addr;
+    for (const m of ms.slice(1)) { w.registered.delete(m.addr); w.markets.delete(m.addr); }
+    for (let i = 0; i < 3; i++) { w.now += 400_000; await runTick(e, w, [ms[0].ctx]); }
+    const after = Object.keys(saved.at(-1) as object).length;
+    console.log(`saved state entries: before=${full} after=${after}; map sizes after=${sizes(e)}`);
+    assert.equal(after, 1);
+    assert.ok(sizes(e).every((n) => n <= 1));
+    assert.ok(keepAddr in (saved.at(-1) as object));
+    // re-appears at the same address: fresh quiet clock, no stale attempt
+    const back = ms[5];
+    w.registered.add(back.addr); w.markets.set(back.addr, back.ctx.data as Uint8Array);
+    w.now += 400_000; await runTick(e, w, [ms[0].ctx, back.ctx]);
+    const q = (e as never as { quiet: Map<string, { quietSinceMs: number }> }).quiet.get(back.addr);
+    assert.equal(q?.quietSinceMs, w.now);
+    assert.equal((e as never as { attempts: Map<string, unknown> }).attempts.has(back.addr), false);
+  });
+
+  it("a still-registered market whose read failed one tick keeps its state", async () => {
+    const w = world();
+    const { e } = engineWithStore(w);
+    const a = addMarket(w, matured()); const b = addMarket(w, matured());
+    await runTick(e, w, [a.ctx, b.ctx]);
+    w.now += 400_000; await runTick(e, w, [a.ctx]);
+    const q = (e as never as { quiet: Map<string, unknown> }).quiet;
+    assert.equal(q.has(b.addr), true);
+  });
+});

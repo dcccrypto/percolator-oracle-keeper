@@ -138,6 +138,8 @@ export class LifecycleEngine {
   private observed = new Map<string, Tracked>();
   private unreg = new Map<string, Tracked>();
   private lastDiscoveryAt = Number.NEGATIVE_INFINITY;
+  /** True once a discovery scan completed (or discovery is off): only then is `unreg` a complete picture, so only then is per-market state pruned. */
+  private scanned = false;
   private lastSaveAt = 0;
   private resolvedThisCycle = 0;
   private resolvesSent = 0;
@@ -274,6 +276,7 @@ export class LifecycleEngine {
           } else this.unreg.set(addr, t);
         });
       }
+      this.scanned = true;
       return;
     }
     // Between scans: ONE batched read of the market accounts that the current mode acts on; registry / vault-LP data is reused.
@@ -321,6 +324,7 @@ export class LifecycleEngine {
     }
     const all: Tracked[] = [...this.observed.values(), ...[...this.unreg.values()].filter((u) => !this.observed.has(u.ctx.marketAddress))];
     this.noteUnregistered(all, nowMs);
+    this.pruneGone(nowMs);
     this.tally(all);
     this.assessOutage(all, nowMs);
     await this.reconcileAlerts(all);
@@ -340,6 +344,22 @@ export class LifecycleEngine {
       if (!this.unregFirstSeenMs.has(t.ctx.marketAddress)) this.unregFirstSeenMs.set(t.ctx.marketAddress, nowMs);
     }
     for (const k of [...this.unregFirstSeenMs.keys()]) if (!now.has(k)) this.unregFirstSeenMs.delete(k);
+  }
+
+  /**
+   * Drop per-market state (quiet clocks, attempts, fee bookkeeping, decisions) for markets that left discovery AND the registry, so the
+   * maps and the saved state file stay bounded and a market re-appearing at the same address starts fresh. Kept: anything observed this
+   * tick, tracked by discovery, still registered (a failed read this tick must not reset its clocks), or with a resolve attempt still
+   * inside its retry window (the one-attempt-per-window guard must survive a brief disappearance).
+   */
+  private pruneGone(nowMs: number): void {
+    if (!this.scanned && this.d.cfg.discoveryMs > 0) return; // no scan yet: unregistered markets loaded from the state file are not known gone
+    const keep = (k: string): boolean => this.observed.has(k) || this.unreg.has(k) || this.d.registered(k);
+    for (const k of [...this.quiet.keys()]) if (!keep(k)) this.quiet.delete(k);
+    for (const [k, a] of [...this.attempts]) if (!keep(k) && !(nowMs - a.atMs < this.d.cfg.resolveRetryMs)) this.attempts.delete(k);
+    for (const k of [...this.lastFeeAt.keys()]) if (!keep(k)) this.lastFeeAt.delete(k);
+    for (const k of [...this.lastFee.keys()]) if (!keep(k)) this.lastFee.delete(k);
+    for (const k of [...this.decisions.keys()]) if (!keep(k)) this.decisions.delete(k);
   }
 
   private tally(all: Tracked[]): void {
