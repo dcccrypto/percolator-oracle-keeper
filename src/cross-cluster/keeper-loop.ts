@@ -1818,6 +1818,7 @@ export function pruneDeregisteredMarkets(
   pruneAuthMarkPusherState(keep);
   pruneMarketAccrual(keep);
   prunePushDeadlines(keep);
+  lifecycleLedger.prune(keep); // usableAt / pushLandedAt are keyed by market address; ObservationLedger.prune had no caller
   return removed;
 }
 
