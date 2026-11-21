@@ -628,3 +628,67 @@ describe("F1 flags", () => {
 });
 
 void PublicKey;
+
+describe("F1 branch coverage: synthetic margin inputs and guard bounds", () => {
+  const P: import("./liquidation.ts").MarginParams = {
+    mmrBps: 1_000n,
+    minNonzeroMmReq: 10n,
+    assets: new Map([[0, { priceE6: 2_000_000n, rawTargetE6: 2_000_000n, aLong: 100n, aShort: 200n }]]),
+  };
+  const withTarget = (raw: bigint): import("./liquidation.ts").MarginParams => ({ ...P, assets: new Map([[0, { ...P.assets.get(0)!, rawTargetE6: raw }]]) });
+
+  it("a short leg and a negative basis use |basis|, the short A, and no penalty when raw target equals the mark", () => {
+    const m = marginOf({ equity: 1_000n, legs: [{ assetIndex: 0, side: 1, basis: -1_000_000n, aBasis: 100n }] }, P);
+    assert.equal(m.notional, 4_000_000n, "short A (200), not long A (100)");
+    assert.equal(m.requirement, 400_000n, "10% of notional beats the 10-atom floor");
+  });
+  it("aBasis <= 0 falls back to the raw |basis|", () => {
+    const m = marginOf({ equity: 0n, legs: [{ assetIndex: 0, side: 0, basis: 3_000_000n, aBasis: 0n }] }, P);
+    assert.equal(m.notional, 6_000_000n);
+  });
+  it("adverse lag: short with raw above the mark is penalised; long with raw above and short with raw below are not", () => {
+    const leg = (side: number) => ({ equity: 100n, legs: [{ assetIndex: 0, side, basis: 1_000_000n, aBasis: 100n }] });
+    const base = marginOf(leg(1), P).requirement;
+    const baseL = marginOf(leg(0), P).requirement;
+    assert.equal(marginOf(leg(1), withTarget(3_000_000n)).requirement, base + 2_000_000n, "q = 1e6 * aShort 200 / 100");
+    assert.equal(marginOf(leg(0), withTarget(3_000_000n)).requirement, baseL, "long, raw above mark: favourable");
+    assert.equal(marginOf(leg(1), withTarget(1_000_000n)).requirement, base, "short, raw below mark: favourable");
+    assert.equal(marginOf(leg(0), withTarget(1_000_000n)).requirement, baseL + 1_000_000n, "long, raw below mark: adverse");
+  });
+  it("a leg on an unknown asset or a zero-priced asset is ignored (flat)", () => {
+    const flat = { equity: 5n, legs: [{ assetIndex: 7, side: 0, basis: 1n, aBasis: 1n }] };
+    assert.equal(marginOf(flat, P).ratioBps, null);
+    const zero: import("./liquidation.ts").MarginParams = { ...P, assets: new Map([[0, { ...P.assets.get(0)!, priceE6: 0n }]]) };
+    assert.equal(marginOf({ equity: 5n, legs: [{ assetIndex: 0, side: 0, basis: 1n, aBasis: 1n }] }, zero).notional, 0n);
+  });
+  it("readMarginParams: a buffer too short for the requested slot count reads as null", () => {
+    assert.ok(readMarginParams(PENGU_MARKET, L, 1));
+    assert.equal(readMarginParams(PENGU_MARKET, L, 50), null);
+  });
+  it("the no-progress guard is bounded: at the cap the oldest entry is evicted", () => {
+    const m = marginOf(snapOf(UNDER), PARAMS);
+    for (let i = 0; i < 4_096; i++) noteLiquidationLanded(`k${i}`, m);
+    noteLiquidationLanded("newest", m);
+    assert.equal(liquidationMadeNoProgress("k0", m), false, "evicted");
+    assert.equal(liquidationMadeNoProgress("k1", m), true, "kept");
+    assert.equal(liquidationMadeNoProgress("newest", m), true);
+  });
+  it("fitLiquidations: equal ratios order by key either way; extra CU per liquidation and a custom maxCu bind", () => {
+    const ms = [3, 1, 2].map((n) => ({ portfolio: entry(n, UNDER), ratioBps: 10n }));
+    const r = fitLiquidations({ flagged: ms, baseCu: 0, maxPerTx: 10 });
+    assert.deepEqual(r.chosen.map((c) => c.portfolio.pubkey.toBase58()), ms.map((c) => c.portfolio.pubkey.toBase58()).sort());
+    const worse = [{ portfolio: entry(1, UNDER), ratioBps: 5n }, { portfolio: entry(2, UNDER), ratioBps: 9n }];
+    assert.equal(fitLiquidations({ flagged: worse, baseCu: 0, maxPerTx: 10 }).chosen[0].ratioBps, 5n);
+    const tight = fitLiquidations({ flagged: worse, baseCu: 0, maxPerTx: 10, maxCu: 400_000, extraCuPerLiquidation: 100_000 });
+    assert.equal(tight.chosen.length, 0);
+    assert.deepEqual(tight.deferred.map((d) => d.why), ["compute", "compute"]);
+  });
+  it("fitToPacket with an impossible limit drops everything; serializedTxSize is Infinity for an unserializable ix", () => {
+    const r = fitToPacket([1, 2], () => [], LP, 0);
+    assert.deepEqual(r.kept, []);
+    assert.deepEqual(r.dropped, [1, 2]);
+    assert.deepEqual(r.ixs, []);
+    const bad = { keys: [{ pubkey: null, isSigner: false, isWritable: false }], programId: null, data: Buffer.alloc(0) } as never;
+    assert.equal(serializedTxSize(LP, [bad]), Number.POSITIVE_INFINITY);
+  });
+});
