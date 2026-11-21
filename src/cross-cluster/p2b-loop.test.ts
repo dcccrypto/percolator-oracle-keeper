@@ -314,3 +314,54 @@ describe("startP2bLoop", () => {
     }
   });
 });
+
+describe("p2bLoopConfigFromEnv decimal-only (hex/exponent/padded)", () => {
+  for (const bad of ["0x10", "0x4E20", "2e4", "1e3", "Infinity", "-Infinity", "+20000", "20_000", "0b101", "20000.0"]) {
+    it(`rejects P2B_TICK_MS=${JSON.stringify(bad)}`, () => {
+      assert.throws(() => p2bLoopConfigFromEnv({ P2B_TICK_MS: bad }, 1, 2), /P2B_TICK_MS/);
+    });
+  }
+  it("rejects hex/exponent for HEDGED_LOCKOUT_INTERVAL_MS", () => {
+    assert.throws(() => p2bLoopConfigFromEnv({ HEDGED_LOCKOUT_INTERVAL_MS: "0x7530" }, 1, 2), /HEDGED_LOCKOUT_INTERVAL_MS/);
+    assert.throws(() => p2bLoopConfigFromEnv({ HEDGED_LOCKOUT_INTERVAL_MS: "3e4" }, 1, 2), /HEDGED_LOCKOUT_INTERVAL_MS/);
+  });
+  it("still accepts surrounding whitespace around a plain decimal", () => {
+    assert.equal(p2bLoopConfigFromEnv({ P2B_TICK_MS: " 5000 " }, 1, 2).tickMs, 5000);
+  });
+  it("rejects tickMs above 2^31-1 (pinned by the 86400000 range bound)", () => {
+    assert.throws(() => p2bLoopConfigFromEnv({ P2B_TICK_MS: "2147483648" }, 1, 2), /P2B_TICK_MS/);
+    assert.throws(() => p2bLoopConfigFromEnv({ P2B_TICK_MS: "99999999999999999999" }, 1, 2), /P2B_TICK_MS/);
+  });
+});
+
+describe("startP2bLoop sleep bounds", () => {
+  async function sleepsFor(cfgTickMs: number, clock: number[]): Promise<number[]> {
+    const before = { int: process.listeners("SIGINT"), term: process.listeners("SIGTERM") };
+    const ol = console.log, oSet = globalThis.setTimeout, oNow = Date.now;
+    console.log = () => undefined;
+    const delays: number[] = [];
+    let i = 0;
+    Date.now = () => clock[Math.min(i++, clock.length - 1)];
+    globalThis.setTimeout = ((fn: () => void, ms?: number) => { delays.push(ms as number); process.emit("SIGTERM"); return oSet(fn, 0); }) as never;
+    const fake = { tick: async () => undefined } as unknown as P2bLoop;
+    try {
+      await startP2bLoop(fake, { tickMs: cfgTickMs });
+    } finally {
+      console.log = ol; globalThis.setTimeout = oSet; Date.now = oNow;
+      for (const sig of ["SIGINT", "SIGTERM"] as const) {
+        for (const l of process.listeners(sig)) if (!(before[sig === "SIGINT" ? "int" : "term"]).includes(l)) process.removeListener(sig, l);
+      }
+    }
+    return delays;
+  }
+  it("a clock step back during a tick never sleeps longer than tickMs", async () => {
+    assert.deepEqual(await sleepsFor(20_000, [1_000_000, 400_000]), [20_000]);
+  });
+  it("never passes setTimeout more than 2^31-1 ms even for a huge programmatic tickMs", async () => {
+    const d = await sleepsFor(2 ** 40, [0, 0]);
+    assert.ok(d[0] <= 2 ** 31 - 1, `delay ${d[0]}`);
+  });
+  it("normal case: sleeps the remainder", async () => {
+    assert.deepEqual(await sleepsFor(20_000, [0, 5_000]), [15_000]);
+  });
+});

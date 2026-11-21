@@ -57,7 +57,8 @@ export function p2bLoopConfigFromEnv(env: Env, minKeeperBalanceLamports: number,
   const get = (name: string, fallback: number): number => {
     const raw = env[name];
     if (raw === undefined || raw.trim() === "") return fallback;
-    const n = Number(raw);
+    // Decimal digits only: Number() also accepts "0x10", "1e3", "+5", "20000.0" (same convention as env-utils / depth-capacity).
+    const n = /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : NaN;
     if (!Number.isInteger(n) || n < 1_000 || n > 86_400_000) throw new Error(`${name}="${raw}" must be an integer in [1000, 86400000]`);
     return n;
   };
@@ -220,6 +221,8 @@ export class P2bLoop {
   }
 }
 
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+
 /** The long-running loop. Never awaited by the entrypoint, never throws out. */
 export async function startP2bLoop(loop: P2bLoop, cfg: Pick<P2bLoopConfig, "tickMs">): Promise<void> {
   console.log(`[p2b] loop starting: tick=${cfg.tickMs}ms (a strict no-op until the wrapper answers the tag-103 probe)`);
@@ -229,6 +232,9 @@ export async function startP2bLoop(loop: P2bLoop, cfg: Pick<P2bLoopConfig, "tick
   while (!stopping) {
     const start = Date.now();
     await loop.tick();
-    await new Promise((r) => setTimeout(r, Math.max(1000, cfg.tickMs - (Date.now() - start))));
+    // Clamp: a backwards clock step makes elapsed negative (sleep > tickMs); setTimeout fires immediately above 2^31-1 ms.
+    const elapsed = Math.max(0, Date.now() - start);
+    const sleepMs = Math.min(MAX_TIMEOUT_MS, Math.max(1000, Number.isFinite(cfg.tickMs) ? cfg.tickMs - elapsed : 1000));
+    await new Promise((r) => setTimeout(r, sleepMs));
   }
 }
