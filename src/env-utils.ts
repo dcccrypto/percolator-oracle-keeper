@@ -139,3 +139,27 @@ export function parsePositiveLamportsFromSolEnv(name: string, fallbackSol: numbe
 
   return Number(lamports);
 }
+
+const SWITCH_OFF_WORDS = ["off", "0", "false", "no"];
+const SWITCH_ON_WORDS = ["on", "1", "true", "yes"];
+
+/**
+ * A default-ON job switch (CRANK_ENABLED, P3_EXHAUSTED_RESOLVE_ENABLED, ...).
+ *
+ * These used to compare with the exact string "false", so `0`, `off`, `no` or `FALSE` left the job running,
+ * including the tag 39 resolve, which cannot be undone. Rule: off / 0 / false / no (any case) = off; unset, empty or
+ * on / 1 / true / yes = on. Any other value keeps the job ON, as before, with a warning. Never throws, so no value
+ * that boots today stops a keeper from booting.
+ */
+export function defaultOnSwitch(
+  env: Readonly<Record<string, string | undefined>>,
+  key: string,
+  warn: (line: string) => void = console.warn,
+): boolean {
+  const v = (env[key] ?? "").trim().toLowerCase();
+  if (SWITCH_OFF_WORDS.includes(v)) return false;
+  if (v !== "" && !SWITCH_ON_WORDS.includes(v)) {
+    warn(`[env] WARNING: ${key} is set to an unrecognised value; the job stays ON. Use off/0/false/no to turn it off.`);
+  }
+  return true;
+}
