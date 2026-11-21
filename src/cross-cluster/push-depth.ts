@@ -31,7 +31,13 @@ export function pushDepthEnabled(env: Record<string, string | undefined> = proce
 export function isqrt(n: bigint): bigint {
   if (n < 0n) throw new RangeError("isqrt: negative input");
   if (n < 2n) return n;
-  let x = 1n << BigInt((n.toString(2).length + 1) >> 1); // >= sqrt(n)
+  // Seed >= sqrt(n) is all Newton needs for exactness. A float sqrt (rel. error ~2^-53, padded by 2^-50) lands within
+  // ~2^-50 of the root, so the loop converges in 1-3 steps; no binary string. Above ~2^1023 Number() overflows: old seed.
+  const f = Number(n);
+  let x =
+    f < Infinity
+      ? BigInt(Math.ceil(Math.sqrt(f) * (1 + 2 ** -50))) + 1n
+      : 1n << BigInt((n.toString(16).length * 4 + 1) >> 1);
   for (;;) {
     const y = (x + n / x) >> 1n;
     if (y >= x) return x;
@@ -46,7 +52,7 @@ export function isqrt(n: bigint): bigint {
  *
  * Exact in bigint. 1/sqrt(1.02) = sqrt(50/51), so R - R*sqrt(50/51) = R - sqrt(50 R^2 / 51), and
  * floor(R - y) = R - ceil(y). ceil(sqrt(50 R^2 / 51)) is the smallest integer m with 51 m^2 >= 50 R^2,
- * found from an isqrt seed and corrected by the exact integer inequality (no scaling, no float).
+ * computed exactly as isqrt(ceil(50 R^2 / 51) - 1) + 1 (no scaling, no float, no correction loops).
  *
  * Rounding: DOWN. The depth is a floor of the true real-valued figure, so it is never overstated. (Also note
  * R*(1 - 1/sqrt(1.02)) is itself the conservative one of the two +2% figures; the quote that must be paid in
@@ -58,9 +64,8 @@ export function plus2PctDepthE6(quoteReserveE6: bigint): bigint {
   if (quoteReserveE6 < 0n) throw new RangeError("plus2PctDepthE6: negative reserve");
   if (quoteReserveE6 === 0n) return 0n;
   const target = 50n * quoteReserveE6 * quoteReserveE6;
-  let m = isqrt(target / 51n);
-  while (51n * m * m < target) m += 1n;
-  while (m > 0n && 51n * (m - 1n) * (m - 1n) >= target) m -= 1n;
+  // Smallest m with 51 m^2 >= target  <=>  m^2 >= c = ceil(target/51)  <=>  m = isqrt(c - 1) + 1 (c >= 1 here). Exact, no correction loops.
+  const m = isqrt((target + 50n) / 51n - 1n) + 1n;
   return quoteReserveE6 - m;
 }
 
