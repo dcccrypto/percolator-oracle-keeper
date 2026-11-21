@@ -104,8 +104,9 @@ export async function stakeSyncOnce(
   const nowMs = p.nowMs ?? Date.now();
   const until = st.backoffUntil.get(key);
   if (until !== undefined && nowSlot < until) return { kind: "backoff", untilSlot: until };
+  // A negative age (wall clock stepped back, or a future stamp) counts as expired: the attempt proceeds and re-stamps.
   const lastMs = st.lastAttemptMs.get(key);
-  if (lastMs !== undefined && nowMs - lastMs < p.intervalMs) return { kind: "skipped", reason: "interval" };
+  if (lastMs !== undefined && nowMs >= lastMs && nowMs - lastMs < p.intervalMs) return { kind: "skipped", reason: "interval" };
   if (decoded.lastSyncSlot !== 0n && nowSlot < decoded.lastSyncSlot + decoded.syncCooldownSlots) {
     return { kind: "quiet", code: 37 };
   }
