@@ -130,3 +130,77 @@ describe("S3-A2 addKeeperPriorityFee", () => {
     assert.ok(on > off, `${on} > ${off}`);
   });
 });
+
+describe("priority fee: cached env read + clamp boundaries", () => {
+  const withEnv = (v: string | undefined) => {
+    if (v === undefined) delete process.env[KEEPER_PRIORITY_FEE_ENV];
+    else process.env[KEEPER_PRIORITY_FEE_ENV] = v;
+    resetKeeperPriorityFeeCache();
+  };
+  const silence = () => {
+    const w = console.warn, l = console.log;
+    const out = { warn: [] as string[], log: [] as string[] };
+    console.warn = (m: string) => void out.warn.push(String(m));
+    console.log = (m: string) => void out.log.push(String(m));
+    return { out, restore: () => { console.warn = w; console.log = l; } };
+  };
+
+  it("process.env read is cached and warns once for a typo; an injected env is never cached", () => {
+    const s = silence();
+    try {
+      withEnv("abc");
+      assert.equal(keeperPriorityFeeMicroLamports(), 0);
+      process.env[KEEPER_PRIORITY_FEE_ENV] = "7";
+      assert.equal(keeperPriorityFeeMicroLamports(), 0, "cached");
+      assert.equal(s.out.warn.length, 1);
+      assert.match(s.out.warn[0], /not a whole number/);
+      assert.equal(keeperPriorityFeeMicroLamports({ [KEEPER_PRIORITY_FEE_ENV]: "9" }), 9);
+      assert.equal(keeperPriorityFeeMicroLamports(), 0, "injected env did not touch the cache");
+      withEnv("150000");
+      assert.equal(keeperPriorityFeeMicroLamports(), MAX_KEEPER_PRIORITY_FEE_MICROLAMPORTS);
+      assert.match(s.out.warn[1], /above the cap/);
+      assert.match(s.out.log[0], /100000 micro-lamports/);
+    } finally { s.restore(); }
+  });
+
+  it("boundaries: cap, cap+1, huge, unsafe integer, NaN/negative/float/hex/exponent/Infinity", () => {
+    const CAP = MAX_KEEPER_PRIORITY_FEE_MICROLAMPORTS;
+    assert.equal(parseKeeperPriorityFee(String(CAP)).microLamports, CAP);
+    assert.equal(parseKeeperPriorityFee(String(CAP)).note, null);
+    assert.equal(parseKeeperPriorityFee(String(CAP - 1)).microLamports, CAP - 1);
+    assert.equal(parseKeeperPriorityFee(String(CAP + 1)).microLamports, CAP);
+    assert.equal(parseKeeperPriorityFee("1" + "0".repeat(400)).microLamports, CAP); // Number() -> Infinity
+    assert.equal(parseKeeperPriorityFee("9007199254740993").microLamports, CAP);
+    assert.equal(parseKeeperPriorityFee("  42 ").microLamports, 42);
+    assert.equal(parseKeeperPriorityFee("0000").microLamports, 0);
+    for (const bad of ["NaN", "-1", "-0", "1.5", "1e3", "0x10", "Infinity", "+5", "1_000", "٣"]) {
+      const r = parseKeeperPriorityFee(bad);
+      assert.equal(r.microLamports, 0, bad);
+      assert.ok(r.note, bad);
+    }
+  });
+
+  it("every parse result is a finite integer in [0, cap]", () => {
+    for (const raw of [undefined, "", "0", "1", "99999", "100000", "100001", "1e9", "-5", "NaN", "9".repeat(30)]) {
+      const n = parseKeeperPriorityFee(raw).microLamports;
+      assert.ok(Number.isInteger(n) && n >= 0 && n <= MAX_KEEPER_PRIORITY_FEE_MICROLAMPORTS, String(raw));
+    }
+  });
+
+  it("keeperPriorityFeeIxs / addKeeperPriorityFee: 0, 1 and cap boundaries", () => {
+    assert.deepEqual(keeperPriorityFeeIxs(0), []);
+    assert.equal(keeperPriorityFeeIxs(1).length, 1);
+    assert.equal(priceOf({ instructions: keeperPriorityFeeIxs(MAX_KEEPER_PRIORITY_FEE_MICROLAMPORTS) }), MAX_KEEPER_PRIORITY_FEE_MICROLAMPORTS);
+    const t = new Transaction().add(ix(1));
+    addKeeperPriorityFee(t, 0);
+    assert.equal(t.instructions.length, 1);
+  });
+
+  it("a compute-budget ix that is not SetComputeUnitPrice (or has empty data) does not suppress the fee", () => {
+    const t = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }));
+    t.add(new TransactionInstruction({ programId: CB, keys: [], data: Buffer.alloc(0) }));
+    addKeeperPriorityFee(t, 5);
+    assert.equal(priceOf(t), 5);
+    assert.equal(t.instructions.length, 3);
+  });
+});
