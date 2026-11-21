@@ -37,6 +37,11 @@ export function restartConfig(env: Readonly<Record<string, string | undefined>>)
   };
 }
 
+/** A launch counts only if it is not in the future (clock stepped back / log copied from another host) and not expired. */
+function inWindow(t: number, now: number, windowMs: number): boolean {
+  return t <= now && now - t < windowMs;
+}
+
 function load(path: string): RestartRecord {
   try {
     const j = JSON.parse(fs.readFileSync(path, "utf8")) as RestartRecord;
@@ -54,7 +59,7 @@ export function recordLaunch(
   windowMs: number,
 ): { health: RestartHealth; alertDue: boolean } {
   const rec = load(path);
-  rec.launches = [...rec.launches.filter((t) => now - t < windowMs), now];
+  rec.launches = [...rec.launches.filter((t) => inWindow(t, now, windowMs)), now];
   const escalated = rec.launches.length >= threshold;
   const alertDue = escalated && (rec.lastAlertAt === undefined || now - rec.lastAlertAt >= windowMs);
   if (alertDue) {
@@ -95,11 +100,12 @@ export function recordAlertFailure(path: string, now: number = Date.now()): bool
 
 export function readHealth(path: string, now: number, threshold: number, windowMs: number): RestartHealth {
   const rec = load(path);
-  return view(rec.launches.filter((t) => now - t < windowMs), now, threshold, windowMs);
+  return view(rec.launches.filter((t) => inWindow(t, now, windowMs)), now, threshold, windowMs);
 }
 
 function view(launches: number[], now: number, threshold: number, windowMs: number): RestartHealth {
-  const last = launches.length ? Math.max(...launches) : null;
+  let last: number | null = null;
+  for (const t of launches) if (last === null || t > last) last = t; // loop, not Math.max(...): a huge array overflows the stack
   return {
     launchesInWindow: launches.length,
     threshold,
