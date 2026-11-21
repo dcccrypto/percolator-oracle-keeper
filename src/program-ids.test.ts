@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { PROGRAM_IDS_DEVNET_V1 as SDK_DEVNET_V1, PROGRAM_IDS_V17 } from "@percolatorct/sdk";
-import { PROGRAM_IDS_DEVNET_V1, PROGRAM_IDS_DEVNET_V21, resolveProgramIds, sdkKnownProgramIds } from "./program-ids.ts";
+import { PROGRAM_IDS_DEVNET_V1, PROGRAM_IDS_DEVNET_V21, describeProgramIds, resolveProgramIds, sdkKnownProgramIds } from "./program-ids.ts";
 
 // An id the pinned SDK knows (so the K-2 allowlist accepts it) but that belongs to neither pinned devnet
 // world (so the mixed-world guard stays out of the way): any other SDK-known id, e.g. a mainnet one.
@@ -95,5 +95,56 @@ describe("no runtime read of the SDK's moving program-id defaults", () => {
       for (const m of src.matchAll(optional)) if (!m[2]!.includes(",")) bad.push(`${f}: ${m[0]}`);
     }
     assert.deepEqual(bad, []);
+  });
+});
+
+describe("describeProgramIds", () => {
+  it("lists the set and four ids with sources; shows the OVERRIDE line only when overridden", () => {
+    const base = resolveProgramIds({});
+    const lines = describeProgramIds(base);
+    assert.equal(lines.length, 5);
+    assert.match(lines[0], /v1 \/ ETDLAdi/);
+    assert.ok(lines[1].startsWith(`wrapper=${base.wrapper.toBase58()} (`));
+    assert.ok(lines[2].startsWith("stake="));
+    assert.ok(lines[3].startsWith("matcher="));
+    assert.ok(lines[4].startsWith("nft="));
+
+    const v21 = describeProgramIds({ ...base, programSet: "v21" });
+    assert.match(v21[0], /KEEPER_DEVNET_V21=1/);
+
+    const ov = describeProgramIds({ ...base, overridden: ["X1", "X2"] });
+    assert.equal(ov.length, 6);
+    assert.match(ov[1], /^OVERRIDE .*X1, X2$/);
+  });
+
+  it("with no argument it describes the process-resolved ids", () => {
+    assert.equal(describeProgramIds().length >= 5, true);
+  });
+});
+
+describe("resolveProgramIds: blank env values count as unset", () => {
+  it("empty and whitespace-only values for every id fall back to the builtin set", () => {
+    const base = resolveProgramIds({});
+    for (const blank of ["", "   ", "\t"]) {
+      const ids = resolveProgramIds({
+        WRAPPER_PROGRAM_ID: blank,
+        PROGRAM_ID: blank,
+        STAKE_PROGRAM_ID: blank,
+        MATCHER_PROGRAM_ID: blank,
+        NFT_PROGRAM_ID: blank,
+        KEEPER_NFT_PROGRAM_ID: blank,
+      });
+      assert.deepEqual(ids.source, base.source);
+      assert.equal(ids.wrapper.toBase58(), base.wrapper.toBase58());
+      assert.equal(ids.nft.toBase58(), base.nft.toBase58());
+    }
+  });
+});
+
+describe("resolveProgramIds: plain NFT_PROGRAM_ID (no KEEPER_ alias)", () => {
+  it("is accepted and reported as `env NFT_PROGRAM_ID`", () => {
+    const ids = resolveProgramIds({ NFT_PROGRAM_ID: PROGRAM_IDS_DEVNET_V1.nft });
+    assert.equal(ids.nft.toBase58(), PROGRAM_IDS_DEVNET_V1.nft);
+    assert.equal(ids.source.nft, "env NFT_PROGRAM_ID");
   });
 });

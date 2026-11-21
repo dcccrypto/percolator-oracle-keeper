@@ -130,3 +130,48 @@ describe("S3-A2 addKeeperPriorityFee", () => {
     assert.ok(on > off, `${on} > ${off}`);
   });
 });
+
+describe("S3-A2 priority fee edge cases", () => {
+  it("a ComputeBudget instruction with empty data is not a price, so the fee is still appended", () => {
+    const t = new Transaction();
+    t.add(new TransactionInstruction({ programId: CB, keys: [], data: Buffer.alloc(0) }), ix(7));
+    addKeeperPriorityFee(t, 10);
+    assert.equal(t.instructions.length, 3);
+    assert.equal(priceOf(t), 10);
+  });
+
+  it("a ComputeBudget instruction with another tag (limit) is not a price either", () => {
+    const t = new Transaction();
+    t.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1 }));
+    addKeeperPriorityFee(t, 10);
+    assert.equal(t.instructions.length, 2);
+  });
+
+  it("process.env read is cached once; a custom env is never cached", () => {
+    process.env[KEEPER_PRIORITY_FEE_ENV] = "11";
+    assert.equal(keeperPriorityFeeMicroLamports(), 11);
+    process.env[KEEPER_PRIORITY_FEE_ENV] = "22";
+    assert.equal(keeperPriorityFeeMicroLamports(), 11); // cached
+    assert.equal(keeperPriorityFeeMicroLamports({ [KEEPER_PRIORITY_FEE_ENV]: "33" }), 33); // custom env bypasses
+    assert.equal(keeperPriorityFeeMicroLamports(), 11);
+    resetKeeperPriorityFeeCache();
+    assert.equal(keeperPriorityFeeMicroLamports(), 22);
+  });
+
+  it("an invalid or over-cap env value warns once and is OFF or clamped", () => {
+    const warn = console.warn;
+    const warns: string[] = [];
+    console.warn = (m: string) => void warns.push(String(m));
+    try {
+      process.env[KEEPER_PRIORITY_FEE_ENV] = "abc";
+      assert.equal(keeperPriorityFeeMicroLamports(), 0);
+      assert.equal(warns.length, 1);
+      resetKeeperPriorityFeeCache();
+      process.env[KEEPER_PRIORITY_FEE_ENV] = "99999999999999999999";
+      assert.equal(keeperPriorityFeeMicroLamports(), 100_000);
+      assert.equal(warns.length, 2);
+    } finally {
+      console.warn = warn;
+    }
+  });
+});
