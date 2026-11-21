@@ -20,7 +20,9 @@
  */
 export function parsePositiveNumberEnv(name: string, fallback: number, max?: number): number {
   const raw = process.env[name];
-  const value = raw == null || raw.trim() === "" ? fallback : Number(raw);
+  const blank = raw == null || raw.trim() === "";
+  // Plain decimal only (#315 rule): Number() would accept 0x10, 0b11, 1e3, +5 and turn a typo into a different threshold.
+  const value = blank ? fallback : /^(?:\d+(?:\.\d+)?|\.\d+)$/.test(raw.trim()) ? Number(raw.trim()) : NaN;
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(
       `${name} must be a finite positive number (got: ${JSON.stringify(raw)})`,
