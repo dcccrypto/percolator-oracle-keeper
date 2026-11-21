@@ -171,11 +171,19 @@ export function reconcileMarkets(
   const removed: string[] = [];
   const updated: string[] = [];
 
+  // Index of the FIRST local entry per address (what findIndex returned), built once.
+  const firstIdx = new Map<string, number>();
+  for (let i = 0; i < registry.markets.length; i++) {
+    const a = registry.markets[i].marketAddress;
+    if (!firstIdx.has(a)) firstIdx.set(a, i);
+  }
+
   for (const [addr, entry] of desiredByAddr) {
     // Present this cycle — any accumulated absence is stale.
     absences.delete(addr);
-    const idx = registry.markets.findIndex((m) => m.marketAddress === addr);
+    const idx = firstIdx.get(addr) ?? -1;
     if (idx === -1) {
+      firstIdx.set(addr, registry.markets.length);
       registry.markets.push(entry);
       added.push(addr);
     } else if (entryDiffers(registry.markets[idx], entry)) {
@@ -188,17 +196,21 @@ export function reconcileMarkets(
     }
   }
 
+  // Iterate a snapshot (duplicates of a removed address still count again, as before);
+  // drop all removed addresses with a single filter instead of one per removal.
+  const dropped = new Set<string>();
   for (const local of [...registry.markets]) {
     if (desiredByAddr.has(local.marketAddress)) continue;
     const n = (absences.get(local.marketAddress) ?? 0) + 1;
     absences.set(local.marketAddress, n);
     if (n >= threshold) {
-      registry.markets = registry.markets.filter(
-        (m) => m.marketAddress !== local.marketAddress,
-      );
+      dropped.add(local.marketAddress);
       absences.delete(local.marketAddress);
       removed.push(local.marketAddress);
     }
+  }
+  if (dropped.size > 0) {
+    registry.markets = registry.markets.filter((m) => !dropped.has(m.marketAddress));
   }
 
   return { added, removed, updated };
