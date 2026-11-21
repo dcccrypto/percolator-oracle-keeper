@@ -7,7 +7,7 @@ import { BAND_EXPECTED_CODES, formatProgramError, isBandExpected, stakeErrorName
 import { bondFeeSkipReason, buildBondCrankFeesIx, crankBondFee, planBondFee } from "./fee-bond.ts";
 import { freshRentState, planRentSettles, settleRentOnce } from "./rent.ts";
 import { dustCandidates, freshDustState, sweepDustOnce } from "./dust.ts";
-import { decideG9, freshG9State, g9ExtraTail, g9Once, oracleQualifies } from "./g9.ts";
+import { G9_TX_UNITS, decideG9, freshG9State, g9ExtraTail, g9Once, oracleQualifies } from "./g9.ts";
 import { freshStakeSyncState, stakeSyncOnce } from "./stake-sync.ts";
 import { commitDueSlot, freshStakeCommitTargetState, stakeCommitTargetOnce } from "./stake-commit-target.ts";
 import { bookIsLossCurrent, executeKeeperExits, selectKeeperRequests } from "./earn-exit.ts";
@@ -307,6 +307,52 @@ describe("tag 111 G9 restore: mode 3 first, mode 1 fallback in the same sweep (G
     assert.equal(r.outcome?.kind, "refused");
     assert.equal(f.sent.length, 0);
     assert.equal(f.sims.length, 2);
+  });
+});
+
+describe("tag 111 G9: prog #641 NAV flow tail (vault ext + lev guard, found by key in [7..]) on the moves, not on PROPOSE", () => {
+  function unitsAcct(market: PublicKey, receivable: bigint, pending = 0n): Uint8Array {
+    const b = Buffer.alloc(16 + 192);
+    b.writeBigUInt64LE(0x5045_5243_5631_3600n, 0);
+    b.writeUInt16LE(19, 8);
+    b[10] = 13;
+    Buffer.from(market.toBytes()).copy(b, 16);
+    b[16 + 136] = 1;
+    b.writeBigUInt64LE(receivable, 16 + 80);
+    b.writeBigUInt64LE(pending, 16 + 160);
+    return new Uint8Array(b);
+  }
+  const pdas = (ctx: ReturnType<typeof v22Ctx>) => ({
+    guard: PublicKey.findProgramAddressSync([Buffer.from("lev_guard"), ctx.market.toBuffer()], ctx.programId)[0].toBase58(),
+    ext: PublicKey.findProgramAddressSync([Buffer.from("vault_lp_ext"), ctx.market.toBuffer()], ctx.programId)[0].toBase58(),
+    units: PublicKey.findProgramAddressSync([Buffer.from("ins_units"), ctx.market.toBuffer()], ctx.programId)[0].toBase58(),
+  });
+  const args = { allowAnyOracleMode: false, mainnetBuild: false, drawCapAtoms: 7n, dryRun: false };
+  it("RESTORE (modes 3 then 1): [7] units, [8] ext, [9] guard on every simulated attempt and on the sent tx", async () => {
+    const ctx = v22Ctx();
+    const P = pdas(ctx);
+    const f = fakeExecConn({ simErr: (_tx, i) => (i === 0 ? customAt(0, 116) : null) });
+    const r = await g9Once(execCtx(f.conn), ctx, unitsAcct(ctx.market, 10n), freshG9State(), args);
+    assert.equal(r.outcome?.kind, "sent");
+    for (const tx of [...f.sims, ...f.sent]) {
+      assert.equal(tx.tags[0], 111);
+      assert.deepEqual(tx.keys[0].slice(7, 10), [P.units, P.ext, P.guard]);
+      assert.equal(tx.keys[0].length, 10);
+    }
+    assert.deepEqual(f.simUnits, [600_000, 600_000], "every tag-111 attempt carries the explicit 600k limit");
+  });
+  it("PROPOSE (mode 2) moves nothing: no ext / guard (the program does not sample it)", async () => {
+    const ctx = v22Ctx();
+    const P = pdas(ctx);
+    const f = fakeExecConn();
+    const r = await g9Once(execCtx(f.conn), ctx, unitsAcct(ctx.market, 0n), freshG9State(), args);
+    assert.equal(r.action.kind, "propose");
+    assert.equal(f.sent[0].keys[0].length, 8);
+    assert.ok(!f.sent[0].keys[0].includes(P.guard) && !f.sent[0].keys[0].includes(P.ext));
+  });
+  it("the G9 tx budget (600k) is at least 2x the worst measured tag-111 move after #641 (150k)", () => {
+    assert.equal(G9_TX_UNITS, 600_000);
+    assert.ok(G9_TX_UNITS >= 2 * 150_000);
   });
 });
 

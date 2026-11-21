@@ -332,7 +332,7 @@ export function rowAgreesWithSdk(l: MarketLayout, sdk: ReadonlyMap<number, Layou
 }
 
 /**
- * Portfolio account lengths the pinned SDK parser decodes (VERSION 18 = 9,563 B, VERSION 19 = 10,603 B).
+ * Portfolio account lengths the pinned SDK parser decodes (VERSION 18 = 9,563 B, VERSION 19 = 10,607 B).
  * A portfolio of any other length is not read: the keeper never hand-rolls leg offsets.
  */
 export const SDK_PORTFOLIO_LENS: ReadonlySet<number> = new Set([...LAYOUTS_BY_VERSION.values()].map((t) => t.portfolio.accountLen));

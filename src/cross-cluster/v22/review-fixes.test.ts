@@ -321,24 +321,24 @@ describe("items 8 and 10: the vault LP is the registry's exact key; the anchor i
   it("F-4: a matcher-enabled impostor is a COUNTERPARTY; the real LP (even flat) is the LP", () => {
     const impostor = acc(60, user, { legs: [{ side: 0, basis: 5n }], matcher: true });
     assert.equal(parsePortfolioV17(impostor.data).matcherEnabled, true, "fixture: the impostor really is matcher-enabled (the old code would call it the LP)");
-    const r = analysePortfolios([impostor, acc(50, key(44), { legs: [{ side: 1, basis: 5n }] })], { lpPortfolio: lp, portfolioLen: 10603 });
+    const r = analysePortfolios([impostor, acc(50, key(44), { legs: [{ side: 1, basis: 5n }] })], { lpPortfolio: lp, portfolioLen: 10607 });
     assert.ok(r.lp?.pubkey.equals(lp));
     assert.ok(r.counterparties.some((c) => c.pubkey.equals(impostor.pubkey)));
     // a flat LP is still the LP
-    const flat = analysePortfolios([impostor], { lpPortfolio: lp, portfolioLen: 10603 });
+    const flat = analysePortfolios([impostor], { lpPortfolio: lp, portfolioLen: 10607 });
     assert.ok(flat.lp?.pubkey.equals(lp));
     assert.equal(flat.lp?.longLegs, 0);
     // unknown LP: no LP at all (the delegate declines), nobody is guessed
-    assert.equal(analysePortfolios([impostor], { lpPortfolio: null, portfolioLen: 10603 }).lp, null);
+    assert.equal(analysePortfolios([impostor], { lpPortfolio: null, portfolioLen: 10607 }).lp, null);
   });
   it("anchor: only the KEEPER's own flat portfolio; a user's flat portfolio is never picked (negative control)", () => {
     const userFlat = acc(61, user);
     const keeperFlat = acc(62, keeper);
     const keeperBusy = acc(63, keeper, { legs: [{ side: 0, basis: 5n }] });
-    assert.equal(analysePortfolios([userFlat], { lpPortfolio: lp, portfolioLen: 10603, keeperOwner: keeper }).flatAnchor, null);
-    assert.equal(analysePortfolios([userFlat, keeperBusy], { lpPortfolio: lp, portfolioLen: 10603, keeperOwner: keeper }).flatAnchor, null, "a keeper portfolio WITH a position is not flat");
-    assert.ok(analysePortfolios([userFlat, keeperFlat], { lpPortfolio: lp, portfolioLen: 10603, keeperOwner: keeper }).flatAnchor?.equals(keeperFlat.pubkey));
-    assert.equal(analysePortfolios([userFlat, keeperFlat], { lpPortfolio: lp, portfolioLen: 10603 }).flatAnchor, null, "no keeper identity: no anchor");
+    assert.equal(analysePortfolios([userFlat], { lpPortfolio: lp, portfolioLen: 10607, keeperOwner: keeper }).flatAnchor, null);
+    assert.equal(analysePortfolios([userFlat, keeperBusy], { lpPortfolio: lp, portfolioLen: 10607, keeperOwner: keeper }).flatAnchor, null, "a keeper portfolio WITH a position is not flat");
+    assert.ok(analysePortfolios([userFlat, keeperFlat], { lpPortfolio: lp, portfolioLen: 10607, keeperOwner: keeper }).flatAnchor?.equals(keeperFlat.pubkey));
+    assert.equal(analysePortfolios([userFlat, keeperFlat], { lpPortfolio: lp, portfolioLen: 10607 }).flatAnchor, null, "no keeper identity: no anchor");
   });
   it("with an anchor the accrue goes through the ANCHOR (counted anchorAccrues); without one it falls back to a counterparty and COUNTS it", async () => {
     const anchor = key(77);
