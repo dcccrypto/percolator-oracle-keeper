@@ -132,3 +132,109 @@ test("publisher: a non-https url fails closed at startup (throws), and the messa
   assert.equal(createTickPublisher({ url: "http://localhost:8787/y", key }).enabled, true);
   assert.equal(createTickPublisher({ url: "", key }).enabled, false);
 });
+
+function withEnv<T>(vars: Record<string, string | undefined>, fn: () => Promise<T> | T): Promise<T> {
+  const prev: Record<string, string | undefined> = {};
+  for (const k of Object.keys(vars)) { prev[k] = process.env[k]; if (vars[k] === undefined) delete process.env[k]; else process.env[k] = vars[k]; }
+  const restore = () => { for (const k of Object.keys(prev)) { if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k]; } };
+  return Promise.resolve().then(fn).finally(restore);
+}
+
+test("publisher: url/key/timeout fall back to env, trimmed; stays disabled when either is unset", async () => {
+  await withEnv({ TICK_INGEST_URL: "  https://env.example/t  ", TICK_INGEST_KEY: " envkey ", TICK_PUBLISH_TIMEOUT_MS: "250" }, async () => {
+    let seen: { url: string; init: RequestInit } | null = null;
+    const p = createTickPublisher({ fetchImpl: (async (u: string, init: RequestInit) => { seen = { url: u, init }; return new Response("ok"); }) as unknown as typeof fetch });
+    assert.equal(p.enabled, true);
+    p.publish([inp(1)], 1, 1);
+    await tick();
+    assert.equal(seen!.url, "https://env.example/t");
+    assert.equal(seen!.init.signal instanceof AbortSignal, true);
+    assert.equal((seen!.init.headers as Record<string, string>).authorization, "Bearer envkey");
+    assert.equal(p.counters().sent, 1);
+  });
+  await withEnv({ TICK_INGEST_URL: "https://env.example/t", TICK_INGEST_KEY: undefined }, () => {
+    assert.equal(createTickPublisher().enabled, false);
+  });
+  await withEnv({ TICK_INGEST_URL: undefined, TICK_INGEST_KEY: "k" }, () => {
+    assert.equal(createTickPublisher().enabled, false);
+  });
+});
+
+test("publisher: invalid timeout (NaN, zero, negative) falls back to the default instead of aborting at once", async () => {
+  for (const bad of [Number.NaN, 0, -5]) {
+    const p = createTickPublisher({ url: "https://u.example/t", key: "k", timeoutMs: bad, fetchImpl: (async (_u: string, init: RequestInit) => {
+      await new Promise((r) => setTimeout(r, 15));
+      assert.equal(init.signal!.aborted, false);
+      return new Response("ok");
+    }) as unknown as typeof fetch });
+    p.publish([inp(1)], 1, 1);
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(p.counters().sent, 1, String(bad));
+  }
+  await withEnv({ TICK_PUBLISH_TIMEOUT_MS: "garbage" }, async () => {
+    const p = createTickPublisher({ url: "https://u.example/t", key: "k", fetchImpl: (async () => new Response("ok")) as typeof fetch });
+    p.publish([inp(1)], 1, 1);
+    await tick();
+    assert.equal(p.counters().sent, 1);
+  });
+});
+
+test("publisher: default log writes to console.warn; default clock/fetch used when not injected", async () => {
+  const warns: string[] = [];
+  const origWarn = console.warn;
+  const origFetch = globalThis.fetch;
+  console.warn = (m: unknown) => { warns.push(String(m)); };
+  globalThis.fetch = (async () => new Response("no", { status: 503 })) as typeof fetch;
+  try {
+    const p = createTickPublisher({ url: "https://u.example/t", key: "k" });
+    p.publish([inp(1)], 1, 1);
+    await tick();
+    assert.equal(p.counters().failed, 1);
+    assert.equal(warns.length, 1);
+    assert.match(warns[0], /publish failed \(HTTP 503\)/);
+  } finally {
+    console.warn = origWarn;
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("publisher: non-Error throw is counted as generic 'error'", async () => {
+  const logs: string[] = [];
+  const p = createTickPublisher({ url: "https://u.example/t", key: "k", now: () => 100_000, log: (m) => logs.push(m), fetchImpl: (async () => { throw "str"; }) as unknown as typeof fetch });
+  p.publish([inp(1)], 1, 1);
+  await tick();
+  assert.equal(p.counters().failed, 1);
+  assert.match(logs[0], /\(error\)/);
+});
+
+test("publisher: multi-chunk batch sends every body; an HTTP failure stops the remaining chunks", async () => {
+  const many = Array.from({ length: 450 }, (_, i) => inp(i));
+  const sizes: number[] = [];
+  const ok = createTickPublisher({ url: "https://u.example/t", key: "k", fetchImpl: (async (_u: string, init: RequestInit) => { sizes.push(JSON.parse(init.body as string).ticks.length); return new Response("ok"); }) as unknown as typeof fetch });
+  ok.publish(many, 1, 1);
+  await tick();
+  assert.deepEqual(sizes, [200, 200, 50]);
+  assert.equal(ok.counters().sent, 450);
+
+  let calls = 0;
+  const bad = createTickPublisher({ url: "https://u.example/t", key: "k", log: () => {}, fetchImpl: (async () => { calls++; return calls === 1 ? new Response("ok") : new Response("no", { status: 502 }); }) as unknown as typeof fetch });
+  bad.publish(many, 1, 1);
+  await tick();
+  assert.equal(calls, 2, "third chunk not attempted");
+  assert.equal(bad.counters().sent, 200);
+  assert.equal(bad.counters().failed, 1);
+});
+
+test("publisher: all-invalid input sends nothing; a throwing input is swallowed, counted failed, and does not wedge the in-flight slot", async () => {
+  let calls = 0;
+  const p = createTickPublisher({ url: "https://u.example/t", key: "k", fetchImpl: (async () => { calls++; return new Response("ok"); }) as typeof fetch });
+  p.publish([{ ...inp(1), markE6: 0n }], 1, 1);
+  await tick();
+  assert.equal(calls, 0);
+  assert.equal(p.counters().failed, 0);
+  assert.doesNotThrow(() => p.publish(null as unknown as TickInput[], 1, 1));
+  assert.equal(p.counters().failed, 1);
+  p.publish([inp(1)], 1, 1);
+  await tick();
+  assert.equal(calls, 1);
+});
