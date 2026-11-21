@@ -152,7 +152,7 @@ export class TakeoverGate {
       const g = this.gapSlots(m, nowMs);
       const at = this.takeoverAt.get(m);
       out[m] = {
-        standby: this.isStandby(m, nowMs),
+        standby: g !== null && g < this.cfg.takeoverSlots,
         gapSlots: g === null ? null : g.toString(),
         lastGoodSlot: s ? s.lastGood.toString() : null,
         takeoverPushes: this.takeoverCount.get(m) ?? 0,
@@ -161,6 +161,20 @@ export class TakeoverGate {
     }
     return out;
   }
+}
+
+// PublicKey per market string, bounded to the market set of the latest refresh (rebuilt, not grown, each call).
+let keyCache = new Map<string, PublicKey>();
+function marketKeys(markets: readonly string[]): PublicKey[] {
+  const next = new Map<string, PublicKey>();
+  const keys = markets.map((m) => {
+    let k = next.get(m) ?? keyCache.get(m);
+    if (!k) k = new PublicKey(m); // throws on a bad market string, exactly as before
+    next.set(m, k);
+    return k;
+  });
+  keyCache = next;
+  return keys;
 }
 
 /**
@@ -176,7 +190,7 @@ export async function refreshTakeoverGate(
 ): Promise<void> {
   try {
     if (markets.length === 0) return;
-    const keys = markets.map((m) => new PublicKey(m));
+    const keys = marketKeys(markets);
     const [slot, infos] = await Promise.all([
       conn.getSlot("confirmed"),
       // dataSlice keeps this to ~176 bytes per market instead of the whole account
@@ -185,11 +199,12 @@ export async function refreshTakeoverGate(
         dataSlice: { offset: 0, length: SLICE_LEN },
       }),
     ]);
+    const slotBig = BigInt(slot);
     infos.forEach((info, i) => {
       if (!info || info.data.length < SLICE_LEN) return;
       const d = info.data;
       const lastGood = d.readBigUInt64LE(LAST_GOOD_SLOT_OFF);
-      gate.update(markets[i], lastGood, BigInt(slot), nowMs);
+      gate.update(markets[i], lastGood, slotBig, nowMs);
     });
   } catch {
     // leave the old state to age out -> fail open
