@@ -19,11 +19,14 @@ import {
   SIDE_MODE_RESET_PENDING,
   BUCKET_FRESH,
   buildFinalizeResetSideIx,
+  buildLivenessRepairIx,
+  describeRepair,
   decodeLivenessState,
   livenessOffsetsFor,
   livenessOffsetsV21,
   planLivenessRepairs,
 } from "./liveness-repair.ts";
+import { LAYOUTS_BY_VERSION } from "@percolatorct/sdk";
 import { detectLayout } from "./market-layout.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -120,5 +123,63 @@ describe("K-8: the cranker sends tag 45 on a v2.2 market (was skipped on v2.2 la
     // NEGATIVE CONTROL: the healthy (repaired) bytes get no tag 45.
     const healthy = await run(JUP);
     assert.ok(!healthy.some((d) => d[0] === 45), `wrapper ixs: ${JSON.stringify(healthy)}`);
+  });
+});
+
+describe("liveness-repair: every refusal / skip arm, with the keeper outcome pinned", () => {
+  it("livenessOffsetsFor returns null for a layout whose VERSION the pinned SDK has no engine-slot table for", () => {
+    // Callers (recovery-cranker.ts:716, v22/loop.ts:988) wrap decode in try/catch: null -> throw -> no repair planned.
+    assert.equal(livenessOffsetsFor({ ...det.layout, wrapperVersion: 65_000 }), null);
+  });
+
+  it("decodeLivenessState throws (never guesses) on an unknown layout, naming the reason", () => {
+    const d = new Uint8Array(JUP);
+    new DataView(d.buffer).setUint16(8, 65_000, true);
+    assert.throws(() => decodeLivenessState(d), /decodeLivenessState: .*65000|decodeLivenessState: /);
+    assert.throws(() => decodeLivenessState(d.subarray(0, 100)), /decodeLivenessState: /);
+  });
+
+  it("decodeLivenessState throws 'no SDK engine-slot table' if the SDK table vanishes after detection (defensive arm)", () => {
+    // detectLayout only returns known for a VERSION the SDK registry has, so this arm is a pure defence against the
+    // registry and the layout rows disagreeing. Reach it by letting detectLayout's lookups pass, then failing the
+    // lookup livenessOffsetsFor makes (the last .get on the registry during decode).
+    const orig = LAYOUTS_BY_VERSION.get.bind(LAYOUTS_BY_VERSION);
+    let calls = 0;
+    // count the gets detectLayout makes on its own, then fail the next one
+    LAYOUTS_BY_VERSION.get = (k: number) => { calls++; return orig(k); };
+    detectLayout(JUP);
+    const detectGets = calls;
+    calls = 0;
+    LAYOUTS_BY_VERSION.get = (k: number) => (++calls > detectGets ? undefined : orig(k));
+    try {
+      assert.throws(() => decodeLivenessState(JUP), /no SDK engine-slot table for VERSION 19/);
+    } finally {
+      delete (LAYOUTS_BY_VERSION as { get?: unknown }).get;
+    }
+    assert.ok(decodeLivenessState(JUP), "registry restored");
+  });
+
+  it("explicit offsets: a buffer shorter than the last bucket throws 'too short' instead of reading past the end", () => {
+    const o = livenessOffsetsFor(det.layout)!;
+    const need = o.engineBase + o.backingShort + 97;
+    assert.throws(() => decodeLivenessState(new Uint8Array(need - 1), 0, o), /market account too short \(\d+ bytes\)/);
+    assert.doesNotThrow(() => decodeLivenessState(new Uint8Array(need), 0, o));
+  });
+
+  it("a slot beyond the account (assetIndex >= slots) throws too short, so the v22 loop skips it", () => {
+    assert.throws(() => decodeLivenessState(JUP, 64), /too short/);
+  });
+
+  it("describeRepair labels both sides and the expire repair", () => {
+    assert.equal(describeRepair({ kind: "expire", domain: 3 }), "ExpireBackingBucket(d3)");
+    assert.equal(describeRepair({ kind: "finalize", assetIndex: 0, side: 0 }), "FinalizeResetSide(long)");
+    assert.equal(describeRepair({ kind: "finalize", assetIndex: 0, side: 1 }), "FinalizeResetSide(short)");
+  });
+
+  it("buildLivenessRepairIx routes both kinds; livenessOffsetsV21 asset 1 shifts by one 2,325 B slot", () => {
+    const m = PublicKey.unique();
+    assert.equal(buildLivenessRepairIx(m, { kind: "expire", domain: 1 }).data[0], 89);
+    assert.equal(buildLivenessRepairIx(m, { kind: "finalize", assetIndex: 0, side: 0 }).data[0], 45);
+    assert.equal(livenessOffsetsV21(1).engineBase - livenessOffsetsV21(0).engineBase, 2325);
   });
 });
