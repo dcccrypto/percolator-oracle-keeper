@@ -57,7 +57,7 @@ import {
 import type { AdlEpisode } from "@percolatorct/sdk";
 import { ADL_ONE, decodeAdlState, isV18MarketHeader } from "./adl-state.ts";
 import type { AdlState } from "./adl-state.ts";
-import { isComputeExhaustion, parseInstructionError } from "./positioned-refresh.ts";
+import { isComputeExhaustion, parseInstructionError, portfolioIsLp } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import { readU64 } from "./p2b-markets.ts";
@@ -209,7 +209,8 @@ export function selectLegHolders(accounts: ReadonlyArray<{ pubkey: PublicKey; da
       else shortLegs++;
     }
     if (longLegs + shortLegs === 0) continue;
-    out.push({ pubkey, portfolioId: p.portfolioId, positionEpoch: p.matcherPositionEpoch, longLegs, shortLegs, isLp: p.matcherEnabled === true });
+    // #645: informational only (targets are every holder); a configured matcher, not the ENABLED bit the program clears.
+    out.push({ pubkey, portfolioId: p.portfolioId, positionEpoch: p.matcherPositionEpoch, longLegs, shortLegs, isLp: portfolioIsLp(pubkey, p) });
   }
   return out;
 }
