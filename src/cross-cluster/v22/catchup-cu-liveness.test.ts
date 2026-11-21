@@ -151,7 +151,7 @@ describe("catch-up is paced across markets (RPC rate limit)", () => {
   // The recovery cranker calls every market's delegate in the same instant, once per CRANK_INTERVAL_MS (20 s,
   // startRecoveryCrankLoop). A market skipped by the pacing used to return at once and wait a whole cycle, so the keeper
   // sent ONE catch-up per cycle across all markets instead of one per spacing window. Fake clock + recorded waits: exact.
-  function behindMarkets(n: number, o: { refused?: string; failSendOnce?: string } = {}) {
+  function behindMarkets(n: number, o: { refused?: string; failSendOnce?: string; slowRead?: string } = {}) {
     const market = v22MarketBytes({ currentSlot: NOW, slotLast: NOW - 150n * 10n });
     const f = fakeLoopConn({ readSlot: Number(NOW), market, registry: registryBytes({ bound: true, ext: true, bond: false }), vaultLpState: vaultLpStateBytes(key(901), 0n), lpAccount: portfolioBytes({ owner: key(8), capital: 1000n, pnl: 0n, legs: [{ side: 0, basis: 5n }] }), simErr: (d) => (o.refused && d.keys.some((ks) => ks.includes(o.refused!)) ? { InstructionError: [2, { Custom: 6 }] } : null) });
     if (o.failSendOnce) {
@@ -164,6 +164,14 @@ describe("catch-up is paced across markets (RPC rate limit)", () => {
           throw new Error("429 Too Many Requests");
         }
         return send(raw);
+      };
+    }
+    if (o.slowRead) {
+      // this market's reads return a macrotask later than every other market's (a slow RPC read)
+      const read = f.conn.getMultipleAccountsInfoAndContext.bind(f.conn);
+      (f.conn as unknown as { getMultipleAccountsInfoAndContext: unknown }).getMultipleAccountsInfoAndContext = async (keys: Array<{ toBase58(): string }>) => {
+        if (keys[0]?.toBase58() === o.slowRead) await new Promise((res) => setTimeout(res, 5));
+        return read();
       };
     }
     const clock = { t: 1_000_000 };
@@ -190,6 +198,45 @@ describe("catch-up is paced across markets (RPC rate limit)", () => {
     assert.equal(s.f.sent.length, 9, "starts at 0, 1.5, ... 12 s; the 10th (13.5 s) waits for the next cycle");
     assert.equal(Math.max(...s.waits), 12_000);
     assert.equal(s.lines.filter((l) => l.includes("deferred to a later cycle")).length, 1);
+  });
+
+  it("catch-up pacing: a slow-loading market is not starved; the market deferred longest gets the next free start", async () => {
+    // 10 markets that stay behind, 9 starts per cycle: one is deferred every cycle. The slow reader asks last every
+    // cycle, so first-come reservation deferred IT every cycle, forever (tip: 0 catch-ups in 4 cycles).
+    const slow = key(1000).toBase58(); // first in call order, but its reads return last
+    const s = behindMarkets(10, { slowRead: slow });
+    const perCycle: string[][] = [];
+    for (let c = 0; c < 4; c++) {
+      const before = s.f.sent.length;
+      await s.cycle();
+      perCycle.push(s.sentBy().slice(before));
+      s.clock.t += 20_000;
+    }
+    assert.deepEqual(perCycle.map((x) => x.length), [9, 9, 9, 9], "still one start per spacing window, 9 per cycle");
+    assert.ok(!perCycle[0].includes(slow), "cycle 1: the slow reader asked last and was deferred");
+    assert.ok(perCycle[1].includes(slow), `cycle 2: deferred longest, so it gets a start (slow-reader catch-ups per cycle: ${perCycle.map((x) => x.filter((m) => m === slow).length)})`);
+    for (let c = 1; c < 4; c++) {
+      const served = new Set([...perCycle[c - 1], ...perCycle[c]]);
+      assert.deepEqual(s.markets.filter((m) => !served.has(m)), [], `cycles ${c}-${c + 1}: no market deferred twice in a row`);
+    }
+  });
+
+  it("catch-up pacing: a deferred market that stops asking stops holding a start back (after 60 s)", async () => {
+    const s = behindMarkets(10);
+    await s.cycle(); // the 10th market (1.5 s past the budget) is deferred
+    const gone = s.markets.pop()!;
+    const deferredAt = s.clock.t;
+    const sentIn = async () => {
+      const before = s.f.sent.length;
+      await s.cycle();
+      return s.sentBy().slice(before);
+    };
+    s.clock.t = deferredAt + 20_000;
+    assert.equal((await sentIn()).length, 8, "inside 60 s the deferred market may still come back: one start held for it");
+    s.clock.t = deferredAt + 60_001;
+    const later = await sentIn();
+    assert.equal(later.length, 9, "past 60 s without asking it holds nothing back");
+    assert.ok(!later.includes(gone));
   });
 
   it("catch-up pacing: a market whose catch-up the program refuses backs off 60 s and does not crowd out the healthy ones", async () => {

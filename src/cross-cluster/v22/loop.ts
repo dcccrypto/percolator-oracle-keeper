@@ -151,6 +151,10 @@ interface MarketRuntime {
   repairBackoffUntilMs: number;
   /** No catch-up before this time after the program refused one (refused, or landed and failed); never after a transport failure. */
   catchupBackoffUntilMs: number;
+  /** When this market was first deferred by the catch-up queue since its last start (null: not waiting); older goes first. */
+  catchupDeferredSinceMs: number | null;
+  /** When this market last asked the catch-up queue for a start (a deferral older than CATCHUP_DEFERRAL_STALE_MS is ignored). */
+  catchupAskedAtMs: number;
   /** Active vault-LP crank liveness alerts from the last GOOD read (kept across a failed read, never cleared by one). */
   lpCertAlerts: Alert[];
   /** #174: active depth-capacity alerts from the last decodable read. */
@@ -180,6 +184,11 @@ const CATCHUP_MEASURED_MARGIN = 1.08;
  * Fixed for the 20 s default cycle; derive it from CRANK_INTERVAL_MS if that is ever run much shorter.
  */
 const CATCHUP_WAIT_BUDGET_MS = 12_000;
+/**
+ * A deferred market that has not asked for a catch-up start for this long (it caught up another way, its reads fail, or
+ * it left the unit list) no longer holds a start back for itself. Three 20 s crank cycles.
+ */
+const CATCHUP_DEFERRAL_STALE_MS = 60_000;
 const sleepMs = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms));
 
 export class V22Loop {
@@ -438,6 +447,8 @@ export class V22Loop {
         anchorBadRounds: 0,
         repairBackoffUntilMs: 0,
         catchupBackoffUntilMs: 0,
+        catchupDeferredSinceMs: null,
+        catchupAskedAtMs: 0,
         deferrals: new Map(),
         escalated: new Map(),
         lastLpSettledAtMs: 0,
@@ -503,17 +514,35 @@ export class V22Loop {
   }
 
   /**
-   * Reserve the next catch-up start across ALL markets (`catchupSpacingMs` apart). Returns the ms to wait for it, or
-   * null (nothing reserved) when that start is more than CATCHUP_WAIT_BUDGET_MS away. A non-positive or non-numeric
-   * spacing means no pacing, as before.
+   * Reserve the next catch-up start across ALL markets (`catchupSpacingMs` apart) for market `r`. Returns the ms to wait
+   * for it, or null (nothing reserved; `r` is deferred) when no start inside CATCHUP_WAIT_BUDGET_MS is left for it. A
+   * non-positive or non-numeric spacing means no pacing, as before.
+   *
+   * Oldest deferral first: the cranker calls every market at once and each reserves when its own reads return, so a
+   * market whose reads are slow always asked last and, with more behind markets than starts in the budget, was deferred
+   * every cycle (starved). Now a market only takes a start if one is still left after holding one back for every market
+   * deferred before it that is still asking; a never-deferred market counts every deferred one as older.
    */
-  private reserveCatchupStart(): number | null {
+  private reserveCatchupStart(r: MarketRuntime): number | null {
     const raw = this.d.catchupSpacingMs ?? Number(process.env.KEEPER_V22_CATCHUP_SPACING_MS ?? 1500);
     const spacing = raw > 0 ? Math.min(raw, Number.MAX_SAFE_INTEGER) : 0; // Infinity: one catch-up, then paced (as before), never NaN
     const now = this.now();
+    r.catchupAskedAtMs = now;
     const start = Math.max(now, this.lastCatchupAtMs + spacing);
-    if (start - now > CATCHUP_WAIT_BUDGET_MS) return null;
+    // Starts left inside the budget from here (unpaced: unlimited). The window only slides later, so a start held back
+    // now is still inside it when the older market asks later in the same cycle.
+    const left = start - now > CATCHUP_WAIT_BUDGET_MS ? 0 : spacing > 0 ? Math.floor((now + CATCHUP_WAIT_BUDGET_MS - start) / spacing) + 1 : Number.POSITIVE_INFINITY;
+    const mine = r.catchupDeferredSinceMs ?? Number.POSITIVE_INFINITY;
+    let older = 0;
+    for (const o of this.rt.values()) {
+      if (o !== r && o.catchupDeferredSinceMs !== null && o.catchupDeferredSinceMs < mine && now - o.catchupAskedAtMs <= CATCHUP_DEFERRAL_STALE_MS) older++;
+    }
+    if (older >= left) {
+      r.catchupDeferredSinceMs ??= now;
+      return null;
+    }
     this.lastCatchupAtMs = start;
+    r.catchupDeferredSinceMs = null;
     return start - now;
   }
 
@@ -597,6 +626,7 @@ export class V22Loop {
       // In steady state the gap is below one window, so n is 0 and nothing changes.
       {
         const n = catchupCrankCount(BigInt(ctx.readSlot) - ctx.refresh.slotLast, ctx.refresh.maxAccrualDtSlots);
+        if (n === 0) r.catchupDeferredSinceMs = null; // caught up: no start held back for it
         if (n > 0) {
           // v22price 2026-10-22: pace catch-up across markets. After an outage every market is behind at once; one
           // catch-up tx per market per cycle (each with two simulations, a send and status polls) hit the RPC key's rate
@@ -604,12 +634,12 @@ export class V22Loop {
           // The cranker calls every market at the same instant, once per crank cycle, so a market skipped by the pacing
           // used to wait a whole cycle: one catch-up per cycle across all markets. Each market now reserves the next free start
           // (one per spacing window) and waits for it inside this call; only a start beyond CATCHUP_WAIT_BUDGET_MS is left
-          // to a later cycle.
+          // to a later cycle, and the market deferred longest is served first (`reserveCatchupStart`).
           let cur: V22MarketCtx | null = ctx;
           // A market the program keeps refusing would hold a start every cycle forever (re-read + 2 simulations each, on the
           // rate-limited RPC key); it backs off 60 s instead. A transport failure (429, blockhash) says nothing about the market.
           const backedOff = this.now() < r.catchupBackoffUntilMs;
-          const wait = backedOff ? null : this.reserveCatchupStart();
+          const wait = backedOff ? null : this.reserveCatchupStart(r);
           if (wait !== null) {
             if (wait > 0) {
               await (this.d.sleep ?? sleepMs)(wait);
