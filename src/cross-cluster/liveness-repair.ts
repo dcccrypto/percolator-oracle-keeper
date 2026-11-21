@@ -111,10 +111,6 @@ export interface LivenessState {
   sides: [SideResetState, SideResetState];
 }
 
-function u64(d: Uint8Array, off: number): bigint {
-  return new DataView(d.buffer, d.byteOffset, d.byteLength).getBigUint64(off, true);
-}
-
 /**
  * The engine-slot offsets the repairs read, for one market layout (K-8, 2026-10-12).
  *
@@ -167,6 +163,16 @@ export function livenessOffsetsFor(layout: MarketLayout, assetIndex = 0): Livene
 }
 
 /**
+ * The market's layout row for liveness decoding, detected ONCE per market (it is the same for every asset slot), or null
+ * when the layout is unknown or the SDK has no engine-slot table for it (decodeLivenessState would throw for every slot).
+ */
+export function livenessLayoutOf(data: Uint8Array): MarketLayout | null {
+  const det = detectLayout(data);
+  if (!det.known) return null;
+  return LAYOUTS_BY_VERSION.has(det.layout.wrapperVersion) ? det.layout : null;
+}
+
+/**
  * Decode the repair-relevant state of asset `assetIndex`. The layout is detected from the account (VERSION + length)
  * unless `offsets` is given; an unknown layout throws (never decoded with a guessed offset).
  */
@@ -183,17 +189,18 @@ export function decodeLivenessState(data: Uint8Array, assetIndex = 0, offsets?: 
   if (data.length < a + o.backingShort + BACKING_LEN) {
     throw new Error(`decodeLivenessState: market account too short (${data.length} bytes)`);
   }
+  const v = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const bucket = (i: 0 | 1): BucketState => {
     const b = a + (i === 0 ? o.backingLong : o.backingShort);
-    return { domain: assetIndex * 2 + i, status: data[b + BK_STATUS], expirySlot: u64(data, b + BK_EXPIRY) };
+    return { domain: assetIndex * 2 + i, status: data[b + BK_STATUS], expirySlot: v.getBigUint64(b + BK_EXPIRY, true) };
   };
   const side = (s: 0 | 1): SideResetState => ({
     side: s,
     mode: data[a + (s === 0 ? o.modeLong : o.modeShort)],
-    storedPos: u64(data, a + (s === 0 ? o.storedPosLong : o.storedPosShort)),
-    stale: u64(data, a + (s === 0 ? o.staleLong : o.staleShort)),
-    pendingObligations: u64(data, a + (s === 0 ? o.pendingOblLong : o.pendingOblShort)),
-    pendingDomainLossBarrier: u64(data, a + (s === 0 ? o.barrierLong : o.barrierShort)),
+    storedPos: v.getBigUint64(a + (s === 0 ? o.storedPosLong : o.storedPosShort), true),
+    stale: v.getBigUint64(a + (s === 0 ? o.staleLong : o.staleShort), true),
+    pendingObligations: v.getBigUint64(a + (s === 0 ? o.pendingOblLong : o.pendingOblShort), true),
+    pendingDomainLossBarrier: v.getBigUint64(a + (s === 0 ? o.barrierLong : o.barrierShort), true),
   });
   return { assetIndex, buckets: [bucket(0), bucket(1)], sides: [side(0), side(1)] };
 }
