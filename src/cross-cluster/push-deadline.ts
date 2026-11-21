@@ -197,13 +197,15 @@ export function recordOnChainMarks(marketAddress: string, data: Uint8Array): voi
       const base = engineSlotBase(det.layout, i);
       const lifecycle = data[base + det.layout.asset.lifecycle];
       // Only a tradable asset has a mark worth trusting as a baseline.
-      if (lifecycle !== LIFECYCLE_ACTIVE && lifecycle !== LIFECYCLE_DRAIN_ONLY) continue;
+      // A slot that is no longer trustworthy DROPS its seed: a stale baseline for a retired / recycled slot is worse than none.
+      const key = markUnitKey(marketAddress, i);
+      if (lifecycle !== LIFECYCLE_ACTIVE && lifecycle !== LIFECYCLE_DRAIN_ONLY) { marksByUnit.delete(key); continue; }
       const mark = u64(data, base + det.layout.asset.rawOracleTargetPrice);
-      if (mark <= 0n) continue;
+      if (mark <= 0n) { marksByUnit.delete(key); continue; }
       // lot_exp of this asset: without it the per-lot mark cannot be compared with the breaker's per-token price (a lot_exp > 0 market would trip on every restart).
       const lotExp = parsePushAuthMarkGenerationFields(data, i)?.lotExp;
-      if (lotExp === undefined) continue; // unknown unit: leave unseeded (fail-open, logged by the breaker)
-      marksByUnit.set(markUnitKey(marketAddress, i), { mark, lotExp });
+      if (lotExp === undefined) { marksByUnit.delete(key); continue; } // unknown unit: leave unseeded (fail-open, logged by the breaker)
+      marksByUnit.set(key, { mark, lotExp });
     }
   } catch {
     // leave unseeded
@@ -231,6 +233,7 @@ export function getPushDeadline(marketAddress: string, nowMs: number = Date.now(
   const c = byMarket.get(marketAddress);
   if (!c) return undefined;
   if (c.deadline.terminal) return c.deadline;
+  // A negative age (record stamped a few ms after the caller's `now`) is deliberately FRESH: keeper-loop captures smoothNowMs once per cycle, and the cranker records concurrently.
   return nowMs - c.atMs <= maxAgeMs ? c.deadline : undefined;
 }
 
@@ -270,6 +273,8 @@ export async function refreshPushDeadlines(
 /** Drop markets no longer registered. */
 export function prunePushDeadlines(keep: ReadonlySet<string>): void {
   for (const m of [...byMarket.keys()]) if (!keep.has(m)) byMarket.delete(m);
+  // Unit keys are `market` or `market:assetIndex`; a seed lives only while its market is registered.
+  for (const k of [...marksByUnit.keys()]) if (!keep.has(k.split(":")[0])) marksByUnit.delete(k);
 }
 
 /** Test hook. */
