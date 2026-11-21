@@ -217,18 +217,48 @@ export function saveRegistry(registry: Registry, registryPath: string): void {
  * If a market with the same `marketAddress` already exists it is replaced.
  * Returns the (possibly updated) entry.
  */
+// addr -> first index, keyed by the markets ARRAY (removeMarket / reload swap the
+// array, which drops the index for free). Trusted only while the array length is
+// unchanged and a hit still points at the same address; otherwise rebuilt.
+// CONTRACT: callers that edit registry.markets directly must keep the length
+// changing (push/splice) or write the SAME address back at an index; overwriting
+// an index with a DIFFERENT address at constant length is not detected. All
+// in-repo mutators (reconcileMarkets, reload, removeMarket) honour this.
+const addIndex = new WeakMap<object, { len: number; map: Map<string, number> }>();
+
+function indexFor(markets: MarketEntry[]): Map<string, number> {
+  let c = addIndex.get(markets);
+  if (!c || c.len !== markets.length) {
+    const map = new Map<string, number>();
+    for (let i = 0; i < markets.length; i++) {
+      if (!map.has(markets[i].marketAddress)) map.set(markets[i].marketAddress, i);
+    }
+    c = { len: markets.length, map };
+    addIndex.set(markets, c);
+  }
+  return c.map;
+}
+
 export function addMarket(
   registry: Registry,
   entry: Omit<MarketEntry, "registeredAt">,
 ): MarketEntry {
-  const idx = registry.markets.findIndex(
-    (m) => m.marketAddress === entry.marketAddress,
-  );
+  const markets = registry.markets;
+  let map = indexFor(markets);
+  let idx = map.get(entry.marketAddress) ?? -1;
+  if (idx >= 0 && markets[idx]?.marketAddress !== entry.marketAddress) {
+    // Stale: rebuild and retry.
+    addIndex.delete(markets);
+    map = indexFor(markets);
+    idx = map.get(entry.marketAddress) ?? -1;
+  }
   const full: MarketEntry = { ...entry, registeredAt: Date.now() };
   if (idx >= 0) {
-    registry.markets[idx] = full;
+    markets[idx] = full;
   } else {
-    registry.markets.push(full);
+    map.set(entry.marketAddress, markets.length);
+    markets.push(full);
+    addIndex.get(markets)!.len = markets.length;
   }
   return full;
 }
