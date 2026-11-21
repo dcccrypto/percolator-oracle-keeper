@@ -6,10 +6,13 @@
  * (RPC connection, keypair load, etc.).
  */
 
+const DECIMAL_RE = /^(?:\d+(?:\.\d*)?|\.\d+)$/;
+
 /**
  * Parse a safety-critical numeric environment variable.
  *
  * If the variable is unset or empty the fallback is used.
+ * The value must be a plain unsigned decimal (no hex/binary/octal, exponent, sign, padding or separators).
  * If the resulting value is not a finite positive number the process throws
  * immediately — a NaN/Infinity/zero/negative value would silently disable
  * guards (e.g. circuit breaker always-false when MAX_PRICE_MOVE_PCT is NaN).
@@ -20,7 +23,8 @@
  */
 export function parsePositiveNumberEnv(name: string, fallback: number, max?: number): number {
   const raw = process.env[name];
-  const value = raw == null || raw.trim() === "" ? fallback : Number(raw);
+  // Decimal-only: Number() would also accept 0x10, 0b11, 0o17, 1e3 and padded " 5 " as thresholds.
+  const value = raw == null || raw.trim() === "" ? fallback : DECIMAL_RE.test(raw) ? Number(raw) : NaN;
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(
       `${name} must be a finite positive number (got: ${JSON.stringify(raw)})`,
