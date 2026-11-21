@@ -226,6 +226,34 @@ export function decideStakeFeePush(s: StakeFeeState, cfg: Pick<StakeFeeConfig, "
   return { action: "push", owed: s.owed, realShares };
 }
 
+// PDA derivation (findProgramAddressSync) costs milliseconds and the inputs repeat every cycle, so memoise.
+// Keyed on raw key bytes; bounded so a long-lived keeper cannot grow it without limit.
+const DERIVE_CACHE_MAX = 4096;
+const poolCache = new Map<string, PublicKey>();
+const vaultCache = new Map<string, ReturnType<typeof deriveMarketVaultAccounts>>();
+const rawKey = (...ks: PublicKey[]): string => ks.map((k) => Buffer.from(k.toBytes()).toString("latin1")).join("");
+
+export function derivePoolPda(market: PublicKey, stakeProgramId: PublicKey): PublicKey {
+  const k = rawKey(market, stakeProgramId);
+  let v = poolCache.get(k);
+  if (!v) {
+    v = deriveStakePool(market, stakeProgramId)[0];
+    if (poolCache.size >= DERIVE_CACHE_MAX) poolCache.clear();
+    poolCache.set(k, v);
+  }
+  return v;
+}
+export function deriveVaultAccounts(wrapperProgramId: PublicKey, market: PublicKey, mint: PublicKey): ReturnType<typeof deriveMarketVaultAccounts> {
+  const k = rawKey(wrapperProgramId, market, mint);
+  let v = vaultCache.get(k);
+  if (!v) {
+    v = Object.freeze(deriveMarketVaultAccounts(wrapperProgramId, market, mint));
+    if (vaultCache.size >= DERIVE_CACHE_MAX) vaultCache.clear();
+    vaultCache.set(k, v);
+  }
+  return v;
+}
+
 export function buildWithdrawInsuranceReserveToStakeIx(p: {
   wrapperProgramId: PublicKey;
   cranker: PublicKey;
@@ -234,7 +262,7 @@ export function buildWithdrawInsuranceReserveToStakeIx(p: {
   stakeVault: PublicKey;
   collateralMint: PublicKey;
 }): TransactionInstruction {
-  const v = deriveMarketVaultAccounts(p.wrapperProgramId, p.market, p.collateralMint);
+  const v = deriveVaultAccounts(p.wrapperProgramId, p.market, p.collateralMint);
   return new TransactionInstruction({
     programId: p.wrapperProgramId,
     keys: buildAccountMetas(ACCOUNTS_WITHDRAW_INSURANCE_RESERVE_TO_STAKE, {
@@ -322,7 +350,7 @@ export async function pushStakeFeesOnce(
   } catch {
     return { kind: "failed", error: "unparseable market address" };
   }
-  const [poolPda] = deriveStakePool(market, cfg.stakeProgramId);
+  const poolPda = derivePoolPda(market, cfg.stakeProgramId);
 
   let marketData: Uint8Array;
   let state: StakeFeeState;
