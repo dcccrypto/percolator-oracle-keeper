@@ -206,7 +206,8 @@ function run(args: string[], env: Record<string, string>, until?: RegExp): Promi
     };
     child.stdout.on("data", onData);
     child.stderr.on("data", onData);
-    const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+    // Generous: one cold tsx start takes 15s+ on a busy machine, with up to 6 at once; a cut-off run fails the source match.
+    const timer = setTimeout(() => child.kill("SIGKILL"), 120_000);
     child.on("close", (code) => {
       clearTimeout(timer);
       resolve({ code, out });
