@@ -101,14 +101,16 @@ export async function confirmBySignature(
 ): Promise<ConfirmOutcome> {
   const retries = opts.statusRetries ?? 3;
   const delayMs = opts.statusRetryDelayMs ?? 2_000;
-  const t0 = Date.now();
+  // Monotonic: a wall-clock step (NTP, VM resume) must neither end the wait early nor stretch it.
+  const now = () => performance.now();
+  const t0 = now();
   const deadline = t0 + (opts.deadlineMs ?? 90_000);
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   // Each RPC call races READ_CAP_MS and the deadline: a hung request must not hold the wait open.
   const bounded = <T>(p: Promise<T>): Promise<T> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<never>((_, reject) => {
-      const left = deadline - Date.now();
+      const left = deadline - now();
       timer = setTimeout(() => reject(new Error(left > READ_CAP_MS ? `read timed out after ${READ_CAP_MS} ms` : "confirm deadline reached")), Math.max(0, Math.min(READ_CAP_MS, left)));
     });
     return Promise.race([p, late]).finally(() => clearTimeout(timer));
@@ -135,8 +137,8 @@ export async function confirmBySignature(
     await sleep(poll <= FAST_POLLS ? Math.min(FAST_POLL_MS, delayMs) : delayMs); // nothing is confirmed the instant it is sent
     const out = await check();
     if (out) return out;
-    if (Date.now() >= deadline) break;
-    if (poll >= FAST_POLLS || Date.now() - t0 >= FAST_POLLS * FAST_POLL_MS) { // capped hung reads must not stretch the fast window
+    if (now() >= deadline) break;
+    if (poll >= FAST_POLLS || now() - t0 >= FAST_POLLS * FAST_POLL_MS) { // capped hung reads must not stretch the fast window
       try {
         const height = await bounded(conn.getBlockHeight("confirmed"));
         if (height > lastValidBlockHeight) {
@@ -149,7 +151,7 @@ export async function confirmBySignature(
     }
   }
 
-  for (let attempt = 0; attempt < retries && Date.now() < deadline; attempt++) {
+  for (let attempt = 0; attempt < retries && now() < deadline; attempt++) {
     await sleep(delayMs);
     const out = await check();
     if (out) return out;
