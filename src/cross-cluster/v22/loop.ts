@@ -175,7 +175,8 @@ const POSITIONED_TTL_MS = 10_000;
 const CATCHUP_MEASURED_MARGIN = 1.08;
 /**
  * The longest a market waits inside one crank cycle for its catch-up start. Below the 20 s CRANK_INTERVAL_MS default,
- * so a cycle of paced catch-ups (about 9 at the 1.5 s spacing) still fits in one interval and the cycle is not stretched.
+ * so a cycle of paced catch-ups (about 9 at the 1.5 s spacing) starts within one interval; the last catch-up's send and
+ * confirm can still stretch that cycle (by at most about this budget over the old behaviour).
  * Fixed for the 20 s default cycle; derive it from CRANK_INTERVAL_MS if that is ever run much shorter.
  */
 const CATCHUP_WAIT_BUDGET_MS = 12_000;
