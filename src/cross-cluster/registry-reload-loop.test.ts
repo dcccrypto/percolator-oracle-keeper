@@ -152,3 +152,29 @@ describe("startRegistryReloadLoop", () => {
     assert.ok(logs.some((l) => l.includes("unexpected error: boom")));
   });
 });
+
+/** Run `fn` with Date.now stepping back 60s after its first call and setTimeout recording delays (then firing at once). */
+async function withBackwardsClock(fn: (delays: number[]) => Promise<void>): Promise<void> {
+  const realNow = Date.now, realSet = globalThis.setTimeout;
+  const delays: number[] = [];
+  let calls = 0;
+  const t0 = realNow();
+  Date.now = () => (calls++ === 0 ? t0 : t0 - 60_000);
+  (globalThis as any).setTimeout = (cb: () => void, ms?: number) => { delays.push(ms ?? 0); return realSet(cb, 0); };
+  try { await fn(delays); } finally { Date.now = realNow; globalThis.setTimeout = realSet; }
+}
+
+describe("startRegistryReloadLoop clock step", () => {
+  it("a backwards wall-clock step never stretches the sleep past intervalMs", async () => {
+    capture();
+    const reg = live([A]);
+    const p = write("clock.json", [A]);
+    await withBackwardsClock(async (delays) => {
+      const done = startRegistryReloadLoop(reg, { registryPath: p, intervalMs: 5_000 });
+      await new Promise<void>((r) => { const t = setInterval(() => { if (delays.length) { clearInterval(t); r(); } }, 1); });
+      process.emit("SIGTERM");
+      await done;
+      assert.ok(delays[0] <= 5_000, `slept ${delays[0]}ms > interval 5000ms`);
+    });
+  });
+});

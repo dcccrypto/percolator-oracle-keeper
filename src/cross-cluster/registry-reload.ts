@@ -164,7 +164,8 @@ export async function startRegistryReloadLoop(
       // mode internally, but never let an unexpected throw kill this loop.
       console.error(`[registry-reload] unexpected error: ${err instanceof Error ? err.message : String(err)}`);
     }
-    const elapsed = Date.now() - cycleStart;
+    // Clamp to [0, intervalMs]: a backwards wall-clock step makes the raw delta negative, which would stretch the sleep to intervalMs + step.
+    const elapsed = Math.min(intervalMs, Math.max(0, Date.now() - cycleStart));
     const remaining = intervalMs - elapsed;
     if (remaining > 0 && !stopping) {
       await new Promise((r) => setTimeout(r, remaining));

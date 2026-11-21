@@ -229,6 +229,8 @@ export async function startP2bLoop(loop: P2bLoop, cfg: Pick<P2bLoopConfig, "tick
   while (!stopping) {
     const start = Date.now();
     await loop.tick();
-    await new Promise((r) => setTimeout(r, Math.max(1000, cfg.tickMs - (Date.now() - start))));
+    // Clamp elapsed to [0, tickMs]: a backwards wall-clock step must not stretch the sleep past tickMs.
+    const elapsed = Math.min(cfg.tickMs, Math.max(0, Date.now() - start));
+    await new Promise((r) => setTimeout(r, Math.max(1000, cfg.tickMs - elapsed)));
   }
 }

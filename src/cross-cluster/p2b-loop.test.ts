@@ -314,3 +314,37 @@ describe("startP2bLoop", () => {
     }
   });
 });
+
+/** Run `fn` with Date.now stepping back 60s after its first call and setTimeout recording delays (then firing at once). */
+async function withBackwardsClock(fn: (delays: number[]) => Promise<void>): Promise<void> {
+  const realNow = Date.now, realSet = globalThis.setTimeout;
+  const delays: number[] = [];
+  let calls = 0;
+  const t0 = realNow();
+  Date.now = () => (calls++ === 0 ? t0 : t0 - 60_000);
+  (globalThis as any).setTimeout = (cb: () => void, ms?: number) => { delays.push(ms ?? 0); return realSet(cb, 0); };
+  try { await fn(delays); } finally { Date.now = realNow; globalThis.setTimeout = realSet; }
+}
+
+describe("startP2bLoop clock step", () => {
+  it("a backwards wall-clock step never stretches the sleep past tickMs", { timeout: 10_000 }, async () => {
+    const before = { int: process.listeners("SIGINT"), term: process.listeners("SIGTERM") };
+    const ol = console.log;
+    console.log = () => undefined;
+    const w = build({ gate: "mode-off", markets: [] });
+    try {
+      await withBackwardsClock(async (delays) => {
+        const done = startP2bLoop(w.loop, { tickMs: 5_000 });
+        await new Promise<void>((r) => { const t = setInterval(() => { if (delays.length) { clearInterval(t); r(); } }, 1); });
+        process.emit("SIGTERM");
+        await done;
+        assert.ok(delays[0] <= 5_000, `slept ${delays[0]}ms > tick 5000ms`);
+      });
+    } finally {
+      console.log = ol;
+      for (const sig of ["SIGINT", "SIGTERM"] as const) {
+        for (const l of process.listeners(sig)) if (!(before[sig === "SIGINT" ? "int" : "term"]).includes(l)) process.removeListener(sig, l);
+      }
+    }
+  });
+});
