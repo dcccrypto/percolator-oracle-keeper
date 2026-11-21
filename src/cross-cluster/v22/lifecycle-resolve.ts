@@ -174,7 +174,10 @@ export const RESOLVE_GUARDS: ReadonlyArray<Guard> = [
     check: (i) => {
       if (!i.attempt) return null;
       if (i.attempt.landed) return "already resolved by this keeper";
-      return i.nowMs - i.attempt.atMs < i.cfg.resolveRetryMs ? `attempted ${i.nowMs - i.attempt.atMs} ms ago (retry after ${i.cfg.resolveRetryMs} ms)` : null;
+      const age = i.nowMs - i.attempt.atMs;
+      // A negative age means the wall clock stepped backwards since the attempt: the stamp is meaningless, so treat it as expired
+      // rather than holding a stale market until the clock catches up.
+      return age >= 0 && age < i.cfg.resolveRetryMs ? `attempted ${age} ms ago (retry after ${i.cfg.resolveRetryMs} ms)` : null;
     },
   },
   { name: "cycle-bound", check: (i) => (i.resolvedThisCycle >= i.cfg.maxResolvesPerCycle ? `already ${i.resolvedThisCycle} resolve(s) this tick (bound ${i.cfg.maxResolvesPerCycle})` : null) },
