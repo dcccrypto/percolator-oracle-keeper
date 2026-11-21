@@ -177,11 +177,19 @@ export function parseFlag(env: Env, key: string, def: boolean): boolean {
   throw new V22FlagError(key, raw, "on/1/true/yes or off/0/false/no");
 }
 
+/** Strict plain-decimal digits only (no 1e3 / 0x14 / 12.0 / +5 / 1_0), and a safe integer (no silent float rounding). */
+function strictDecimal(raw: string): number | null {
+  const s = raw.trim();
+  if (!/^\d+$/.test(s)) return null;
+  const n = Number(s);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
 function posInt(env: Env, key: string, def: number): number {
   const raw = env[key];
   if (raw === undefined || raw.trim() === "") return def;
-  const n = Number(raw.trim());
-  if (!Number.isInteger(n) || n <= 0) throw new V22FlagError(key, raw, "a positive integer");
+  const n = strictDecimal(raw);
+  if (n === null || n <= 0) throw new V22FlagError(key, raw, "a positive integer");
   return n;
 }
 
@@ -189,8 +197,8 @@ function posInt(env: Env, key: string, def: number): number {
 function nonNegInt(env: Env, key: string, def: number): number {
   const raw = env[key];
   if (raw === undefined || raw.trim() === "") return def;
-  const n = Number(raw.trim());
-  if (!Number.isInteger(n) || n < 0) throw new V22FlagError(key, raw, "a non-negative integer");
+  const n = strictDecimal(raw);
+  if (n === null || n < 0) throw new V22FlagError(key, raw, "a non-negative integer");
   return n;
 }
 
