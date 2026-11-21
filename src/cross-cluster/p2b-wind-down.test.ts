@@ -411,3 +411,149 @@ describe("windDownConfigFromEnv", () => {
     assert.equal(windDownConfigFromEnv({ P2B_WIND_DOWN_MAX_PER_CYCLE: "2" }, true).dryRun, true);
   });
 });
+
+describe("runner: defaults, logging and failure paths", () => {
+  const EXPIRED = () => snap(roMarket({ episodeSince: BigInt(NOW - 9000) }));
+  const bare = (o: { holders?: LegHolder[]; sims?: Array<{ err: unknown; logs?: string[]; unitsConsumed?: number }>; confirmErr?: unknown; cfg?: Partial<WindDownConfig>; fetchHolders?: () => Promise<LegHolder[]> } = {}) => {
+    const c = fakeConn({ sims: o.sims as never, confirmErr: o.confirmErr as never });
+    const r = new AdlWindDownRunner({ ...DEFAULT_WIND_DOWN_CONFIG, ...o.cfg }, {
+      programId: PROGRAM, conn: c.conn as never, keeper: KEEPER,
+      fetchHolders: o.fetchHolders ?? (async () => o.holders ?? []),
+      mintDecimals: async () => 6,
+      confirm: { statusRetries: 0, statusRetryDelayMs: 1 },
+    });
+    return { c, r };
+  };
+  const withConsole = async (fn: () => Promise<void>) => {
+    const lines: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => { lines.push(a.join(" ")); };
+    try { await fn(); } finally { console.log = orig; }
+    return lines;
+  };
+
+  it("with no log dep: a stale mark is logged through console.log", async () => {
+    const g = bare({ holders: [holder(1, "short")] });
+    const lines = await withConsole(async () => {
+      const out = await g.r.runMarket(snap(roMarket({ episodeSince: BigInt(NOW - 9000), markSlot: BigInt(NOW - 200) })));
+      assert.deepEqual(out, { kind: "skipped", why: "stale-mark" });
+    });
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /expired but the mark is 200 slots old \(> 140\)/);
+    assert.equal(g.r.stats.skippedStaleMark, 1);
+    assert.equal(g.c.calls.length, 0);
+  });
+
+  it("default clock: a turn that sent nothing cools the market down against Date.now()", async () => {
+    const g = bare({ holders: [holder(1, "short")], sims: [{ err: ie({ Custom: 21 }) }] });
+    const s = EXPIRED(); // same snapshot => same market address
+    await g.r.runMarket(s);
+    assert.deepEqual(await g.r.runMarket(s), { kind: "skipped", why: "cooldown" });
+    assert.equal(g.r.stats.skippedCooldown, 1);
+    assert.equal(g.c.count("simulateTransaction"), 1);
+  });
+
+  it("an error with a non-Error value is contained and logged as a string (default log)", async () => {
+    const g = bare({ fetchHolders: async () => { throw "rpc down"; } });
+    const lines = await withConsole(async () => {
+      assert.deepEqual(await g.r.runMarket(EXPIRED()), { kind: "skipped", why: "unreadable" });
+    });
+    assert.deepEqual(lines, ["[p2b-wind-down] PERC: rpc down"]);
+  });
+
+  it("dry-run logs the would-succeed line and counts a sim but no send", async () => {
+    const g = bare({ holders: [holder(1, "short")], cfg: { dryRun: true }, sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    const lines = await withConsole(async () => {
+      assert.deepEqual(await g.r.runMarket(EXPIRED()), { kind: "acted", armed: 0, closed: 0, sims: 1, sent: 0 });
+    });
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /\[DRY-RUN\] PERC: tag 104 \(close\) on \w{8}… would succeed \(not sent\)/);
+    assert.equal(g.c.sent.length, 0);
+  });
+
+  it("a close that lands on chain is logged with the simulated CU; `?` when the sim reports none", async () => {
+    const g = bare({ holders: [holder(1, "short")], sims: [{ err: null, logs: [CLOSED_LOG], unitsConsumed: 123_456 }] });
+    const lines = await withConsole(async () => { await g.r.runMarket(EXPIRED()); });
+    assert.match(lines[0], /landed on \w{8}….*\(simulated 123456 CU of 600000\)/);
+    const h = bare({ holders: [holder(1, "short")], sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    h.c.conn.simulateTransaction = (async () => ({ context: { slot: 1 }, value: { err: null, logs: [CLOSED_LOG], accounts: null, unitsConsumed: undefined, returnData: null } })) as never;
+    const l2 = await withConsole(async () => { await h.r.runMarket(EXPIRED()); });
+    assert.match(l2[0], /\(simulated \? CU of 600000\)/);
+  });
+
+  it("a send that lands but failed on chain is 'failed': logged, not counted as sent", async () => {
+    const g = bare({ holders: [holder(1, "short")], confirmErr: { InstructionError: [1, { Custom: 5 }] }, sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    const lines = await withConsole(async () => {
+      assert.deepEqual(await g.r.runMarket(EXPIRED()), { kind: "acted", armed: 0, closed: 0, sims: 1, sent: 0 });
+    });
+    assert.equal(g.c.sent.length, 1);
+    assert.match(lines[0], /landed but failed on chain/);
+    assert.equal(g.r.stats.sent, 0);
+  });
+
+  it("a send that never confirms is logged 'not landed'", async () => {
+    const g = bare({ holders: [holder(1, "short")], sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    g.c.conn.getSignatureStatuses = (async () => ({ context: { slot: 1 }, value: [null] })) as never;
+    (g.c.conn as unknown as Record<string, unknown>).getBlockHeight = (async () => 1_000_000) as never;
+    const lines = await withConsole(async () => {
+      assert.deepEqual(await g.r.runMarket(EXPIRED()), { kind: "acted", armed: 0, closed: 0, sims: 1, sent: 0 });
+    });
+    assert.match(lines[0], /not landed sig=/);
+  });
+
+  it("close targets fall back to all holders when none sits on the reduce-only side", async () => {
+    const g = bare({ holders: [holder(1, "long")], sims: [{ err: null, logs: [CLOSED_LOG] }] });
+    await withConsole(async () => {
+      assert.deepEqual(await g.r.runMarket(EXPIRED()), { kind: "acted", armed: 0, closed: 1, sims: 1, sent: 1 });
+    });
+  });
+
+  it("market with no data is 'none'", async () => {
+    const g = bare({ holders: [holder(1, "short")] });
+    assert.deepEqual(await g.r.runMarket({ ...snap(roMarket()), marketData: null } as never), { kind: "none" });
+  });
+});
+
+describe("pure helpers: remaining branches", () => {
+  it("reduceOnlySide: both sides reduce-only -> fewer holders; tie -> long; short-only -> short", () => {
+    assert.equal(reduceOnlySide({ aLong: 1n, aShort: 1n }, 3, 5), "long");
+    assert.equal(reduceOnlySide({ aLong: 1n, aShort: 1n }, 5, 3), "short");
+    assert.equal(reduceOnlySide({ aLong: 1n, aShort: 1n }, 4, 4), "long");
+    assert.equal(reduceOnlySide({ aLong: ADL_ONE, aShort: 1n }, 0, 9), "short");
+    assert.equal(reduceOnlySide({ aLong: 1n, aShort: ADL_ONE }, 9, 0), "long");
+  });
+
+  it("windDownConfigFromEnv: blank / whitespace values fall back to defaults; out-of-range or fractional throw", () => {
+    const c = windDownConfigFromEnv({ P2B_WIND_DOWN_MAX_PER_MARKET: "   ", P2B_WIND_DOWN_CU: "" }, false);
+    assert.equal(c.maxSendsPerMarket, 3);
+    assert.equal(c.computeUnits, 600_000);
+    assert.throws(() => windDownConfigFromEnv({ P2B_WIND_DOWN_CU: "49999" }, false), /P2B_WIND_DOWN_CU/);
+    assert.throws(() => windDownConfigFromEnv({ P2B_WIND_DOWN_COOLDOWN_MS: "1.5" }, false), /P2B_WIND_DOWN_COOLDOWN_MS/);
+    assert.throws(() => windDownConfigFromEnv({ P2B_WIND_DOWN_MAX_SIMS: "abc" }, false), /P2B_WIND_DOWN_MAX_SIMS/);
+  });
+
+  it("classifyWindDownError: compute exhaustion wins; non-instruction errors are 'other'", () => {
+    assert.equal(classifyWindDownError("weird"), "other");
+    assert.equal(classifyWindDownError({ InstructionError: [1, "ProgramFailedToComplete"] }, ["Program failed: exceeded CUs meter at BPF instruction"]), "compute");
+    assert.equal(classifyWindDownError({ InstructionError: [1, "ComputationalBudgetExceeded"] }), "compute");
+    assert.equal(classifyWindDownError({ InstructionError: [1, "ProgramFailedToComplete"] }, ["exceeded CUs meter"]), "compute", "compute class is checked before custom-code mapping");
+    assert.equal(classifyWindDownError({ InstructionError: [1, "ProgramFailedToComplete"] }, ["some other failure"]), "other");
+  });
+});
+
+describe("readWindDownView: mark age picks the newer of the two profile slots", () => {
+  const WRAP = 592 + 758; // wrapper (asset-oracle profile) base for asset 0
+  const withSlots = (ewma: bigint, lastGood: bigint) => {
+    const b = Buffer.from(roMarket({ episodeSince: BigInt(NOW - 9000) }));
+    b.writeBigUInt64LE(ewma, WRAP + 176);
+    b.writeBigUInt64LE(lastGood, WRAP + 216);
+    return new Uint8Array(b);
+  };
+  it("ewma newer than last-good -> age measured from the ewma slot; last-good newer -> from last-good", () => {
+    assert.equal(readWindDownView(withSlots(BigInt(NOW - 10), BigInt(NOW - 300)), 0, BigInt(NOW))!.markAgeSlots, 10n);
+    assert.equal(readWindDownView(withSlots(BigInt(NOW - 300), BigInt(NOW - 20)), 0, BigInt(NOW))!.markAgeSlots, 20n);
+  });
+  it("a mark slot ahead of nowSlot clamps to age 0 (never negative)", () => {
+    assert.equal(readWindDownView(withSlots(BigInt(NOW + 50), BigInt(NOW + 40)), 0, BigInt(NOW))!.markAgeSlots, 0n);
+  });
+});
