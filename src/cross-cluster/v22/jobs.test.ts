@@ -310,6 +310,63 @@ describe("tag 111 G9 restore: mode 3 first, mode 1 fallback in the same sweep (G
   });
 });
 
+describe("tag 111 G9 g9Once: undecodable ledger, draw, and the per-market+action throttle", () => {
+  const args = { allowAnyOracleMode: false, mainnetBuild: false, drawCapAtoms: 7n, dryRun: false };
+  function unitsAcct(market: PublicKey, pending: bigint): Uint8Array {
+    const b = Buffer.alloc(16 + 192);
+    b.writeBigUInt64LE(0x5045_5243_5631_3600n, 0);
+    b.writeUInt16LE(19, 8);
+    b[10] = 13;
+    Buffer.from(market.toBytes()).copy(b, 16);
+    b[16 + 136] = 1;
+    b.writeBigUInt64LE(pending, 16 + 160);
+    return new Uint8Array(b);
+  }
+  it("an undecodable units account is treated as no ledger: action none, nothing simulated", async () => {
+    const ctx = v22Ctx();
+    const f = fakeExecConn();
+    const st = freshG9State();
+    const r = await g9Once(execCtx(f.conn), ctx, new Uint8Array(8), st, args);
+    assert.equal(r.action.kind, "none");
+    assert.equal(r.outcome, null);
+    assert.equal(f.sims.length, 0);
+    assert.equal(st.lastAttempt.size, 0);
+  });
+  it("a due draw is sent as mode 0 with the draw cap", async () => {
+    const ctx = v22Ctx({ currentSlot: 13000n });
+    const f = fakeExecConn();
+    const r = await g9Once(execCtx(f.conn), ctx, unitsAcct(ctx.market, 4000n), freshG9State(), args);
+    assert.equal(r.action.kind, "draw");
+    assert.equal(r.outcome?.kind, "sent");
+    assert.equal(f.sentData[0][0][1], 0, "mode byte = 0 (DRAW)");
+  });
+  it("a REFUSED attempt is still throttled; a different action kind on the same market is not", async () => {
+    const ctx = v22Ctx({ currentSlot: 13000n });
+    const f = fakeExecConn({ simErr: () => customAt(0, 116) });
+    const st = freshG9State();
+    const acct = unitsAcct(ctx.market, 4000n);
+    const r1 = await g9Once(execCtx(f.conn), ctx, acct, st, args);
+    assert.equal(r1.action.kind, "draw");
+    assert.equal(r1.outcome?.kind, "refused");
+    assert.equal(st.lastAttempt.get(`${ctx.marketAddress}|draw`), 13000n, "recorded although refused");
+    const sims = f.sims.length;
+    const r2 = await g9Once(execCtx(f.conn), ctx, acct, st, args);
+    assert.deepEqual(r2.action, { kind: "none", reason: "draw retry spacing" });
+    assert.equal(r2.outcome, null);
+    assert.equal(f.sims.length, sims, "throttled: no second simulation");
+    // 50 slots later the same draw is due again
+    const r3 = await g9Once(execCtx(f.conn), v22Ctx({ currentSlot: 13050n }), acct, st, args);
+    assert.equal(r3.action.kind, "draw");
+    // a different kind (propose, ledger with no open proposal) on the same market is not throttled by the draw entry
+    const r4 = await g9Once(execCtx(f.conn), ctx, unitsAcct(ctx.market, 0n), st, args);
+    assert.equal(r4.action.kind, "propose");
+    assert.equal(f.sims.length, sims + 2);
+    // and another market is independent too
+    const other = v22Ctx({ currentSlot: 13000n });
+    assert.equal(decideG9({ ...other, marketAddress: key(77).toBase58() }, { g9PendingSlot: 4000n, backstopReceivableAtoms: 0n }, 13000n, false, st).kind, "draw");
+  });
+});
+
 describe("stake v5 sync (tag 31)", () => {
   function poolBytes(lastSync: bigint, cooldown = 150n, o: { riskMode?: number; poolMode?: number } = {}): Uint8Array {
     const F = STAKE_POOL_FIELD_OFF_V5;
