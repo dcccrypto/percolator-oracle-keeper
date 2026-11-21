@@ -40,7 +40,7 @@ export function restartConfig(env: Readonly<Record<string, string | undefined>>)
 function load(path: string): RestartRecord {
   try {
     const j = JSON.parse(fs.readFileSync(path, "utf8")) as RestartRecord;
-    return { launches: Array.isArray(j.launches) ? j.launches.filter((n) => Number.isFinite(n)) : [], lastAlertAt: j.lastAlertAt, alertFails: Number.isFinite(j.alertFails) ? j.alertFails : undefined };
+    return { launches: Array.isArray(j.launches) ? j.launches.filter((n) => Number.isFinite(n)) : [], lastAlertAt: Number.isFinite(j.lastAlertAt) ? j.lastAlertAt : undefined, alertFails: Number.isFinite(j.alertFails) ? j.alertFails : undefined };
   } catch {
     return { launches: [] };
   }
@@ -56,9 +56,10 @@ export function recordLaunch(
   const rec = load(path);
   rec.launches = [...rec.launches.filter((t) => now - t < windowMs), now];
   const escalated = rec.launches.length >= threshold;
-  const alertDue = escalated && (rec.lastAlertAt === undefined || now - rec.lastAlertAt >= windowMs);
+  const alertDue = escalated && (rec.lastAlertAt === undefined || now < rec.lastAlertAt || now - rec.lastAlertAt >= windowMs);
   if (alertDue) {
     // A new window (previous stamp expired) starts with a fresh retry budget; a retry after a failure keeps its count.
+    // (a stamp in the future = the clock stepped back; treat it as expired, never as a mute)
     if (rec.lastAlertAt !== undefined) rec.alertFails = 0;
     rec.lastAlertAt = now;
   }
