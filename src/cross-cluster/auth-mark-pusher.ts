@@ -787,6 +787,33 @@ export async function fetchPushAuthMarkGenerationFields(
   return result;
 }
 
+/**
+ * lot_exp per unit key, read from the live market accounts (one batched read). Used ONLY by the keeper loop's
+ * tiny-price path (a pool whose e6 price is 0), so a default-scale market costs no extra RPC. A unit whose account
+ * cannot be read / parsed is absent (the caller drops it, as before).
+ */
+export async function fetchUnitLotExps(
+  devnetConn: Connection,
+  units: ReadonlyArray<{ key: string; marketAddress: string; assetIndex: number }>,
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (units.length === 0) return out;
+  const addrs = [...new Set(units.map((u) => u.marketAddress))];
+  const read = await getMultipleAccountsInfoChunked(devnetConn, addrs.map((a) => new PublicKey(a)), "processed");
+  const byAddr = new Map<string, Uint8Array>();
+  addrs.forEach((a, i) => {
+    const info = read.infos[i];
+    if (info) byAddr.set(a, new Uint8Array(info.data));
+  });
+  for (const u of units) {
+    const data = byAddr.get(u.marketAddress);
+    if (!data) continue;
+    const f = parsePushAuthMarkGenerationFields(data, u.assetIndex);
+    if (f) out.set(u.key, f.lotExp);
+  }
+  return out;
+}
+
 // ── Local observation_sequence watermark (Custom(19) self-race, 2026-09-28) ───
 //
 // ROOT CAUSE of the recurring `{"InstructionError":[1,{"Custom":19}]}`

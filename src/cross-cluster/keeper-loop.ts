@@ -59,7 +59,7 @@ import { getMarketAccrual, laggingAssets, multiAssetKey, priceUnitsOfRegistry, p
 import { DEADLINE_FRESH_MS, getOnChainTokenPriceUsd, getPushDeadline, isKnownTerminal, markTerminal, prunePushDeadlines, refreshPushDeadlines } from "./push-deadline.ts";
 import type { PushDeadline } from "./push-deadline.ts";
 import type { PriceUnit } from "./multi-asset.ts";
-import { pushGenerationKey } from "./auth-mark-pusher.ts";
+import { pushGenerationKey, fetchUnitLotExps } from "./auth-mark-pusher.ts";
 import { dlmmDepthObserveEnabled, dlmmDepthObserver, startDlmmDepthObservation } from "./dlmm-depth-observe.ts";
 
 /** Round 2: pins re-read every KEEPER_DEPTH_SRC_REFRESH_MS (default 5 min). */
@@ -156,6 +156,8 @@ interface MarketStat {
   sourceUnchangedSince: number | null;
   /** The last raw pool price read (E6), for sourceUnchangedSince. */
   lastRawPriceE6: bigint;
+  /** The last raw e12 price on the tiny-price path (e6 == 0), for sourceUnchangedSince; null on the e6 path. */
+  lastRawPriceE12: bigint | null;
   /** G8: the depth_e6 carried by the last landed push (null = that push was the 35 B form, or none yet). */
   lastDepthE6: bigint | null;
   /** G8: where that depth came from (null when lastDepthE6 is null). */
@@ -198,6 +200,7 @@ export function newMarketStat(m: {
     markGap: null,
     sourceUnchangedSince: null,
     lastRawPriceE6: 0n,
+    lastRawPriceE12: null,
     lastDepthE6: null,
     lastDepthSource: null,
     depthAbsentSince: null,
@@ -211,13 +214,16 @@ export function newMarketStat(m: {
  * elsewhere (WIF/KMNO marks did not change for 74.8k/19.5k slots on 10-03).
  */
 export function recordRawPrice(
-  stat: Pick<MarketStat, "sourceUnchangedSince" | "lastRawPriceE6">,
+  stat: Pick<MarketStat, "sourceUnchangedSince" | "lastRawPriceE6"> & Partial<Pick<MarketStat, "lastRawPriceE12">>,
   rawPriceE6: bigint,
   nowMs: number,
+  /** Tiny-price path only (e6 == 0): the raw e12 reading, so a moving sub-$0.000001 price is not "frozen". */
+  rawPriceE12: bigint | null = null,
 ): void {
-  if (stat.sourceUnchangedSince === null || rawPriceE6 !== stat.lastRawPriceE6) {
+  if (stat.sourceUnchangedSince === null || rawPriceE6 !== stat.lastRawPriceE6 || rawPriceE12 !== (stat.lastRawPriceE12 ?? null)) {
     stat.sourceUnchangedSince = nowMs;
     stat.lastRawPriceE6 = rawPriceE6;
+    stat.lastRawPriceE12 = rawPriceE12;
   }
 }
 
@@ -1150,6 +1156,41 @@ export function acceptedPublishPrice(
 }
 
 /**
+ * Tiny-price (lot_exp > 0, e6 == 0) twin of {@link acceptedPublishPrice}: the breaker works in USD per token, so a
+ * price carried at e12 is compared in the same unit as the e6 baseline. Returns the e12 to publish (>= 1) and its
+ * exact USD value (the baseline to stage), mirroring the e6 rules: unchanged price -> the e12 itself, hold -> the
+ * baseline, clamp -> rounded toward the baseline.
+ */
+export function acceptedPublishE12(
+  smoothedE12: bigint,
+  smoothedUsd: number,
+  acceptedUsd: number,
+  baselineUsd?: number,
+): { priceE12: bigint; priceUsd: number } {
+  if (acceptedUsd === smoothedUsd) return { priceE12: smoothedE12, priceUsd: smoothedUsd };
+  let e12: bigint;
+  if (baselineUsd !== undefined && acceptedUsd === baselineUsd) e12 = BigInt(Math.round(acceptedUsd * 1e12));
+  else e12 = BigInt(acceptedUsd < smoothedUsd ? Math.floor(acceptedUsd * 1e12) : Math.ceil(acceptedUsd * 1e12));
+  if (e12 < 1n) e12 = 1n;
+  return { priceE12: e12, priceUsd: Number(e12) / 1e12 };
+}
+
+/** lot_exp per unit key (immutable on chain), filled lazily by the tiny-price path only. */
+const unitLotExpCache = new Map<string, number>();
+/** Test hook: a process restart empties the lazily filled lot_exp cache but not the on-chain breaker seed. */
+export function resetUnitLotExpCacheForTests(): void {
+  unitLotExpCache.clear();
+}
+
+/** A pool priced below $0.000001: no e6 price (the reader leaves it out of `prices`) but a positive e12. */
+export function tinyE12Of(prices: ReadonlyMap<string, bigint>, pricesE12: ReadonlyMap<string, bigint>, pool: string): bigint | null {
+  const e6 = prices.get(pool);
+  if (e6 !== undefined && e6 > 0n) return null;
+  const e12 = pricesE12.get(pool);
+  return e12 !== undefined && e12 > 0n && e12 < 1_000_000n ? e12 : null;
+}
+
+/**
  * Split a breaker-accepted candidate into (a) the accounting that MUST be
  * committed immediately and (b) the baseline that may only be committed once
  * the mark is actually published.
@@ -1389,6 +1430,103 @@ export async function runCycle(
   // 25 unheld cycles of 174, i.e. one sample per ~21 s against a 15 s window) never held 3 samples and re-primed
   // forever, while its siblings' pools were kept primed by other markets. Withholding a push must not starve its window.
   samplePoolsForCycle(units, (m) => isTerminalForPush(state, m), prices, pricesE12, { e6: markSmoother, e12: markSmootherE12 }, smoothNowMs, smoothedThisCycle, smoothedE12ThisCycle, primedPools);
+  // Tiny-price pools (e6 == 0, e12 > 0): only a lot_exp > 0 market can carry them (the per-lot mark is representable).
+  // lot_exp is immutable on chain, so it is read once per unit and only for such pools: a default-scale market with a
+  // normal price costs no RPC, and a lot_exp 0 one with a tiny price costs one read ever, then drops as before.
+  const tinyLotExps = new Map<string, number>();
+  {
+    const tinyUnits = units.filter((u) => u.source === "pool" && tinyE12Of(prices, pricesE12, u.poolAddress) !== null && !isTerminalForPush(state, u.marketAddress));
+    // A unit whose breaker baseline is already sub-$0.000001 (seeded from the on-chain mark after a restart, or left by an
+    // earlier tiny push) needs its lot_exp too even when the pool is back above $0.000001 now: an upward clamp toward that
+    // baseline lands under $0.000001 and must stay at e12. Decided from the baseline, not from the lazily filled cache.
+    const baselineTiny = units.filter((u) => {
+      if (u.source !== "pool" || isTerminalForPush(state, u.marketAddress) || tinyUnits.includes(u)) return false;
+      const e6 = prices.get(u.poolAddress);
+      if (e6 === undefined || e6 <= 0n) return false;
+      const b = crossClusterCircuitBreakerStates.get(u.key)?.lastPrice ?? getOnChainTokenPriceUsd(u.marketAddress, u.assetIndex);
+      return b !== null && b !== undefined && b > 0 && b < 1e-6;
+    });
+    const unknown = [...tinyUnits, ...baselineTiny].filter((u) => !unitLotExpCache.has(u.key));
+    if (unknown.length > 0) {
+      try {
+        for (const [k, v] of await fetchUnitLotExps(devnetConn, unknown)) unitLotExpCache.set(k, v);
+      } catch (err) {
+        console.warn(`[loop] tiny-price lot_exp read failed (those pools drop this cycle): ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}`);
+      }
+    }
+    for (const u of tinyUnits) {
+      const v = unitLotExpCache.get(u.key);
+      if (v !== undefined && v > 0) tinyLotExps.set(u.key, v);
+    }
+  }
+  const tinyPricePush = (
+    entry: (typeof units)[number],
+    rawE12: bigint,
+    nowMs: number,
+    stat: NonNullable<ReturnType<typeof state.stats.get>>,
+  ): (typeof pushes)[number] | null => {
+    stat.sourcePriceE6 = 0n;
+    recordRawPrice(stat, 0n, nowMs, rawE12);
+    lifecycleLedger.recordSource(entry.marketAddress, true, nowMs);
+    let e12 = smoothedE12ThisCycle.get(entry.poolAddress);
+    if (e12 === undefined) {
+      e12 = markSmootherE12.smooth(entry.poolAddress, rawE12, nowMs);
+      smoothedE12ThisCycle.set(entry.poolAddress, e12);
+      if (e12 === null) primedPools.delete(entry.poolAddress);
+      else primedPools.add(entry.poolAddress);
+    }
+    if (e12 === null) {
+      const bypass = deadlineBypass(getPushDeadline(entry.marketAddress, nowMs, DEADLINE_FRESH_MS), markSmootherE12.peek(entry.poolAddress));
+      if (bypass === null) {
+        stat.totalErrors++;
+        stat.lastErrorMsg = primingMessage(markSmootherE12.status(entry.poolAddress));
+        return null;
+      }
+      e12 = bypass.priceE6; // the e12 window median (deadlineBypass is unit-agnostic)
+      console.warn(`[loop] ${entry.label}: smoother still priming but ${bypass.reason} — publishing the window median now (R3.24 deadline bypass)`);
+    }
+    if (config.standby?.(entry.marketAddress)) {
+      (state.standbyThisCycle ??= new Set()).add(entry.key);
+      state.landedThisCycle.add(entry.key);
+      return null;
+    }
+    const current = getCrossClusterCircuitBreakerState(entry.key, entry.label, { marketAddress: entry.marketAddress, assetIndex: entry.assetIndex });
+    const candidate = cloneCircuitBreakerState(current);
+    const usd = Number(e12) / 1e12;
+    const acceptedUsd = checkCircuitBreaker(candidate, usd, {
+      maxMovePct: CROSS_CLUSTER_MAX_MOVE_PCT,
+      confirmTrips: CROSS_CLUSTER_CIRCUIT_BREAKER_CONFIRM_TRIPS,
+      sustainedRelocationMs: CROSS_CLUSTER_SUSTAINED_RELOCATION_MS,
+      log: (msg) => console.warn(`[loop] ${msg}`),
+    });
+    {
+      const g = markGap(candidate, usd, Date.now());
+      stat.markGap = g && { pct: g.pct, ageMs: g.ageMs, checks: g.checks, dir: g.dir };
+    }
+    if (acceptedUsd === null) {
+      crossClusterCircuitBreakerStates.set(entry.key, candidate);
+      stat.totalErrors++;
+      stat.lastErrorMsg = `circuit breaker blocked mark move at ${usd.toFixed(12)}`;
+      return null;
+    }
+    const publish = acceptedPublishE12(e12, usd, acceptedUsd, current.lastPrice);
+    const { commitNow, deferred } = splitBreakerCommit(current, candidate, publish.priceUsd);
+    crossClusterCircuitBreakerStates.set(entry.key, commitNow);
+    pendingCircuitBreakerStates.set(entry.key, deferred);
+    const priceE6 = publish.priceE12 / 1_000_000n; // 0 unless a clamp lifted it to >= $0.000001
+    stat.sourcePriceE6 = priceE6;
+    stat.lastPriceE6 = priceE6;
+    return {
+      key: entry.key,
+      multi: entry.multi,
+      marketAddress: entry.marketAddress,
+      assetIndex: entry.assetIndex,
+      priceE6,
+      priceE12: publish.priceE12,
+      depth: null,
+      ...(pushDepthOnchain ? { dex: depthSourceCache.get(entry.marketAddress) } : {}),
+    };
+  };
   for (const entry of units) {
     if (notPushable.has(entry.key)) continue;
     // Authority not confirmed (read failed, retry pending): do not push. lastErrorMsg already says why.
@@ -1437,6 +1575,14 @@ export async function runCycle(
       continue;
     }
     const rawPriceE6 = prices.get(entry.poolAddress);
+    const tinyE12 = tinyLotExps.has(entry.key) ? tinyE12Of(prices, pricesE12, entry.poolAddress) : null;
+    if (tinyE12 !== null) {
+      // lot_exp > 0 market whose price is under $0.000001: smooth, breaker-check and push it at e12 (same USD unit as
+      // the e6 baseline). Never reached for lot_exp 0, so those markets keep today's drop below.
+      const tinyPush = tinyPricePush(entry, tinyE12, smoothNowMs, stat);
+      if (tinyPush) pushes.push(tinyPush);
+      continue;
+    }
     if (rawPriceE6 === undefined || rawPriceE6 <= 0n) {
       stat.totalErrors++;
       stat.lastErrorMsg = noPoolPriceReason(priceSkipReasons, entry.poolAddress);
@@ -1531,12 +1677,21 @@ export async function runCycle(
     // rate-limited to the edge of the cumulative bound). Publish exactly what
     // it accepted — never the smoothed price it was shown — and record that
     // same value as the pending baseline.
-    const publish = acceptedPublishPrice(
-      priceE6,
-      priceUsd,
-      acceptedUsd,
-      currentCircuitBreakerState.lastPrice,
-    );
+    // lot_exp > 0 market whose breaker baseline is sub-$0.000001 (it was priced by the tiny path): a clamp / hold that lands
+    // below $0.000001 must stay at e12. The e6 rounding below would floor it to 0 -> 1 and publish $0.000001 instead.
+    const subMicro =
+      (unitLotExpCache.get(entry.key) ?? 0) > 0 && currentCircuitBreakerState.lastPrice > 0 && currentCircuitBreakerState.lastPrice < 1e-6 &&
+      acceptedUsd !== priceUsd && acceptedUsd < 1e-6
+        ? acceptedPublishE12(smoothedE12 ?? priceE6 * 1_000_000n, priceUsd, acceptedUsd, currentCircuitBreakerState.lastPrice)
+        : null;
+    const publish = subMicro
+      ? { priceE6: subMicro.priceE12 / 1_000_000n, priceUsd: subMicro.priceUsd }
+      : acceptedPublishPrice(
+          priceE6,
+          priceUsd,
+          acceptedUsd,
+          currentCircuitBreakerState.lastPrice,
+        );
     const { commitNow, deferred } = splitBreakerCommit(
       currentCircuitBreakerState,
       candidateCircuitBreakerState,
@@ -1547,7 +1702,8 @@ export async function runCycle(
 
     stat.lastPriceE6 = publish.priceE6;
     // e12 rides along only when the breaker published the smoothed price itself (not a clamp / hold).
-    if (publish.priceE6 !== priceE6) smoothedE12 = null;
+    if (subMicro) smoothedE12 = subMicro.priceE12;
+    else if (publish.priceE6 !== priceE6) smoothedE12 = null;
     // G8: flag off / non-CPMM / reserve unknown -> null -> the exact 35 B bytes of today.
     const depth = resolvePushDepth(pushDepthOn, attestReservesUsdE6.get(entry.poolAddress));
     noteDepthAttempt(stat, pushDepthOn && entry.dexType === "pumpswap", depth !== null, smoothNowMs);
