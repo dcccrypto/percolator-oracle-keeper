@@ -97,6 +97,17 @@ interface Sample {
   phase: DepthSamplePhase;
 }
 
+/** Samples plus cached oldest timestamp and min reserve, so the hot path skips the scan. */
+interface PoolState {
+  list: Sample[];
+  minAt: number;
+  minRes: bigint;
+  /** atMs is non-decreasing along the list, so expired samples are exactly a prefix. */
+  ordered: boolean;
+  /** Holds a non-finite timestamp: use the plain filter (matches the original for NaN/Infinity). */
+  irregular: boolean;
+}
+
 /** The bracketing signature: a sharp drop between a pre-push read and the post-push re-read. */
 export interface BracketSignal {
   pool: string;
@@ -110,7 +121,7 @@ export interface BracketSignal {
  * (`plus2PctDepthE6`), so the min reserve gives the min depth.
  */
 export class DepthSampleWindow {
-  private readonly samples = new Map<string, Sample[]>();
+  private readonly samples = new Map<string, PoolState>();
   constructor(
     private readonly windowMs = DEFAULT_DEPTH_MIN_WINDOW_MS,
     dropPct = DEFAULT_DEPTH_BRACKET_DROP_PCT,
@@ -124,27 +135,90 @@ export class DepthSampleWindow {
 
   record(pool: string, reserveE6: bigint, phase: DepthSamplePhase, atMs: number): void {
     if (reserveE6 < 0n) return;
-    const list = this.samples.get(pool) ?? [];
+    let st = this.samples.get(pool);
+    if (!st) {
+      st = { list: [], minAt: atMs, minRes: reserveE6, ordered: true, irregular: false };
+      this.samples.set(pool, st);
+    }
+    const list = st.list;
+    if (!Number.isFinite(atMs)) st.irregular = true;
+    if (list.length > 0 && atMs < list[list.length - 1].atMs) st.ordered = false;
     list.push({ atMs, reserveE6, phase });
-    while (list.length > MAX_SAMPLES_PER_POOL) list.shift();
-    this.samples.set(pool, list);
-    this.prune(pool, atMs);
+    if (list.length === 1) {
+      st.minAt = atMs;
+      st.minRes = reserveE6;
+    } else {
+      if (atMs < st.minAt) st.minAt = atMs;
+      if (reserveE6 < st.minRes) st.minRes = reserveE6;
+    }
+    if (list.length > MAX_SAMPLES_PER_POOL) {
+      const gone = list.shift()!;
+      // Cap eviction removed a sample: refresh the cached extremes only if it could have been one of them.
+      if (gone.reserveE6 <= st.minRes || gone.atMs <= st.minAt) this.recompute(st);
+    }
+    this.prune(pool, st, atMs);
   }
 
-  private prune(pool: string, nowMs: number): void {
-    const list = this.samples.get(pool);
-    if (!list) return;
-    const kept = list.filter((s) => nowMs - s.atMs <= this.windowMs);
-    if (kept.length === 0) this.samples.delete(pool);
-    else this.samples.set(pool, kept);
+  private recompute(st: PoolState): void {
+    const list = st.list;
+    if (list.length === 0) return;
+    let minAt = list[0].atMs;
+    let minRes = list[0].reserveE6;
+    let ordered = true;
+    let irregular = !Number.isFinite(list[0].atMs);
+    for (let i = 1; i < list.length; i++) {
+      const s = list[i];
+      if (s.atMs < list[i - 1].atMs) ordered = false;
+      if (!Number.isFinite(s.atMs)) irregular = true;
+      if (s.atMs < minAt) minAt = s.atMs;
+      if (s.reserveE6 < minRes) minRes = s.reserveE6;
+    }
+    st.ordered = ordered;
+    st.irregular = irregular;
+    st.minAt = minAt;
+    st.minRes = minRes;
+  }
+
+  /** Drop every sample older than the window (same predicate as before). No-op unless the oldest one is expired. */
+  private prune(pool: string, st: PoolState, nowMs: number): void {
+    const regular = !st.irregular && Number.isFinite(nowMs) && Number.isFinite(this.windowMs);
+    if (regular && nowMs - st.minAt <= this.windowMs) return;
+    const list = st.list;
+    if (regular && st.ordered) {
+      // Ordered window: the expired samples are a prefix. Drop it in one splice; rescan only if it held the min.
+      let k = 0;
+      let lostMin = false;
+      while (k < list.length && nowMs - list[k].atMs > this.windowMs) {
+        if (list[k].reserveE6 <= st.minRes) lostMin = true;
+        k++;
+      }
+      if (k === list.length) {
+        this.samples.delete(pool);
+        list.length = 0;
+        return;
+      }
+      if (k === 1) list.shift();
+      else list.splice(0, k);
+      st.minAt = list[0].atMs;
+      if (lostMin) this.recompute(st);
+      return;
+    }
+    let w = 0;
+    for (let i = 0; i < list.length; i++) {
+      const s = list[i];
+      if (nowMs - s.atMs <= this.windowMs) list[w++] = s;
+    }
+    list.length = w;
+    if (w === 0) this.samples.delete(pool);
+    else this.recompute(st);
   }
 
   /** Min reserve over the window, or undefined when the pool has no sample in it. */
   minReserve(pool: string, nowMs: number): bigint | undefined {
-    this.prune(pool, nowMs);
-    const list = this.samples.get(pool);
-    if (!list || list.length === 0) return undefined;
-    return list.reduce((m, s) => (s.reserveE6 < m ? s.reserveE6 : m), list[0].reserveE6);
+    const st = this.samples.get(pool);
+    if (!st) return undefined;
+    this.prune(pool, st, nowMs);
+    return st.list.length === 0 ? undefined : st.minRes;
   }
 
   /**
@@ -159,8 +233,10 @@ export class DepthSampleWindow {
 
   /** The latest pre-push sample for a pool within the window. */
   lastPre(pool: string, nowMs: number): bigint | undefined {
-    this.prune(pool, nowMs);
-    const list = this.samples.get(pool) ?? [];
+    const st = this.samples.get(pool);
+    if (!st) return undefined;
+    this.prune(pool, st, nowMs);
+    const list = st.list;
     for (let i = list.length - 1; i >= 0; i--) if (list[i].phase === "pre") return list[i].reserveE6;
     return undefined;
   }
@@ -175,7 +251,7 @@ export class DepthSampleWindow {
 
   /** Test/ops hook. */
   size(pool: string): number {
-    return this.samples.get(pool)?.length ?? 0;
+    return this.samples.get(pool)?.list.length ?? 0;
   }
 }
 

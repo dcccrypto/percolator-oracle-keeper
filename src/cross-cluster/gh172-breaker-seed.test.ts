@@ -26,8 +26,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { getOnChainMarkE6, getOnChainTokenPriceUsd, recordOnChainMarks, resetOnChainMarks } from "./push-deadline.ts";
-import { PROFILE_LOT_EXP_OFF } from "./auth-mark-pusher.ts";
+import { getOnChainMarkE6, getOnChainTokenPriceUsd, recordOnChainMarks, recordPushDeadline, resetOnChainMarks } from "./push-deadline.ts";
+import { PROFILE_LOT_EXP_OFF, PROFILE_ORACLE_TARGET_PRICE_OFF } from "./auth-mark-pusher.ts";
 import { assetSlotOffset, selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
 import { checkCircuitBreaker, type CircuitBreakerState } from "../circuit-breaker.ts";
 import {
@@ -138,7 +138,7 @@ describe("GH#172 the seeding WIRING, not just the decode", () => {
       marketAddress: MARKET,
       assetIndex: 0,
     });
-    assert.equal(st.lastPrice, 0.00031, "seeded from raw_oracle_target_price 31.000000 per lot at lot_exp 5 = 0.00031 per token");
+    assert.equal(st.lastPrice, 0.00031, "seeded from the last pushed mark 31.000000 per lot at lot_exp 5 = 0.00031 per token");
   });
 
   it("a fresh state is UNSEEDED when the market has not been read — behaviour is unchanged", () => {
@@ -195,5 +195,53 @@ describe("GH#172 the seed is per TOKEN: the on-chain mark is per lot (token pric
     b[assetSlotOffset(g, 0) + PROFILE_LOT_EXP_OFF] = 200; // > LOT_EXP_MAX
     recordOnChainMarks(MARKET, b);
     assert.equal(getOnChainTokenPriceUsd(MARKET, 0), null);
+  });
+});
+
+/**
+ * PushAuthMark writes only the asset's oracle PROFILE (`oracle_target_price_e6`); the engine's
+ * `raw_oracle_target_price` catches up at the next accrual crank. A keeper restarted between the two
+ * must seed from the profile, or the breaker treats the mark already on chain as a fresh move: two
+ * dropped cycles, and past the cumulative band a band-edge push that moves the on-chain mark back
+ * toward the older price until the sustained-relocation snap (about 5 minutes).
+ */
+describe("GH#172 the seed is the last PUSHED mark (profile), not the engine's last accrued target", () => {
+  beforeEach(() => resetOnChainMarks());
+  const fixture = (name: string) =>
+    new Uint8Array(Buffer.from(readFileSync(join(HERE, "__fixtures__", name), "utf8").trim(), "base64"));
+  function setProfileTarget(b: Uint8Array, assetIndex: number, perLotE6: bigint): void {
+    const g = selectMarketGroupOffset(b);
+    if (!g.ok) throw new Error("fixture");
+    new DataView(b.buffer, b.byteOffset, b.byteLength).setBigUint64(assetSlotOffset(g, assetIndex) + PROFILE_ORACLE_TARGET_PRICE_OFF, perLotE6, true);
+  }
+
+  // Real accounts captured with a push newer than the last crank: profile and engine differ, no bytes edited.
+  it("VERSION 19 five-asset market: assets 3 and 1 seed from the profile", () => {
+    recordOnChainMarks("Cap4b", fixture("v22-cap4b-market-v19-5assets.b64"));
+    assert.equal(getOnChainMarkE6("Cap4b", 3), 109_005_519n, "engine raw_oracle_target_price is 108_961_934");
+    assert.equal(getOnChainMarkE6("Cap4b", 1), 13_027_438n, "engine raw_oracle_target_price is 13_029_483");
+  });
+
+  it("VERSION 18 market: asset 0 seeds from the profile", () => {
+    recordOnChainMarks("SolV18", fixture("sol-market-v18.b64"));
+    assert.equal(getOnChainMarkE6("SolV18", 0), 119_864_955n, "engine raw_oracle_target_price is 118_597_994");
+  });
+
+  it("a profile target of 0 falls back to the engine target", () => {
+    const b = fixture("v22-cap4b-market-v19-5assets.b64");
+    setProfileTarget(b, 3, 0n);
+    recordOnChainMarks("Cap4b", b);
+    assert.equal(getOnChainMarkE6("Cap4b", 3), 108_961_934n);
+  });
+
+  it("restart after a push with no crank since: the first check publishes the mark already on chain (lot_exp 4, live market)", () => {
+    const LIVE = "SwordcatLive1111111111111111111111111111111";
+    const b = fixture("swordcat-t-live-v22.b64");
+    setProfileTarget(b, 0, 37_607_084n); // +50% over the engine's 25_071_389 per lot
+    resetCrossClusterCircuitBreakerStates();
+    recordPushDeadline(LIVE, b, 1n); // the boot read
+    const st = getCrossClusterCircuitBreakerState(LIVE, "swordcat", { marketAddress: LIVE, assetIndex: 0 });
+    assert.equal(st.lastPrice, 0.0037607084, "per-token seed = 37.607084 per lot / 10^4");
+    assert.equal(checkCircuitBreaker(st, 0.0037607084, { maxMovePct: 10, confirmTrips: 3, sustainedRelocationMs: 300_000 }), 0.0037607084);
   });
 });

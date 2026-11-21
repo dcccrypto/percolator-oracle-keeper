@@ -111,3 +111,52 @@ describe("drainFeeLegsBeforeResolve (SOL real bytes: lp 13,690,922 / stake 4,563
     assert.equal(r.safeToResolve, false);
   });
 });
+
+// ---- fail-closed on unknown stake-bound budget / unreadable state ----
+import { windDownAfterResolve } from "./pre-resolve.ts";
+import type { TerminalInsuranceConfig } from "./terminal-insurance.ts";
+
+describe("pre-resolve fails closed when the terminal view is unknown", () => {
+  const sol = fx("sol-market-v18-fees");
+  const empty = drained(drained(sol, { lp: true, stake: true }), { lp: true, stake: true });
+  const noCranks: PreResolveDeps = { crankLp: async () => "skipped", pushStake: async () => ({ kind: "skipped", reason: "x" }) };
+  const tcfg = {} as TerminalInsuranceConfig;
+  const base = { state: null, stakeBound: false, budget: null, support: null };
+
+  // Zero the owed legs so only the terminal view can block.
+  const zero = Buffer.from(sol);
+  zero.fill(0, 16 + 496, 16 + 560);
+
+  it("stake-bound with budget null is a blocker, not safe", async () => {
+    const deps: PreResolveDeps = { ...noCranks, inspectTerminal: async () => ({ ...base, state: { kind: "live", budget: 0n, materializedPortfolios: 0n }, stakeBound: true, support: "supported" }) };
+    const r = await drainFeeLegsBeforeResolve(conn(zero, zero).c, Keypair.generate(), SOL, false, CFG, undefined, deps, tcfg);
+    assert.equal(r.safeToResolve, false);
+    assert.match(r.blockers.join("\n"), /budget unknown/);
+  });
+
+  it("terminal state unreadable (inspect swallowed an error) is a blocker, not safe", async () => {
+    const deps: PreResolveDeps = { ...noCranks, inspectTerminal: async () => base };
+    const r = await drainFeeLegsBeforeResolve(conn(zero, zero).c, Keypair.generate(), SOL, false, CFG, undefined, deps, tcfg);
+    assert.equal(r.safeToResolve, false);
+  });
+
+  it("known not-stake-bound live market stays safe", async () => {
+    const deps: PreResolveDeps = { ...noCranks, inspectTerminal: async () => ({ ...base, state: { kind: "live", budget: 0n, materializedPortfolios: 0n } }) };
+    const r = await drainFeeLegsBeforeResolve(conn(zero, zero).c, Keypair.generate(), SOL, false, CFG, undefined, deps, tcfg);
+    assert.equal(r.safeToResolve, true);
+  });
+
+  const wd = (o: Record<string, unknown>) => async () => ({ outcome: { kind: "skipped", reason: "x" }, steps: [], state: null, budget: null, stakeBound: false, support: null, ...o }) as never;
+  it("wind-down with unreadable state is NOT complete", async () => {
+    const w = await windDownAfterResolve({} as never, Keypair.generate(), SOL, false, tcfg, wd({}));
+    assert.equal(w.complete, false);
+  });
+  it("wind-down stake-bound with null budget is NOT complete", async () => {
+    const w = await windDownAfterResolve({} as never, Keypair.generate(), SOL, false, tcfg, wd({ state: { kind: "resolved" }, stakeBound: true }));
+    assert.equal(w.complete, false);
+  });
+  it("wind-down of a closed tombstone is complete", async () => {
+    const w = await windDownAfterResolve({} as never, Keypair.generate(), SOL, false, tcfg, wd({ state: { kind: "closed" }, stakeBound: true, outcome: { kind: "nothing", detail: "" } }));
+    assert.equal(w.complete, true);
+  });
+});

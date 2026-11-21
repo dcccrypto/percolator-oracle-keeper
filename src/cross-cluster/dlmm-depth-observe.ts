@@ -69,6 +69,11 @@ export class DlmmDepthObserver {
     return this.obs.get(key);
   }
 
+  /** Map sizes, for tests and leak checks. */
+  sizes(): { obs: number; lastStart: number; inFlight: number } {
+    return { obs: this.obs.size, lastStart: this.lastStart.size, inFlight: this.inFlight.size };
+  }
+
   async observe(
     conn: Conn,
     units: ReadonlyArray<{ key: string; dexType: string; source: string; poolAddress: string }>,
@@ -76,6 +81,14 @@ export class DlmmDepthObserver {
     solPriceE6: bigint | undefined,
     now: number,
   ): Promise<void> {
+    // Prune markets that left the unit list (not mid-flight: that one is cleaned by its own finally) so churn cannot grow the maps.
+    const live = new Set(units.map((u) => u.key));
+    for (const k of [...this.obs.keys(), ...this.lastStart.keys()]) {
+      if (!live.has(k) && !this.inFlight.has(k)) {
+        this.obs.delete(k);
+        this.lastStart.delete(k);
+      }
+    }
     for (const u of units) {
       if (u.dexType !== "meteora-dlmm" || u.source !== "pool") continue;
       if (this.inFlight.has(u.key)) continue;
