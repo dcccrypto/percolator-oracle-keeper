@@ -409,8 +409,14 @@ export interface CleanupConfig {
   now?: () => number;
 }
 
+/** Anything the owner still has to claim: capital, pnl, reserved pnl, an active leg or a cancel-deposit escrow. */
+const hasClaim = (c: Pf["claim"]): boolean =>
+  c.capital !== 0n || c.pnl !== 0n || c.reservedPnl !== 0n || c.activeLegs > 0 || c.cancelDepositEscrow !== 0n;
+
 export class CleanupState {
   support: { value: CleanupSupport; at: number } | null = null;
+  /** Per market, the last non-LP portfolio (base58) the per-cycle window reached; the next cycle resumes after it. */
+  readonly cursor = new Map<string, string>();
 }
 
 export type CleanupConnection = Pick<
@@ -677,7 +683,27 @@ export async function cleanupResolvedPortfolios(
   // Order (coordinator, P3 07a1d0eb): every other portfolio first (CloseResolved +
   // tag 8), THEN the vault LP (tag 101 settle, then its tag 8), so the senior-first
   // settle of the vault LP sees the other positions already settled.
-  pfs.sort((x, y) => Number(pdaOwnerKind(x.owner, market, cfg) === "lp-registry") - Number(pdaOwnerKind(y.owner, market, cfg) === "lp-registry"));
+  //
+  // The per-cycle bound covers only the NON-LP portfolios, taken as a window that resumes
+  // after the last one the previous cycle reached (pubkey order). A fixed window from index 0
+  // starved the vault LP (always last) and every trader behind >= maxPerCycle stuck ones. On the
+  // current wrapper and engine that can deadlock: a winner's CloseResolved stays ProgressOnly while
+  // ANY stored position exists (engine resolved_positive_payout_ready / resolved_payout_blocker_count),
+  // the vault LP's legs included, and only the LP's own tag 101 detaches those. A winning LP waits
+  // the same way on every trader's legs, so the window must reach all of them. The LP is exempt.
+  //
+  // NFT-escrowed portfolios WITH a claim are never attempted (GH#496, holder-only), so they sit
+  // outside the window too: they take no slot and all of them are in `waitingOnHolder` every cycle.
+  // terminal-insurance picks its alert kind from that list; a rotating subset would flip it.
+  // ponytail: 2 NFT-program getProgramAccounts per holder-only portfolio per cycle, uncapped; cache the holder per portfolio if a market ever holds many.
+  const isLp = (q: Pf): boolean => pdaOwnerKind(q.owner, market, cfg) === "lp-registry";
+  const holderOnly = (q: Pf): boolean => pdaOwnerKind(q.owner, market, cfg) === "nft-escrow" && hasClaim(q.claim);
+  const others = pfs.filter((q) => !isLp(q) && !holderOnly(q)).sort((x, y) => (x.pubkey.toBase58() < y.pubkey.toBase58() ? -1 : 1));
+  const after = st.cursor.get(market.toBase58());
+  const from = after === undefined ? 0 : Math.max(0, others.findIndex((q) => q.pubkey.toBase58() > after));
+  const window = [...others.slice(from), ...others.slice(0, from)];
+  if (window.length) st.cursor.set(market.toBase58(), window[Math.min(cfg.maxPerCycle, window.length) - 1].pubkey.toBase58());
+  pfs = [...window, ...pfs.filter(holderOnly), ...pfs.filter(isLp)];
   const graceLeft = pdaGraceLeft(clock.nowSlot, clock.resolvedSlot, cfg.pdaGraceSlots);
   // Vault LP (tag 101 first): its state names the LP portfolio and junior owner.
   let vaultLp: { key: PublicKey; state: VaultLpState; domain: number } | null = null;
@@ -703,7 +729,7 @@ export async function cleanupResolvedPortfolios(
   for (let i = 0; i < pfs.length; i++) {
     const p = pfs[i];
     const pdaKind = pdaOwnerKind(p.owner, market, cfg);
-    if (i >= cfg.maxPerCycle) {
+    if (i >= cfg.maxPerCycle && i < window.length) {
       out.remaining.push({ portfolio: p.pubkey.toBase58(), reason: `over the ${cfg.maxPerCycle}-per-cycle bound; next cycle` });
       continue;
     }
@@ -753,8 +779,7 @@ export async function cleanupResolvedPortfolios(
     }
     if (pdaKind === "nft-escrow") {
       const c = p.claim;
-      const hasClaim = c.capital !== 0n || c.pnl !== 0n || c.reservedPnl !== 0n || c.activeLegs > 0 || c.cancelDepositEscrow !== 0n;
-      if (hasClaim) {
+      if (hasClaim(c)) {
         // GH#496: never attempted — only the holder can settle an escrowed payout.
         const nft = await positionNftFor(conn, cfg.nftProgramId, p.pubkey, { marketGroup: market, portfolioId: p.portfolioId });
         out.waitingOnHolder.push({ portfolio: p.pubkey.toBase58(), nftMint: nft?.nftMint ?? null, holder: nft?.holder ?? null, capital: c.capital, pnl: c.pnl, reservedPnl: c.reservedPnl, activeLegs: c.activeLegs });
@@ -780,10 +805,6 @@ export async function cleanupResolvedPortfolios(
       } catch (err) {
         out.remaining.push({ portfolio: p.pubkey.toBase58(), reason: (err instanceof Error ? err.message : String(err)).slice(0, 120) });
       }
-      continue;
-    }
-    if (i >= cfg.maxPerCycle) {
-      out.remaining.push({ portfolio: p.pubkey.toBase58(), reason: `over the ${cfg.maxPerCycle}-per-cycle bound; next cycle` });
       continue;
     }
     try {
