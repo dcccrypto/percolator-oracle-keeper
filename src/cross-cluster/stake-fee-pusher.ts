@@ -270,6 +270,21 @@ export function buildStakeAccrueFeesIx(p: {
   });
 }
 
+const ACCRUED_LINE = /AccrueFees: accrued \d+ fees/;
+
+/** JSON.stringify that never throws (BigInt, circular) — falls back to String(). */
+function safeJson(v: unknown): string {
+  try {
+    return JSON.stringify(v) ?? String(v);
+  } catch {
+    try {
+      return JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x)) ?? String(v);
+    } catch {
+      return String(v);
+    }
+  }
+}
+
 /**
  * Classify a failed simulation of [CU, 87, 12]. `staleWait` is the reason from `staleResolveWait` when the market's
  * stale-resolve window is confirmed matured: tag 87 calls the same `reject_permissionless_resolve_matured_live_view`
@@ -286,8 +301,9 @@ export function classifyStakeFeeError(err: unknown, logs: string[] | null, stale
     if (blocked) return { kind: "blocked", reason: `Custom(${code}) ${blocked}` };
   }
   const where = ie ? (ie.index === 1 ? "tag 87" : ie.index === 2 ? "stake AccrueFees" : `ix ${ie.index}`) : "tx";
-  const tail = logs?.filter((l) => /Error|failed|#290|AccrueFees/i.test(l)).slice(-2).join(" / ") ?? "";
-  const codeText = code === null ? JSON.stringify(err) : ie?.index === 2 ? `Custom(${code})` : formatWrapperCode(code);
+  // The success line "AccrueFees: accrued N fees" is not an error; keep it out of the tail.
+  const tail = logs?.filter((l) => /Error|failed|#290|AccrueFees/i.test(l) && !ACCRUED_LINE.test(l)).slice(-2).join(" / ") ?? "";
+  const codeText = code === null ? safeJson(err) : ie?.index === 2 ? `Custom(${code})` : formatWrapperCode(code);
   return { kind: "failed", error: `${where} ${codeText}${tail ? ` — ${tail}` : ""}` };
 }
 
