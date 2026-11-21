@@ -35,7 +35,13 @@ import { getAlertSink } from "./cross-cluster/alerting.ts";
 import { TakeoverGate, pusherConfigFromEnv, refreshTakeoverGate, rpcEndpointProblem } from "./cross-cluster/pusher-role.ts";
 
 process.on("unhandledRejection", (r) => console.error(`[pusher][unhandledRejection] ${r instanceof Error ? (r.stack ?? r.message) : String(r)}`));
-process.on("uncaughtException", (e) => console.error(`[pusher][uncaughtException] ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`));
+// Boot latch, as in cross-cluster.ts: a throw before the push loop starts is a failed boot and exits 1; after that it is
+// logged and the pusher stays up.
+let booted = false;
+process.on("uncaughtException", (e) => {
+  console.error(`[pusher][uncaughtException] ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`);
+  if (!booted) fatal("boot failed (error above); exiting 1");
+});
 
 function fatal(msg: string): never {
   console.error(`[fatal] ${msg}`);
@@ -142,6 +148,9 @@ void startRegistryReloadLoop(registry, {
 
 await startKeeperLoop(mainnetConn, devnetConn, keeper, registry, {
   standby: (m) => gate.isStandby(m),
+  onStarted: () => {
+    booted = true;
+  },
   onPushLanded: (m, _px, label) => {
     gate.recordPush(m);
     console.warn(`[pusher][TAKEOVER] pushed ${label}: the on-chain price was older than ${CFG.takeoverSlots} slots (primary silent)`);
