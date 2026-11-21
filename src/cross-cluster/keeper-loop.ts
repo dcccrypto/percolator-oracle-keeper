@@ -609,6 +609,10 @@ export function multiAssetMarketHealth(
     if (lagging.has(assetIndex)) {
       accrualLagging.push(stat.label);
       if (status === "ok") status = "accrual-lagging";
+    } else if (!ctx.terminal && accrual?.unreadable.includes(assetIndex)) {
+      // The cranker's read could not decode this asset: its accrual is UNKNOWN, which must not look healthy.
+      accrualLagging.push(stat.label);
+      if (status === "ok") status = "accrual-unknown";
     }
     return {
       assetIndex,
