@@ -215,3 +215,51 @@ describe("earnGapConfigFromEnv", () => {
     assert.throws(() => earnGapConfigFromEnv({ EARN_GAP_ALERT_CYCLES: "0" }), /EARN_GAP_ALERT_CYCLES/);
   });
 });
+
+describe("constructor defaults and error shapes", () => {
+  it("defaults to Date.now for the clock and console.warn for the log", async () => {
+    const m = new EarnGapMonitor(DEFAULT_EARN_GAP_CONFIG, PROGRAM);
+    assert.equal(m.isDue(), true);
+    const warns: string[] = [];
+    const orig = console.warn;
+    console.warn = (l: string) => void warns.push(l);
+    try {
+      const { s } = vault();
+      await m.run({ getMultipleAccountsInfoAndContext: async () => { throw new Error("rpc down"); } } as never, [s]);
+    } finally {
+      console.warn = orig;
+    }
+    assert.equal(m.isDue(), false, "lastRunAt stamped from the real Date.now");
+    assert.equal(warns.length, 1);
+    assert.match(warns[0], /cannot price the vault \(rpc down\)/);
+  });
+
+  it("a non-Error rejection is stringified into the once-only log line", async () => {
+    const logs: string[] = [];
+    const m = new EarnGapMonitor(DEFAULT_EARN_GAP_CONFIG, PROGRAM, () => 0, (l) => logs.push(l));
+    const { s } = vault();
+    await m.run({ getMultipleAccountsInfoAndContext: async () => { throw "plain string failure"; } } as never, [s]);
+    assert.deepEqual(m.health(), []);
+    assert.match(logs[0], /\(plain string failure\)/);
+  });
+
+  it("a blank (whitespace-only) env value falls back to the default; out-of-range throws", () => {
+    assert.deepEqual(earnGapConfigFromEnv({ EARN_GAP_INTERVAL_MS: "   ", EARN_GAP_ALERT_BPS: "" }), DEFAULT_EARN_GAP_CONFIG);
+    assert.throws(() => earnGapConfigFromEnv({ EARN_GAP_INTERVAL_MS: "999" }), /EARN_GAP_INTERVAL_MS/);
+    assert.throws(() => earnGapConfigFromEnv({ EARN_GAP_ALERT_BPS: "1.5" }), /EARN_GAP_ALERT_BPS/);
+  });
+});
+
+describe("sibling-domain ledger present", () => {
+  it("passes the sibling ledger bytes to the SDK pricing when the sibling account exists", async () => {
+    const { s } = vault();
+    const accounts = new Map<string, Uint8Array>();
+    accounts.set(deriveLpBackingLedger(PROGRAM, s.market, 2)[0].toBase58(), ownLedger());
+    accounts.set(deriveLpBackingLedger(PROGRAM, s.market, 3)[0].toBase58(), ownLedger(500));
+    const c = fakeConn({ accounts, slot: 9 });
+    const m = mon();
+    await m.run(c.conn as never, [s]);
+    const p = nonboundVaultPricingFromAccountsP2b({ marketData: plantedMarket(), registryDomain: 2, feeShareBps: 0, ownLedgerData: ownLedger(), siblingLedgerData: ownLedger(500) });
+    assert.deepEqual([m.health()[0].entryNavAtoms, m.health()[0].exitNavAtoms, m.health()[0].parMinusE3Bps], [String(p.entryNavAtoms), String(p.exitNavAtoms), p.parMinusE3Bps]);
+  });
+});
