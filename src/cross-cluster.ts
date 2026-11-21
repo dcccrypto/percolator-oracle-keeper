@@ -74,7 +74,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { DEFAULT_REGISTRY_FILE, loadRegistryForProgramSet } from "./cross-cluster/registry.ts";
 import { bindObservationRegistry, registryRowProblems } from "./cross-cluster/multi-asset.ts";
-import { bootPositiveNumberEnv, defaultOnSwitch, parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv, parseSecretKeyJson } from "./env-utils.ts";
+import { bootPositiveNumberEnv, defaultOnSwitch, parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv, loadSecretKey } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { MIN_POOL_LIQUIDITY_USD_E6 } from "./cross-cluster/price-reader.ts";
@@ -253,20 +253,17 @@ try {
 
 // ── Keeper keypair ─────────────────────────────────────────────────────────────
 function loadKeypair(): Keypair {
-  if (process.env.KEEPER_KEYPAIR) {
-    return Keypair.fromSecretKey(parseSecretKeyJson(process.env.KEEPER_KEYPAIR, "KEEPER_KEYPAIR"));
-  }
   const kpPath =
     process.env.KEEPER_KEYPAIR_PATH ??
     `${process.env.HOME}/.config/solana/percolator-v17-devnet.json`;
-  if (!fs.existsSync(kpPath)) {
+  if (!process.env.KEEPER_KEYPAIR && !fs.existsSync(kpPath)) {
     console.error(
       `[fatal] Keeper keypair not found at ${kpPath}.` +
         " Set KEEPER_KEYPAIR_PATH or KEEPER_KEYPAIR.",
     );
     process.exit(1);
   }
-  return Keypair.fromSecretKey(parseSecretKeyJson(fs.readFileSync(kpPath, "utf8"), `keypair file ${kpPath}`));
+  return Keypair.fromSecretKey(loadSecretKey(process.env.KEEPER_KEYPAIR, kpPath));
 }
 
 // ── Config ─────────────────────────────────────────────────────────────────────
