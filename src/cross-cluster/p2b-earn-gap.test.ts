@@ -67,6 +67,19 @@ function vault(o: { label?: string; principal?: number; registry?: Uint8Array | 
 const quiet = () => undefined;
 const mon = (cfg = DEFAULT_EARN_GAP_CONFIG, now = () => 0) => new EarnGapMonitor(cfg, PROGRAM, now, quiet);
 
+describe("K-SWFIX: an unread market keeps its earn-gap record", () => {
+  it("run with the market in `unread` (failed chunk) does not sweep its record; without it the record is swept", async () => {
+    const { s, c } = vault();
+    const m = mon();
+    await m.run(c.conn as never, [s]);
+    assert.equal(m.health().length, 1);
+    await m.run(c.conn as never, [], new Set([s.ref.marketAddress]));
+    assert.equal(m.health().length, 1, "unread market keeps its record");
+    await m.run(c.conn as never, []);
+    assert.equal(m.health().length, 0, "a market that truly left the set is still swept");
+  });
+});
+
 describe("earnVaults /health record on the hand-built pot", () => {
   it("exact shape and values: entry 1100, exit 1032, gap 68 atoms = 618 bps; bigints are strings", async () => {
     const { s, c } = vault();

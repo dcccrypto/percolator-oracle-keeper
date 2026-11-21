@@ -45,6 +45,8 @@ export async function readVaultMarketSnapshots(
   conn: SnapshotConnection,
   programId: PublicKey,
   markets: ReadonlyArray<MarketRef>,
+  /** Optional out-param: how many chunk reads failed and how many markets they dropped this call. */
+  stats?: { droppedChunks: number; droppedMarkets: number },
 ): Promise<Map<string, VaultMarketSnapshot>> {
   const out = new Map<string, VaultMarketSnapshot>();
   const PER_CHUNK = 33; // 3 accounts each -> 99 keys
@@ -67,7 +69,13 @@ export async function readVaultMarketSnapshots(
     let res;
     try {
       res = await conn.getMultipleAccountsInfoAndContext(keys, "confirmed");
-    } catch {
+    } catch (err) {
+      const dropped = parsed.filter((p) => p !== null).length;
+      if (stats) {
+        stats.droppedChunks++;
+        stats.droppedMarkets += dropped;
+      }
+      console.warn(`[p2b-markets] snapshot chunk read failed (${dropped} markets dropped this tick): ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`);
       continue;
     }
     let k = 0;

@@ -98,9 +98,10 @@ export class EarnGapMonitor {
    * Evaluate every non-bound Earn vault of `snaps`. Returns the ACTIVE alerts (streak >= alertCycles).
    * A vault that cannot be priced this run keeps no record and resets its streak. Never throws.
    */
-  async run(conn: EarnGapConnection, snaps: Iterable<VaultMarketSnapshot>): Promise<Alert[]> {
+  /** `unread`: market addresses with no snapshot this tick (failed chunk). Their records and streaks are kept, not swept. */
+  async run(conn: EarnGapConnection, snaps: Iterable<VaultMarketSnapshot>, unread: ReadonlySet<string> = new Set()): Promise<Alert[]> {
     this.lastRunAt = this.now();
-    const seen = new Set<string>();
+    const seen = new Set<string>(unread);
     const alerts: Alert[] = [];
     for (const s of snaps) {
       if (!isNonBoundEarnVault(s)) continue;
