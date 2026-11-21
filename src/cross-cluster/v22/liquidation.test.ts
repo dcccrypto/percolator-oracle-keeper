@@ -20,7 +20,7 @@ import { LIQUIDATE_CRANK_CU, V22_CU_PER_WEIGHT, riskSnapOf } from "../positioned
 import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import { layoutById } from "../market-layout.ts";
 import {
-  DEFAULT_LIQ_MAX_PER_TX, MAX_TX_BYTES, atOrBelowMaintenance, estimateBaseCu, fitLiquidations, liqExtraWeight, marginOf, markLiquidationCandidates,
+  DEFAULT_LIQ_MAX_PER_TX, MAX_TX_BYTES, MIN_PROGRESS_BPS, atOrBelowMaintenance, estimateBaseCu, fitLiquidations, liqExtraWeight, marginOf, markLiquidationCandidates,
   readMarginParams, serializedTxSize, fitToPacket, resetLiquidationGuard, liquidationMadeNoProgress, noteLiquidationLanded,
 } from "./liquidation.ts";
 import { DEFAULT_SWEEP_ROUND_CONFIG, buildSweepTxSlots, pairingStats, resetPairingStats, runSettleRound } from "./sweep.ts";
@@ -162,6 +162,23 @@ describe("F1 margin arithmetic on real accounts", () => {
     assert.equal(liquidationMadeNoProgress("k", { ...m, equity: m.equity - 80n }), true, "equity drift alone (funding) does not clear it");
     assert.equal(liquidationMadeNoProgress("k", { ...m, notional: m.notional - 5_000_000n, requirement: m.requirement - 300_000n }), false, "the position moved: cleared");
     assert.equal(liquidationMadeNoProgress("k", m), false, "entry was cleared");
+  });
+
+  it("the guard cannot stall forever: equity that keeps falling (same notional/requirement) re-opens the crank once the deficit grows by MIN_PROGRESS_BPS of notional", () => {
+    const m = marginOf(snapOf(UNDER), PARAMS);
+    noteLiquidationLanded("k", m);
+    const step = (m.notional * BigInt(MIN_PROGRESS_BPS)) / 10_000n;
+    assert.equal(liquidationMadeNoProgress("k", { ...m, equity: m.equity - step + 1n }), true, "dust drift stays guarded");
+    assert.equal(liquidationMadeNoProgress("k", { ...m, equity: m.equity - step - 1n }), false, "cumulative deficit growth re-opens the crank (flat price, same position)");
+    assert.equal(liquidationMadeNoProgress("k", m), false, "entry cleared");
+  });
+
+  it("fitLiquidations: the same portfolio twice orders deterministically (comparator returns 0 for equal keys)", () => {
+    const m = marginOf(snapOf(UNDER), PARAMS);
+    const p = { pubkey: Keypair.generate().publicKey, risk: snapOf(UNDER), isLp: false, activeLegs: 1, longLegs: 1, shortLegs: 0 } as never;
+    const f = { portfolio: p, ratioBps: m.ratioBps as bigint, margin: m };
+    const r = fitLiquidations({ flagged: [f, f], baseCu: 0, maxPerTx: 2 });
+    assert.equal(r.chosen.length, 2);
   });
 
   it("a flat portfolio is never flagged; a market of another layout or a nonsense mmr reads as null (no guess)", () => {

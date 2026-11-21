@@ -161,8 +161,8 @@ export function atOrBelowMaintenance(m: MarginState, padBps: number): boolean {
 
 /**
  * No-progress guard. After a LANDED liquidation crank on an account the keeper remembers the margin it measured; while the next
- * measurement shows the same state (notional and requirement each within one atom: the position did not move; equity drifts
- * with funding so it is not compared) it does not crank that account again. Any other state clears the entry. Process-lifetime, bounded.
+ * measurement shows the same state (notional and requirement each within one atom: the position did not move; per-round equity
+ * drift (funding) is tolerated, but a cumulative fall of MIN_PROGRESS_BPS of notional re-opens it) it does not crank that account again. Any other state clears the entry. Process-lifetime, bounded.
  */
 const liqGuard = new Map<string, MarginState>();
 const LIQ_GUARD_MAX = 4_096;
@@ -175,7 +175,11 @@ export function noteLiquidationLanded(key: string, m: MarginState): void {
 export function liquidationMadeNoProgress(key: string, m: MarginState): boolean {
   const prev = liqGuard.get(key);
   if (!prev) return false;
-  if (near1(prev.requirement, m.requirement) && near1(prev.notional, m.notional)) return true;
+  // equity is not compared per round (funding drift), but a CUMULATIVE deficit growth of MIN_PROGRESS_BPS of notional since the
+  // remembered state re-opens the crank: an account still below maintenance whose equity keeps falling must not be skipped forever.
+  const deficitGrowth = prev.equity - m.equity;
+  const equityFell = deficitGrowth * 10_000n >= prev.notional * BigInt(MIN_PROGRESS_BPS);
+  if (!equityFell && near1(prev.requirement, m.requirement) && near1(prev.notional, m.notional)) return true;
   liqGuard.delete(key);
   return false;
 }
@@ -241,7 +245,7 @@ export function fitLiquidations(i: FitInput): FitResult {
   const cap = (i.maxCu ?? LIQ_TX_MAX_CU) - LIQ_TX_HEADROOM_CU;
   const order = i.flagged
     .map((f) => ({ f, k: f.portfolio.pubkey.toBase58() }))
-    .sort((a, b) => (a.f.ratioBps < b.f.ratioBps ? -1 : a.f.ratioBps > b.f.ratioBps ? 1 : a.k < b.k ? -1 : 1))
+    .sort((a, b) => (a.f.ratioBps < b.f.ratioBps ? -1 : a.f.ratioBps > b.f.ratioBps ? 1 : a.k < b.k ? -1 : a.k > b.k ? 1 : 0))
     .map((e) => e.f);
   const chosen: FlaggedAccount[] = [];
   const deferred: FitResult["deferred"] = [];
