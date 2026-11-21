@@ -542,7 +542,16 @@ export async function cleanupResolvedPortfolios(
   const resolvedIx = (p: Pf) =>
     buildCloseResolvedIx({ wrapperProgramId: cfg.wrapperProgramId, owner: p.owner, market, portfolio: p.pubkey, collateralMint });
 
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+  let blockhash: string;
+  let lastValidBlockHeight: number;
+  try {
+    ({ blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed"));
+  } catch (err) {
+    // Never throws: an RPC blip here must not abort the caller's pass; the next cycle retries.
+    out.support = st.support?.value ?? "unknown";
+    out.remaining.push({ portfolio: "*", reason: `blockhash: ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}` });
+    return out;
+  }
   const mk = (ixs: TransactionInstruction[]): Transaction => {
     const tx = new Transaction();
     tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT }));
@@ -597,9 +606,11 @@ export async function cleanupResolvedPortfolios(
     for (;;) {
       if ((finishFirst || calls > 0) && (await finish())) return { closed: true, calls, stop: "closed" };
       if (calls >= chunkCap) return { closed: false, calls, stop: `per-cycle cap of ${chunkCap} ${label} chunk calls reached` };
-      const tx = mkChunk(chunk(calls), calls);
+      const ixs = chunk(calls);
+      const tx = mkChunk(ixs, calls);
       const r = await simWatch(tx, p.pubkey);
-      if (r.err) return { closed: false, calls, stop: why(r.err, r.logs, { 1: label }) };
+      // ix 0 is the compute budget; the chunk ix is the LAST one (an ATA create may precede it).
+      if (r.err) return { closed: false, calls, stop: why(r.err, r.logs, ixs.length > 1 ? { 1: "CreateAtaIdempotent", [ixs.length]: label } : { 1: label }) };
       if (!r.post || Buffer.from(r.post).equals(Buffer.from(current))) {
         return { closed: false, calls, stop: `${label} would make no progress` };
       }
