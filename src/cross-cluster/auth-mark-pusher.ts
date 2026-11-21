@@ -557,10 +557,21 @@ const quarantineStrikes = new Map<string, number>();
 const QUARANTINE_AFTER_STRIKES = 3;
 const QUARANTINE_MS = 10 * 60_000;
 
+/**
+ * Is the hold on `market` active at `nowMs`? A hold never runs longer than `durationMs` from now: a wall clock that
+ * stepped backwards by H would otherwise stretch it to duration + H, so a hold further out than its duration is cut
+ * back to `nowMs + durationMs` (still held, just not longer than intended).
+ */
+function holdActive(map: Map<string, number>, market: string, nowMs: number, durationMs: number): boolean {
+  const until = map.get(market);
+  if (until === undefined) return false;
+  if (until - nowMs > durationMs) map.set(market, nowMs + durationMs);
+  return until > nowMs;
+}
+
 /** Exported for the health log + tests. */
-export function getQuarantinedMarkets(): string[] {
-  const now = Date.now();
-  return [...quarantinedUntil.entries()].filter(([, t]) => t > now).map(([m]) => m);
+export function getQuarantinedMarkets(nowMs: number = Date.now()): string[] {
+  return [...quarantinedUntil.entries()].map(([m]) => m).filter((m) => holdActive(quarantinedUntil, m, nowMs, QUARANTINE_MS));
 }
 
 const MAX_TX_BYTES = 1232;
@@ -868,14 +879,14 @@ const landedRevertTimes = new Map<string, number[]>();
 
 /** Markets currently pushed in their own tx (for /health and tests). */
 export function getSoloMarkets(nowMs: number = Date.now()): string[] {
-  return [...soloUntil].filter(([, until]) => until > nowMs).map(([m]) => m);
+  return [...soloUntil.keys()].filter((m) => holdActive(soloUntil, m, nowMs, SOLO_MS));
 }
 
-function noteLandedRevert(market: string, nowMs: number): void {
-  const times = (landedRevertTimes.get(market) ?? []).filter((t) => nowMs - t < SOLO_STRIKE_WINDOW_MS);
+export function noteLandedRevert(market: string, nowMs: number): void {
+  const times = (landedRevertTimes.get(market) ?? []).map((t) => Math.min(t, nowMs)).filter((t) => nowMs - t < SOLO_STRIKE_WINDOW_MS);
   times.push(nowMs);
   landedRevertTimes.set(market, times);
-  if (times.length >= SOLO_AFTER_LANDED_REVERTS && !((soloUntil.get(market) ?? 0) > nowMs)) {
+  if (times.length >= SOLO_AFTER_LANDED_REVERTS && !holdActive(soloUntil, market, nowMs, SOLO_MS)) {
     soloUntil.set(market, nowMs + SOLO_MS);
     console.warn(
       `[push][SOLO] ${market.slice(0, 8)}… reverted on chain ${times.length}x in ${SOLO_STRIKE_WINDOW_MS / 60_000} min — ` +
@@ -1002,6 +1013,8 @@ export function resetPushLandingState(): void {
  */
 export async function reconcilePushOutcomes(devnetConn: Connection, nowMs: number = Date.now()): Promise<void> {
   try {
+    // A push stamped in the future means the wall clock stepped back since it was sent; it was sent no later than now.
+    for (const f of inFlightPushes) if (f.sentAtMs > nowMs) f.sentAtMs = nowMs;
     const due = inFlightPushes.filter((f) => nowMs - f.sentAtMs >= PUSH_STATUS_MIN_AGE_MS);
     if (due.length === 0) return;
     const { value } = await devnetConn.getSignatureStatuses(due.map((f) => f.signature));
@@ -1124,9 +1137,8 @@ export async function pushAuthMarkBatch(
   // automatically when the timer lapses.
   const now = Date.now();
   const eligible = pushes.filter((p) => {
-    const until = quarantinedUntil.get(p.marketAddress);
-    if (until === undefined) return true;
-    if (until > now) return false;
+    if (!quarantinedUntil.has(p.marketAddress)) return true;
+    if (holdActive(quarantinedUntil, p.marketAddress, now, QUARANTINE_MS)) return false;
     quarantinedUntil.delete(p.marketAddress);
     quarantineStrikes.delete(p.marketAddress);
     console.log(`[push] ${p.marketAddress.slice(0, 8)}… leaving quarantine — will retry`);
