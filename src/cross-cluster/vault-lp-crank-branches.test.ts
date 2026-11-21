@@ -185,6 +185,29 @@ describe("vaultLpFor / windowFor", () => {
     assert.equal(cn.c.lookups, 2);
   });
 
+  it("backwards clock step: a cache stamped in the future is expired, not served (stale not-bound)", async () => {
+    let t = 1_000_000;
+    let bound = false;
+    const cn = conn({ getInfo: async () => (bound ? [{ data: vaultLpState() }] : [null]) });
+    const k = mk(cn, new Sink(), { lookupTtlMs: 60_000, now: () => t });
+    assert.equal(await k.vaultLpFor(MKT), null); // recorded at t: not bound
+    bound = true; // chain changed
+    t -= 10 * 60_000; // clock stepped back 10 min
+    assert.ok((await k.vaultLpFor(MKT))?.equals(VAULT_LP));
+    assert.equal(cn.c.lookups, 2);
+  });
+
+  it("backwards clock step: an old lpPortfolio is not reused", async () => {
+    let t = 1_000_000;
+    let state: Buffer | null = vaultLpState();
+    const cn = conn({ getInfo: async () => [state ? { data: state } : null] });
+    const k = mk(cn, new Sink(), { lookupTtlMs: 60_000, now: () => t });
+    assert.ok((await k.vaultLpFor(MKT))?.equals(VAULT_LP));
+    state = null; // unbound on chain
+    t -= 10 * 60_000;
+    assert.equal(await k.vaultLpFor(MKT), null);
+  });
+
   it("RPC error with nothing cached returns null", async () => {
     const cn = conn({ getInfo: async () => { throw new Error("down"); } });
     assert.equal(await mk(cn).vaultLpFor(MKT), null);
