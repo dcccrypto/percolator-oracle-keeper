@@ -17,6 +17,12 @@ export function redactErrorText(s: string, max = 160): string {
     .replace(/\bBearer\s+[A-Za-z0-9._~+\/=-]+/gi, "Bearer ***")
     .replace(/\b(x-api-key|api-key|authorization|x-auth-token)\s*:\s*[^\s"',;)]+(?:\s+[^\s"',;)]+)?/gi, "$1: ***")
     .replace(/(api[-_]?key|apikey|token|secret|auth|key|password|passwd|pwd)=[^&\s"')]+/gi, "$1=***")
+    // Quoted / colon / spaced forms: JSON bodies (`{"api_key":"<k>"}`), util.inspect output (`{ 'x-api-key': '<k>' }`),
+    // `token: <k>`, `key = <k>`. The `name=value` rule above only matches the unquoted, unspaced form.
+    .replace(
+      /(["']?)\b(x-api-key|x-auth-token|api[-_]?key|apikey|token|secret|auth|authorization|key|password|passwd|pwd)\1\s*[:=]\s*(?!\*\*\*)(?:(["'])[^"']*\3|[^\s"',;&)}]+)/gi,
+      "$1$2$1: ***",
+    )
     // Any scheme, not just http(s)/ws(s): `postgres://user:pass@host/db` (a DB / pooler URL), `redis://`, `ftp://` carry
     // credentials the same way. ws(s) too: web3.js derives its websocket endpoint (same host, same path key) from the RPC URL.
     .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'),]+/gi, (u) => {
