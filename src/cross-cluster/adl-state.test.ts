@@ -162,3 +162,59 @@ describe("recovery cranker wiring: decoded ADL state reaches the sink", () => {
     assert.ok(lines.some((l) => l.startsWith("[health]") && l.includes('"ro":1')));
   });
 });
+
+describe("adl-state: header predicates, asset index, adlHealthOf, parseAdlFraction", () => {
+  it("isV18MarketHeader: true for a v18 market; false for short, wrong version, wrong kind, wrong magic", async () => {
+    const { isV18MarketHeader, isWrapperMarketHeader } = await import("./adl-state.ts");
+    const good = new Uint8Array(fx("sol-market-v18-fees"));
+    assert.equal(isV18MarketHeader(good), true);
+    assert.equal(isV18MarketHeader(good.subarray(0, 15)), false);
+    const v17 = new Uint8Array(good);
+    new DataView(v17.buffer).setUint16(8, 17, true);
+    assert.equal(isV18MarketHeader(v17), false);
+    assert.equal(isWrapperMarketHeader(v17), true, "any VERSION counts for the wrapper predicate");
+    const kind = new Uint8Array(good);
+    kind[10] = 3;
+    assert.equal(isV18MarketHeader(kind), false);
+    const magic = new Uint8Array(good);
+    magic[0] ^= 0xff;
+    assert.equal(isV18MarketHeader(magic), false);
+    assert.equal(isWrapperMarketHeader(good.subarray(0, 15)), false);
+  });
+
+  it("decodeAdlState: a non-integer, negative or out-of-range asset index throws RangeError", () => {
+    const d = new Uint8Array(fx("sol-market-v18-fees"));
+    assert.throws(() => decodeAdlState(d, 0.5), RangeError);
+    assert.throws(() => decodeAdlState(d, -1), RangeError);
+    assert.throws(() => decodeAdlState(d, 10_000), RangeError);
+  });
+
+  it("adlHealthOf: single-slot -> adl only; multi-slot lists every non-Disabled slot, skipping Disabled ones", async () => {
+    const { adlHealthOf } = await import("./adl-state.ts");
+    const { detectLayout, engineSlotBase } = await import("./market-layout.ts");
+    for (const f of ["sol-market-v18-fees"]) {
+      const d = new Uint8Array(fx(f));
+      const det = detectLayout(d);
+      assert.ok(det.known);
+      const h = adlHealthOf(d);
+      assert.ok(h.adl);
+      assert.ok(det.slots > 1, "multi-slot fixture");
+      assert.ok(h.adlAssets && h.adlAssets.length >= 1);
+      const disabled = new Uint8Array(d);
+      disabled[engineSlotBase(det.layout, 1) + 16] = 0;
+      const live = new Uint8Array(d);
+      live[engineSlotBase(det.layout, 1) + 16] = 2;
+      assert.ok(!adlHealthOf(disabled).adlAssets!.some((a) => a.asset === 1));
+      assert.ok(adlHealthOf(live).adlAssets!.some((a) => a.asset === 1));
+    }
+  });
+
+  it("parseAdlFraction is the exact inverse of adlFraction; rejects sign, exponent, empty parts, >15 digits", async () => {
+    const { parseAdlFraction } = await import("./adl-state.ts");
+    assert.equal(parseAdlFraction("0.861700"), 861_700_000_000_000n);
+    assert.equal(parseAdlFraction("1.000000"), ADL_ONE);
+    assert.equal(parseAdlFraction("2"), 2n * ADL_ONE);
+    assert.equal(parseAdlFraction("0.123456789012345"), 123_456_789_012_345n);
+    for (const bad of ["", "-1", "1e3", ".5", "1.", "0.1234567890123456", "1.2.3", " 1"]) assert.equal(parseAdlFraction(bad), null, bad);
+  });
+});

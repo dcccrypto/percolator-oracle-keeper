@@ -4,7 +4,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { Keypair } from "@solana/web3.js";
+import { Keypair, PublicKey } from "@solana/web3.js";
 import {
   DEFAULT_P2B_GATE_CONFIG,
   P2bFeatureGate,
@@ -204,5 +204,106 @@ describe("makeTag103Probe: simulate only, on a BOUND market", () => {
     const gate = new P2bFeatureGate(DEFAULT_P2B_GATE_CONFIG, probe);
     assert.equal(await gate.ensure(), false);
     assert.equal(gate.snapshot().lastProbe, "unknown");
+  });
+});
+
+describe("coverage: classifyProbeError odd shapes", () => {
+  it("undefined is a clean simulation; a non-array InstructionError, a null detail, or a non-numeric Custom is unknown", () => {
+    assert.equal(classifyProbeError(undefined), "supported");
+    assert.equal(classifyProbeError({ InstructionError: "weird" }), "unknown");
+    assert.equal(classifyProbeError({ InstructionError: [1, null] }), "unknown");
+    assert.equal(classifyProbeError({ InstructionError: [1, { Custom: "100" }] }), "unknown");
+    assert.equal(classifyProbeError({ Other: 1 }), "unknown");
+    assert.equal(classifyProbeError(42), "unknown");
+  });
+});
+
+describe("coverage: p2bGateConfigFromEnv number parsing", () => {
+  it("blank / whitespace TTLs fall back to the default; non-integers, zero and non-numbers throw", () => {
+    assert.deepEqual(p2bGateConfigFromEnv({ P2B_PROBE_RETRY_MS: "   ", P2B_PROBE_SUPPORTED_TTL_MS: "" }), DEFAULT_P2B_GATE_CONFIG);
+    assert.equal(p2bGateConfigFromEnv({ P2B_PROBE_RETRY_MS: "5000" }).unknownRetryMs, 5000);
+    for (const bad of ["1.5", "0", "abc", "Infinity"]) assert.throws(() => p2bGateConfigFromEnv({ P2B_PROBE_UNSUPPORTED_TTL_MS: bad }), /positive integer/, bad);
+  });
+});
+
+describe("coverage: P2bFeatureGate snapshot / reportUnsupported / logging transitions", () => {
+  it("snapshot: auto reports the learned answer, on reports true, off reports false", () => {
+    const mk = (mode: "auto" | "on" | "off") => new P2bFeatureGate({ ...DEFAULT_P2B_GATE_CONFIG, mode }, async () => "supported").snapshot();
+    assert.equal(mk("auto").supported, null);
+    assert.equal(mk("on").supported, true);
+    assert.equal(mk("off").supported, false);
+  });
+
+  it("reportUnsupported is a no-op outside auto mode", () => {
+    const on = new P2bFeatureGate({ ...DEFAULT_P2B_GATE_CONFIG, mode: "on" }, async () => "supported");
+    on.reportUnsupported();
+    assert.equal(on.isSupported(), true);
+    assert.equal(on.snapshot().lastProbe, null);
+  });
+
+  it("a re-probe that stays supported does not log 'supports' again; flipping back from unsupported does", async () => {
+    const g = gateWith(["supported", "supported", "unsupported", "supported"]);
+    await g.gate.ensure();
+    g.advance(DEFAULT_P2B_GATE_CONFIG.supportedTtlMs + 1);
+    await g.gate.ensure();
+    assert.equal(g.logs.filter((l) => /supports P2b/.test(l)).length, 1);
+    g.advance(DEFAULT_P2B_GATE_CONFIG.supportedTtlMs + 1);
+    await g.gate.ensure();
+    assert.equal(g.gate.isSupported(), false);
+    g.advance(DEFAULT_P2B_GATE_CONFIG.unsupportedTtlMs + 1);
+    await g.gate.ensure();
+    assert.equal(g.gate.isSupported(), true);
+    assert.equal(g.logs.filter((l) => /supports P2b/.test(l)).length, 2);
+  });
+
+  it("default clock and logger: constructs without injected deps and probes once", async () => {
+    const orig = console.log;
+    const lines: string[] = [];
+    console.log = (l: string) => { lines.push(l); };
+    try {
+      const gate = new P2bFeatureGate(DEFAULT_P2B_GATE_CONFIG, async () => "supported");
+      assert.equal(await gate.ensure(), true);
+      assert.equal(await gate.ensure(), true, "fresh TTL: no second probe");
+      assert.equal(gate.snapshot().probes, 1);
+    } finally {
+      console.log = orig;
+    }
+    assert.ok(lines.some((l) => /supports P2b/.test(l)));
+  });
+});
+
+describe("coverage: makeTag103Probe candidate skipping and batching", () => {
+  const mk = () => Keypair.generate().publicKey;
+  const probeFor = (markets: ReturnType<typeof mk>[], accounts: Map<string, Uint8Array>, sims?: Array<{ err: unknown }>) => {
+    const c = fakeConn({ accounts, sims });
+    const probe = makeTag103Probe({ conn: c.conn as never, keeper: KEEPER, programId: PROGRAM, markets: () => markets.map((m) => ({ marketAddress: m.toBase58() })) });
+    return { c, probe };
+  };
+
+  it("skips a market missing its registry or its vault_lp_state, an unparseable registry, and an undecodable state; ends no-candidate", async () => {
+    const [noReg, noState, badReg, badState] = [mk(), mk(), mk(), mk()];
+    const accounts = new Map<string, Uint8Array>();
+    accounts.set(deriveVaultLpState(PROGRAM, noReg).toBase58(), vaultLpStateBytes({ lp: mk() }));
+    accounts.set(deriveLpVaultRegistry(PROGRAM, noState)[0].toBase58(), registryBytes({ bound: true }));
+    accounts.set(deriveLpVaultRegistry(PROGRAM, badReg)[0].toBase58(), new Uint8Array(4));
+    accounts.set(deriveVaultLpState(PROGRAM, badReg).toBase58(), vaultLpStateBytes({ lp: mk() }));
+    accounts.set(deriveLpVaultRegistry(PROGRAM, badState)[0].toBase58(), registryBytes({ bound: true }));
+    accounts.set(deriveVaultLpState(PROGRAM, badState).toBase58(), new Uint8Array(3));
+    const { c, probe } = probeFor([noReg, noState, badReg, badState], accounts);
+    assert.equal(await probe(), "no-candidate");
+    assert.equal(c.simulated.length, 0);
+  });
+
+  it("more than 50 markets (100+ keys) are read in batches of 100 and a bound one past the first batch is still found", async () => {
+    const markets = Array.from({ length: 60 }, () => PublicKey.unique());
+    const accounts = new Map<string, Uint8Array>();
+    markets.forEach((m, i) => {
+      accounts.set(deriveLpVaultRegistry(PROGRAM, m)[0].toBase58(), registryBytes({ bound: i === 55 }));
+      accounts.set(deriveVaultLpState(PROGRAM, m).toBase58(), vaultLpStateBytes({ lp: mk() }));
+    });
+    const { c, probe } = probeFor(markets, accounts, [{ err: { InstructionError: [1, { Custom: 100 }] } }]);
+    assert.equal(await probe(), "supported");
+    assert.equal(c.count("getMultipleAccountsInfo"), 2, "120 keys -> two batches");
+    assert.ok(c.simulated[0].instructions[1].keys[1].pubkey.equals(markets[55]));
   });
 });
