@@ -51,9 +51,21 @@ export function rentHeldForCatchup(ctx: Pick<V22MarketCtx, "readSlot" | "refresh
   return catchupCrankCount(BigInt(ctx.readSlot) - ctx.refresh.slotLast, ctx.refresh.maxAccrualDtSlots) > 0;
 }
 
-/** Portfolios due for a rent settle: never settled, or older than the cadence; heaviest first. Empty while the asset lags (see rentHeldForCatchup). Pure. */
+/**
+ * Drop this market's cadence entries for portfolios no longer in `positioned.all` (closed portfolios would otherwise stay for the
+ * keeper's lifetime). Other markets' entries are untouched. A portfolio that reappears is simply "never settled": rent is exact
+ * regardless of timing, so at worst it is settled one cadence early.
+ */
+export function pruneRentState(st: RentState, marketAddress: string, positioned: V22Positioned): void {
+  const prefix = `${marketAddress}|`;
+  const live = new Set(positioned.all.map((p) => `${prefix}${p.pubkey.toBase58()}`));
+  for (const k of st.last.keys()) if (k.startsWith(prefix) && !live.has(k)) st.last.delete(k);
+}
+
+/** Portfolios due for a rent settle: never settled, or older than the cadence; heaviest first. Empty while the asset lags (see rentHeldForCatchup). Prunes closed portfolios from `st` first. */
 export function planRentSettles(ctx: V22MarketCtx, positioned: V22Positioned, st: RentState, cadenceSlots: number, pairingActive: boolean, maxPerTick: number): RentPlan {
   if (rentHeldForCatchup(ctx)) return { due: [], skippedLp: false };
+  pruneRentState(st, ctx.marketAddress, positioned);
   const now = BigInt(ctx.readSlot);
   const rows: RentPlan["due"] = [];
   let skippedLp = false;
