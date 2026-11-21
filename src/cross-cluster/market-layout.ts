@@ -101,10 +101,11 @@ export interface MarketLayout {
   asset: {
     lifecycle: number;
     /**
-     * GH#172: `raw_oracle_target_price` — the last AuthMark PUSHED for this asset, as opposed to
-     * `effectivePrice`, which is the engine's walked mark and lags it by the per-slot step cap. This
-     * is the trusted-but-possibly-stale value the cross-cluster circuit breaker seeds its baseline
-     * from on a cold start, so a restart cannot accept an unbounded first price.
+     * GH#172: `raw_oracle_target_price` — the engine's copy of the oracle profile's target as of the
+     * last accrual crank (a push writes only the profile), as opposed to `effectivePrice`, the walked
+     * mark that lags it further by the per-slot step cap. The circuit breaker's cold-start seed reads
+     * the profile and falls back to this field only while the profile holds 0 (push-deadline.ts), the
+     * wrapper's own `lev_target_price` order.
      */
     rawOracleTargetPrice: number;
     effectivePrice: number;
