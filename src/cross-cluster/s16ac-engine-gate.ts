@@ -85,7 +85,8 @@ export async function s16acEngineDeployed(
   now: () => number = Date.now,
 ): Promise<{ on: boolean; state: S16acState }> {
   const t = now();
-  if (st.value && st.value.state !== "unknown" && t - st.value.at < ttlMs) return { on: st.value.state === "s16ac", state: st.value.state };
+  // A negative age (clock stepped back) is expired, not fresh, so a stale answer cannot outlive the TTL.
+  if (st.value && st.value.state !== "unknown" && t >= st.value.at && t - st.value.at < ttlMs) return { on: st.value.state === "s16ac", state: st.value.state };
   let state: S16acState;
   try {
     state = classifyS16acElfPrefix(await readElfPrefix(conn, wrapperProgramId));
