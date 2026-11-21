@@ -355,13 +355,27 @@ export function revertAdvice(code: number | null, computeExhausted: boolean): st
 }
 
 /** Parse a Solana "custom program error: 0xNN" (or {"Custom":NN}) code out of an error/sim result. */
-function parseCustomErrorCode(errLike: unknown): number | null {
-  const text =
-    typeof errLike === "string"
-      ? errLike
-      : errLike instanceof Error
-        ? errLike.message
-        : JSON.stringify(errLike ?? "");
+export function parseCustomErrorCode(errLike: unknown): number | null {
+  // Structured {"InstructionError":[i,{"Custom":N}]} wins over any text scan.
+  if (errLike && typeof errLike === "object" && !(errLike instanceof Error)) {
+    const ie = (errLike as { InstructionError?: unknown }).InstructionError;
+    if (Array.isArray(ie) && ie[1] && typeof ie[1] === "object") {
+      const c = (ie[1] as { Custom?: unknown }).Custom;
+      if (typeof c === "number" && Number.isFinite(c)) return c;
+      if (typeof c === "bigint") return Number(c);
+    }
+  }
+  let text: string;
+  if (typeof errLike === "string") text = errLike;
+  else if (errLike instanceof Error) text = errLike.message;
+  else {
+    try {
+      // BigInt-safe; a circular object throws and is treated as unclassified, never an uncaught throw.
+      text = JSON.stringify(errLike ?? "", (_k, v) => (typeof v === "bigint" ? v.toString() : v)) ?? "";
+    } catch {
+      return null;
+    }
+  }
   const hex = text.match(/custom program error: (0x[0-9a-fA-F]+)/);
   if (hex) return parseInt(hex[1], 16);
   const dec = text.match(/"Custom":\s*(\d+)/);
