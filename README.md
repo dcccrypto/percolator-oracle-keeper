@@ -1,84 +1,61 @@
 # percolator-oracle-keeper
 
-Production-grade oracle keeper for [Percolator](https://github.com/dcccrypto/percolator-launch) — pushes price feeds to Percolator devnet markets via `PushOraclePrice` + `KeeperCrank`.
+Oracle keeper for [Percolator](https://github.com/dcccrypto/percolator-launch) devnet markets. It reads spot prices from mainnet DEX pools (Raydium CLMM, Meteora DLMM, PumpSwap) and pushes them to the matching devnet markets as `PushAuthMark` instructions. The keeper keypair is the oracle authority for those markets. It also runs a recovery crank loop and an LP fee crank loop.
 
-## What It Does
-
-- **Multi-source price failover**: Pyth Hermes → Jupiter → DexScreener → mainnet CA lookup
-- **Staleness detection**: alerts if price hasn't updated in configurable threshold (default 30s)
-- **Circuit breaker**: rejects price moves > 10% per update (configurable); a sustained move confirms after 3 consecutive trips, and every published mark is rate-limited to ±30% of every mark in force during the trailing hour — sub-threshold steps included (a larger move advances to the band edge, is held there — re-pushed unchanged so the oracle stays fresh — and continues as older marks leave the window)
-- **Health endpoint**: `/health` for Railway/monitoring with per-market stats
-- **Graceful shutdown** with drain on SIGINT/SIGTERM
-- **Supabase auto-discovery**: automatically cranks newly-created markets
-- **HYPERP oracle mode**: cranks DEX-pool-based oracle markets (PumpSwap, Raydium, Meteora)
-- **Wallet balance guard**: pauses pushes if keeper wallet goes below threshold
-- **Oracle authority verification**: skips markets where the keeper isn't the oracle authority
+The entrypoint is `src/cross-cluster.ts`. The markets it serves are listed in `registry.json`, which is hot-reloaded, and can be extended from Supabase registrations.
 
 ## Requirements
 
-- Node.js 20+
-- A Solana keypair with oracle authority over the target markets
-- RPC endpoint (Helius recommended for devnet)
+- Node.js 22 (the Dockerfile uses `node:22-slim`)
+- A mainnet RPC URL (price reads) and a devnet RPC URL (pushes)
+- A keypair that is the oracle authority for the markets in `registry.json`
+- `@percolatorct/sdk` is a local dependency (`file:../percolator-sdk`), so a checkout of `percolator-sdk` must sit next to this repo before `npm install`
 
-## Quick Start
+## Build and run
 
 ```bash
 npm install
-cp .env.example .env
-# Edit .env with your RPC_URL and keypair
-npm start
+cp .env.example .env     # see the note on env vars below
+npm test                 # node:test via tsx
+npm run build            # type-check only (tsc --noEmit)
+npm run cross-cluster:dry-run   # no on-chain writes
+npm start                # live: pushes prices
 ```
 
-## Environment Variables
+The keeper does not load `.env` itself. Export the variables in your shell, or use `start-keeper.sh`, which sources `.env` first.
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `RPC_URL` | ✅ | — | Solana RPC endpoint |
-| `ADMIN_KEYPAIR` | ✅* | — | JSON array of 64-byte keypair (for Railway) |
-| `ADMIN_KEYPAIR_PATH` | ✅* | `~/.config/solana/percolator-upgrade-authority.json` | Path to keypair file |
-| `SUPABASE_URL` | — | — | Enables auto-discovery of new markets |
-| `SUPABASE_SERVICE_ROLE_KEY` | — | — | Required if SUPABASE_URL set |
-| `DEPLOYMENT_JSON` | — | — | Deployment JSON (alternative to Supabase) |
-| `PUSH_INTERVAL_MS` | — | `3000` | How often to push prices (ms) |
-| `HEALTH_PORT` | — | `18810` | Health endpoint port |
-| `HEALTH_BIND` | — | `0.0.0.0` | Health endpoint bind address |
-| `HEALTH_AUTH_TOKEN` | — | — | Bearer token for health endpoint |
-| `MAX_PRICE_MOVE_PCT` | — | `10` | Circuit breaker threshold (%) |
-| `STALE_THRESHOLD_S` | — | `30` | Staleness alert threshold (seconds) |
-| `MIN_KEEPER_BALANCE_SOL` | — | `0.05` | Minimum wallet balance before pausing |
-| `ORACLE_KEEPER_BLOCKED_MARKETS` | — | — | Comma-separated slab addresses to skip |
+## Configuration
 
-*One of `ADMIN_KEYPAIR` or `ADMIN_KEYPAIR_PATH` is required.
+Read directly from `process.env` in `src/cross-cluster.ts`:
 
-## Health Endpoint
+| Variable | Default | Notes |
+|---|---|---|
+| `MAINNET_RPC_URL` | required | Mainnet RPC for pool reads |
+| `DEVNET_RPC_URL` | required | Devnet RPC for pushes |
+| `KEEPER_KEYPAIR` | | Inline JSON u8 array |
+| `KEEPER_KEYPAIR_PATH` | see source | Path to a keypair file, used if `KEEPER_KEYPAIR` is unset |
+| `REGISTRY_PATH` | `./registry.json` | Market list |
+| `CC_INTERVAL_MS` | `7000` | Push cycle interval |
+| `CC_HEALTH_PORT` / `CC_HEALTH_BIND` | `3001` / `0.0.0.0` | Health server |
+| `DRY_RUN` | `false` | Same as `--dry-run` |
+| `CRANK_ENABLED`, `CRANK_INTERVAL_MS` | `true`, `20000` | Recovery crank loop |
+| `REGISTER_SOURCE_URL` | unset | Polled for newly registered markets |
+| `SUPABASE_URL`, `SUPABASE_ANON_KEY` | unset | Realtime market registration |
 
-```
-GET /health
-```
+`src/cross-cluster.ts` has the full list, including poll and reload intervals. `.env.example` may lag the source, so check the source when in doubt.
 
-Returns JSON with per-market stats, wallet balance, and overall status:
+## Health
 
-```json
-{
-  "status": "ok",
-  "uptime": "3600s",
-  "wallet": { "address": "...", "balanceSol": 0.12, "low": false },
-  "markets": {
-    "SOL": { "lastPrice": 135.42, "lastPushAgo": "2s", "stale": false, "source": "pyth", "totalPushes": 1200 }
-  }
-}
-```
+`GET /health` returns JSON with per-market stats and service counters.
 
-## Deployment (Railway)
+## Deployment
 
-This service is deployed to Railway as `oracle-keeper` (service ID: `8bcc8946`).
+The `Dockerfile` runs `npx tsx src/cross-cluster.ts` and `railway.toml` points Railway at it with `/health` as the healthcheck. Which branch Railway builds is set in the Railway project, not in this repo.
 
-Required Railway environment variables:
-- `RPC_URL` — Helius devnet RPC
-- `ADMIN_KEYPAIR` — JSON keypair array
-- `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` — for market auto-discovery
-- `HEALTH_AUTH_TOKEN` — for secured health checks
+## Layout
 
-## Architecture
-
-Previously part of `percolator-launch/bots/oracle-keeper/`. Extracted to standalone repo for cleaner architecture. The oracle-keeper is a backend service; the frontend lives in [percolator-launch](https://github.com/dcccrypto/percolator-launch).
+- `src/cross-cluster.ts`: entrypoint
+- `src/cross-cluster/`: price readers, mark pusher, keeper loop, crank loops, registry handling
+- `src/circuit-breaker.ts`: price-move limiting
+- `registry.json`: markets to serve
+- `scripts/`: log rotation helpers
