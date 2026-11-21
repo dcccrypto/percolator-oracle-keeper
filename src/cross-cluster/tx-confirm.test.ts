@@ -109,6 +109,48 @@ describe("confirmBySignature", () => {
  * has no websocket; the fallback answers; the chain advances 1 block / 400 ms and the blockhash is valid for 150 of them.
  * Before the fix a tx that landed in 300 ms was reported only at expiry (~60 s); with every endpoint down it never returned.
  */
+describe("confirmBySignature wall-clock steps (NTP / VM resume)", () => {
+  /** Steps Date.now() by `stepMs` right after the first status read; returns a restore fn. */
+  function stepWallClock(k: ReturnType<typeof conn>, stepMs: number) {
+    const real = Date.now;
+    let offset = 0;
+    Date.now = () => real() + offset;
+    const orig = (k.c as unknown as { getSignatureStatuses: (...a: unknown[]) => Promise<unknown> }).getSignatureStatuses;
+    let first = true;
+    (k.c as unknown as { getSignatureStatuses: unknown }).getSignatureStatuses = async function (...a: unknown[]) {
+      const r = await orig.apply(this, a);
+      if (first) { first = false; offset = stepMs; }
+      return r;
+    };
+    return () => { Date.now = real; };
+  }
+  it("wall clock jumps +120 s after the first poll: still polls, the next poll's status lands (no false not-landed)", async () => {
+    const k = conn({ statuses: [null, { err: null, confirmationStatus: "confirmed" }], height: 1 });
+    const restore = stepWallClock(k, 120_000);
+    try {
+      const r = await confirmBySignature(k.c, "s", "b", 1, { statusRetries: 2, statusRetryDelayMs: 5 });
+      assert.equal(r.status, "landed");
+    } finally { restore(); }
+  });
+  it("wall clock jumps -1 h: the 300 ms deadline still holds", { timeout: 6_000 }, async () => {
+    const k = conn({ statuses: [null], height: 1 });
+    const restore = stepWallClock(k, -3_600_000);
+    const t0 = performance.now();
+    try {
+      const r = await confirmBySignature(k.c, "s", "b", 1, { statusRetries: 1, statusRetryDelayMs: 20, deadlineMs: 300 });
+      assert.equal(r.status, "not-landed");
+      assert.ok(performance.now() - t0 < 2_000, `${performance.now() - t0} ms`);
+    } finally { restore(); }
+  });
+  it("an injected clock drives the deadline", async () => {
+    const k = conn({ statuses: [null], height: 1 });
+    let t = 0;
+    const r = await confirmBySignature(k.c, "s", "b", 1, { statusRetries: 0, statusRetryDelayMs: 0, deadlineMs: 1_000, now: () => (t += 400) });
+    assert.equal(r.status, "not-landed");
+    assert.match((r as { reason: string }).reason, /deadline/);
+  });
+});
+
 describe("confirmBySignature through the RPC failover (primary down, its websocket unreachable)", () => {
   const SIG = "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW";
 
