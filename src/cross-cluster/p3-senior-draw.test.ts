@@ -15,7 +15,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import { exhaustionOf, parseSeniorDrawLogs, reportSeniorDraw, seniorDrawAlerts, VaultLpCranker } from "./vault-lp-crank.ts";
-import { ExhaustedRegistry, buildResolveStalePermissionlessIx, makeExhaustedResolveJob } from "./p3-exhausted-resolve.ts";
+import { ExhaustedRegistry, buildResolveStalePermissionlessIx, exhaustedAlert, makeExhaustedResolveJob } from "./p3-exhausted-resolve.ts";
 import { CFG_LAST_GOOD_ORACLE_SLOT, CFG_PERMISSIONLESS_RESOLVE_STALE_SLOTS, CONFIG_OFF, staleResolveWindow } from "./market-state.ts";
 import { decodeVaultLpState, deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 import { landedPushes, withheldFromPush } from "./keeper-loop.ts";
@@ -374,5 +374,74 @@ describe("tag 78 books the pending draw: 'Earn absorbed' only when the booking l
     assert.equal(o.kind, "nothing");
     assert.equal(c.sent.length, 0);
     assert.equal(o.events, undefined);
+  });
+});
+
+describe("p3-exhausted job: log parsing and an unreadable market (J-K-BUG-P3EXHAUSTED)", () => {
+  const ctx = (c: ReturnType<typeof stub>) => ({ conn: c.conn as never, keeper: KEEPER, dryRun: false });
+  const job = (reg: ExhaustedRegistry, vaultLpFor?: (m: PublicKey) => Promise<PublicKey | null>) =>
+    makeExhaustedResolveJob({ wrapperProgramId: WRAPPER, registry: reg, vaultLpFor, withholdPushes: true, confirmOpts: { statusRetries: 0, statusRetryDelayMs: 0 } });
+  const marked = () => { const r = new ExhaustedRegistry(); r.mark(SOL, 9000n, 5000n); r.setWindow(SOL, true); return r; };
+  const detect = async (logs: string[]) => {
+    const reg = new ExhaustedRegistry();
+    const c = stub({ logs, mkt: market({ staleSlots: 1_000n }) });
+    const run = job(reg, async () => VAULT_LP).run(ctx(c), { marketAddress: SOL, label: "SOL" });
+    return { reg, o: await run };
+  };
+  /** A connection whose market read returns `read()` (null = account missing / short data). */
+  const flaky = (read: () => Buffer | null) => {
+    const c = stub({});
+    const orig = c.conn.getMultipleAccountsInfo.bind(c.conn);
+    c.conn.getMultipleAccountsInfo = async (keys: PublicKey[]) => {
+      const r = await orig(keys);
+      return r.map((x, i) => (keys[i].toBase58() === SOL ? (read() ? { data: read()! } : null) : x)) as never;
+    };
+    return c;
+  };
+
+  it("parsing (lead 1): extra fields, a first funded draw then a second short draw, u64-max: all parse; non-decimal / negative never throw", async () => {
+    assert.equal((await detect([DRAW_OK, DRAW_SHORT])).reg.get(SOL)?.unfunded, 5000n, "second draw line in the tx is read");
+    assert.equal((await detect([L("p3_senior_draw deficit=1 moved=0 unfunded=18446744073709551615 a=1 b=2")])).reg.get(SOL)?.unfunded, 18446744073709551615n);
+    for (const bad of ["unfunded=-5", "unfunded=0x10", "unfunded=", "unfunded=١٢"]) {
+      const { reg, o } = await detect([L(`p3_senior_draw deficit=9 moved=1 ${bad}`)]);
+      assert.equal(o.kind, "nothing", bad);
+      assert.equal(reg.has(SOL), false);
+    }
+  });
+
+  it("an unreadable market read (RPC miss / short data) does NOT lift withholding", async () => {
+    for (const read of [() => null, () => market().subarray(0, 100)]) {
+      const reg = marked();
+      const o = await job(reg).run(ctx(flaky(read)), { marketAddress: SOL, label: "SOL" });
+      assert.notEqual(o.kind, "done");
+      assert.equal(reg.has(SOL), true);
+      assert.equal(reg.shouldWithholdPush(SOL, true), true);
+    }
+  });
+  it("a market that stays unreadable for 3 consecutive cycles is treated as gone; a good read resets the count", async () => {
+    const reg = marked();
+    let buf: Buffer | null = null;
+    const j = job(reg);
+    const c = flaky(() => buf);
+    const run = () => j.run(ctx(c), { marketAddress: SOL, label: "SOL" });
+    await run(); await run();
+    assert.equal(reg.has(SOL), true);
+    buf = market({ staleSlots: 1_000n });
+    await run();
+    buf = null;
+    await run(); await run();
+    assert.equal(reg.has(SOL), true, "count was reset by the good read");
+    assert.equal((await run()).kind, "done");
+    assert.equal(reg.has(SOL), false);
+  });
+
+  it("a not-Live market that was never marked: nothing; alert with an unknown window says so and carries null data", async () => {
+    const reg = new ExhaustedRegistry();
+    const c = stub({ mkt: market({ mode: 2 }) });
+    assert.equal((await job(reg).run(ctx(c), { marketAddress: SOL, label: "SOL" })).kind, "nothing");
+    const a = exhaustedAlert(SOL, "SOL", { deficit: 9n, unfunded: 4n }, null, true);
+    assert.match(a.message, /resolve window unknown/);
+    assert.equal(a.data?.permissionlessResolve, null);
+    assert.equal(a.data?.slotsUntilTag39, null);
   });
 });
