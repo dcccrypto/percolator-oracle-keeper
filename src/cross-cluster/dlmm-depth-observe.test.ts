@@ -110,6 +110,149 @@ describe("observation shape", () => {
   });
 });
 
+/** A conn whose Nth call (0-based) is answered by `script[N]`; later calls fall back to the plain fixture. */
+function scriptedConn(script: Array<(keys: PublicKey[]) => Array<ReturnType<typeof acct> | null>>) {
+  const base = fakeConn();
+  let n = 0;
+  return { getMultipleAccountsInfo: async (keys: PublicKey[]) => { const s = script[n++]; return s ? s(keys) : base.conn.getMultipleAccountsInfo(keys); } };
+}
+const poolBytes = () => Buffer.from(fx.poolData, "base64");
+const withActiveId = (delta: number) => {
+  const b = Buffer.from(poolBytes());
+  b.writeInt32LE(b.readInt32LE(76) + delta, 76);
+  return { owner: DLMM_PROGRAM_ID, data: b, lamports: 1, executable: false };
+};
+const AT = 7;
+
+describe("observation error branches carry exact reasons (never numbers)", () => {
+  it("first read: pool account null -> missing/not-owned error", async () => {
+    const conn = scriptedConn([() => [null]]);
+    const r = await observeDlmmDepth(conn, fx.pool, dec, undefined, AT);
+    assert.deepEqual(r, { error: "pool account missing or not owned by the DLMM program", at: AT });
+  });
+  it("first read: pool data too short -> the planner's reason is surfaced", async () => {
+    const short = { owner: DLMM_PROGRAM_ID, data: Buffer.alloc(10), lamports: 1, executable: false };
+    const r = await observeDlmmDepth(scriptedConn([() => [short]]), fx.pool, dec, undefined, AT);
+    assert.deepEqual(r, { error: "LbPair too short (want 904) (10)", at: AT });
+  });
+  it("second read: pool null -> 'missing on the second read'", async () => {
+    const conn = scriptedConn([() => [acct(fx.poolData)], (k) => k.map(() => null)]);
+    const r = await observeDlmmDepth(conn, fx.pool, dec, undefined, AT);
+    assert.deepEqual(r, { error: "pool account missing on the second read", at: AT });
+  });
+  it("second read: pool foreign-owned -> 'missing on the second read'", async () => {
+    const foreign = { owner: Keypair.generate().publicKey, data: poolBytes(), lamports: 1, executable: false };
+    const conn = scriptedConn([() => [acct(fx.poolData)], (k) => k.map(() => foreign)]);
+    const r = await observeDlmmDepth(conn, fx.pool, dec, undefined, AT);
+    assert.deepEqual(r, { error: "pool account missing on the second read", at: AT });
+  });
+  it("second read: pool corrupted between reads -> planner reason on the second plan", async () => {
+    const corrupt = { owner: DLMM_PROGRAM_ID, data: Buffer.alloc(5), lamports: 1, executable: false };
+    const conn = scriptedConn([() => [acct(fx.poolData)], (k) => k.map(() => corrupt)]);
+    const r = await observeDlmmDepth(conn, fx.pool, dec, undefined, AT);
+    assert.deepEqual(r, { error: "LbPair too short (want 904) (5)", at: AT });
+  });
+  it("second read: active bin moved a whole array -> 'active bin moved' retry error", async () => {
+    const plain = fakeConn();
+    // Second call: real arrays, but the pool account now has an active id 70 bins higher (one array further).
+    let n = 0;
+    const moving = {
+      getMultipleAccountsInfo: async (keys: PublicKey[]) => {
+        n++;
+        const infos = await plain.conn.getMultipleAccountsInfo(keys);
+        if (n === 2) infos[0] = withActiveId(70);
+        return infos;
+      },
+    };
+    const r = await observeDlmmDepth(moving, fx.pool, dec, undefined, AT);
+    assert.deepEqual(r, { error: "active bin moved between reads; retry next interval", at: AT });
+  });
+  it("a foreign-owned bin array is treated as missing -> computeDlmmDepth refuses with 'bin array -86 missing'", async () => {
+    const f = fakeConn();
+    const conn = {
+      getMultipleAccountsInfo: async (keys: PublicKey[]) => {
+        const infos = await f.conn.getMultipleAccountsInfo(keys);
+        if (keys.length > 1) infos[infos.length - 1] = { owner: Keypair.generate().publicKey, data: infos[infos.length - 1]!.data, lamports: 1, executable: false };
+        return infos;
+      },
+    };
+    const r = await observeDlmmDepth(conn, fx.pool, dec, undefined, AT);
+    assert.deepEqual(r, { error: "bin array -86 missing", at: AT });
+  });
+  it("computeDlmmDepth refusal (unknown decimals) is surfaced verbatim", async () => {
+    const r = await observeDlmmDepth(fakeConn().conn, fx.pool, undefined, undefined, AT);
+    assert.deepEqual(r, { error: "token decimals unknown", at: AT });
+  });
+  it("an invalid pool address (PublicKey throws) -> error, no RPC", async () => {
+    const f = fakeConn();
+    const r = await observeDlmmDepth(f.conn, "not-a-pubkey", dec, undefined, AT);
+    assert.ok("error" in r && r.error.length > 0 && r.at === AT);
+    assert.equal(f.calls.length, 0);
+  });
+  it("a non-Error throw is stringified; the message is cut to 160 chars", async () => {
+    const r1 = await observeDlmmDepth({ getMultipleAccountsInfo: async () => { throw "plain string"; } }, fx.pool, dec, undefined, AT);
+    assert.deepEqual(r1, { error: "plain string", at: AT });
+    const r2 = await observeDlmmDepth({ getMultipleAccountsInfo: async () => { throw new Error("x".repeat(500)); } }, fx.pool, dec, undefined, AT);
+    assert.deepEqual(r2, { error: "x".repeat(160), at: AT });
+  });
+  it("success values equal the exact depth the fixture produces and stay decimal strings", async () => {
+    const a = await observeDlmmDepth(fakeConn().conn, fx.pool, dec, undefined, AT);
+    assert.deepEqual(a, { bidUsdE6: "277415463261", askUsdE6: "405111879296", minUsdE6: "277415463261", binArrays: [-87, -86], at: AT });
+  });
+});
+
+describe("DlmmDepthObserver in-flight / error handling", () => {
+  it("a key already in flight is skipped (no second RPC) and the first observation still lands", async () => {
+    const f = fakeConn();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const slow = { getMultipleAccountsInfo: async (k: PublicKey[]) => { await gate; return f.conn.getMultipleAccountsInfo(k); } };
+    const o = new DlmmDepthObserver(0);
+    const first = o.observe(slow, [unit], () => dec, undefined, 1);
+    await o.observe(slow, [unit], () => dec, undefined, 2); // same key while the first is pending
+    assert.equal(f.calls.length, 0);
+    release();
+    await first;
+    assert.equal(f.calls.length, 2);
+    const got = o.get("mkt")!;
+    assert.equal(got.at, 1);
+  });
+  it("an RPC failure is stored as an { error } observation, and the key is released for the next interval", async () => {
+    const o = new DlmmDepthObserver(0);
+    await o.observe({ getMultipleAccountsInfo: async () => { throw new Error("429"); } }, [unit], () => dec, undefined, 5);
+    assert.deepEqual(o.get("mkt"), { error: "429", at: 5 });
+    await o.observe(fakeConn().conn, [unit], () => dec, undefined, 6);
+    assert.ok("minUsdE6" in o.get("mkt")!);
+  });
+  it("decimalsOf throwing rejects observe() but releases the in-flight key", async () => {
+    const o = new DlmmDepthObserver(0);
+    await assert.rejects(() => o.observe(fakeConn().conn, [unit], () => { throw new Error("no decimals"); }, undefined, 1), /no decimals/);
+    await o.observe(fakeConn().conn, [unit], () => dec, undefined, 2);
+    assert.ok("minUsdE6" in o.get("mkt")!);
+  });
+  it("startDlmmDepthObservation(true) swallows a rejection and warns with the cut message (Error and non-Error)", async () => {
+    const warns: string[] = [];
+    const orig = console.warn;
+    console.warn = (m: unknown) => { warns.push(String(m)); };
+    try {
+      startDlmmDepthObservation(true, new DlmmDepthObserver(0), fakeConn().conn, [unit], () => { throw new Error("y".repeat(300)); }, undefined, 1);
+      startDlmmDepthObservation(true, new DlmmDepthObserver(0), fakeConn().conn, [unit], () => { throw "raw"; }, undefined, 1);
+      await new Promise((r) => setTimeout(r, 30));
+    } finally {
+      console.warn = orig;
+    }
+    assert.deepEqual(warns.sort(), [`[dlmm-depth] observe failed: ${"y".repeat(100)}`, "[dlmm-depth] observe failed: raw"].sort());
+  });
+  it("startDlmmDepthObservation(true) populates the observer without being awaited", async () => {
+    const f = fakeConn();
+    const o = new DlmmDepthObserver(0);
+    startDlmmDepthObservation(true, o, f.conn, [unit], () => dec, undefined, 9);
+    assert.equal(o.get("mkt"), undefined); // not yet: fire-and-forget
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(o.get("mkt")!.at, 9);
+  });
+});
+
 describe("observe-only: push bytes are unchanged", () => {
   const args: Parameters<typeof encodePushAuthMark>[0] = { assetIndex: 0, marketId: 7n, nowSlot: 123n, markE6: 89_679_082n, observationSequence: 9n };
   it("resolvePushDepth is null for a DLMM market (no CPMM reserve), flag on or off, observation or not", async () => {
