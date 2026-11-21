@@ -18,6 +18,7 @@
  */
 import http from "http";
 import { Connection, Keypair } from "@solana/web3.js";
+import { pruneMergedSkipLog } from "./v22/sweep.ts";
 import { lifecycleLedger } from "./v22/lifecycle-ledger.ts";
 import type { DexType, Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
@@ -1815,6 +1816,7 @@ export function pruneDeregisteredMarkets(
   for (const m of [...crossClusterCircuitBreakerStates.keys()]) if (!keepKeys.has(m)) crossClusterCircuitBreakerStates.delete(m);
   pruneAuthMarkPusherState(keep);
   pruneMarketAccrual(keep);
+  pruneMergedSkipLog(keep);
   prunePushDeadlines(keep);
   return removed;
 }
