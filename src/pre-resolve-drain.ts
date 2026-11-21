@@ -32,7 +32,7 @@ import { PublicKey } from "@solana/web3.js";
 import { stakeFeeConfigFromEnv } from "./cross-cluster/stake-fee-pusher.ts";
 import { describeProgramIds } from "./program-ids.ts";
 import { devnetConnectionConfig } from "./rpc-headers.ts";
-import { parseSecretKeyJson } from "./env-utils.ts";
+import { loadSecretKey } from "./env-utils.ts";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
@@ -40,11 +40,8 @@ function arg(name: string): string | undefined {
 }
 
 function loadKeypair(): Keypair {
-  if (process.env.KEEPER_KEYPAIR) {
-    return Keypair.fromSecretKey(parseSecretKeyJson(process.env.KEEPER_KEYPAIR, "KEEPER_KEYPAIR"));
-  }
   const p = process.env.KEEPER_KEYPAIR_PATH ?? `${process.env.HOME}/.config/solana/id.json`;
-  return Keypair.fromSecretKey(parseSecretKeyJson(fs.readFileSync(p, "utf8"), `keypair file ${p}`));
+  return Keypair.fromSecretKey(loadSecretKey(process.env.KEEPER_KEYPAIR, p));
 }
 
 async function main(): Promise<number> {
