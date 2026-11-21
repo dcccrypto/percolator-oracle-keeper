@@ -127,6 +127,7 @@ export type { TerminalState } from "./market-state.ts";
 import { decodeTerminalState, isTerminalFlat } from "./market-state.ts";
 import type { TerminalState } from "./market-state.ts";
 import { addKeeperPriorityFee } from "./priority-fee.ts";
+import { defaultOnSwitch } from "../env-utils.ts";
 
 /** Asset-0 insurance authority, via the VERSION-gated profile offset. null if unreadable. */
 export function asset0InsuranceAuthority(d: Uint8Array): PublicKey | null {
@@ -230,8 +231,8 @@ export function terminalInsuranceConfigFromEnv(env: Readonly<Record<string, stri
   const raw = env.ALERT_TERMINAL_BUDGET_CYCLES;
   const n = raw === undefined || raw.trim() === "" ? 3 : Number(raw);
   if (!Number.isInteger(n) || n <= 0) throw new Error(`ALERT_TERMINAL_BUDGET_CYCLES="${raw}" must be a positive integer`);
-  const cleanupOn = env.TERMINAL_CLEANUP_ENABLED !== "false";
-  const receiptCleanupOn = env.TERMINAL_RECEIPT_CLEANUP_ENABLED !== "false";
+  const cleanupOn = defaultOnSwitch(env, "TERMINAL_CLEANUP_ENABLED");
+  const receiptCleanupOn = defaultOnSwitch(env, "TERMINAL_RECEIPT_CLEANUP_ENABLED");
   const graceRaw = env.TERMINAL_PDA_GRACE_SLOTS;
   if (graceRaw !== undefined && graceRaw.trim() !== "" && !/^\d+$/.test(graceRaw.trim())) {
     throw new Error(`TERMINAL_PDA_GRACE_SLOTS="${graceRaw}" must be a non-negative integer`);
