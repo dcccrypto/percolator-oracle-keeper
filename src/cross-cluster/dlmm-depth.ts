@@ -142,6 +142,9 @@ export function planDlmmBinArrays(poolData: Uint8Array): DlmmPlan | Refusal {
   if (!p.ok) return p;
   const { activeId, binStep } = p;
   const p0 = priceQ64(activeId, binStep);
+  // Q64.64 floors to 0 once (1+step/1e4)^activeId < 2^-64 (e.g. step 10000, id <= -65). With p0 = 0 both widening loops below
+  // compare 0 <= 0 / 0 >= 0 forever (an unbounded synchronous hang), so a zero active price is a refusal, never a guess.
+  if (p0 === 0n) return { ok: false, reason: `active bin price underflows to 0 (active_id ${activeId}, bin_step ${binStep})` };
   const hi = p0 * 102n;
   const lo = p0 * 98n;
   const est = (ratio: number) => Math.max(0, Math.floor(Math.log(ratio) / Math.log(1 + binStep / 1e4)));
