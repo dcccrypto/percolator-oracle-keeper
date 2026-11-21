@@ -475,7 +475,7 @@ describe("K-COV4: rotating scan window when candidates exceed maxScanPerCycle", 
     const r1 = await run(w, AFTER, st, cfg);
     assert.equal(r1.outcome, "no-wait");
     assert.equal(w.log.sends, 0);
-    assert.equal(st.cursor.get(CODEC.toBase58()), 1);
+    assert.equal(st.cursor.get(CODEC.toBase58()), WINNER.toBase58());
     // Pass 2 sees only the winner: waiting (21), nothing closable in this window.
     const r2 = await run(w, AFTER, st, cfg);
     assert.equal(r2.outcome, "nothing-closable");
@@ -677,5 +677,59 @@ describe("K-COV4: the fee-job wrapper", () => {
     const stuck = world({ elf: ELF.s16ac, nowSlot: AFTER, loserEscrowedPayout: true });
     const r = await job.run(jobCtx(stuck), item(CODEC.toBase58()));
     assert.equal(r.kind, "waiting");
+  });
+});
+
+describe("K-BUG cursor: scan cursor survives list shrink and is cleaned up", () => {
+  const addClones = (w: ReturnType<typeof world>, n: number): PublicKey[] => {
+    const ks: PublicKey[] = [];
+    for (let i = 0; i < n; i++) {
+      const k = PublicKey.unique();
+      w.state.set(k.toBase58(), new Uint8Array(w.state.get(LOSER.toBase58())!));
+      ks.push(k);
+    }
+    return ks;
+  };
+  const zero = (w: ReturnType<typeof world>, k: string): void => {
+    const d = w.state.get(k)!;
+    const z = new Uint8Array(d);
+    z.fill(0, capitalOffset(d), capitalOffset(d) + 16);
+    w.state.set(k, z);
+  };
+
+  it("when closed portfolios leave the list, the next window starts at the first unscanned one (no skip)", async () => {
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    addClones(w, 3);
+    const order = [...w.state.keys()].filter((k) => k !== VAULT_LP.toBase58()).sort((a, b) => a.localeCompare(b));
+    assert.equal(order.length, 5);
+    const st = new LoserForceCloseState();
+    const cfg = CFG({ maxScanPerCycle: 2 });
+    await run(w, AFTER, st, cfg);
+    zero(w, order[0]);
+    zero(w, order[1]);
+    w.log.simTargets.length = 0;
+    await run(w, AFTER, st, cfg);
+    assert.equal(w.log.simTargets[0], order[2], "must resume at the first portfolio not yet scanned");
+  });
+
+  it("drops the cursor once the scan is no longer truncated", async () => {
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    const st = new LoserForceCloseState();
+    await run(w, AFTER, st, CFG({ maxScanPerCycle: 1 }));
+    assert.ok(st.cursor.has(CODEC.toBase58()));
+    await run(w, AFTER, st, CFG({ maxScanPerCycle: 32 }));
+    assert.ok(!st.cursor.has(CODEC.toBase58()));
+  });
+
+  it("drops the cursor for a market that is no longer Resolved / has no candidates", async () => {
+    const w = world({ elf: ELF.s16ac, nowSlot: AFTER });
+    const st = new LoserForceCloseState();
+    st.cursor.set(CODEC.toBase58(), "x");
+    await forceCloseResolvedLosers(w.conn as never, Keypair.generate(), CODEC, new Uint8Array(MARKET.length), AFTER, false, CFG(), st);
+    assert.ok(!st.cursor.has(CODEC.toBase58()));
+    st.cursor.set(CODEC.toBase58(), "x");
+    for (const k of [LOSER, WINNER]) zero(w, k.toBase58());
+    await run(w, AFTER, st);
+    assert.ok(!st.cursor.has(CODEC.toBase58()));
   });
 });
