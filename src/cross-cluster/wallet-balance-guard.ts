@@ -44,7 +44,10 @@ export function shouldRefreshBalance(
   nowMs: number,
   intervalMs: number,
 ): boolean {
-  return nowMs - state.lastCheckAt >= intervalMs;
+  // A backwards wall-clock step (NTP) makes the difference negative; re-read then
+  // rather than going blind until the clock catches up.
+  const elapsed = nowMs - state.lastCheckAt;
+  return elapsed < 0 || elapsed >= intervalMs;
 }
 
 export type BalanceTransition = "went-low" | "recovered" | null;
@@ -62,6 +65,12 @@ export function applyBalanceReading(
   minLamports: number,
   nowMs: number,
 ): BalanceTransition {
+  // NaN < min is false, which would read as "funded" and flip a low wallet to
+  // recovered. A non-numeric reading is a failed read: keep the verdict.
+  if (!Number.isFinite(balanceLamports) || balanceLamports < 0) {
+    state.lastCheckAt = nowMs;
+    return null;
+  }
   const wasLow = state.low;
   state.balanceLamports = balanceLamports;
   state.lastCheckAt = nowMs;
