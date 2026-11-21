@@ -786,6 +786,27 @@ describe("rpc-failover: stale getLatestBlockhash (2026-10-29)", () => {
     assert.ok(logs.some((l) => /blockhash fresh again/.test(l)));
   });
 
+  it("all endpoints stale for several rounds, then both recover: blockhash() resolves within ~one poll (no multi-minute stall)", async () => {
+    const { f, net, tick } = mk({ [P]: { bhLag: 3_800 }, [F1]: { bhLag: 3_800 } }, [P, F1], { backoffBaseMs: 2_000, backoffMaxMs: 300_000 });
+    // poll every 2 s while both are stale: backoff grows on every probe after a cooldown ends
+    for (let i = 0; i < 40; i++) {
+      await assert.rejects(blockhash(f), /rpc-degraded: no devnet RPC endpoint is serving a fresh blockhash/);
+      tick(2_000);
+    }
+    net.hosts[P] = { bhLag: 0 };
+    net.hosts[F1] = { bhLag: 0 };
+    let ok = false;
+    for (let i = 0; i < 2 && !ok; i++) {
+      try {
+        await bhOf(await blockhash(f));
+        ok = true;
+      } catch {
+        tick(2_000);
+      }
+    }
+    assert.ok(ok, "blockhash() must resolve within ~4 s of the RPCs recovering, not wait out a grown backoff");
+  });
+
   it("a stale blockhash never moves the active endpoint (sends keep their endpoint)", async () => {
     const { f, net } = mk({ [P]: { bhLag: 3_800 }, [F1]: { bhLag: 0 } }, [P, F1]);
     await blockhash(f);

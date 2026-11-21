@@ -280,6 +280,7 @@ export class RpcFailover {
   private switches = 0;
   private lastSwitchAt: number | null = null;
   private lastPrimaryProbeAt = 0;
+  private lastBhForcedProbeAt = 0;
   private allDownLoggedAt = 0;
   private rpcId = 1;
   /** Highest slot ever observed on any endpoint. Never expires, never projected: the chain only moves forward. */
@@ -915,8 +916,16 @@ export class RpcFailover {
     let lastRes: Response | null = null;
     let lastErr: unknown = null;
     let staleBlockhash = false;
+    // Every endpoint in blockhash cooldown: waiting out a grown backoff (up to backoffMaxMs) after the RPCs recovered would stall
+    // all pushes. Probe the endpoint whose cooldown ends first, at most once per backoffBaseMs. The reply's own lag is still
+    // judged, so a stale blockhash is never handed out.
+    let forcedProbe: Endpoint | null = null;
+    if (isBlockhash && this.eps.every((e) => e.bhStale && t0 < e.bhStaleUntil) && t0 - this.lastBhForcedProbeAt >= this.cfg.backoffBaseMs) {
+      forcedProbe = this.eps.reduce((a, b) => (b.bhStaleUntil < a.bhStaleUntil ? b : a));
+      this.lastBhForcedProbeAt = t0;
+    }
     for (const ep of order) {
-      if (isBlockhash && ep.bhStale && this.now() < ep.bhStaleUntil) {
+      if (isBlockhash && ep.bhStale && this.now() < ep.bhStaleUntil && ep !== forcedProbe) {
         staleBlockhash = true;
         continue;
       }
