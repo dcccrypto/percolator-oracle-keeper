@@ -327,6 +327,7 @@ describe("monitor over snapshots", () => {
     const r = await evaluateHedgedLockouts(c.conn as never, [s], T);
     assert.deepEqual(r, { alerts: [], records: [] });
     assert.equal(c.calls.length, 0);
+    assert.equal(c.calls.length, 0);
   });
 
   it("an unbound market is skipped", async () => {
@@ -351,5 +352,132 @@ describe("monitor over snapshots", () => {
     for (const f of ["sol-market-v18", "ansem-market-v18", "jup-market-v18", "cate-market-v18"]) {
       assert.equal(decodeAssetGrowthV19(new Uint8Array(fx(f)), 0), null, f);
     }
+  });
+});
+
+describe("coverage of remaining branches (decision + reason asserted)", () => {
+  it("env: blank / whitespace falls back to the default; out-of-range, fractional and flat-bound errors are rejected with the variable name", () => {
+    assert.deepEqual(hedgedLockoutThresholdsFromEnv({ HEDGED_LOCKOUT_UTIL_BPS: "  ", HEDGED_LOCKOUT_FLAT_BPS: "" }), { utilBps: 9000, flatBps: 300 });
+    assert.deepEqual(hedgedLockoutThresholdsFromEnv({ HEDGED_LOCKOUT_FLAT_BPS: "0" }), { utilBps: 9000, flatBps: 0 });
+    assert.throws(() => hedgedLockoutThresholdsFromEnv({ HEDGED_LOCKOUT_UTIL_BPS: "0" }), /HEDGED_LOCKOUT_UTIL_BPS="0" must be an integer in \[1, 20000\]/);
+    assert.throws(() => hedgedLockoutThresholdsFromEnv({ HEDGED_LOCKOUT_UTIL_BPS: "20001" }), /UTIL_BPS/);
+    assert.throws(() => hedgedLockoutThresholdsFromEnv({ HEDGED_LOCKOUT_FLAT_BPS: "10001" }), /HEDGED_LOCKOUT_FLAT_BPS/);
+    assert.throws(() => hedgedLockoutThresholdsFromEnv({ HEDGED_LOCKOUT_FLAT_BPS: "1.5" }), /FLAT_BPS/);
+    assert.throws(() => hedgedLockoutThresholdsFromEnv({ HEDGED_LOCKOUT_FLAT_BPS: "-1" }), /FLAT_BPS/);
+  });
+
+  it("verdict: no-capacity carries a null N_cap figure and no per-side numbers", () => {
+    const v = evaluateHedgedLockout(input({ uLong: 9900, uShort: 9900, cM: 0n }), T);
+    assert.equal(v.status, "no-capacity");
+    assert.equal(v.utilLongBps, null);
+    assert.equal(v.lpNetBps, null);
+  });
+
+  it("v22 path with zero capacity (C_m 0): no-capacity, not alert", () => {
+    const g = decodeAssetGrowthV19(patchedMarket({ growthLambdaBps: 10_000 }), 0)!;
+    const v = evaluateHedgedLockout({ growth: g, cM: 0n, priceE6: 1_000_000n, oiEffLongQ: N, oiEffShortQ: N, lpEffQ: 0n, v22: { bandBps: 0, nowSlot: 1n } }, T);
+    assert.equal(v.status, "no-capacity");
+  });
+
+  it("vaultLpEffectivePositionQ: inactive legs and other assets ignored; aBasis 0 uses |basis|; short leg is negative", () => {
+    const legs = [
+      { active: false, assetIndex: 0, basisPosQ: 5n, side: 0, aBasis: 1n },
+      { active: true, assetIndex: 1, basisPosQ: 7n, side: 0, aBasis: 1n },
+      { active: true, assetIndex: 0, basisPosQ: -40n, side: 1, aBasis: 0n },
+      { active: true, assetIndex: 0, basisPosQ: 10n, side: 0, aBasis: 4n },
+    ] as never;
+    // short: eff = 40 (aBasis 0 -> abs), net -40; long: 10 * 8 / 4 = 20
+    assert.equal(vaultLpEffectivePositionQ({ legs }, 0, { aLong: 8n, aShort: 3n }), -20n);
+  });
+
+  it("placement: a v2.2 layout with data truncated before the band field is null; a huge band_bps saturates", () => {
+    const d = new Uint8Array(Buffer.from(live.accounts[0].slab, "base64"));
+    assert.equal(hedgedLockoutPlacement(d.slice(0, 200), 0, 1), null);
+    const full = hedgedLockoutPlacement(d, 0, 1);
+    assert.ok(full !== null && full.v22 !== undefined);
+    const big = d.slice();
+    // locate band_bps via the decoder: write u64 max at the same offset by diffing placements
+    const bandOff = (() => {
+      for (let o = 0; o + 8 <= big.length; o++) {
+        let m = true;
+        const want = BigInt(full.v22!.bandBps);
+        let x = 0n;
+        for (let k = 7; k >= 0; k--) x = (x << 8n) | BigInt(big[o + k]);
+        if (x !== want) m = false;
+        if (m && decodeBandConfigV22(Object.assign(big.slice(), {})).bandBps === full.v22!.bandBps) {
+          const t = big.slice();
+          new DataView(t.buffer).setBigUint64(o, 1n << 40n, true);
+          const p = hedgedLockoutPlacement(t, 0, 1);
+          if (p?.v22?.bandBps === Number.MAX_SAFE_INTEGER) return o;
+        }
+      }
+      return -1;
+    })();
+    assert.ok(bandOff >= 0, "found the band_bps field and saturated it");
+  });
+
+  it("placement: a known v2.1 layout whose header kind is not a market (so not the v18 fast path) is refused, version < 19", () => {
+    const d = patchedMarket({}).slice();
+    d[10] = 0; // header kind byte
+    assert.equal(isV18MarketHeader(d), false);
+    assert.equal(hedgedLockoutPlacement(d, 0, 1), null);
+  });
+
+  it("placement: a known v2.2 layout but an asset index past the slot table (engine slot beyond the account) is null", () => {
+    const d = new Uint8Array(Buffer.from(live.accounts[0].slab, "base64"));
+    assert.ok(hedgedLockoutPlacement(d, 0, 1) !== null);
+    assert.equal(hedgedLockoutPlacement(d, 1_000, 1), null);
+  });
+
+  it("monitor: an asset index past the slot table makes the growth decode throw; swallowed, no record", async () => {
+    const lp = Keypair.generate().publicKey;
+    const d = new Uint8Array(Buffer.from(live.accounts[0].slab, "base64"));
+    const s = snapshot({ marketData: d, registryData: registryBytes({ bound: true }), vaultLpData: vaultLpStateBytes({ lp }) });
+    s.ref.assetIndex = 1_000;
+    assert.deepEqual(await evaluateHedgedLockouts(fakeConn().conn as never, [s], T), { alerts: [], records: [] });
+  });
+
+  it("monitor: growth decodes but placement is refused (known v2.1 layout, non-market kind byte) -> no record, no RPC, no alert", async () => {
+    const lp = Keypair.generate().publicKey;
+    const m = patchedMarket({ effectivePriceE6: 1_000n, growthLambdaBps: 10_000 }).slice();
+    m[10] = 0;
+    const s = snapshot({ marketData: m, registryData: registryBytes({ bound: true }), vaultLpData: vaultLpStateBytes({ lp }) });
+    const c = fakeConn({ accounts: new Map([[lp.toBase58(), new Uint8Array(fx("cate-lp-portfolio-v18"))]]) });
+    const r = await evaluateHedgedLockouts(c.conn as never, [s], T);
+    assert.deepEqual(r, { alerts: [], records: [] });
+    assert.equal(c.calls.length, 0);
+  });
+
+  it("monitor: vault LP missing -> skipped; market data missing -> skipped; throwing RPC -> skipped without throwing", async () => {
+    const lp = Keypair.generate().publicKey;
+    const m = patchedMarket({ effectivePriceE6: 1_000n, growthLambdaBps: 10_000 });
+    const noLp = snapshot({ marketData: m, registryData: registryBytes({ bound: true }), vaultLpData: null });
+    assert.deepEqual(await evaluateHedgedLockouts(fakeConn().conn as never, [noLp], T), { alerts: [], records: [] });
+    const noData = snapshot({ marketData: null, registryData: registryBytes({ bound: true }), vaultLpData: vaultLpStateBytes({ lp }) });
+    assert.deepEqual(await evaluateHedgedLockouts(fakeConn().conn as never, [noData], T), { alerts: [], records: [] });
+    const s = snapshot({ marketData: m, registryData: registryBytes({ bound: true }), vaultLpData: vaultLpStateBytes({ lp }) });
+    const boom = { getAccountInfo: async () => { throw new Error("rpc down"); } };
+    assert.deepEqual(await evaluateHedgedLockouts(boom as never, [s], T), { alerts: [], records: [] });
+  });
+
+  it("monitor: v2.2 market whose layout is unknown after growth decodes -> skipped", async () => {
+    const lp = Keypair.generate().publicKey;
+    const d = new Uint8Array(Buffer.from(live.accounts[0].slab, "base64")).slice(0, 300);
+    const s = snapshot({ marketData: d, registryData: registryBytes({ bound: true }), vaultLpData: vaultLpStateBytes({ lp }) });
+    assert.deepEqual(await evaluateHedgedLockouts(fakeConn().conn as never, [s], T), { alerts: [], records: [] });
+  });
+
+  it("alert builder: null verdict numbers render '?' / null in the message and data; thresholds are echoed", async () => {
+    const { hedgedLockoutAlert } = await import("./p2b-hedged-lockout.ts");
+    const a = hedgedLockoutAlert("MKT", "LBL", { status: "alert", nCapQ: null, usersLongQ: null, usersShortQ: null, utilLongBps: null, utilShortBps: null, lpNetBps: null }, { utilBps: 8500, flatBps: 150 });
+    assert.equal(a.kind, "hedged-lockout");
+    assert.equal(a.subject, "LBL");
+    assert.match(a.message, /users long \?, users short \?/);
+    assert.match(a.message, /threshold 85%/);
+    assert.match(a.message, /\|net\| \? of N_cap, flat <= 1.5%/);
+    assert.deepEqual(a.data, { market: "MKT", utilLongBps: null, utilShortBps: null, lpNetBps: null, nCapQ: null });
+    const b = hedgedLockoutAlert("M", "L", { status: "alert", nCapQ: 100n, usersLongQ: 1n, usersShortQ: 1n, utilLongBps: 9550n, utilShortBps: 9000n, lpNetBps: 25n }, T);
+    assert.match(b.message, /users long 95.5%, users short 90%/);
+    assert.deepEqual(b.data, { market: "M", utilLongBps: 9550, utilShortBps: 9000, lpNetBps: 25, nCapQ: "100" });
   });
 });
