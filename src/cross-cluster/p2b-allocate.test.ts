@@ -281,3 +281,64 @@ describe("tag 103: bond tranche account (EARN-10)", () => {
     assert.equal(r.c.count("simulateTransaction"), 1);
   });
 });
+
+describe("tag 103: per-market state is pruned with the registry", () => {
+  it("prune() drops pacing and failure state (and alerts) for markets no longer live; live ones keep theirs", async () => {
+    const r = rig({ sims: [{ err: ie("InvalidAccountData") }] });
+    const gone = boundSnap({ label: "GONE" });
+    const live = boundSnap({ label: "LIVE" });
+    for (const s of [gone, live]) await r.a.runMarket(s);
+    r.advance(CFG.intervalMs + 1);
+    for (let i = 0; i < 3; i++) {
+      for (const s of [gone, live]) assert.equal(await r.a.runMarket(s), "failed");
+      r.advance(CFG.intervalMs * 20);
+    }
+    assert.equal(r.a.activeAlerts().length, 2);
+    r.a.prune(new Set([live.ref.marketAddress]));
+    const alerts = r.a.activeAlerts();
+    assert.deepEqual(alerts.map((a) => a.subject), ["LIVE"], "a removed market must stop alerting");
+    assert.equal(await r.a.runMarket(live), "failed", "live market keeps its schedule and streak");
+    assert.equal(r.a.activeAlerts()[0]?.data?.streak, 4);
+    assert.equal(await r.a.runMarket(gone), "not-due", "a returning market is re-staggered like a new one");
+  });
+
+  it("registry churn of 1k markets keeps state bounded by the live set", async () => {
+    const r = rig();
+    for (let i = 0; i < 1_000; i++) {
+      const s = snapshot({ label: `M${i}` });
+      await r.a.runMarket(s);
+      r.a.prune(new Set([s.ref.marketAddress]));
+    }
+    assert.ok(r.a.trackedMarkets() <= 1, `leaked ${r.a.trackedMarkets()} entries`);
+  });
+});
+
+describe("tag 103: failure accounting (leads checked, not bugs)", () => {
+  it("each failed attempt counts stats.failed exactly once, whether returned or thrown", async () => {
+    const r = rig({ sims: [{ err: ie("InvalidAccountData") }] });
+    const s = boundSnap();
+    await firstDue(r, s);
+    assert.equal(await r.a.runMarket(s), "failed");
+    assert.equal(r.a.stats.failed, 1);
+    r.advance(CFG.intervalMs * 20);
+    r.c.conn.simulateTransaction = async () => { throw new Error("boom"); };
+    assert.equal(await r.a.runMarket(s), "failed");
+    assert.equal(r.a.stats.failed, 2);
+  });
+
+  it("alternating thrown and 'failed' share one streak and back off 2x, 4x", async () => {
+    const r = rig({ sims: [{ err: ie("InvalidAccountData") }], rand: () => 0.5 });
+    const s = boundSnap();
+    await firstDue(r, s);
+    const good = r.c.conn.simulateTransaction;
+    const gaps: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      r.c.conn.simulateTransaction = i % 2 === 0 ? good : async () => { throw new Error("boom"); };
+      assert.equal(await r.a.runMarket(s), "failed");
+      let g = 0;
+      while ((await r.a.isDue(s.ref.marketAddress)) === false) { r.advance(1_000); g += 1_000; }
+      gaps.push(g);
+    }
+    assert.deepEqual(gaps, [120_000, 240_000, 480_000]);
+  });
+});
