@@ -80,7 +80,7 @@ export interface ExecOptions {
   extend?: (post: ReadonlyArray<Uint8Array | null>) => readonly TransactionInstruction[] | null;
   /**
    * F1: called with the post-simulation accounts of the EXTENDED (second) simulation, when it was clean. Returning a reason rejects the
-   * extension: the original list (already simulated clean) is sent instead. Must not throw (a throw rejects nothing).
+   * extension: the original list (already simulated clean) is sent instead. A throw rejects the extension (fail closed).
    */
   verifyExtended?: (post: ReadonlyArray<Uint8Array | null>) => string | null;
 }
@@ -234,11 +234,14 @@ export async function simulateAndSend(
               const raw2 = (sim.value.accounts as Array<{ data: [string, string] } | null> | null | undefined) ?? [];
               why = o.verifyExtended(o.accounts.map((_, i) => (raw2[i] ? new Uint8Array(Buffer.from(raw2[i]!.data[0], "base64")) : null)));
             } catch {
-              why = null;
+              // fail closed: an unverifiable extension is not sent; fall back to the first (already clean) list.
+              why = "verifyExtended threw";
             }
             if (why) {
               list = ixs;
-              tx = firstTx;
+              // firstTx may be signed with a hash that a later refresh replaced; rebuild on the current one so
+              // the sent tx and confirmBySignature's lastValidBlockHeight agree.
+              tx = firstTx.recentBlockhash === blockhash ? firstTx : make(ixs);
               sim = firstSim;
             }
           }
