@@ -102,6 +102,8 @@ export interface V22LoopDeps {
   /** #174 depth-capacity thresholds (default: from ALERT_DEPTH_* env, boot-safe). */
   depthCapacityThresholds?: DepthCapacityThresholds;
   now?: () => number;
+  /** The catch-up queue's wait (default setTimeout); tests with an injected `now` pass a recorder. */
+  sleep?: (ms: number) => Promise<void>;
   log?: (s: string) => void;
 }
 
@@ -147,6 +149,8 @@ interface MarketRuntime {
   sweepInflight: boolean;
   /** Liveness repairs (tag 89 / 45) are not retried before this time after one did not land (ms). */
   repairBackoffUntilMs: number;
+  /** No catch-up before this time after the program refused one (refused, or landed and failed); never after a transport failure. */
+  catchupBackoffUntilMs: number;
   /** Active vault-LP crank liveness alerts from the last GOOD read (kept across a failed read, never cleared by one). */
   lpCertAlerts: Alert[];
   /** #174: active depth-capacity alerts from the last decodable read. */
@@ -169,6 +173,13 @@ export const DEPTH_CAPACITY_ALERT_SCOPE = "v22-depth-capacity";
 const POSITIONED_TTL_MS = 10_000;
 /** Margin on a simulated one-crank catch-up cost when sizing the catch-up tx (per-crank cost varies a few % with state). */
 const CATCHUP_MEASURED_MARGIN = 1.08;
+/**
+ * The longest a market waits inside one crank cycle for its catch-up start. Below the 20 s CRANK_INTERVAL_MS default,
+ * so a cycle of paced catch-ups (about 9 at the 1.5 s spacing) still fits in one interval and the cycle is not stretched.
+ * Fixed for the 20 s default cycle; derive it from CRANK_INTERVAL_MS if that is ever run much shorter.
+ */
+const CATCHUP_WAIT_BUDGET_MS = 12_000;
+const sleepMs = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms));
 
 export class V22Loop {
   private readonly rt = new Map<string, MarketRuntime>();
@@ -180,7 +191,7 @@ export class V22Loop {
   private ticks = 0;
   private lastTickAt: number | null = null;
   private layoutProblems = new Map<string, string>();
-  /** v22price 2026-10-22: when the last catch-up tx (any market) was started; see `catchupSpacingMs`. */
+  /** v22price 2026-10-22: start of the last catch-up tx reserved by any market (may be in the future); see `catchupSpacingMs`. */
   private lastCatchupAtMs = Number.NEGATIVE_INFINITY;
   /** Market lifecycle: dead-market classifier, permissionless stale resolve (default OFF), warn-band fee forcing (default OFF). */
   private readonly lifecycle: LifecycleEngine | null;
@@ -425,6 +436,7 @@ export class V22Loop {
         quarantineHistory: new Map(),
         anchorBadRounds: 0,
         repairBackoffUntilMs: 0,
+        catchupBackoffUntilMs: 0,
         deferrals: new Map(),
         escalated: new Map(),
         lastLpSettledAtMs: 0,
@@ -487,6 +499,21 @@ export class V22Loop {
     const v = await loadV22Positioned(this.d.conn, ctx, (this.d.anchors ?? parseAccrueAnchors(process.env.KEEPER_V22_ACCRUE_ANCHORS)).get(ctx.market.toBase58()) ?? null, this.d.keeper.publicKey);
     if (v) r.positionedCache = { at: t, value: v };
     return v;
+  }
+
+  /**
+   * Reserve the next catch-up start across ALL markets (`catchupSpacingMs` apart). Returns the ms to wait for it, or
+   * null (nothing reserved) when that start is more than CATCHUP_WAIT_BUDGET_MS away. A non-positive or non-numeric
+   * spacing means no pacing, as before.
+   */
+  private reserveCatchupStart(): number | null {
+    const raw = this.d.catchupSpacingMs ?? Number(process.env.KEEPER_V22_CATCHUP_SPACING_MS ?? 1500);
+    const spacing = raw > 0 ? Math.min(raw, Number.MAX_SAFE_INTEGER) : 0; // Infinity: one catch-up, then paced (as before), never NaN
+    const now = this.now();
+    const start = Math.max(now, this.lastCatchupAtMs + spacing);
+    if (start - now > CATCHUP_WAIT_BUDGET_MS) return null;
+    this.lastCatchupAtMs = start;
+    return start - now;
   }
 
   private noteLoad(entry: { marketAddress: string }, load: V22MarketLoad): V22MarketCtx | null {
@@ -572,17 +599,31 @@ export class V22Loop {
         if (n > 0) {
           // v22price 2026-10-22: pace catch-up across markets. After an outage every market is behind at once; one
           // catch-up tx per market per cycle (each with two simulations, a send and status polls) hit the RPC key's rate
-          // limit (429) and starved the pushes. Skipped markets catch up on a later cycle; returning true keeps the
-          // legacy cranker from sending its own catch-up meanwhile.
-          const spacing = this.d.catchupSpacingMs ?? Number(process.env.KEEPER_V22_CATCHUP_SPACING_MS ?? 1500);
-          const paced = this.now() - this.lastCatchupAtMs < spacing;
-          if (!paced) {
-            this.lastCatchupAtMs = this.now();
-            await this.multiAssetCatchup(ctx, positioned.flatAnchor ?? positioned.lp.pubkey, n);
+          // limit (429) and starved the pushes. Returning true keeps the legacy cranker from sending its own catch-up meanwhile.
+          // The cranker calls every market at the same instant, once per crank cycle, so a market skipped by the pacing
+          // used to wait a whole cycle: one catch-up per cycle across all markets. Each market now reserves the next free start
+          // (one per spacing window) and waits for it inside this call; only a start beyond CATCHUP_WAIT_BUDGET_MS is left
+          // to a later cycle.
+          let cur: V22MarketCtx | null = ctx;
+          // A market the program keeps refusing would hold a start every cycle forever (re-read + 2 simulations each, on the
+          // rate-limited RPC key); it backs off 60 s instead. A transport failure (429, blockhash) says nothing about the market.
+          const backedOff = this.now() < r.catchupBackoffUntilMs;
+          const wait = backedOff ? null : this.reserveCatchupStart();
+          if (wait !== null) {
+            if (wait > 0) {
+              await (this.d.sleep ?? sleepMs)(wait);
+              // Re-read: the chain moved while we waited, and a crank past the gap would settle the target alone.
+              const again = await loadV22Market(conn, entry, this.d.programId);
+              cur = again.ok ? again.ctx : null;
+            }
+            const m = cur ? catchupCrankCount(BigInt(cur.readSlot) - cur.refresh.slotLast, cur.refresh.maxAccrualDtSlots) : 0;
+            if (cur && m > 0 && (await this.multiAssetCatchup(cur, positioned.flatAnchor ?? positioned.lp.pubkey, m))) r.catchupBackoffUntilMs = this.now() + 60_000;
+          } else if (!backedOff) {
+            this.log(`[v22][catchup] ${ctx.label}: ${BigInt(ctx.readSlot) - ctx.refresh.slotLast} slots behind, deferred to a later cycle (catch-up queue full this cycle)`);
           }
           // A9-1: no round this cycle, so publish this cycle's read as the crank-health record. Without it /health kept the
           // last round's record for as long as the market stayed behind (a refused catch-up: for good).
-          await this.publishHealth(ctx, r, positioned, null);
+          await this.publishHealth(cur ?? ctx, r, positioned, null);
           return true;
         }
       }
@@ -699,9 +740,10 @@ export class V22Loop {
   /**
    * K-6: one transaction of bounded catch-up cranks for a multi-asset market, each observing every asset (simulate first,
    * dry-run = simulate only). `n` is capped to what fits the compute budget at the multi-hint cost; a further gap is
-   * covered on the next cycles. Never throws.
+   * covered on the next cycles. Never throws. Returns true when the program refused it (refused in simulation, or landed
+   * and failed); a transport failure returns false (catch-up backoff).
    */
-  private async multiAssetCatchup(ctx: V22MarketCtx, target: PublicKey, wanted: number): Promise<void> {
+  private async multiAssetCatchup(ctx: V22MarketCtx, target: PublicKey, wanted: number): Promise<boolean> {
     const hints = observationAssetsFor(ctx.marketAddress).length;
     const crank = () => buildObservationCrankIx(this.d.keeper.publicKey, ctx.market, target, crankOracleAccounts(ctx));
     // v22price 2026-10-22: the per-crank cost depends on the market's config (v2.2 single-asset 36,350 CU; a band market
@@ -723,6 +765,7 @@ export class V22Loop {
     const gap = BigInt(ctx.readSlot) - ctx.refresh.slotLast;
     const what = out.kind === "sent" ? `sent ${out.landed}` : out.kind === "refused" ? `refused ${out.name}` : out.kind === "failed" ? `failed ${out.error}` : out.kind;
     this.log(`[v22][catchup] ${ctx.label}: ${hints} assets, oldest ${gap} slots behind: ${n} catch-up crank(s) (${wanted} wanted) on ${target.toBase58().slice(0, 8)}…: ${what}`);
+    return out.kind === "refused" || (out.kind === "sent" && out.landed === "failed");
   }
 
   /**
