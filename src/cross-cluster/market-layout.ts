@@ -415,7 +415,7 @@ export function detectLayout(data: Uint8Array, sdkRegistry: ReadonlyMap<number, 
     slots: n,
     version,
     reason:
-      matches.length === 0
+      matches.length < 2
         ? `length ${data.length} with VERSION ${version}, max_market_slots=${n} matches no known layout (${knownStrides()})${guardCode ? ` [sdk-guard: ${guardCode}]` : ""}`
         : `length ${data.length} with VERSION ${version} is ambiguous between ${matches.map((m) => m.id).join(" / ")}`,
   };
