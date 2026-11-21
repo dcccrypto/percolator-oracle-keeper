@@ -113,8 +113,10 @@ export interface TickPublisherOptions {
 export function createTickPublisher(opts: TickPublisherOptions = {}): TickPublisher {
   const url = (opts.url ?? process.env.TICK_INGEST_URL ?? "").trim();
   const key = (opts.key ?? process.env.TICK_INGEST_KEY ?? "").trim();
-  const rawTimeout = opts.timeoutMs ?? Number(process.env.TICK_PUBLISH_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS);
-  const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : DEFAULT_TIMEOUT_MS;
+  // Env value: plain decimal digits only (Number() would read 1e9 as an 11-day timeout, 0x10 as 16); anything else = default.
+  const envTimeout = (process.env.TICK_PUBLISH_TIMEOUT_MS ?? "").trim();
+  const rawTimeout = opts.timeoutMs ?? (envTimeout === "" ? DEFAULT_TIMEOUT_MS : /^\d+$/.test(envTimeout) ? Number(envTimeout) : NaN);
+  const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0 && rawTimeout <= 2_147_483_647 ? rawTimeout : DEFAULT_TIMEOUT_MS;
   const doFetch = opts.fetchImpl ?? globalThis.fetch;
   const now = opts.now ?? Date.now;
   const log = opts.log ?? ((m: string) => console.warn(m));
