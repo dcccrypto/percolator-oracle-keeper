@@ -66,6 +66,7 @@ import { decodeStakePoolAnyVersion } from "./stake-pool-decode.ts";
 import type { StakePoolView } from "./stake-pool-decode.ts";
 import { STAKE_PROGRAM_ID, WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { assetSlotOffset, selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
+import { redactErrorText } from "./v22/redact.ts";
 import { parseInstructionError } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
@@ -299,6 +300,15 @@ export function isLegacyShapeRefusal(err: unknown): boolean {
   return !!e && typeof e === "object" && "Custom" in e && (e as { Custom: unknown }).Custom === STAKE_ERR_INVALID_ACCOUNT;
 }
 
+/** JSON.stringify that survives BigInt values (a throw here would mask the real sim error; #392). */
+function safeJson(v: unknown): string {
+  try {
+    return JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x)) ?? String(v);
+  } catch {
+    return String(v);
+  }
+}
+
 function mkTx(keeper: Keypair, blockhash: string, ix: TransactionInstruction): Transaction {
   const tx = new Transaction();
   tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT }));
@@ -380,7 +390,7 @@ export async function windDownOnce(
     data = new Uint8Array(mi.data);
     if (pi && pi.owner.equals(cfg.stakeProgramId)) poolState = decodeStakePoolAnyVersion(new Uint8Array(pi.data));
   } catch (err) {
-    return res({ kind: "failed", error: `account read failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}` });
+    return res({ kind: "failed", error: `account read failed: ${redactErrorText(err instanceof Error ? err.message : String(err), 120)}` });
   }
 
   let state = decodeTerminalState(data);
@@ -396,7 +406,7 @@ export async function windDownOnce(
   let lateNote = "";
   if (cfg.receiptCleanup !== false && cfg.cleanup && state.kind === "resolved" && state.materializedPortfolios > 0n) {
     const lc = await closeFinalizedReceiptPortfolios(conn as CleanupConnection, keeper, market, dryRun, cfg.cleanup);
-    for (const f of lc.failed) console.warn(`[terminal-insurance] ${marketAddress.slice(0, 8)}…: receipt-only portfolio ${f.portfolio} not closed: ${f.reason}`);
+    for (const f of lc.failed) console.warn(`[terminal-insurance] ${marketAddress.slice(0, 8)}…: receipt-only portfolio ${f.portfolio} not closed: ${redactErrorText(f.reason)}`);
     if (lc.closed.length > 0) {
       console.log(`[terminal-insurance] ${marketAddress.slice(0, 8)}…: closed ${lc.closed.length} receipt-only portfolio(s) (tag 8 after a late receipt finalize): ${lc.closed.join(", ")}`);
       lateNote = ` Late-finalize cleanup: tag 8 closed ${lc.closed.length} receipt-only portfolio(s).`;
@@ -413,7 +423,7 @@ export async function windDownOnce(
         const h = await crankLpFeesOnce(conn, keeper, marketAddress, dryRun, cfg.confirm);
         lateNote += h === "cranked" ? " Tag 78 harvested (terminal-flat): the junior's 102 is unblocked."
           : h === "no-fees" || h === "skipped" ? " Terminal-flat: the junior's 102 is unblocked."
-            : ` Tag 78 harvest failed: ${h.error}.`;
+            : ` Tag 78 harvest failed: ${redactErrorText(h.error)}.`;
       }
     }
   }
@@ -469,7 +479,7 @@ export async function windDownOnce(
   }
   const cleanupNote = cleanup
     ? ` Cleanup: support=${cleanup.support}, closed ${cleanup.closed}, progressed ${cleanup.progressed}, ${cleanup.remaining.length} left` +
-      (cleanup.remaining.length ? ` [${cleanup.remaining.slice(0, 3).map((r) => `${r.portfolio.slice(0, 8)}…: ${r.reason}`).join("; ")}${cleanup.remaining.length > 3 ? "; …" : ""}]` : "") + "."
+      (cleanup.remaining.length ? ` [${cleanup.remaining.slice(0, 3).map((r) => `${r.portfolio.slice(0, 8)}…: ${redactErrorText(r.reason)}`).join("; ")}${cleanup.remaining.length > 3 ? "; …" : ""}]` : "") + "."
     : "";
   // Not stake-bound: no tag 29 here; report what the cleanup did.
   const unbound = (reason: string, extra: Parameters<typeof res>[1]) =>
@@ -512,7 +522,7 @@ export async function windDownOnce(
       h === "cranked" ? " Tag 78 harvested the LP fee leg into the seniors (Earn redemption unlocked)."
         : h === "no-fees" ? " Tag 78: no LP fees pending."
           : h === "skipped" ? ""
-            : ` Tag 78 harvest failed: ${h.error}.`;
+            : ` Tag 78 harvest failed: ${redactErrorText(h.error)}.`;
     if (h === "cranked") console.log(`[terminal-insurance] ${marketAddress.slice(0, 8)}…: resolved terminal-flat LP fee harvest (tag 78) landed`);
   }
 
@@ -617,7 +627,7 @@ export async function windDownOnce(
         if (code === STAKE_ERR_CREATOR_ACCOUNT_REQUIRED) return creatorRequired(amount);
         // FIRST_LOSS pool without the creator ATA: the legacy 9-account list answers NotEnoughAccountKeys at the stake ix.
         if (!(useV5 && v5Plan) && poolState!.version === 5 && isLegacyShapeRefusal(sim.err) && !(typeof ie?.custom === "number")) return creatorRequired(amount);
-        return { amount, outcome: "failed", detail: `sim ${JSON.stringify(sim.err)} ${(sim.logs ?? []).filter((l) => /Error|failed/i.test(l)).slice(-1).join("")}`.slice(0, 200) };
+        return { amount, outcome: "failed", detail: redactErrorText(`sim ${safeJson(sim.err)} ${(sim.logs ?? []).filter((l) => /Error|failed/i.test(l)).slice(-1).join("")}`, 200) };
       }
       if (dryRun) return { amount, outcome: "dry-run", detail: "simulated clean; not sent" };
       const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
@@ -625,9 +635,9 @@ export async function windDownOnce(
       if (c.status === "landed") return { amount, outcome: "sent", detail: `sig=${sig.slice(0, 16)}… [${c.via}]` };
       if (c.status === "failed" && c.code === STAKE_ERR_NOTHING_TO_RECOVER) return { amount, outcome: "nothing", detail: "Custom(31) on chain" };
       if (c.status === "failed" && c.code === STAKE_ERR_CREATOR_ACCOUNT_REQUIRED) return creatorRequired(amount);
-      return { amount, outcome: "failed", detail: c.status === "failed" ? `landed but failed ${JSON.stringify(c.err)}` : `not landed: ${c.reason}` };
+      return { amount, outcome: "failed", detail: c.status === "failed" ? redactErrorText(`landed but failed ${safeJson(c.err)}`, 200) : `not landed: ${c.reason}` };
     } catch (err) {
-      return { amount, outcome: "failed", detail: (err instanceof Error ? err.message : String(err)).slice(0, 160) };
+      return { amount, outcome: "failed", detail: redactErrorText(err instanceof Error ? err.message : String(err), 160) };
     }
   };
 
