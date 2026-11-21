@@ -48,7 +48,13 @@ export async function classifyPools(
   pools: readonly string[],
   cache: DexCache,
 ): Promise<DexCache> {
-  const unknown = [...new Set(pools)].filter((p) => !cache.has(p));
+  const seen = new Set<string>();
+  const unknown: string[] = [];
+  for (const p of pools) {
+    if (cache.has(p) || seen.has(p)) continue;
+    seen.add(p);
+    unknown.push(p);
+  }
   for (let i = 0; i < unknown.length; i += 100) {
     const chunk = unknown.slice(i, i + 100);
     const infos = await conn.getMultipleAccountsInfo(
@@ -152,14 +158,18 @@ export function capMarketRows(
   caps: KeeperMarketCaps,
   isPriceable: (r: DbMarketRow) => boolean = () => true,
 ): { kept: DbMarketRow[]; capped: DbMarketRow[] } {
-  const order = [...rows].sort((a, b) => {
-    const ta = a.created_at ? Date.parse(a.created_at) : Number.POSITIVE_INFINITY;
-    const tb = b.created_at ? Date.parse(b.created_at) : Number.POSITIVE_INFINITY;
-    const da = Number.isNaN(ta) ? Number.POSITIVE_INFINITY : ta;
-    const db = Number.isNaN(tb) ? Number.POSITIVE_INFINITY : tb;
-    if (da !== db) return da < db ? -1 : 1;
-    return a.slab_address < b.slab_address ? -1 : a.slab_address > b.slab_address ? 1 : 0;
+  // Decorate-sort-undecorate: parse created_at once per row, not twice per comparison.
+  const keyed = rows.map((r) => {
+    const t = r.created_at ? Date.parse(r.created_at) : Number.POSITIVE_INFINITY;
+    return { r, t: Number.isNaN(t) ? Number.POSITIVE_INFINITY : t };
   });
+  keyed.sort((a, b) => {
+    if (a.t !== b.t) return a.t < b.t ? -1 : 1;
+    const sa = a.r.slab_address;
+    const sb = b.r.slab_address;
+    return sa < sb ? -1 : sa > sb ? 1 : 0;
+  });
+  const order = keyed.map((k) => k.r);
   const kept: DbMarketRow[] = [];
   const capped: DbMarketRow[] = [];
   const perDeployer = new Map<string, number>();
