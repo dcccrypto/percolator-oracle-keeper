@@ -238,7 +238,9 @@ export async function simulateAndSend(
             }
             if (why) {
               list = ixs;
-              tx = firstTx;
+              // firstTx carries the hash it was signed with; if the extended pass refreshed the blockhash, re-sign the
+              // base list under the current one so tx and the confirm deadline (blockhash/lastValidBlockHeight) stay paired.
+              tx = firstTx.recentBlockhash === blockhash ? firstTx : make(ixs);
               sim = firstSim;
             }
           }
