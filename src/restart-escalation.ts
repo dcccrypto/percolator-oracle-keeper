@@ -9,6 +9,8 @@
  *   - the keeper's /health carries `restarts` {launchesInWindow, threshold, windowMin, escalated} and reports
  *     status `restart-loop` when escalated.
  * No URL, key or token is ever written to the file or logged.
+ * Pruning is strict (`now - t < windowMs`): a launch exactly one window old has already drained, so the oldest entry
+ * leaves the count on the same tick the newest one arrives.
  */
 import fs from "node:fs";
 
