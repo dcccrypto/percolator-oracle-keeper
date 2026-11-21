@@ -53,7 +53,8 @@ export function depthCapacityThresholdsFromEnv(env: Env): DepthCapacityThreshold
   const get = (name: string, fallback: number): number => {
     const raw = env[name];
     if (raw === undefined || raw.trim() === "") return fallback;
-    const n = Number(raw);
+    const t = raw.trim();
+    const n = /^\d+$/.test(t) ? Number(t) : NaN; // decimal digits only: no 0x / 1e1 / 8.0 / signs
     if (!Number.isInteger(n) || n < 1 || n > 64) throw new Error(`${name}="${raw}" must be an integer in [1, 64]`);
     return n;
   };

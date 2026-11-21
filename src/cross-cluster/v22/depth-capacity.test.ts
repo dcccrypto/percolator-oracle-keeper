@@ -94,11 +94,36 @@ describe("#174 assessDepthCapacity", () => {
     assert.deepEqual([d.status, d.capDepthE6], ["closed", 0n]);
   });
 
+  it("decay boundaries match the program's last_good >> k (0 once k >= bitlength; k >= 64 is 0): 1, 2^63, 0, k > zeroAt", () => {
+    const e = (v: bigint, k: bigint) => assessDepthCapacity(record({ lastGoodE6: v }), 0, BAND, at(k));
+    assert.deepEqual([e(1n, 0n).capDepthE6, e(1n, 0n).epochsToZero], [1n, 1]);
+    assert.deepEqual([e(1n, 1n).capDepthE6, e(1n, 1n).status], [0n, "closed"]);
+    const big = 1n << 63n;
+    assert.deepEqual([e(big, 63n).capDepthE6, e(big, 63n).epochsToZero], [1n, 1]);
+    assert.deepEqual([e(big, 64n).capDepthE6, e(big, 64n).status], [0n, "closed"]);
+    assert.equal(e(big, 1000n).stickyEpochs, 1000);
+    assert.deepEqual([e(0n, 0n).capDepthE6, e(0n, 0n).status, e(0n, 0n).epochsToZero], [0n, "closed", 0]);
+  });
+
+  it("alert text: depthAgeSlots null says never, 0 says 0 slots ago", () => {
+    const closed = assessDepthCapacity(record(), 0, BAND, at(131n));
+    assert.match(depthCapacityAlert("M", "m", { ...closed, depthAgeSlots: null }, T, { keeperAttestsVenue: true })?.message ?? "", /last depth push never\)/);
+    assert.match(depthCapacityAlert("M", "m", { ...closed, depthAgeSlots: 0n }, T, { keeperAttestsVenue: true })?.message ?? "", /last depth push 0 slots ago\)/);
+  });
+
   it("thresholds from env: defaults, overrides, garbage throws", () => {
     assert.deepEqual(depthCapacityThresholdsFromEnv({}), T);
     assert.deepEqual(depthCapacityThresholdsFromEnv({ ALERT_DEPTH_STALE_WARN_EPOCHS: "4", ALERT_DEPTH_ZERO_CRITICAL_EPOCHS: "10" }), { staleWarnEpochs: 4, criticalEpochs: 10 });
     assert.throws(() => depthCapacityThresholdsFromEnv({ ALERT_DEPTH_STALE_WARN_EPOCHS: "0" }));
     assert.throws(() => depthCapacityThresholdsFromEnv({ ALERT_DEPTH_ZERO_CRITICAL_EPOCHS: "x" }));
+    // decimal-only (same rule as the other env parsers): hex / exponent / fractional forms are garbage, surrounding whitespace is trimmed
+    for (const bad of ["0x10", "1e1", "8.0", "+8", "-8", "1_0", "0b11", "Infinity"]) {
+      assert.throws(() => depthCapacityThresholdsFromEnv({ ALERT_DEPTH_STALE_WARN_EPOCHS: bad }), /integer in \[1, 64\]/, bad);
+      assert.throws(() => depthCapacityThresholdsFromEnv({ ALERT_DEPTH_ZERO_CRITICAL_EPOCHS: bad }), /integer in \[1, 64\]/, bad);
+    }
+    assert.equal(depthCapacityThresholdsFromEnv({ ALERT_DEPTH_STALE_WARN_EPOCHS: " 8 " }).staleWarnEpochs, 8);
+    assert.equal(depthCapacityThresholdsFromEnv({ ALERT_DEPTH_STALE_WARN_EPOCHS: "064" }).staleWarnEpochs, 64);
+    assert.throws(() => depthCapacityThresholdsFromEnv({ ALERT_DEPTH_STALE_WARN_EPOCHS: "65" }));
   });
 
   it("the sink pages the closed alert (critical) and resolves it when depth returns", async () => {
