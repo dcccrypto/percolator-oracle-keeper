@@ -153,7 +153,8 @@ export function makeSharedCloseScan(ttlMs = 90_000, now: () => number = Date.now
             const byMarket = new Map<string, Array<{ pubkey: PublicKey; data: Uint8Array }>>();
             for (const a of accs) {
               const d = new Uint8Array(a.account.data);
-              const key = new PublicKey(d.subarray(0, 32)).toBase58();
+              // Bucket by the raw 32 market bytes (hex): no base58 encode per scanned account.
+              const key = Buffer.from(d.buffer, d.byteOffset, 32).toString("hex");
               const list = byMarket.get(key) ?? [];
               list.push({ pubkey: a.pubkey, data: d.subarray(layout.closeOff - PORTFOLIO_MARKET_OFF) });
               byMarket.set(key, list);
@@ -169,7 +170,7 @@ export function makeSharedCloseScan(ttlMs = 90_000, now: () => number = Date.now
         }
         await inflight;
       }
-      return (cachedBy.get(layout.accountLen)?.byMarket.get(market.toBase58()) ?? []).map((x) => ({ pubkey: x.pubkey, account: { data: x.data } }));
+      return (cachedBy.get(layout.accountLen)?.byMarket.get(Buffer.from(market.toBytes()).toString("hex")) ?? []).map((x) => ({ pubkey: x.pubkey, account: { data: x.data } }));
     },
   };
 }
