@@ -100,7 +100,8 @@ export function loserForceCloseConfigFromEnv(env: Readonly<Record<string, string
 /** Per-process state: the build cache, the rotating scan cursor and the markets seen waiting while truncated. */
 export class LoserForceCloseState {
   readonly gate = new S16acGateState();
-  readonly cursor = new Map<string, number>();
+  /** market -> pubkey of the first candidate the next truncated scan starts at (a key, not an index, so a shrinking list never skips). */
+  readonly cursor = new Map<string, string>();
   readonly waitingSeen = new Set<string>();
 }
 
@@ -199,6 +200,7 @@ export async function forceCloseResolvedLosers(
     const state = decodeTerminalState(marketData);
     if (!state || state.kind !== "resolved" || state.materializedPortfolios === 0n) {
       st.waitingSeen.delete(mkt);
+      st.cursor.delete(mkt);
       out.detail = "market is not Resolved with materialized portfolios";
       return out;
     }
@@ -236,14 +238,20 @@ export async function forceCloseResolvedLosers(
     all.sort((x, y) => x.pubkey.toBase58().localeCompare(y.pubkey.toBase58()));
     if (all.length === 0) {
       st.waitingSeen.delete(mkt);
+      st.cursor.delete(mkt);
       out.outcome = "no-candidates";
       out.detail = "no portfolio with a claim left";
       return out;
     }
     const truncated = all.length > cfg.maxScanPerCycle;
-    const start = truncated ? (st.cursor.get(mkt) ?? 0) % all.length : 0;
+    let start = 0;
+    if (truncated) {
+      const at = st.cursor.get(mkt);
+      const i = at === undefined ? -1 : all.findIndex((c) => c.pubkey.toBase58().localeCompare(at) >= 0);
+      start = i < 0 ? 0 : i;
+    } else st.cursor.delete(mkt);
     const window = truncated ? Array.from({ length: cfg.maxScanPerCycle }, (_, i) => all[(start + i) % all.length]) : all;
-    if (truncated) st.cursor.set(mkt, (start + cfg.maxScanPerCycle) % all.length);
+    if (truncated) st.cursor.set(mkt, all[(start + cfg.maxScanPerCycle) % all.length].pubkey.toBase58());
 
     const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
     const mkTx = (ixs: TransactionInstruction[], n: number): Transaction => {
@@ -408,10 +416,18 @@ export function makeResolvedLoserForceCloseJob(cfg: LoserForceCloseConfig, st = 
       let nowSlot: bigint;
       try {
         const [mi] = await conn.getMultipleAccountsInfo([market], "confirmed");
-        if (!mi || !mi.owner.equals(cfg.wrapperProgramId)) return { kind: "skipped", reason: "market not owned by the configured wrapper" };
+        if (!mi || !mi.owner.equals(cfg.wrapperProgramId)) {
+          st.cursor.delete(m.marketAddress);
+          st.waitingSeen.delete(m.marketAddress);
+          return { kind: "skipped", reason: "market not owned by the configured wrapper" };
+        }
         data = new Uint8Array(mi.data);
         const s = decodeTerminalState(data);
-        if (!s || s.kind !== "resolved" || s.materializedPortfolios === 0n) return { kind: "nothing" };
+        if (!s || s.kind !== "resolved" || s.materializedPortfolios === 0n) {
+          st.cursor.delete(m.marketAddress);
+          st.waitingSeen.delete(m.marketAddress);
+          return { kind: "nothing" };
+        }
         nowSlot = BigInt(await conn.getSlot("confirmed"));
       } catch (err) {
         return { kind: "failed", error: `read failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}` };
