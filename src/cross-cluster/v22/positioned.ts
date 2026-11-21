@@ -35,6 +35,23 @@ export interface V22Positioned {
   undecodable: number;
 }
 
+/**
+ * base58 of a pubkey, memoised across cycles: bs58 encoding costs ~90 us per key (~20x a byte copy), and the same
+ * portfolio addresses recur every cycle. Keyed by the raw 32 bytes (latin1), so a hit never calls toBase58. Bounded.
+ */
+const B58_CACHE_MAX = 65_536;
+const b58Cache = new Map<string, string>();
+function base58Of(k: PublicKey): string {
+  const raw = k.toBuffer().toString("latin1");
+  let s = b58Cache.get(raw);
+  if (s === undefined) {
+    if (b58Cache.size >= B58_CACHE_MAX) b58Cache.clear();
+    s = k.toBase58();
+    b58Cache.set(raw, s);
+  }
+  return s;
+}
+
 export function analysePortfolios(
   accounts: ReadonlyArray<{ pubkey: PublicKey; data: Uint8Array }>,
   p: {
@@ -55,6 +72,7 @@ export function analysePortfolios(
   let overrideAnchor: PublicKey | null = null;
   let overrideSeen = false;
   let overrideWhy: string | null = null;
+  let overrideReason: string | null = null; // the message is built once, after the scan, only if the override failed
   let lpData: Uint8Array | null = null;
   let undecodable = 0;
   for (const { pubkey, data } of accounts) {
@@ -100,15 +118,16 @@ export function analysePortfolios(
     if (p.anchorOverride && pubkey.equals(p.anchorOverride)) {
       overrideSeen = true;
       if (keeperFlat) overrideAnchor = pubkey;
-      else overrideWhy = `override ${pubkey.toBase58()} is ${isLp ? "the vault LP" : anyActive ? "not flat" : parsed.matcherEnabled ? "a matcher portfolio" : "not owned by the keeper"}`;
+      else overrideReason = isLp ? "the vault LP" : anyActive ? "not flat" : parsed.matcherEnabled ? "a matcher portfolio" : "not owned by the keeper";
     }
     if (longLegs + shortLegs === 0) continue;
     all.push({ pubkey, longLegs, shortLegs, isLp, activeLegs, lossWeight, kfEpochSnapLong: kfLong, kfEpochSnapShort: kfShort, risk: riskSnapOf(parsed) });
-    if (minAbs !== null) minLegAbs.set(pubkey.toBase58(), minAbs);
+    if (minAbs !== null) minLegAbs.set(base58Of(pubkey), minAbs);
   }
   let lp: PositionedPortfolio | null = all.find((x) => x.isLp) ?? null;
   // A flat LP (no legs on the asset) is still the LP: it settles at the end of every round.
   if (!lp && p.lpPortfolio) lp = { pubkey: p.lpPortfolio, longLegs: 0, shortLegs: 0, isLp: true, lossWeight: 0n };
+  if (overrideReason !== null) overrideWhy = `override ${p.anchorOverride!.toBase58()} is ${overrideReason}`;
   if (p.anchorOverride && !overrideSeen) overrideWhy = `override ${p.anchorOverride.toBase58()} is not a decodable portfolio of this market`;
   // a passing override wins; a failing one is IGNORED (discovery of the keeper's own flat portfolio stays)
   return { all, counterparties: all.filter((x) => !x.isLp), lp, minLegAbs, flatAnchor: overrideAnchor ?? flatAnchor, lpData, anchorOverrideRejected: overrideWhy, undecodable };
@@ -137,6 +156,15 @@ export async function loadV22Positioned(
 
 /** KEEPER_V22_ACCRUE_ANCHORS="market:portfolio,market:portfolio". Malformed pairs are ignored. */
 export function parseAccrueAnchors(raw: string | undefined): Map<string, PublicKey> {
+  // The env list is re-read every cycle but almost never changes: parse once per distinct value, hand out a copy.
+  if (anchorsMemo !== null && anchorsMemo.raw === raw) return new Map(anchorsMemo.out);
+  const out = parseAccrueAnchorsUncached(raw);
+  anchorsMemo = { raw, out };
+  return new Map(out);
+}
+let anchorsMemo: { raw: string | undefined; out: Map<string, PublicKey> } | null = null;
+
+function parseAccrueAnchorsUncached(raw: string | undefined): Map<string, PublicKey> {
   const out = new Map<string, PublicKey>();
   for (const part of (raw ?? "").split(",")) {
     const [m, a] = part.trim().split(":");
