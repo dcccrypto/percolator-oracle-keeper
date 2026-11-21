@@ -16,19 +16,24 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { ComputeBudgetProgram, Keypair, PublicKey, Transaction } from "@solana/web3.js";
-import { V17_PORTFOLIO_ACCOUNT_LEN } from "@percolatorct/sdk";
+import { LAYOUTS_BY_VERSION, LAYOUT_V22, V17_PORTFOLIO_ACCOUNT_LEN } from "@percolatorct/sdk";
+import type { LayoutTable } from "@percolatorct/sdk";
 import {
   ABS_MAX_MARKET_SLOTS,
   ABS_WRAPPER_VERSION,
   KF_DRIFT_FIELDS,
   MARKET_LAYOUTS,
   assetSlotsOff,
+  describeUnknownLayout,
   detectLayout,
   engineSlotBase,
   knownStrides,
   layoutById,
   marketAccountLen,
+  rowAgreesWithSdk,
+  v22VariantBRow,
 } from "./market-layout.ts";
+import { layoutGuardSnapshot, resetLayoutGuardMetrics } from "./layout-guard-metrics.ts";
 import type { MarketLayout } from "./market-layout.ts";
 import { decodeMarketRefreshState, staleCountOffsets } from "./positioned-refresh.ts";
 import {
@@ -476,5 +481,166 @@ describe("recognised layouts stay healthy", () => {
       const h = layoutHealthFor(detectLayout(emptyMarket(layoutById(id))), { storedPosLong: 1n, storedPosShort: 0n });
       assert.deepEqual([h.id, h.problem, h.kind], [id, null, "ok"]);
     }
+  });
+});
+
+describe("detectLayout guard branches (byte buffers built from table constants)", () => {
+  const unknown = (d: ReturnType<typeof detectLayout>) => {
+    assert.equal(d.known, false);
+    return d as Extract<ReturnType<typeof detectLayout>, { known: false }>;
+  };
+  afterEach(() => resetLayoutGuardMetrics());
+  const origError = console.error;
+  const quiet = () => { console.error = () => {}; };
+  afterEach(() => { console.error = origError; });
+
+  it("too short: one byte under the max_market_slots word is refused with slots/version null", () => {
+    const d = unknown(detectLayout(Buffer.alloc(ABS_MAX_MARKET_SLOTS + 3)));
+    assert.equal(d.slots, null);
+    assert.equal(d.version, null);
+    assert.match(describeUnknownLayout(d), /^unknown market layout: length \d+: account too short for a market group header$/);
+  });
+
+  it("exactly long enough to read the slot count, zero slots: reported with the version", () => {
+    const b = Buffer.alloc(ABS_MAX_MARKET_SLOTS + 4);
+    b.writeUInt16LE(layoutById("v2.1-legacy").wrapperVersion, ABS_WRAPPER_VERSION);
+    const d = unknown(detectLayout(b));
+    assert.equal(d.slots, 0);
+    assert.equal(d.version, 18);
+    assert.equal(describeUnknownLayout(d), `unknown market layout: length ${b.length}: max_market_slots is 0`);
+  });
+
+  it("wrong magic bytes do not matter: the VERSION word alone picks the row (documented)", () => {
+    const l = layoutById("v2.1-legacy");
+    const b = emptyMarket(l);
+    b.fill(0xee, 0, ABS_WRAPPER_VERSION);
+    const d = detectLayout(b);
+    assert.ok(d.known && d.layout.id === "v2.1-legacy");
+  });
+
+  it("unknown VERSION: refused with the sdk-guard tag and counted as UNKNOWN_VERSION", () => {
+    quiet();
+    const l = layoutById("v2.1-legacy");
+    const b = emptyMarket(l);
+    b.writeUInt16LE(0xfffe, ABS_WRAPPER_VERSION);
+    const d = unknown(detectLayout(b));
+    assert.equal(d.version, 0xfffe);
+    assert.equal(d.slots, 1);
+    assert.match(describeUnknownLayout(d), /VERSION 65534, max_market_slots=1 matches no known layout \(.*\) \[sdk-guard: UNKNOWN_VERSION\]$/);
+    assert.equal(layoutGuardSnapshot().byCode.UNKNOWN_VERSION, 1);
+  });
+
+  it("known VERSION registered in the SDK but a registry without it: UNKNOWN_VERSION, even for an exact-length account", () => {
+    quiet();
+    const b = emptyMarket(layoutById("v2.1-legacy"));
+    const d = unknown(detectLayout(b, new Map()));
+    assert.match(d.reason, /matches no known layout .*\[sdk-guard: UNKNOWN_VERSION\]$/);
+    assert.doesNotMatch(d.reason, /ambiguous/);
+  });
+
+  it("known VERSION, wrong length (v2.1/v2.2 boundary: one byte over / under) is NO_ROW_FOR_LENGTH", () => {
+    quiet();
+    for (const l of MARKET_LAYOUTS) {
+      for (const delta of [-1, 1]) {
+        const base = emptyMarket(l);
+        const b = Buffer.alloc(base.length + delta);
+        base.copy(b, 0, 0, Math.min(base.length, b.length));
+        const d = unknown(detectLayout(b));
+        assert.equal(d.version, l.wrapperVersion, l.id);
+        assert.doesNotMatch(d.reason, /sdk-guard/, l.id);
+        assert.match(d.reason, /matches no known layout/, l.id);
+        assert.ok(d.reason.includes(knownStrides()), l.id);
+      }
+    }
+    assert.ok((layoutGuardSnapshot().byCode.NO_ROW_FOR_LENGTH ?? 0) >= 8);
+  });
+
+  it("v2.1 length under the v2.2 VERSION (and the reverse) is refused, never read with the other row", () => {
+    quiet();
+    const legacy = layoutById("v2.1-legacy");
+    const b22 = emptyMarket(legacy);
+    b22.writeUInt16LE(layoutById("v2.2-b").wrapperVersion, ABS_WRAPPER_VERSION);
+    assert.equal(detectLayout(b22).known, false);
+    const b21 = emptyMarket(layoutById("v2.2-b"));
+    b21.writeUInt16LE(legacy.wrapperVersion, ABS_WRAPPER_VERSION);
+    assert.equal(detectLayout(b21).known, false);
+  });
+
+  it("same total length under VERSION 18 but different slot counts: the header slot count decides (no ambiguity)", () => {
+    const [legacy, drift] = MARKET_LAYOUTS.filter((l) => l.wrapperVersion === 18);
+    const n = drift.slotStride;
+    const m = legacy.slotStride;
+    assert.equal(marketAccountLen(legacy, n), marketAccountLen(drift, m));
+    const b = Buffer.alloc(marketAccountLen(legacy, n));
+    b.writeUInt16LE(18, ABS_WRAPPER_VERSION);
+    b.writeUInt32LE(n, ABS_MAX_MARKET_SLOTS);
+    const d = detectLayout(b);
+    assert.ok(d.known && d.layout.id === "v2.1-legacy" && d.slots === n);
+    b.writeUInt32LE(m, ABS_MAX_MARKET_SLOTS);
+    const d2 = detectLayout(b);
+    assert.ok(d2.known && d2.layout.id === "v2.1-drift" && d2.slots === m);
+  });
+
+  it("AMBIGUOUS_ROW: two rows with the same VERSION and length are refused, naming both", () => {
+    quiet();
+    const legacy = layoutById("v2.1-legacy");
+    const dup: MarketLayout = { ...legacy, id: "v2.1-drift" };
+    const rows = MARKET_LAYOUTS as MarketLayout[];
+    rows.push(dup);
+    try {
+      const d = unknown(detectLayout(emptyMarket(legacy)));
+      assert.equal(describeUnknownLayout(d), `unknown market layout: length ${marketAccountLen(legacy, 1)} with VERSION 18 is ambiguous between v2.1-legacy / v2.1-drift`);
+      assert.equal(layoutGuardSnapshot().byCode.AMBIGUOUS_ROW, 1);
+    } finally {
+      rows.pop();
+    }
+    assert.equal(MARKET_LAYOUTS.length, 4);
+  });
+
+  it("ROW_DISAGREES_WITH_SDK: an SDK table whose geometry moved refuses the account", () => {
+    quiet();
+    const l = layoutById("v2.2-b");
+    const t = LAYOUTS_BY_VERSION.get(l.wrapperVersion)!;
+    const moved = { ...t, wrapperSlotLen: t.wrapperSlotLen + 8 } as LayoutTable;
+    const d = unknown(detectLayout(emptyMarket(l), new Map([[l.wrapperVersion, moved]])));
+    assert.match(describeUnknownLayout(d), /layout row v2\.2-b disagrees with the pinned SDK table for VERSION 19 \(wrapperLen keeper 1024 != SDK 1032\); refusing to decode/);
+    assert.equal(layoutGuardSnapshot().byCode.ROW_DISAGREES_WITH_SDK, 1);
+  });
+});
+
+describe("rowAgreesWithSdk / layoutById / v22VariantBRow", () => {
+  it("every shipped row agrees with the pinned SDK", () => {
+    for (const l of MARKET_LAYOUTS) assert.equal(rowAgreesWithSdk(l), null, l.id);
+  });
+  it("no SDK table for the VERSION", () => {
+    assert.equal(rowAgreesWithSdk(layoutById("v2.1-legacy"), new Map()), "SDK has no layout for VERSION 18");
+  });
+  it("every geometry difference is listed for the variant-B row (stride, portfolio, leg too)", () => {
+    const l = layoutById("v2.2-b");
+    const t = LAYOUTS_BY_VERSION.get(l.wrapperVersion)!;
+    const bad = { ...t, marketGroupOff: t.marketGroupOff + 1, marketGroupLen: t.marketGroupLen + 1, wrapperSlotLen: t.wrapperSlotLen + 1, assetSlotStride: t.assetSlotStride + 1, portfolio: { ...t.portfolio, accountLen: t.portfolio.accountLen + 1, legStride: t.portfolio.legStride + 1 } } as LayoutTable;
+    const r = rowAgreesWithSdk(l, new Map([[l.wrapperVersion, bad]]))!;
+    for (const k of ["groupOff", "headerLen", "wrapperLen", "slotStride", "portfolioAccountLen", "portfolioLegLen"]) assert.ok(r.includes(`${k} keeper`), k);
+    assert.equal(r.split("; ").length, 6);
+  });
+  it("non variant-B rows only compare group/header/wrapper lengths", () => {
+    const l = layoutById("v2.1-legacy");
+    const t = LAYOUTS_BY_VERSION.get(18)!;
+    const bad = { ...t, assetSlotStride: 1, portfolio: { ...t.portfolio, accountLen: 1 } } as LayoutTable;
+    assert.equal(rowAgreesWithSdk(l, new Map([[18, bad]])), null);
+  });
+  it("layoutById throws on an unknown id", () => {
+    assert.throws(() => layoutById("v9" as never), /no market layout "v9"/);
+  });
+  it("v22VariantBRow: provisional follows the SDK status and the geometry comes from the table", () => {
+    const prov = v22VariantBRow({ ...LAYOUT_V22, status: "PROVISIONAL" } as LayoutTable);
+    assert.equal(prov.provisional, true);
+    const fin = v22VariantBRow({ ...LAYOUT_V22, status: "FINAL" } as unknown as LayoutTable);
+    assert.equal(fin.provisional, false);
+    assert.equal(fin.slotStride, LAYOUT_V22.assetSlotStride);
+    assert.match(fin.source, /^SDK LAYOUT_V22 /);
+  });
+  it("engineSlotBase of asset k sits k strides after asset 0", () => {
+    for (const l of MARKET_LAYOUTS) assert.equal(engineSlotBase(l, 3) - engineSlotBase(l, 0), 3 * l.slotStride, l.id);
   });
 });
