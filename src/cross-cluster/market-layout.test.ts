@@ -16,18 +16,23 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { ComputeBudgetProgram, Keypair, PublicKey, Transaction } from "@solana/web3.js";
-import { V17_PORTFOLIO_ACCOUNT_LEN } from "@percolatorct/sdk";
+import { LAYOUTS_BY_VERSION, V17_PORTFOLIO_ACCOUNT_LEN } from "@percolatorct/sdk";
+import type { LayoutTable } from "@percolatorct/sdk";
 import {
   ABS_MAX_MARKET_SLOTS,
   ABS_WRAPPER_VERSION,
   KF_DRIFT_FIELDS,
   MARKET_LAYOUTS,
+  SDK_PORTFOLIO_LENS,
   assetSlotsOff,
+  describeUnknownLayout,
   detectLayout,
   engineSlotBase,
   knownStrides,
   layoutById,
   marketAccountLen,
+  rowAgreesWithSdk,
+  v22VariantBRow,
 } from "./market-layout.ts";
 import type { MarketLayout } from "./market-layout.ts";
 import { decodeMarketRefreshState, staleCountOffsets } from "./positioned-refresh.ts";
@@ -476,5 +481,85 @@ describe("recognised layouts stay healthy", () => {
       const h = layoutHealthFor(detectLayout(emptyMarket(layoutById(id))), { storedPosLong: 1n, storedPosShort: 0n });
       assert.deepEqual([h.id, h.problem, h.kind], [id, null, "ok"]);
     }
+  });
+});
+
+describe("layout table: SDK agreement and guard branches", () => {
+  const sdkB = LAYOUTS_BY_VERSION.get(19)!;
+
+  it("layoutById throws for an id that is not in the table", () => {
+    assert.throws(() => layoutById("v9.9" as never), /no market layout "v9.9"/);
+  });
+
+  it("v22VariantBRow: provisional follows the SDK status, geometry is read from the SDK table", () => {
+    const prov = v22VariantBRow({ ...sdkB, status: "PROVISIONAL" } as LayoutTable);
+    const fin = v22VariantBRow({ ...sdkB, status: "FINAL" } as unknown as LayoutTable);
+    assert.equal(prov.provisional, true);
+    assert.equal(fin.provisional, false);
+    assert.equal(fin.groupOff, sdkB.marketGroupOff);
+    assert.equal(fin.headerLen, sdkB.marketGroupLen);
+    assert.equal(fin.slotStride, sdkB.assetSlotStride);
+    assert.equal(fin.portfolioAccountLen, sdkB.portfolio.accountLen);
+    assert.equal(fin.portfolioLegLen, sdkB.portfolio.legStride);
+  });
+
+  it("rowAgreesWithSdk: every row agrees with the pinned SDK; a missing VERSION or drifted geometry is named", () => {
+    for (const l of MARKET_LAYOUTS) assert.equal(rowAgreesWithSdk(l), null, l.id);
+    assert.match(rowAgreesWithSdk(layoutById("v2.2-b"), new Map())!, /SDK has no layout for VERSION 19/);
+    const moved = { ...sdkB, marketGroupOff: sdkB.marketGroupOff + 8 } as LayoutTable;
+    assert.match(rowAgreesWithSdk(layoutById("v2.2-b"), new Map([[19, moved]]))!, /groupOff keeper 592 != SDK 600/);
+    // the variant-B row also compares stride / portfolio length / leg stride; stage A does not
+    const bent = {
+      ...sdkB,
+      assetSlotStride: sdkB.assetSlotStride + 1,
+      portfolio: { ...sdkB.portfolio, accountLen: sdkB.portfolio.accountLen + 1, legStride: sdkB.portfolio.legStride + 1 },
+    } as LayoutTable;
+    const msg = rowAgreesWithSdk(layoutById("v2.2-b"), new Map([[19, bent]]))!;
+    assert.match(msg, /slotStride/);
+    assert.match(msg, /portfolioAccountLen/);
+    assert.match(msg, /portfolioLegLen/);
+    assert.equal(rowAgreesWithSdk(layoutById("v2.2-drift"), new Map([[19, bent]])), null);
+  });
+
+  it("detectLayout refuses a VERSION the SDK registry lacks, and a row that disagrees with the SDK table", () => {
+    const b = layoutById("v2.2-b");
+    const acct = emptyMarket(b, 1);
+    const noSdk = detectLayout(acct, new Map());
+    assert.equal(noSdk.known, false);
+    // a row matched the length but the registry has no table: refused (today the reason text says "ambiguous")
+    if (!noSdk.known) assert.match(noSdk.reason, /VERSION 19 is ambiguous between v2.2-b/);
+    const oddLen = Buffer.concat([acct, Buffer.alloc(1)]);
+    const noSdkOdd = detectLayout(oddLen, new Map());
+    if (!noSdkOdd.known) assert.match(noSdkOdd.reason, /matches no known layout.*\[sdk-guard: UNKNOWN_VERSION\]/);
+    else assert.fail("must be unknown");
+    const moved = { ...sdkB, assetSlotStride: sdkB.assetSlotStride + 1 } as LayoutTable;
+    const bad = detectLayout(acct, new Map([[19, moved]]));
+    assert.equal(bad.known, false);
+    if (!bad.known) {
+      assert.match(bad.reason, /disagrees with the pinned SDK table for VERSION 19/);
+      assert.equal(bad.slots, 1);
+    }
+  });
+
+  it("detectLayout: a short account and a zero slot count carry their own reasons", () => {
+    const short = detectLayout(Buffer.alloc(10));
+    assert.equal(short.known, false);
+    if (!short.known) {
+      assert.equal(short.slots, null);
+      assert.match(short.reason, /account too short/);
+    }
+    const zero = emptyMarket(layoutById("v2.1-legacy"), 1);
+    zero.writeUInt32LE(0, ABS_MAX_MARKET_SLOTS);
+    const z = detectLayout(zero);
+    if (!z.known) {
+      assert.equal(z.slots, 0);
+      assert.match(z.reason, /max_market_slots is 0/);
+      assert.match(describeUnknownLayout(z), /^unknown market layout: /);
+    } else assert.fail("zero slots must be unknown");
+  });
+
+  it("SDK_PORTFOLIO_LENS holds exactly the portfolio lengths of the pinned SDK tables", () => {
+    for (const t of LAYOUTS_BY_VERSION.values()) assert.ok(SDK_PORTFOLIO_LENS.has(t.portfolio.accountLen));
+    assert.equal(SDK_PORTFOLIO_LENS.has(layoutById("v2.2-drift").portfolioAccountLen), false);
   });
 });

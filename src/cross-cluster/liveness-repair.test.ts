@@ -19,11 +19,17 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Keypair, PublicKey, Transaction, VersionedTransaction } from "@solana/web3.js";
 import { IX_TAG, parseBackingBucketsV17 } from "@percolatorct/sdk";
+import { ABS_MAX_MARKET_SLOTS, ABS_WRAPPER_VERSION, engineSlotBase, layoutById, marketAccountLen } from "./market-layout.ts";
+import type { MarketLayout } from "./market-layout.ts";
 import {
   FINALIZE_RESET_SIDE_TAG,
   buildExpireBackingBucketIx,
   buildFinalizeResetSideIx,
+  buildLivenessRepairIx,
   decodeLivenessState,
+  describeRepair,
+  livenessOffsetsFor,
+  livenessOffsetsV21,
   planLivenessRepairs,
 } from "./liveness-repair.ts";
 import type { LivenessState } from "./liveness-repair.ts";
@@ -230,5 +236,53 @@ describe("crank transaction carries the repairs", () => {
     const r = await resolveCrankPlan(build, [], async () => ({ err: { InstructionError: [1, { Custom: 19 }] }, logs: null, marketData: null }));
     assert.ok(r.sim.err);
     assert.equal(r.plan.cranks[0].kind, "repair");
+  });
+});
+
+describe("liveness offsets and error branches", () => {
+  const legacy = () => layoutById("v2.1-legacy");
+
+  it("livenessOffsetsV21 pins the v2.1 numbers and honours assetIndex", () => {
+    const o = livenessOffsetsV21();
+    assert.equal(o.engineBase, 592 + 758 + 1024);
+    assert.equal(livenessOffsetsV21(2).engineBase, 592 + 758 + 2 * 2325 + 1024);
+    assert.equal(o.storedPosLong, 321);
+    assert.equal(o.modeShort, 514);
+    assert.equal(o.barrierLong, 579);
+    assert.equal(o.backingLong, 963);
+    assert.equal(o.backingShort, 963 + 97);
+  });
+
+  it("livenessOffsetsFor: row numbers for a known VERSION, null when the SDK has no table", () => {
+    const o = livenessOffsetsFor(legacy(), 1);
+    assert.ok(o);
+    assert.equal(o.engineBase, engineSlotBase(legacy(), 1));
+    assert.equal(o.backingLong, 963);
+    assert.equal(livenessOffsetsFor({ ...legacy(), wrapperVersion: 9999 }), null);
+  });
+
+  it("decodeLivenessState refuses an unknown layout, and a too-short account with explicit offsets", () => {
+    assert.throws(() => decodeLivenessState(new Uint8Array(10)), /decodeLivenessState: unknown market layout/);
+    const o = livenessOffsetsV21();
+    assert.throws(() => decodeLivenessState(new Uint8Array(100), 0, o), /market account too short \(100 bytes\)/);
+  });
+
+  it("decodeLivenessState: a VERSION the SDK has no table for is refused as an unknown layout", () => {
+    const row = { ...legacy(), wrapperVersion: 9999 } as MarketLayout;
+    const b = Buffer.alloc(marketAccountLen(row, 1));
+    b.writeUInt16LE(9999, ABS_WRAPPER_VERSION);
+    b.writeUInt32LE(1, ABS_MAX_MARKET_SLOTS);
+    assert.throws(() => decodeLivenessState(b), /unknown market layout/);
+  });
+
+  it("describeRepair and buildLivenessRepairIx cover both repair kinds", () => {
+    const market = PublicKey.unique();
+    assert.equal(describeRepair({ kind: "expire", domain: 3 }), "ExpireBackingBucket(d3)");
+    assert.equal(describeRepair({ kind: "finalize", assetIndex: 0, side: 0 }), "FinalizeResetSide(long)");
+    assert.equal(describeRepair({ kind: "finalize", assetIndex: 0, side: 1 }), "FinalizeResetSide(short)");
+    const fin = buildLivenessRepairIx(market, { kind: "finalize", assetIndex: 2, side: 1 });
+    assert.deepEqual([...fin.data], [FINALIZE_RESET_SIDE_TAG, 2, 0, 1]);
+    const exp = buildLivenessRepairIx(market, { kind: "expire", domain: 1 });
+    assert.equal(exp.data[0], IX_TAG.ExpireBackingBucket);
   });
 });
