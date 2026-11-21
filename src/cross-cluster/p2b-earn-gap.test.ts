@@ -215,3 +215,92 @@ describe("earnGapConfigFromEnv", () => {
     assert.throws(() => earnGapConfigFromEnv({ EARN_GAP_ALERT_CYCLES: "0" }), /EARN_GAP_ALERT_CYCLES/);
   });
 });
+
+describe("untaken paths: sibling ledger, non-Error rejection, default logger, u64 max, owed < paid", () => {
+  const key = (s: ReturnType<typeof vault>["s"], d: number) => deriveLpBackingLedger(PROGRAM, s.market, d)[0].toBase58();
+
+  it("a sibling (domain ^ 1) ledger present is read and added to entry; its pot is empty so exit adds 0", async () => {
+    const { s } = vault();
+    const accounts = new Map([[key(s, 2), ownLedger(1_100)], [key(s, 3), ownLedger(500)]]);
+    const m = mon();
+    await m.run(fakeConn({ accounts, slot: 9 }).conn as never, [s]);
+    assert.deepEqual(m.health()[0], {
+      market: s.ref.marketAddress, label: "EARN", domain: 2,
+      entryNavAtoms: "1600", exitNavAtoms: "1032", parMinusE3Atoms: "568", parMinusE3Bps: 3_550, updatedSlot: 9,
+    });
+  });
+
+  it("u64-max principal: exact bigint strings, no wrap, bps floor(gap*10000/entry)", async () => {
+    const { s } = vault();
+    const own = ownLedger(1_100);
+    new DataView(own.buffer).setBigUint64(16 + 64, (1n << 64n) - 1n, true);
+    const m = mon();
+    await m.run(fakeConn({ accounts: new Map([[key(s, 2), own]]) }).conn as never, [s]);
+    const gap = ((1n << 64n) - 1n) - 1_032n;
+    assert.deepEqual([m.health()[0].entryNavAtoms, m.health()[0].exitNavAtoms, m.health()[0].parMinusE3Atoms], ["18446744073709551615", "1032", "18446744073709550583"]);
+    assert.equal(gap.toString(), "18446744073709550583");
+    assert.equal(m.health()[0].parMinusE3Bps, Number((gap * 10_000n) / ((1n << 64n) - 1n)));
+    assert.equal(m.health()[0].parMinusE3Bps, 9_999);
+  });
+
+  it("owed < paid (principal below physical net) never yields a negative gap: exactly 0 atoms / 0 bps / exit == entry", async () => {
+    for (const principal of [0, 1, 1_031, 1_032]) {
+      const { s, c } = vault({ principal });
+      const m = mon();
+      await m.run(c.conn as never, [s]);
+      const h = m.health()[0];
+      assert.equal(h.parMinusE3Atoms, "0", `principal ${principal}`);
+      assert.equal(h.parMinusE3Bps, 0);
+      assert.equal(h.entryNavAtoms, h.exitNavAtoms);
+    }
+    const one = vault({ principal: 1_033 });
+    const m = mon();
+    await m.run(one.c.conn as never, [one.s]);
+    assert.deepEqual([m.health()[0].parMinusE3Atoms, m.health()[0].parMinusE3Bps], ["1", 9]);
+  });
+
+  it("with feeShareBps 5000 the earnings term is identical on entry and exit, so the gap is unchanged (1 atom)", async () => {
+    const base = vault({ principal: 1_033 });
+    const s = { ...base.s, registry: { ...base.s.registry!, feeShareBps: 5_000 } };
+    const m = mon();
+    await m.run(base.c.conn as never, [s]);
+    const h = m.health()[0];
+    assert.equal(h.parMinusE3Atoms, "1");
+    assert.equal(BigInt(h.entryNavAtoms) - BigInt(h.exitNavAtoms), 1n);
+    assert.equal(h.parMinusE3Bps, Number(10_000n / BigInt(h.entryNavAtoms)));
+  });
+
+  it("a non-Error rejection is stringified into the once-only log line", async () => {
+    const { s } = vault();
+    const logs: string[] = [];
+    const conn = { getMultipleAccountsInfoAndContext: async () => { throw "rpc down"; } };
+    const m = new EarnGapMonitor(DEFAULT_EARN_GAP_CONFIG, PROGRAM, () => 0, (l) => logs.push(l));
+    await m.run(conn as never, [s]);
+    assert.deepEqual(logs, ["[earn-gap] EARN: cannot price the vault (rpc down) — logged once"]);
+    assert.deepEqual(m.health(), []);
+  });
+
+  it("the default logger writes the line to console.warn", async () => {
+    const { s } = vault({ market: new Uint8Array(6000) });
+    const seen: string[] = [];
+    const orig = console.warn;
+    console.warn = (l: string) => { seen.push(l); };
+    try {
+      await new EarnGapMonitor(DEFAULT_EARN_GAP_CONFIG, PROGRAM).run(fakeConn().conn as never, [s]);
+    } finally {
+      console.warn = orig;
+    }
+    assert.equal(seen.length, 1);
+    assert.match(seen[0], /^\[earn-gap\] EARN: cannot price the vault/);
+  });
+
+  it("config bounds are inclusive: min and max accepted, one outside rejected", () => {
+    assert.deepEqual(earnGapConfigFromEnv({ EARN_GAP_INTERVAL_MS: "1000", EARN_GAP_ALERT_BPS: "0", EARN_GAP_ALERT_CYCLES: "1" }), { intervalMs: 1_000, alertBps: 0, alertCycles: 1 });
+    assert.deepEqual(earnGapConfigFromEnv({ EARN_GAP_INTERVAL_MS: "86400000", EARN_GAP_ALERT_BPS: "10000", EARN_GAP_ALERT_CYCLES: "1000" }), { intervalMs: 86_400_000, alertBps: 10_000, alertCycles: 1_000 });
+    assert.throws(() => earnGapConfigFromEnv({ EARN_GAP_INTERVAL_MS: "999" }), /EARN_GAP_INTERVAL_MS/);
+    assert.throws(() => earnGapConfigFromEnv({ EARN_GAP_ALERT_BPS: "10001" }), /EARN_GAP_ALERT_BPS/);
+    assert.throws(() => earnGapConfigFromEnv({ EARN_GAP_ALERT_CYCLES: "1001" }), /EARN_GAP_ALERT_CYCLES/);
+    assert.throws(() => earnGapConfigFromEnv({ EARN_GAP_ALERT_BPS: "1.5" }), /EARN_GAP_ALERT_BPS/);
+    assert.deepEqual(earnGapConfigFromEnv({ EARN_GAP_ALERT_BPS: "  " }).alertBps, 100);
+  });
+});
