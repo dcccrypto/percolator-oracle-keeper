@@ -245,7 +245,8 @@ type Env = Readonly<Record<string, string | undefined>>;
 function envInt(env: Env, name: string, fallback: number, min: number, max: number): number {
   const raw = env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
-  const n = Number(raw);
+  // decimal digits only: Number() would also accept "0x10", "1e2", "0b1", "5.0"
+  const n = /^-?\d+$/.test(raw.trim()) ? Number(raw) : NaN;
   if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${name}="${raw}" must be an integer in [${min}, ${max}]`);
   return n;
 }
