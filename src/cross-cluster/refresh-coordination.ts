@@ -25,6 +25,8 @@ const holds = new Map<string, number>();
 
 /** Hold pushes for `market` for `ms` (capped at MAX_PUSH_HOLD_MS). */
 export function holdPushes(market: string, ms: number, nowMs: number = Date.now()): void {
+  // A non-finite ms or clock would store a NaN deadline that never expires: no hold at all.
+  if (!Number.isFinite(ms) || !Number.isFinite(nowMs)) return;
   holds.set(market, nowMs + Math.max(0, Math.min(ms, MAX_PUSH_HOLD_MS)));
 }
 
@@ -36,7 +38,8 @@ export function releasePushes(market: string): void {
 export function isPushHeld(market: string, nowMs: number = Date.now()): boolean {
   const until = holds.get(market);
   if (until === undefined) return false;
-  if (nowMs >= until) {
+  // Also cap at now+MAX so a wall clock stepped backwards after the hold cannot extend it.
+  if (!(nowMs < until) || until - nowMs > MAX_PUSH_HOLD_MS) {
     holds.delete(market);
     return false;
   }
