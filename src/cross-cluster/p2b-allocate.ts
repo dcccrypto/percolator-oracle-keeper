@@ -172,6 +172,21 @@ export class VaultLpAllocator {
     return this.now() >= at;
   }
 
+  /**
+   * Drop pacing, failure and refusal-log state for markets no longer in the registry (closed / delisted markets would otherwise stay for the
+   * keeper's lifetime, and a stale failure streak would keep alerting forever). A market that returns is simply re-staggered like a new one.
+   */
+  prune(liveMarkets: ReadonlySet<string>): void {
+    for (const k of this.nextAt.keys()) if (!liveMarkets.has(k)) this.nextAt.delete(k);
+    for (const k of this.failStreak.keys()) if (!liveMarkets.has(k)) this.failStreak.delete(k);
+    for (const k of this.loggedRefusals) if (!liveMarkets.has(k.slice(0, k.lastIndexOf(":")))) this.loggedRefusals.delete(k);
+  }
+
+  /** Number of markets with any retained pacing/failure state (test + diagnostics). */
+  trackedMarkets(): number {
+    return new Set([...this.nextAt.keys(), ...this.failStreak.keys()]).size;
+  }
+
   /** Local eligibility from the shared snapshot: bound, Live, a decodable vault state and no senior draw outstanding. */
   static eligible(snap: VaultMarketSnapshot): boolean {
     if (!snap.bound || !snap.vaultLp || !snap.registry || !snap.marketData) return false;
