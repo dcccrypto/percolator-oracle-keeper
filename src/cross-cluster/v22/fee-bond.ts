@@ -108,7 +108,7 @@ export function planBondFee(
   return mk("fee-only", "none", [], `strict: weight ${w} > ${weightBudget}; 78 alone if its simulation passes, else deferred`);
 }
 
-export type BondFeeResult = { kind: "skipped"; reason: BondFeeSkip } | { kind: "nothing"; detail: string } | { kind: "deferred"; detail: string } | { kind: "sent" | "dry-run"; shape: BondFeeShape; outcome: ExecOutcome } | { kind: "refused"; outcome: ExecOutcome; shape: BondFeeShape } | { kind: "failed"; error: string };
+export type BondFeeResult = { kind: "skipped"; reason: BondFeeSkip } | { kind: "nothing"; detail: string } | { kind: "deferred"; detail: string; /** the refusal that deferred it (absent for a hold) */ outcome?: ExecOutcome } | { kind: "sent" | "dry-run"; shape: BondFeeShape; outcome: ExecOutcome } | { kind: "refused"; outcome: ExecOutcome; shape: BondFeeShape } | { kind: "failed"; error: string };
 
 /**
  * Crank 78 once. The paired shape goes through the SAME prune / isolate loop as the sweep (a non-stale counterparty
@@ -133,7 +133,7 @@ export async function crankBondFee(
     const out = run.outcome;
     if (out.kind === "refused") {
       if (out.code === NO_FEES_TO_CRANK) return { kind: "nothing", detail: "no new LP fees (38)" };
-      if (plan.shape === "fee-only" || plan.shape === "after-round") return { kind: "deferred", detail: `${plan.shape}: 78 refused (${out.name}); deferred` };
+      if (plan.shape === "fee-only" || plan.shape === "after-round") return { kind: "deferred", detail: `${plan.shape}: 78 refused (${out.name}); deferred`, outcome: out };
       return { kind: "refused", outcome: out, shape: plan.shape };
     }
     if (out.kind === "failed") return { kind: "failed", error: out.error };
