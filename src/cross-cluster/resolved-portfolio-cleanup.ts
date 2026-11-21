@@ -548,7 +548,15 @@ export async function cleanupResolvedPortfolios(
   const resolvedIx = (p: Pf) =>
     buildCloseResolvedIx({ wrapperProgramId: cfg.wrapperProgramId, owner: p.owner, market, portfolio: p.pubkey, collateralMint });
 
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+  let blockhash: string;
+  let lastValidBlockHeight: number;
+  try {
+    ({ blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed"));
+  } catch (err) {
+    // "Never throws": an RPC error here must not escape to the wind-down caller (it does not wrap this call).
+    out.remaining.push({ portfolio: "*", reason: `blockhash: ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}` });
+    return out;
+  }
   const mk = (ixs: TransactionInstruction[]): Transaction => {
     const tx = new Transaction();
     tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT }));
