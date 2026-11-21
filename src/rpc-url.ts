@@ -18,6 +18,15 @@ export function isLocalRpcHostname(hostname: string): boolean {
   );
 }
 
+// A URL that failed to parse can't be split reliably, so keep only the
+// scheme://host[:port] prefix: drop userinfo, path (QuickNode-style keys),
+// query and fragment. Anything not shaped like scheme://host collapses to "<redacted>".
+function redactMalformedUrl(value: string): string {
+  const m = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@\s]*@)?([^/?#@\s]*)/i.exec(value);
+  if (!m || !m[2]) return "<redacted>";
+  return `${m[1]}${m[2]}/...`;
+}
+
 export function validateRpcEndpoint(
   name: string,
   rawUrl: string | undefined,
@@ -40,7 +49,7 @@ export function validateRpcEndpoint(
   try {
     url = new URL(value);
   } catch {
-    return `${name} is not a valid URL: ${value}`;
+    return `${name} is not a valid URL (value redacted, it may hold an API key): ${redactMalformedUrl(value)}`;
   }
 
   if (url.protocol === "https:") {
