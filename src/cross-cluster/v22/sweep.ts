@@ -800,9 +800,17 @@ export const MERGED_SKIP_LOG_MS = 60_000;
 export function resetMergedSkipLog(): void {
   mergedSkipLog.clear();
 }
-function logMergedSkip(deps: SweepDeps, market: string, label: string, why: string, now: number = Date.now()): void {
+/** Forget the throttle of every market not in `keep` (deregistered), so the map is bounded by the live registry. */
+export function pruneMergedSkipLog(keep: ReadonlySet<string>): void {
+  for (const m of [...mergedSkipLog.keys()]) if (!keep.has(m)) mergedSkipLog.delete(m);
+}
+export function mergedSkipLogSize(): number {
+  return mergedSkipLog.size;
+}
+export function logMergedSkip(deps: SweepDeps, market: string, label: string, why: string, now: number = Date.now()): void {
   const prev = mergedSkipLog.get(market);
-  if (prev && prev.why === why && now - prev.at < MERGED_SKIP_LOG_MS) return;
+  // `now < prev.at` = the clock stepped backwards: do not stay muted until it catches up.
+  if (prev && prev.why === why && now >= prev.at && now - prev.at < MERGED_SKIP_LOG_MS) return;
   mergedSkipLog.set(market, { at: now, why });
   (deps.exec.log ?? ((l: string) => console.log(l)))(`[v22][merged] ${label}: merged round skipped, phased plan: ${why}`);
 }
