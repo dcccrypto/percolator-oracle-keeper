@@ -303,3 +303,156 @@ describe("pusher: mode 2", () => {
     assert.equal(ix.data.length, 35);
   });
 });
+
+// ── branch coverage: every decoder rejection, refresh outcome and default parameter ──────────────
+describe("decodeActiveDepthSource: each structural rejection is its own null, a valid pin decodes", () => {
+  const pool = k(), bv = k(), qv = k();
+  const ds = k();
+  const good = () => pinAccount({ pool, bv, qv, marketId: 7n, assetIndex: 3 });
+  const B = 16; // body offset
+  const mutate = (f: (b: Buffer) => void): Buffer => { const b = good(); f(b); return b; };
+
+  it("valid record -> the exact pin (source = the pinned pool, same asset slot and generation)", () => {
+    const p = decodeActiveDepthSource(good(), ds)!;
+    assert.ok(p.depthSource.equals(ds) && p.pool.equals(pool) && p.baseVault.equals(bv) && p.quoteVault.equals(qv) && p.ammProgram.equals(PUMP));
+    assert.equal(p.assetIndex, 3);
+    assert.equal(p.marketId, 7n);
+  });
+  it("accepts every in-range edge: decimals 18, mode 2, flags 3 (active + known bit)", () => {
+    const p = decodeActiveDepthSource(mutate((b) => { b[B + 242] = 18; b[B + 243] = 18; b[B + 247] = 2; b[B + 244] = 3; }), ds);
+    assert.ok(p && p.pool.equals(pool));
+  });
+  const rejects: Array<[string, (b: Buffer) => void]> = [
+    ["bad magic", (b) => b.writeBigUInt64LE(MAGIC + 1n, 0)],
+    ["zero market key", (b) => b.fill(0, B, B + 32)],
+    ["version != 1", (b) => { b[B + 245] = 2; }],
+    ["non-zero reserved byte", (b) => { b[B + 250] = 1; }],
+    ["unknown flag bit", (b) => { b[B + 244] = 1 | 4; }],
+    ["inactive flag", (b) => { b[B + 244] = 2; }],
+    ["zero pool", (b) => b.fill(0, B + 64, B + 96)],
+    ["zero base vault", (b) => b.fill(0, B + 96, B + 128)],
+    ["zero quote vault", (b) => b.fill(0, B + 128, B + 160)],
+    ["zero base mint", (b) => b.fill(0, B + 160, B + 192)],
+    ["zero quote mint", (b) => b.fill(0, B + 192, B + 224)],
+    ["duplicate vaults", (b) => b.copy(b, B + 128, B + 96, B + 128)],
+    ["duplicate mints", (b) => b.copy(b, B + 192, B + 160, B + 192)],
+    ["base decimals > 18", (b) => { b[B + 242] = 19; }],
+    ["quote decimals > 18", (b) => { b[B + 243] = 19; }],
+    ["mode 0", (b) => { b[B + 247] = 0; }],
+    ["mode 3", (b) => { b[B + 247] = 3; }],
+  ];
+  for (const [name, f] of rejects) {
+    it(`rejects: ${name}`, () => assert.equal(decodeActiveDepthSource(mutate(f), ds), null));
+  }
+  it("decodes from a view with a non-zero byteOffset", () => {
+    const g = good();
+    const padded = new Uint8Array(g.length + 5);
+    padded.set(g, 5);
+    const p = decodeActiveDepthSource(padded.subarray(5), ds);
+    assert.ok(p && p.pool.equals(pool));
+  });
+});
+
+describe("DepthSourceCache: remaining refresh outcomes", () => {
+  const market = k();
+  const pool = k(), bv = k(), qv = k();
+  const pda = deriveDepthSource(WRAPPER_PROGRAM_ID, market).toBase58();
+  const T22 = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+  const base = () => new Map([
+    [pda, acct(pinAccount({ pool, bv, qv }), WRAPPER_PROGRAM_ID)],
+    [pool.toBase58(), acct(Buffer.alloc(301), PUMP)],
+    [bv.toBase58(), acct(Buffer.alloc(165), TOKEN)],
+    [qv.toBase58(), acct(Buffer.alloc(165), TOKEN)],
+  ]);
+  const m = market.toBase58();
+
+  it("first read fails -> no pin, why 'depth-source read failed'", async () => {
+    const c = new DepthSourceCache(60_000, () => 0);
+    await c.refresh(cluster(base(), true).conn, WRAPPER_PROGRAM_ID, [m]);
+    assert.equal(c.get(m), null);
+    assert.equal(c.why(m), "depth-source read failed");
+  });
+  it("PDA owned by another program -> 'no depth source'", async () => {
+    const x = base();
+    x.set(pda, acct(pinAccount({ pool, bv, qv }), k()));
+    const c = new DepthSourceCache(60_000, () => 0);
+    await c.refresh(cluster(x).conn, WRAPPER_PROGRAM_ID, [m]);
+    assert.equal(c.get(m), null);
+    assert.equal(c.why(m), "no depth source");
+  });
+  it("invalid record -> 'depth source inactive or invalid'", async () => {
+    const x = base();
+    x.set(pda, acct(Buffer.alloc(DEPTH_SOURCE_ACCOUNT_LEN), WRAPPER_PROGRAM_ID));
+    const c = new DepthSourceCache(60_000, () => 0);
+    await c.refresh(cluster(x).conn, WRAPPER_PROGRAM_ID, [m]);
+    assert.equal(c.why(m), "depth source inactive or invalid");
+  });
+  it("pool/vault read fails on the second fetch -> 'pool read failed', no pin", async () => {
+    let calls = 0;
+    const inner = cluster(base());
+    const conn = { async getMultipleAccountsInfo(keys: PublicKey[]) { if (++calls === 2) throw new Error("rpc down"); return inner.conn.getMultipleAccountsInfo(keys); } };
+    const c = new DepthSourceCache(60_000, () => 0);
+    await c.refresh(conn, WRAPPER_PROGRAM_ID, [m]);
+    assert.equal(c.get(m), null);
+    assert.equal(c.why(m), "pool read failed");
+  });
+  it("Token-2022 vaults are accepted -> pin, why 'ok'", async () => {
+    const x = base();
+    x.set(bv.toBase58(), acct(Buffer.alloc(165), T22));
+    x.set(qv.toBase58(), acct(Buffer.alloc(165), T22));
+    const c = new DepthSourceCache(60_000, () => 0);
+    await c.refresh(cluster(x).conn, WRAPPER_PROGRAM_ID, [m]);
+    assert.ok(c.get(m)?.pool.equals(pool));
+    assert.equal(c.why(m), "ok");
+  });
+  it("a vault owned by a non-token program -> not on the push cluster (either vault)", async () => {
+    for (const v of [bv, qv]) {
+      const x = base();
+      x.set(v.toBase58(), acct(Buffer.alloc(165), k()));
+      const c = new DepthSourceCache(60_000, () => 0);
+      await c.refresh(cluster(x).conn, WRAPPER_PROGRAM_ID, [m]);
+      assert.equal(c.get(m), null);
+      assert.equal(c.why(m), "pinned pool/vaults not on the push cluster");
+    }
+  });
+  it("get/why of an unknown market: null/undefined; invalidate of an unknown market is a no-op; empty refresh does no RPC", async () => {
+    const c = new DepthSourceCache();
+    assert.equal(c.get("nope"), null);
+    assert.equal(c.why("nope"), undefined);
+    c.invalidate("nope");
+    const cl = cluster(base());
+    await c.refresh(cl.conn, WRAPPER_PROGRAM_ID, []);
+    assert.equal(cl.reads(), 0);
+  });
+  it("defaults (5 min TTL, Date.now): a fresh entry is not re-read", async () => {
+    const c = new DepthSourceCache();
+    const cl = cluster(base());
+    await c.refresh(cl.conn, WRAPPER_PROGRAM_ID, [m]);
+    const r = cl.reads();
+    await c.refresh(cl.conn, WRAPPER_PROGRAM_ID, [m]);
+    assert.equal(cl.reads(), r);
+    assert.equal(c.why(m), "ok");
+  });
+  it("one market failing does not stop another from pinning (batch isolation)", async () => {
+    const m2 = k();
+    const c = new DepthSourceCache(60_000, () => 0);
+    await c.refresh(cluster(base()).conn, WRAPPER_PROGRAM_ID, [m, m2.toBase58()]);
+    assert.equal(c.why(m), "ok");
+    assert.equal(c.why(m2.toBase58()), "no depth source");
+  });
+});
+
+describe("pushDepthOnchainEnabled default env", () => {
+  it("reads process.env when no env is passed", () => {
+    const keys = ["KEEPER_PUSH_DEPTH", "KEEPER_PUSH_DEPTH_ONCHAIN"] as const;
+    const saved = keys.map((x) => process.env[x]);
+    try {
+      delete process.env.KEEPER_PUSH_DEPTH; delete process.env.KEEPER_PUSH_DEPTH_ONCHAIN;
+      assert.equal(pushDepthOnchainEnabled(), false);
+      process.env.KEEPER_PUSH_DEPTH = "on"; process.env.KEEPER_PUSH_DEPTH_ONCHAIN = "on";
+      assert.equal(pushDepthOnchainEnabled(), true);
+    } finally {
+      keys.forEach((x, i) => { if (saved[i] === undefined) delete process.env[x]; else process.env[x] = saved[i]; });
+    }
+  });
+});
