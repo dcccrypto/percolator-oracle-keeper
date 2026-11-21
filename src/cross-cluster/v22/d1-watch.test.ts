@@ -127,6 +127,70 @@ describe("d1-watch: evaluation (pure)", () => {
   });
 });
 
+describe("d1-watch: remaining branches", () => {
+  it("env: blank / whitespace-only is the default silently; above 10,000,000 is rejected; padded valid values are trimmed", () => {
+    const errs: string[] = [];
+    const log = (l: string) => errs.push(l);
+    assert.deepEqual(adlD1ThresholdsFromEnv({ ALERT_ADL_WIND_DOWN_BOUND_SLOTS: "   ", ALERT_ADL_WIND_DOWN_GRACE_SLOTS: "" }, log), T);
+    assert.equal(errs.length, 0);
+    assert.deepEqual(adlD1ThresholdsFromEnv({ ALERT_ADL_WIND_DOWN_GRACE_SLOTS: "10000001" }, log), T);
+    assert.equal(errs.length, 1);
+    assert.match(errs[0], /ALERT_ADL_WIND_DOWN_GRACE_SLOTS="10000001" must be an integer/);
+    assert.deepEqual(adlD1ThresholdsFromEnv({ ALERT_ADL_WIND_DOWN_BOUND_SLOTS: " 10000000 ", ALERT_ADL_WIND_DOWN_GRACE_SLOTS: "1" }, log), { boundSlots: 10_000_000n, graceSlots: 1n });
+    assert.equal(errs.length, 1);
+  });
+  it("env: default logger writes to console.error", (t) => {
+    const calls: unknown[][] = [];
+    t.mock.method(console, "error", (...a: unknown[]) => void calls.push(a));
+    assert.deepEqual(adlD1ThresholdsFromEnv({ ALERT_ADL_WIND_DOWN_BOUND_SLOTS: "nope" }), T);
+    assert.equal(calls.length, 1);
+    assert.match(String(calls[0][0]), /^\[v22\]\[d1\] ALERT_ADL_WIND_DOWN_BOUND_SLOTS="nope"/);
+  });
+  it("tracker: a clock that runs backwards gives age 0 (open and close); an asset missing from the readings ends its episode", () => {
+    const tr = new AdlEpisodeTracker(T);
+    tr.observe([reading(true, 0), reading(true, 1)], 5_000n);
+    const back = tr.observe([reading(true, 0), reading(true, 1)], 4_000n);
+    assert.equal(back[0].ageSlots, 0n);
+    assert.equal(back[0].slotsToBound, 9_000n);
+    // asset 1 vanishes: its episode ends (age 0, backwards clock), asset 0 continues
+    const eps = tr.observe([reading(true, 0)], 3_000n);
+    assert.deepEqual(eps.map((e) => e.assetIndex), [0]);
+    const sm = tr.summary(eps);
+    assert.equal(sm.endedEpisodes, 1);
+    assert.equal(sm.longestEndedSlots, "0");
+    assert.equal(sm.endedPastBound, 0);
+    assert.equal(sm.episodes.length, 1);
+    assert.notEqual(sm.episodes, eps, "summary copies the episode list");
+  });
+  it("tracker: an episode ending exactly at the bound counts as past bound (vanished asset)", () => {
+    const tr = new AdlEpisodeTracker(T);
+    tr.observe([reading(true, 0)], 1_000n);
+    tr.observe([], 10_000n);
+    const sm = tr.summary([]);
+    assert.equal(sm.endedPastBound, 1);
+    assert.equal(sm.longestEndedSlots, "9000");
+  });
+  it("evaluate: sinceBoot and already-eligible wording; no matching reading omits OI", () => {
+    const ep = { assetIndex: 3, observedSinceSlot: 100n, ageSlots: 9_000n, sinceBoot: true, level: "wind-down-due" as const, slotsToBound: 0n };
+    const [a] = evaluateAdlD1({ label: "BAND/T", market: "M", nowSlot: 9_100n, terminal: false, episodes: [ep], readings: [reading(true, 0)] }, T);
+    assert.equal(a.subject, "BAND/T#3");
+    assert.match(a.message, /\(observed since keeper boot\)/);
+    assert.match(a.message, /\(already eligible\)\.$/);
+    assert.doesNotMatch(a.message, /OI long/);
+    assert.equal(a.data?.oiEffLong, undefined);
+    assert.equal(a.data?.oiEffShort, undefined);
+    assert.equal(a.data?.sinceBoot, true);
+    assert.equal(a.data?.nowSlot, "9100");
+  });
+  it("evaluate: overdue episode with no reading still pages critical, without OI", () => {
+    const ep = { assetIndex: 1, observedSinceSlot: 0n, ageSlots: 11_000n, sinceBoot: false, level: "overdue" as const, slotsToBound: 0n };
+    const out = evaluateAdlD1({ label: "L", market: "M", nowSlot: 11_000n, terminal: false, episodes: [ep], readings: [] }, T);
+    assert.deepEqual(out.map((x) => x.kind), ["adl-close-only", "adl-wind-down-overdue"]);
+    assert.doesNotMatch(out[1].message, /OI long/);
+    assert.equal(out[1].data?.oiEffLong, undefined);
+  });
+});
+
 // ── V22Loop wiring ───────────────────────────────────────────────────────────
 
 const MARKET = key(900);
