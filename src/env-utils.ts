@@ -139,3 +139,26 @@ export function parsePositiveLamportsFromSolEnv(name: string, fallbackSol: numbe
 
   return Number(lamports);
 }
+
+/**
+ * Parse a keypair JSON (a 64-number byte array, as `solana-keygen` writes it) without echoing it.
+ *
+ * JSON.parse's SyntaxError quotes a window of the input (V8: ~10 chars each side of the bad token), and Node's crash
+ * printer adds the whole offending source line. For a keypair that is secret-key bytes, so the parse error is replaced by
+ * one that names only `source` (the variable name or file path). No position either: it depends on the digits before
+ * the bad character, so it carries a little information about the key. Deliberately no `cause`: Node prints a cause's
+ * message and stack too. Still a SyntaxError, so handlers and tests that match on it keep working.
+ * A valid key returns exactly what `Uint8Array.from(JSON.parse(text))` did; size/curve checks stay in Keypair.fromSecretKey.
+ */
+export function parseSecretKeyJson(text: string, source: string): Uint8Array {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new SyntaxError(
+      `${source} is not valid JSON: expected the 64-number byte array from a ` +
+        "`solana-keygen` keypair file (base58 is not accepted). The parse error is omitted because it can contain secret-key bytes.",
+    );
+  }
+  return Uint8Array.from(parsed as number[]);
+}

@@ -74,7 +74,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { DEFAULT_REGISTRY_FILE, loadRegistryForProgramSet } from "./cross-cluster/registry.ts";
 import { bindObservationRegistry, registryRowProblems } from "./cross-cluster/multi-asset.ts";
-import { bootPositiveNumberEnv, parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
+import { bootPositiveNumberEnv, parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv, parseSecretKeyJson } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { MIN_POOL_LIQUIDITY_USD_E6 } from "./cross-cluster/price-reader.ts";
@@ -254,8 +254,7 @@ try {
 // ── Keeper keypair ─────────────────────────────────────────────────────────────
 function loadKeypair(): Keypair {
   if (process.env.KEEPER_KEYPAIR) {
-    const raw = JSON.parse(process.env.KEEPER_KEYPAIR) as number[];
-    return Keypair.fromSecretKey(Uint8Array.from(raw));
+    return Keypair.fromSecretKey(parseSecretKeyJson(process.env.KEEPER_KEYPAIR, "KEEPER_KEYPAIR"));
   }
   const kpPath =
     process.env.KEEPER_KEYPAIR_PATH ??
@@ -267,9 +266,7 @@ function loadKeypair(): Keypair {
     );
     process.exit(1);
   }
-  return Keypair.fromSecretKey(
-    Uint8Array.from(JSON.parse(fs.readFileSync(kpPath, "utf8")) as number[]),
-  );
+  return Keypair.fromSecretKey(parseSecretKeyJson(fs.readFileSync(kpPath, "utf8"), `keypair file ${kpPath}`));
 }
 
 // ── Config ─────────────────────────────────────────────────────────────────────
