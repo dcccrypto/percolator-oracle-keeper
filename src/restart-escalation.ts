@@ -54,11 +54,12 @@ export function recordLaunch(
   windowMs: number,
 ): { health: RestartHealth; alertDue: boolean } {
   const rec = load(path);
-  rec.launches = [...rec.launches.filter((t) => now - t < windowMs), now];
+  rec.launches = [...rec.launches.filter((t) => t <= now && now - t < windowMs), now];
   const escalated = rec.launches.length >= threshold;
-  const alertDue = escalated && (rec.lastAlertAt === undefined || now - rec.lastAlertAt >= windowMs);
+  const alertDue = escalated && (rec.lastAlertAt === undefined || rec.lastAlertAt > now || now - rec.lastAlertAt >= windowMs);
   if (alertDue) {
     // A new window (previous stamp expired) starts with a fresh retry budget; a retry after a failure keeps its count.
+    // (a stamp from the future, after a clock step back, counts as expired)
     if (rec.lastAlertAt !== undefined) rec.alertFails = 0;
     rec.lastAlertAt = now;
   }
@@ -95,7 +96,7 @@ export function recordAlertFailure(path: string, now: number = Date.now()): bool
 
 export function readHealth(path: string, now: number, threshold: number, windowMs: number): RestartHealth {
   const rec = load(path);
-  return view(rec.launches.filter((t) => now - t < windowMs), now, threshold, windowMs);
+  return view(rec.launches.filter((t) => t <= now && now - t < windowMs), now, threshold, windowMs);
 }
 
 function view(launches: number[], now: number, threshold: number, windowMs: number): RestartHealth {

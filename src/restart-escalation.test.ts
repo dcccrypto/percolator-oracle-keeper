@@ -49,7 +49,41 @@ test("a failed webhook delivery does not burn the alert window; retries are capp
   assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, true);
   assert.equal(recordAlertFailure(p), true); // delivery failed -> stamp rolled back
   assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, true); // retried on next launch
-  for (let i = 0; i < MAX_ALERT_RETRIES - 1; i++) recordAlertFailure(p);
+  for (let i = 0; i < MAX_ALERT_RETRIES - 1; i++) recordAlertFailure(p, t);
   // cap reached: stamp stays, a dead endpoint is not retried again this window
   assert.equal(recordLaunch(p, (t += MIN), 5, 15 * MIN).alertDue, false);
+});
+
+test("lead1: a launch stamped in the future (clock stepped back) does not keep the keeper escalated", () => {
+  const p = tmp();
+  const FAR = 10_000 * MIN;
+  fs.writeFileSync(p, JSON.stringify({ launches: [FAR, FAR, FAR, FAR] }));
+  // now is long before the stamps; a lone launch must not read as a 5-launch storm
+  const r = recordLaunch(p, 1_000, 5, 15 * MIN);
+  assert.equal(r.health.launchesInWindow, 1);
+  assert.equal(r.health.escalated, false);
+  fs.writeFileSync(p, JSON.stringify({ launches: [FAR, FAR, FAR, FAR, FAR] }));
+  assert.equal(readHealth(p, 1_000, 5, 15 * MIN).escalated, false);
+});
+
+test("lead2: a future lastAlertAt does not suppress later alerts", () => {
+  const p = tmp();
+  fs.writeFileSync(p, JSON.stringify({ launches: [1, 2, 3, 4], lastAlertAt: 10_000 * MIN }));
+  assert.equal(recordLaunch(p, 5, 5, 15 * MIN).alertDue, true);
+});
+
+test("lead3: env num() accepts hex/exponent/fractional values via Number() (same as every other parser on this base; documented, not changed)", () => {
+  const c = (n: string) => restartConfig({ KEEPER_RESTART_ALERT_N: n }).threshold;
+  assert.equal(c("0x10"), 16);
+  assert.equal(c("1e1"), 10);
+  assert.equal(c("2.5"), 2.5);
+  assert.equal(c("0"), 5);
+  assert.equal(c("abc"), 5);
+});
+
+test("lead4: a corrupt file is dropped and rewritten as a valid record (no throw)", () => {
+  const p = tmp();
+  fs.writeFileSync(p, "{not json");
+  recordLaunch(p, 1, 5, MIN);
+  assert.deepEqual(JSON.parse(fs.readFileSync(p, "utf8")).launches, [1]);
 });
