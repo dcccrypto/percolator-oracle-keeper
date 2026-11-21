@@ -518,6 +518,24 @@ export function isStaleAtRead(p: PositionedPortfolio, epochs: SideEpochs | null)
   );
 }
 
+interface RankItem {
+  p: PositionedPortfolio;
+  key: string;
+  stale: boolean;
+  w: bigint;
+}
+
+/** base58 of a pubkey, memoised per PublicKey object (the encode dominates the sweep's per-cycle planning). */
+const KEY_CACHE = new WeakMap<PublicKey, string>();
+function keyOf(pk: PublicKey): string {
+  let k = KEY_CACHE.get(pk);
+  if (k === undefined) {
+    k = pk.toBase58();
+    KEY_CACHE.set(pk, k);
+  }
+  return k;
+}
+
 /**
  * Next batch of up to `k` portfolios (security review I2 of #277).
  *
@@ -544,23 +562,39 @@ export function selectSweepBatch(
   exclude: ReadonlySet<string> = new Set(),
   epochs: SideEpochs | null = null,
 ): PositionedPortfolio[] {
-  if (k <= 0) return [];
-  const candidates = positioned
-    .map((p) => ({ p, key: p.pubkey.toBase58() }))
-    .filter((x) => !exclude.has(x.key));
+  k = Math.trunc(k);
+  if (!(k > 0)) return [];
+  const candidates: RankItem[] = [];
+  for (const p of positioned) {
+    const key = keyOf(p.pubkey);
+    if (!exclude.has(key)) candidates.push({ p, key, stale: false, w: 0n });
+  }
   if (candidates.length === 0) return [];
   const last = (key: string) => cursor.visits.get(key) ?? -1;
-  const rank = (xs: typeof candidates) =>
-    xs
-      .map((x) => ({ ...x, stale: isStaleAtRead(x.p, epochs), w: x.p.lossWeight ?? 0n }))
-      .sort((a, b) => {
-        if (a.stale !== b.stale) return a.stale ? -1 : 1;
-        if (a.w !== b.w) return a.w > b.w ? -1 : 1;
-        const va = last(a.key);
-        const vb = last(b.key);
-        if (va !== vb) return va - vb;
-        return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
-      });
+  const cmp = (a: RankItem, b: RankItem): number => {
+    if (a.stale !== b.stale) return a.stale ? -1 : 1;
+    if (a.w !== b.w) return a.w > b.w ? -1 : 1;
+    const va = last(a.key);
+    const vb = last(b.key);
+    if (va !== vb) return va - vb;
+    return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+  };
+  for (const x of candidates) {
+    x.stale = isStaleAtRead(x.p, epochs);
+    x.w = x.p.lossWeight ?? 0n;
+  }
+  // Top-`n` by `cmp` (stable: equal items keep input order), O(len * n) instead of a full sort.
+  const top = (xs: ReadonlyArray<RankItem>, n: number): RankItem[] => {
+    const out: RankItem[] = [];
+    for (const x of xs) {
+      if (out.length === n && cmp(x, out[n - 1]) >= 0) continue;
+      let i = out.length < n ? out.length : n - 1;
+      if (out.length === n) out.pop();
+      while (i > 0 && cmp(x, out[i - 1]) < 0) i--;
+      out.splice(i, 0, x);
+    }
+    return out;
+  };
   let due = candidates.filter((x) => last(x.key) < cursor.roundStart);
   if (due.length === 0) {
     // Round complete: the next one starts with this batch.
@@ -568,13 +602,13 @@ export function selectSweepBatch(
     cursor.roundPending = false;
     due = candidates;
   }
-  const picked = rank(due).slice(0, k);
+  const picked = top(due, k);
   if (picked.length < k) {
     // The round is (or is about to be) complete: top the batch up from the next round's
     // order, so a tx never goes out half-empty at a round boundary. The new round starts
     // once this batch is recorded (see `roundPending`).
     const inBatch = new Set(picked.map((x) => x.key));
-    const next = rank(candidates.filter((x) => !inBatch.has(x.key))).slice(0, k - picked.length);
+    const next = top(candidates.filter((x) => !inBatch.has(x.key)), k - picked.length);
     if (next.length > 0) cursor.roundPending = true;
     picked.push(...next);
   }
@@ -588,7 +622,7 @@ export function selectSweepBatch(
 export function markVisited(cursor: SweepCursor, pubkeys: ReadonlyArray<PublicKey>): void {
   if (pubkeys.length === 0) return;
   const seq = ++cursor.seq;
-  for (const pk of pubkeys) cursor.visits.set(pk.toBase58(), seq);
+  for (const pk of pubkeys) cursor.visits.set(keyOf(pk), seq);
   if (cursor.roundPending) {
     cursor.roundStart = seq + 1;
     cursor.roundPending = false;
@@ -597,7 +631,7 @@ export function markVisited(cursor: SweepCursor, pubkeys: ReadonlyArray<PublicKe
 
 /** Forget portfolios that are no longer positioned. */
 export function pruneVisits(cursor: SweepCursor, positioned: ReadonlyArray<PositionedPortfolio>): void {
-  const live = new Set(positioned.map((p) => p.pubkey.toBase58()));
+  const live = new Set(positioned.map((p) => keyOf(p.pubkey)));
   for (const k of [...cursor.visits.keys()]) if (!live.has(k)) cursor.visits.delete(k);
 }
 
@@ -610,9 +644,9 @@ export function refreshPositionedFrom(
   positioned: PositionedPortfolio[],
   fresh: ReadonlyArray<PositionedPortfolio>,
 ): void {
-  const byKey = new Map(fresh.map((p) => [p.pubkey.toBase58(), p]));
+  const byKey = new Map(fresh.map((p) => [keyOf(p.pubkey), p]));
   for (let i = 0; i < positioned.length; i++) {
-    const f = byKey.get(positioned[i].pubkey.toBase58());
+    const f = byKey.get(keyOf(positioned[i].pubkey));
     if (f) positioned[i] = f;
   }
 }
