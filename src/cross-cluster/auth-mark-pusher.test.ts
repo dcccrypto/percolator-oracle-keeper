@@ -367,3 +367,86 @@ describe("pushAuthMarkBatch — v18 market_id + observation_sequence", () => {
     assert.equal(calls, 1, "one batched call for N markets, not N individual getAccountInfo calls");
   });
 });
+
+// ── wall-clock step-back: holds must not stretch by the size of the step ──────
+import { mock } from "node:test";
+import {
+  noteLandedRevert,
+  getSoloMarkets,
+  SOLO_MS,
+  reconcilePushOutcomes,
+  pushLandingStats,
+  resetPushLandingState,
+  pruneAuthMarkPusherState,
+} from "./auth-mark-pusher.ts";
+
+describe("auth-mark-pusher clock step-back", () => {
+  const T = 1_800_000_000_000;
+  const HOUR = 3_600_000;
+
+  it("quarantine hold is capped at QUARANTINE_MS after the clock steps back", async () => {
+    const [good, bad] = markets(2);
+    const { conn } = fakeConn(new Set([bad]));
+    const keeper = Keypair.generate();
+    const pushes = [good, bad].map((m) => ({ marketAddress: m, assetIndex: 0, priceE6: 1_000_000n }));
+    const now = mock.method(Date, "now", () => T);
+    try {
+      for (let i = 0; i < 3; i++) await pushAuthMarkBatch(conn as never, keeper, pushes, 100n, BLOCKHASH, false);
+      assert.ok(getQuarantinedMarkets().includes(bad));
+      now.mock.mockImplementation(() => T - HOUR); // step back 1h: hold would be 70 min
+      assert.ok(getQuarantinedMarkets().includes(bad), "still held right after the step");
+      now.mock.mockImplementation(() => T - HOUR + 10 * 60_000 + 1);
+      assert.ok(!getQuarantinedMarkets().includes(bad), "hold must not outlive its 10 min duration");
+      const { conn: healthy, sent } = fakeConn(new Set());
+      const res = await pushAuthMarkBatch(healthy as never, keeper, pushes, 100n, BLOCKHASH, false);
+      assert.ok(res.pushedMarkets.includes(bad), `bad market still silent after step-back (sent ${sent.length})`);
+    } finally {
+      now.mock.restore();
+    }
+  });
+
+  it("solo hold is capped at SOLO_MS after a step-back (held, not stretched, not lifted)", () => {
+    const m = "SoloStep1111111111111111111111111111111111";
+    noteLandedRevert(m, T);
+    noteLandedRevert(m, T + 1);
+    assert.ok(getSoloMarkets(T + 2).includes(m));
+    assert.ok(getSoloMarkets(T - HOUR).includes(m), "still held right after the step");
+    assert.ok(getSoloMarkets(T - HOUR + SOLO_MS - 1).includes(m));
+    assert.ok(!getSoloMarkets(T - HOUR + SOLO_MS + 1).includes(m), "solo hold must not stretch by the step");
+    resetPushLandingState();
+  });
+
+  it("out-of-order (overlapping reconcile / stepped-back) landed reverts both still count", () => {
+    const m = "SoloFuture11111111111111111111111111111111";
+    noteLandedRevert(m, T + 10);
+    noteLandedRevert(m, T); // earlier stamp arrives second: must not be discarded
+    assert.ok(getSoloMarkets(T + 1).includes(m));
+    resetPushLandingState();
+  });
+
+  it("reconcile settles in-flight pushes sent before a backwards step", async () => {
+    resetPushLandingState();
+    const [a] = markets(1);
+    const { conn } = fakeConn(new Set());
+    const now = mock.method(Date, "now", () => T);
+    try {
+      await pushAuthMarkBatch(conn as never, Keypair.generate(), [{ marketAddress: a, assetIndex: 0, priceE6: 1_000_000n }], 100n, BLOCKHASH, false);
+    } finally {
+      now.mock.restore();
+    }
+    const statusConn = { getSignatureStatuses: async (sigs: string[]) => ({ value: sigs.map(() => ({ err: null })) }) };
+    await reconcilePushOutcomes(statusConn as never, T - HOUR); // first look after the step re-anchors the stamp
+    await reconcilePushOutcomes(statusConn as never, T - HOUR + 10_000);
+    assert.equal(pushLandingStats.landedOk, 1, "push sent at T must be reconciled after the clock steps back");
+    resetPushLandingState();
+  });
+
+  it("lead 4: solo/quarantine/landed-revert state is pruned for deregistered markets", () => {
+    const m = "Pruned111111111111111111111111111111111111";
+    noteLandedRevert(m, T);
+    noteLandedRevert(m, T + 1);
+    pruneAuthMarkPusherState(new Set());
+    assert.deepEqual(getSoloMarkets(T + 2), []);
+    resetPushLandingState();
+  });
+});
