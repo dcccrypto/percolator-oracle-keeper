@@ -8,7 +8,7 @@
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { Keypair } from "@solana/web3.js";
+import { Keypair, Transaction } from "@solana/web3.js";
 import { resetJobCounters } from "./exec.ts";
 import { resetPairingStats } from "./sweep.ts";
 import { V22Loop, livenessRepairsFor } from "./loop.ts";
@@ -129,22 +129,138 @@ describe("v2.2 loop sizes the catch-up tx from a one-crank simulation of the mar
 });
 
 describe("catch-up is paced across markets (RPC rate limit)", () => {
-  it("a second market behind in the same instant waits for the spacing; after it, it catches up", async () => {
+  it("a second market behind in the same instant waits for the spacing; after it, it catches up (inside the same call)", async () => {
     const gap = 150n * 10n;
     const market = v22MarketBytes({ currentSlot: NOW, slotLast: NOW - gap });
     const f = fakeLoopConn({ readSlot: Number(NOW), market, registry: registryBytes({ bound: true, ext: true, bond: false }), vaultLpState: vaultLpStateBytes(key(901), 0n), lpAccount: portfolioBytes({ owner: key(8), capital: 1000n, pnl: 0n, legs: [{ side: 0, basis: 5n }] }) });
     let t = 1_000_000;
+    const waits: number[] = [];
     const lines: string[] = [];
-    const loop = new V22Loop({ conn: f.conn as never, keeper: Keypair.generate(), programId: WRAPPER_PROGRAM_ID, markets: () => [{ marketAddress: MARKET.toBase58(), label: "T/V22" }], flags: v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_SWEEP: "on" }), dryRun: false, log: (l) => lines.push(l), now: () => t, catchupSpacingMs: 1500 });
+    const loop = new V22Loop({ conn: f.conn as never, keeper: Keypair.generate(), programId: WRAPPER_PROGRAM_ID, markets: () => [{ marketAddress: MARKET.toBase58(), label: "T/V22" }], flags: v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_SWEEP: "on" }), dryRun: false, log: (l) => lines.push(l), now: () => t, sleep: async (ms) => void waits.push(ms), catchupSpacingMs: 1500 });
     const run = (label: string) => loop.sweepDelegate({ conn: f.conn as never, keeper: Keypair.generate(), entry: { marketAddress: MARKET.toBase58(), label }, marketData: market, slot: Number(NOW), dryRun: false });
     assert.equal(await run("A"), true);
     assert.equal(f.sent.length, 1);
     t += 100;
     assert.equal(await run("B"), true, "handled (the legacy cranker must not send its own catch-up)");
-    assert.equal(f.sent.length, 1, "paced: nothing sent inside the spacing");
-    t += 1500;
-    await run("B");
+    // Was "paced: nothing sent", then a second call 1.5 s later; the real cranker comes back only after a whole 20 s
+    // cycle. B now waits out the rest of the spacing inside its call (nothing is sent inside it) and then catches up.
+    assert.deepEqual(waits, [1400]);
     assert.equal(f.sent.length, 2);
+  });
+
+  // The recovery cranker calls every market's delegate in the same instant, once per CRANK_INTERVAL_MS (20 s,
+  // startRecoveryCrankLoop). A market skipped by the pacing used to return at once and wait a whole cycle, so the keeper
+  // sent ONE catch-up per cycle across all markets instead of one per spacing window. Fake clock + recorded waits: exact.
+  function behindMarkets(n: number, o: { refused?: string; failSendOnce?: string; slowRead?: string } = {}) {
+    const market = v22MarketBytes({ currentSlot: NOW, slotLast: NOW - 150n * 10n });
+    const f = fakeLoopConn({ readSlot: Number(NOW), market, registry: registryBytes({ bound: true, ext: true, bond: false }), vaultLpState: vaultLpStateBytes(key(901), 0n), lpAccount: portfolioBytes({ owner: key(8), capital: 1000n, pnl: 0n, legs: [{ side: 0, basis: 5n }] }), simErr: (d) => (o.refused && d.keys.some((ks) => ks.includes(o.refused!)) ? { InstructionError: [2, { Custom: 6 }] } : null) });
+    if (o.failSendOnce) {
+      // one transport failure (a 429 thrown by sendRawTransaction) on this market's first send
+      let armed = true;
+      const send = f.conn.sendRawTransaction.bind(f.conn);
+      (f.conn as unknown as { sendRawTransaction: unknown }).sendRawTransaction = async (raw: Uint8Array) => {
+        if (armed && Transaction.from(Buffer.from(raw)).instructions.some((ix) => ix.keys.some((k) => k.pubkey.toBase58() === o.failSendOnce))) {
+          armed = false;
+          throw new Error("429 Too Many Requests");
+        }
+        return send(raw);
+      };
+    }
+    if (o.slowRead) {
+      // this market's reads return a macrotask later than every other market's (a slow RPC read)
+      const read = f.conn.getMultipleAccountsInfoAndContext.bind(f.conn);
+      (f.conn as unknown as { getMultipleAccountsInfoAndContext: unknown }).getMultipleAccountsInfoAndContext = async (keys: Array<{ toBase58(): string }>) => {
+        if (keys[0]?.toBase58() === o.slowRead) await new Promise((res) => setTimeout(res, 5));
+        return read();
+      };
+    }
+    const clock = { t: 1_000_000 };
+    const waits: number[] = [];
+    const lines: string[] = [];
+    const markets = Array.from({ length: n }, (_, i) => key(1000 + i).toBase58());
+    const loop = new V22Loop({ conn: f.conn as never, keeper: Keypair.generate(), programId: WRAPPER_PROGRAM_ID, markets: () => markets.map((m) => ({ marketAddress: m, label: m.slice(0, 4) })), flags: v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_SWEEP: "on" }), dryRun: false, log: (l) => lines.push(l), now: () => clock.t, sleep: async (ms) => void waits.push(ms), catchupSpacingMs: 1500 });
+    const cycle = () => Promise.all(markets.map((m) => loop.sweepDelegate({ conn: f.conn as never, keeper: Keypair.generate(), entry: { marketAddress: m, label: m.slice(0, 4) }, marketData: market, slot: Number(NOW), dryRun: false })));
+    const sentBy = () => f.sent.map((s) => s.keys[0][1]);
+    return { f, clock, waits, lines, markets, cycle, sentBy };
+  }
+
+  it("catch-up pacing: 5 markets behind in one crank cycle all catch up in that cycle, one start per spacing window", async () => {
+    const s = behindMarkets(5);
+    assert.deepEqual(await s.cycle(), [true, true, true, true, true], "handled: the legacy cranker sends no catch-up of its own");
+    assert.equal(s.f.sent.length, 5, "every behind market sent its catch-up this cycle (tip: 1 of 5)");
+    assert.equal(new Set(s.sentBy()).size, 5, "one per market");
+    assert.deepEqual([...s.waits].sort((a, b) => a - b), [1500, 3000, 4500, 6000], "the first starts at once, the rest one 1.5 s spacing apart");
+  });
+
+  it("catch-up pacing: past the 12 s wait budget a market is deferred to a later cycle, and says so", async () => {
+    const s = behindMarkets(10);
+    await s.cycle();
+    assert.equal(s.f.sent.length, 9, "starts at 0, 1.5, ... 12 s; the 10th (13.5 s) waits for the next cycle");
+    assert.equal(Math.max(...s.waits), 12_000);
+    assert.equal(s.lines.filter((l) => l.includes("deferred to a later cycle")).length, 1);
+  });
+
+  it("catch-up pacing: a slow-loading market is not starved; the market deferred longest gets the next free start", async () => {
+    // 10 markets that stay behind, 9 starts per cycle: one is deferred every cycle. The slow reader asks last every
+    // cycle, so first-come reservation deferred IT every cycle, forever (tip: 0 catch-ups in 4 cycles).
+    const slow = key(1000).toBase58(); // first in call order, but its reads return last
+    const s = behindMarkets(10, { slowRead: slow });
+    const perCycle: string[][] = [];
+    for (let c = 0; c < 4; c++) {
+      const before = s.f.sent.length;
+      await s.cycle();
+      perCycle.push(s.sentBy().slice(before));
+      s.clock.t += 20_000;
+    }
+    assert.deepEqual(perCycle.map((x) => x.length), [9, 9, 9, 9], "still one start per spacing window, 9 per cycle");
+    assert.ok(!perCycle[0].includes(slow), "cycle 1: the slow reader asked last and was deferred");
+    assert.ok(perCycle[1].includes(slow), `cycle 2: deferred longest, so it gets a start (slow-reader catch-ups per cycle: ${perCycle.map((x) => x.filter((m) => m === slow).length)})`);
+    for (let c = 1; c < 4; c++) {
+      const served = new Set([...perCycle[c - 1], ...perCycle[c]]);
+      assert.deepEqual(s.markets.filter((m) => !served.has(m)), [], `cycles ${c}-${c + 1}: no market deferred twice in a row`);
+    }
+  });
+
+  it("catch-up pacing: a deferred market that stops asking stops holding a start back (after 60 s)", async () => {
+    const s = behindMarkets(10);
+    await s.cycle(); // the 10th market (1.5 s past the budget) is deferred
+    const gone = s.markets.pop()!;
+    const deferredAt = s.clock.t;
+    const sentIn = async () => {
+      const before = s.f.sent.length;
+      await s.cycle();
+      return s.sentBy().slice(before);
+    };
+    s.clock.t = deferredAt + 20_000;
+    assert.equal((await sentIn()).length, 8, "inside 60 s the deferred market may still come back: one start held for it");
+    s.clock.t = deferredAt + 60_001;
+    const later = await sentIn();
+    assert.equal(later.length, 9, "past 60 s without asking it holds nothing back");
+    assert.ok(!later.includes(gone));
+  });
+
+  it("catch-up pacing: a market whose catch-up the program refuses backs off 60 s and does not crowd out the healthy ones", async () => {
+    const refused = key(1000).toBase58(); // first in call order, so it reaches the gate first
+    const s = behindMarkets(5, { refused });
+    const attempts: number[] = [];
+    for (let c = 0; c < 3; c++) {
+      await s.cycle();
+      attempts.push(s.f.sims.filter((d) => d.keys.some((ks) => ks.includes(refused))).length);
+      s.clock.t += 20_000; // the next crank cycle
+    }
+    assert.equal(s.sentBy().filter((m) => m !== refused).length, 12, "4 healthy markets x 3 cycles (tip: 0, the refused market takes the only slot each cycle)");
+    assert.equal(s.sentBy().filter((m) => m === refused).length, 0);
+    assert.ok(attempts[0] > 0 && attempts[1] === attempts[0] && attempts[2] === attempts[0], `the refused market tried in cycle 1 only, then backed off (simulations after each cycle: ${attempts})`);
+  });
+
+  it("catch-up pacing: a transport failure (429) on the send does NOT back the market off", async () => {
+    const m0 = key(1000).toBase58();
+    const s = behindMarkets(3, { failSendOnce: m0 });
+    for (let c = 0; c < 3; c++) {
+      await s.cycle();
+      s.clock.t += 20_000;
+    }
+    assert.equal(s.sentBy().filter((m) => m === m0).length, 2, "cycle 1 failed on the RPC; cycles 2 and 3 sent (a backoff would leave 0)");
   });
 });
 
