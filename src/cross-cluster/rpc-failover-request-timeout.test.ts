@@ -1,12 +1,14 @@
 // The per-attempt request deadline in RpcFailover.doFetch, through Node's real fetch against local JSON-RPC servers, so the
 // signal / body interaction is undici's own. Deadline 300 ms (1 s where a slow answer must survive it); every wait on a
-// possible hang is raced against 2 s.
+// possible hang is raced against 2 s. Where a hang on the active endpoint must fail over, the test fires the deadlines
+// itself (manualDeadlines): on a loaded machine a real 300 ms one also expired on the fallback's own answer, and the
+// fallback then "failed" too. Those tests race against 10 s instead: no deadline is real there, so it only catches a hang.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { Connection, PublicKey } from "@solana/web3.js";
-import { RpcFailover, GENESIS_HASH } from "../rpc-failover.ts";
+import { RpcFailover, GENESIS_HASH, type RpcFailoverOptions } from "../rpc-failover.ts";
 
 /** What a server does with one JSON-RPC method: answer (default), never answer, stall after headers, answer slowly, or HTTP 500. */
 type Behaviour = "hole" | "stall-body" | "slow-body" | "slow-headers" | "500";
@@ -55,6 +57,26 @@ const init = (method: string, signal?: AbortSignal): RequestInit => ({
 });
 const within = <T>(p: Promise<T>, ms = 2_000): Promise<T | "still pending"> =>
   Promise.race([p, new Promise<"still pending">((r) => setTimeout(() => r("still pending"), ms))]);
+/** Resolves once `ok()` holds (polled); race it with `within`. */
+const until = async (ok: () => boolean): Promise<void> => {
+  while (!ok()) await new Promise((r) => setTimeout(r, 5));
+};
+/** Request deadlines the test fires itself: none expires until `fire`, which expires them as AbortSignal.timeout would. */
+function manualDeadlines() {
+  const made: Array<{ ms: number; ctl: AbortController }> = [];
+  return {
+    made,
+    requestDeadline: (ms: number): AbortSignal => {
+      const ctl = new AbortController();
+      made.push({ ms, ctl });
+      return ctl.signal;
+    },
+    /** Expire every deadline made so far (call it while only the hung attempts are in flight). */
+    fire: () => {
+      for (const d of made) if (!d.ctl.signal.aborted) d.ctl.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+    },
+  };
+}
 const settle = <T>(p: Promise<T>) => p.then((v) => ({ ok: true as const, v }), (e: unknown) => ({ ok: false as const, e }));
 
 async function pair(
@@ -62,35 +84,46 @@ async function pair(
   requestTimeoutMs = 300,
   log: (l: string) => void = () => {},
   behaveF: (method: string) => Behaviour | undefined = () => undefined,
+  extra: Partial<RpcFailoverOptions> = {},
 ) {
   const hits: string[] = [];
   const P = await server("P", hits, behaveP);
   const F = await server("F", hits, behaveF);
-  const f = new RpcFailover({ cluster: "devnet", urls: [P.url, F.url], log, requestTimeoutMs });
+  const f = new RpcFailover({ cluster: "devnet", urls: [P.url, F.url], log, requestTimeoutMs, ...extra });
   return { f, hits, P, F, close: () => { P.close(); F.close(); } };
 }
 
 test("request deadline: a send the active endpoint never answers goes to the fallback, and status polls follow it", async () => {
-  const { f, hits, P, close } = await pair((m) => (m === "sendTransaction" ? "hole" : undefined));
+  const dl = manualDeadlines();
+  const { f, hits, P, close } = await pair((m) => (m === "sendTransaction" ? "hole" : undefined), 300, () => {}, undefined, { requestDeadline: dl.requestDeadline });
   try {
-    const r = await within(f.fetch(P.url, init("sendTransaction")).then((x) => x.text()));
+    const sent = f.fetch(P.url, init("sendTransaction")).then((x) => x.text());
+    assert.notEqual(await within(until(() => hits.includes("P:sendTransaction")), 10_000), "still pending", hits.join(" "));
+    dl.fire(); // P holds the send: its deadline expires
+    const r = await within(sent, 10_000);
     assert.match(String(r), /from-F/, `got ${String(r)} | ${hits.join(" ")}`);
     assert.ok(hits.includes("P:sendTransaction"));
     assert.equal(f.snapshot().endpoints[0].consecutiveFailures, 1); // one timeout is not an outage
-    const poll = await within(f.fetch(P.url, init("getSignatureStatuses")).then((x) => x.text()));
+    const poll = await within(f.fetch(P.url, init("getSignatureStatuses")).then((x) => x.text()), 10_000);
     assert.match(String(poll), /from-F/);
+    assert.ok(dl.made.every((d) => d.ms === 300), "every attempt got the configured deadline");
   } finally {
     close();
   }
 });
 
 test("request deadline: web3.js getLatestBlockhash is served by the fallback when the active endpoint never answers", async () => {
-  const { f, P, close } = await pair((m) => (m === "getLatestBlockhash" ? "hole" : undefined));
+  const dl = manualDeadlines();
+  const { f, hits, P, close } = await pair((m) => (m === "getLatestBlockhash" ? "hole" : undefined), 300, () => {}, undefined, { requestDeadline: dl.requestDeadline });
   try {
     const conn = new Connection(P.url, { commitment: "confirmed", fetch: f.fetch });
-    const r = await within(conn.getLatestBlockhash("confirmed"));
+    const got = conn.getLatestBlockhash("confirmed");
+    assert.notEqual(await within(until(() => hits.includes("P:getLatestBlockhash")), 10_000), "still pending", hits.join(" "));
+    dl.fire(); // P holds the request: its deadline expires
+    const r = await within(got, 10_000);
     assert.notEqual(r, "still pending");
     assert.equal((r as { blockhash: string }).blockhash, BLOCKHASH);
+    assert.ok(dl.made.every((d) => d.ms === 300), "every attempt got the configured deadline");
   } finally {
     close();
   }
@@ -165,16 +198,28 @@ test("request deadline: a 500 kept while the next endpoint times out still reach
 
 test("request deadline: ten requests timing out together mark the endpoint down once, with the base cooldown", async () => {
   const lines: string[] = [];
-  const { f, P, close } = await pair((m) => (m === "getBalance" ? "hole" : undefined), 300, (l) => lines.push(l));
+  const dl = manualDeadlines();
+  let frozenAt: number | null = null; // the keeper clock stops while the ten time out: none of them can outlive the cooldown
+  const { f, hits, P, close } = await pair((m) => (m === "getBalance" ? "hole" : undefined), 300, (l) => lines.push(l), undefined, {
+    requestDeadline: dl.requestDeadline,
+    now: () => frozenAt ?? Date.now(),
+  });
   try {
     await f.fetch(P.url, init("getSlot")); // vet both endpoints first
-    const r = await within(Promise.all(Array.from({ length: 10 }, () => f.fetch(P.url, init("getBalance")).then((x) => x.text()))));
+    const all = Promise.all(Array.from({ length: 10 }, () => f.fetch(P.url, init("getBalance")).then((x) => x.text())));
+    const held = () => hits.filter((h) => h === "P:getBalance").length;
+    assert.notEqual(await within(until(() => held() === 10), 10_000), "still pending", hits.join(" "));
+    assert.equal(dl.made.length, 11); // the getSlot (answered) + the ten P holds; nothing else in flight
+    frozenAt = Date.now();
+    dl.fire(); // all ten deadlines expire together
+    const r = await within(all, 10_000);
     assert.notEqual(r, "still pending");
     for (const t of r as string[]) assert.match(t, /from-F/);
     const downs = lines.filter((l) => /endpoint #0 .* DOWN/.test(l));
     assert.equal(downs.length, 1, downs.join("\n"));
     assert.match(downs[0], /retry in 2s/);
-    assert.ok(f.snapshot().endpoints[0].downForMs <= 2_000);
+    assert.equal(f.snapshot().endpoints[0].downForMs, 2_000);
+    assert.ok(dl.made.every((d) => d.ms === 300), "every attempt got the configured deadline");
   } finally {
     close();
   }
