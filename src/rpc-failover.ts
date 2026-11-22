@@ -180,6 +180,9 @@ export interface RpcFailoverOptions {
   /** Per-attempt deadline (headers AND body) for traffic; on expiry the attempt counts as a network error and the next
    *  endpoint is tried. Default 20_000 (env `RPC_REQUEST_TIMEOUT_MS`). */
   requestTimeoutMs?: number;
+  /** Makes each attempt's deadline signal from `requestTimeoutMs` (default `AbortSignal.timeout`). Tests inject one they
+   *  fire themselves, so a loaded machine cannot expire it early or late. */
+  requestDeadline?: (ms: number) => AbortSignal;
   /** Upper bound on chain speed (slots/s) until it is measured; also caps an uncorroborated rate report. Default 5. */
   slotsPerSecond?: number;
   /** Re-measure the chain speed at the next agreement of two endpoints once the measurement is this old. Default 600_000. */
@@ -264,6 +267,7 @@ export class RpcFailover {
   private readonly eps: Endpoint[];
   private readonly base: FetchLike;
   private readonly now: () => number;
+  private readonly deadline: (ms: number) => AbortSignal;
   private readonly cfg: Required<
     Pick<
       RpcFailoverOptions,
@@ -323,6 +327,7 @@ export class RpcFailover {
     this.urls = [...opts.urls];
     this.base = opts.base ?? ((i, init) => fetch(i, init));
     this.now = opts.now ?? Date.now;
+    this.deadline = opts.requestDeadline ?? ((ms) => AbortSignal.timeout(ms));
     this.expectedGenesis = opts.expectedGenesis ?? GENESIS_HASH[opts.cluster];
     this.cfg = {
       maxSlotLag: opts.maxSlotLag ?? 50,
@@ -941,7 +946,7 @@ export class RpcFailover {
       let res: Response;
       try {
         // Never cleared: web3.js reads the body after we return, and the deadline must bound that too (see DEADLINE above).
-        const deadline = AbortSignal.timeout(this.cfg.requestTimeoutMs);
+        const deadline = this.deadline(this.cfg.requestTimeoutMs);
         res = await this.base(ep.url, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline });
       } catch (e) {
         if (init?.signal?.aborted) throw e; // the caller cancelled: not an endpoint failure, do not fail over
