@@ -512,7 +512,16 @@ describe("planSweepTx", () => {
     const plan = planSweepTx({ owner: OWNER.publicKey, market: MARKET, lpPortfolio: LP, targets: portfolios(10), cfg: DEFAULT_SWEEP_CONFIG, catchup: 2 });
     assert.deepEqual(plan.cranks.slice(0, 3).map((c) => c.kind), ["catchup", "catchup", "accrue"]);
     assert.ok(plan.computeUnits <= MAX_TX_CU);
-    assert.equal(plan.cranks.filter((c) => c.kind === "refresh").length, 9);
+    // Full crank routing: a catch-up crank is a 32-step path (static estimate 120k, was 45k), so the two catch-ups take
+    // the room of two more refreshes: 7 fit (9 against the single-segment wrapper, checked below).
+    assert.equal(plan.cranks.filter((c) => c.kind === "refresh").length, 7);
+    process.env.KEEPER_V22_CRANK_PATH_STEPS = "0";
+    try {
+      const legacy = planSweepTx({ owner: OWNER.publicKey, market: MARKET, lpPortfolio: LP, targets: portfolios(10), cfg: DEFAULT_SWEEP_CONFIG, catchup: 2 });
+      assert.equal(legacy.cranks.filter((c) => c.kind === "refresh").length, 9);
+    } finally {
+      delete process.env.KEEPER_V22_CRANK_PATH_STEPS;
+    }
     // too far behind: catch-up only, every target deferred
     const far = planSweepTx({ owner: OWNER.publicKey, market: MARKET, lpPortfolio: LP, targets: portfolios(3), cfg: DEFAULT_SWEEP_CONFIG, catchup: 11 });
     assert.equal(far.cranks.every((c) => c.kind === "catchup"), true);
