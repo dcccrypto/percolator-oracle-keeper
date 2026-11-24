@@ -19,6 +19,12 @@ import { maxCatchupCranksFor } from "../multi-asset.ts";
 import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import { fakeLoopConn, key, portfolioBytes, registryBytes, v22MarketBytes, vaultLpStateBytes } from "./test-helpers.ts";
 
+// Full crank routing (agent/J-20261124-KEEPER-FULLROUTE): this file models the single-segment wrapper, where one crank
+// covers max_accrual_dt_slots. Its gaps, counts and CU figures are in those windows, so it runs in the keeper's legacy mode
+// (KEEPER_V22_CRANK_PATH_STEPS=0), which stays supported until the full-routing wrapper deploys. The 32-slot window is
+// covered in v22/fullroute-catchup.test.ts.
+process.env.KEEPER_V22_CRANK_PATH_STEPS = "0";
+
 const MARKET = key(900);
 const DT = 150n; // v22MarketBytes: max_accrual_dt_slots
 const NOW = 50000n;

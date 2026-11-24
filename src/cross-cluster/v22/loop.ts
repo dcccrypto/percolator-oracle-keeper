@@ -23,7 +23,7 @@ import type { Connection, Keypair } from "@solana/web3.js";
 import { deriveInsuranceUnitsV22, deriveStakePool } from "@percolatorct/sdk";
 import type { MarketEntry } from "../registry.ts";
 import { STAKE_PROGRAM_ID } from "../../program-ids.ts";
-import { ACCRUAL_TX_CU_HEADROOM, CATCHUP_CRANK_CU, MAX_CATCHUP_CRANKS, MAX_TX_CU, catchupCrankCount, isAssetLossStale } from "../positioned-refresh.ts";
+import { ACCRUAL_TX_CU_HEADROOM, MAX_CATCHUP_CRANKS, catchupCrankCuEstimate, MAX_TX_CU, catchupCrankCount, crankPathStepsFromEnv, isAssetLossStale } from "../positioned-refresh.ts";
 import { CU_PER_WEIGHT } from "./settle-pairing.ts";
 import { EXTRA_HINT_ACCRUE_CU, accrueCrankCuFor, catchupCrankCuFor, isMultiAssetMarket, maxCatchupCranksFor, observationAssetsFor, refreshStateForMarket } from "../multi-asset.ts";
 import { setCrankRefreshHealth } from "../refresh-coordination.ts";
@@ -205,6 +205,12 @@ const CATCHUP_MEASURED_MARGIN = 1.08;
  * Fixed for the 20 s default cycle; derive it from CRANK_INTERVAL_MS if that is ever run much shorter.
  */
 const CATCHUP_WAIT_BUDGET_MS = 12_000;
+/**
+ * Full crank routing: most catch-up txs one market sends in one crank cycle before its round (each re-reads the market
+ * first). 2 covers the steady state (one window behind, plus one boundary crossed while the first lands); a market further
+ * behind than that keeps the old shape (catch-up only, round on a later cycle). KEEPER_V22_CATCHUP_TXS_PER_CYCLE overrides.
+ */
+const CATCHUP_TXS_PER_CYCLE = Math.max(1, Math.floor(Number(process.env.KEEPER_V22_CATCHUP_TXS_PER_CYCLE ?? 2)) || 2);
 const sleepMs = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms));
 
 export class V22Loop {
@@ -605,8 +611,10 @@ export class V22Loop {
     r.sweepInflight = true;
     try {
       const load = await loadV22Market(conn, entry, this.d.programId);
-      const ctx = this.noteLoad(entry, load);
-      if (!ctx) return false;
+      const ctx0 = this.noteLoad(entry, load);
+      if (!ctx0) return false;
+      // Full crank routing: a cycle that catches the market up re-reads it and runs the round on the fresh read.
+      let ctx: V22MarketCtx = ctx0;
       r.lastBand = bandHealthFor(ctx);
       if (ctx.refresh.lifecycle !== 2 && ctx.refresh.lifecycle !== 3) return false; // not Active / DrainOnly
       // v22price 2026-10-22: liveness repairs on EVERY asset of a v2.2 market, before any crank. A lapsed `Fresh` backing
@@ -644,8 +652,8 @@ export class V22Loop {
       // before settling anyone, so the LP is never settled alone. The round runs on the next cycle, inside one window.
       // In steady state the gap is below one window, so n is 0 and nothing changes.
       {
-        const n = catchupCrankCount(BigInt(ctx.readSlot) - ctx.refresh.slotLast, ctx.refresh.maxAccrualDtSlots);
-        if (n > 0) {
+        const behind = (c: V22MarketCtx): number => catchupCrankCount(BigInt(c.readSlot) - c.refresh.slotLast, c.refresh.maxAccrualDtSlots);
+        if (behind(ctx) > 0) {
           // v22price 2026-10-22: pace catch-up across markets. After an outage every market is behind at once; one
           // catch-up tx per market per cycle (each with two simulations, a send and status polls) hit the RPC key's rate
           // limit (429) and starved the pushes. Returning true keeps the legacy cranker from sending its own catch-up meanwhile.
@@ -653,27 +661,57 @@ export class V22Loop {
           // used to wait a whole cycle: one catch-up per cycle across all markets. Each market now reserves the next free start
           // (one per spacing window) and waits for it inside this call; only a start beyond CATCHUP_WAIT_BUDGET_MS is left
           // to a later cycle.
+          //
+          // Full crank routing (wrapper agent/J-20261124-PROG-FULLROUTE): one crank now covers at most 32 slots, below the
+          // ~50 slots of the 20 s cycle, so in steady state EVERY cycle starts one window behind. Returning after the catch-up
+          // (the old rule) would then skip the round on every cycle. Instead: up to CATCHUP_TXS_PER_CYCLE paced catch-up txs,
+          // re-reading after each (the chain may cross another window boundary while one lands), and when the market is
+          // inside one window the round below runs in this same cycle on the fresh read.
+          // Legacy mode (KEEPER_V22_CRANK_PATH_STEPS=0, the single-segment wrapper): the old shape exactly, one catch-up
+          // tx and the round on a later cycle.
+          const fullRoute = crankPathStepsFromEnv() > 0n;
           let cur: V22MarketCtx | null = ctx;
-          // A market the program keeps refusing would hold a start every cycle forever (re-read + 2 simulations each, on the
-          // rate-limited RPC key); it backs off 60 s instead. A transport failure (429, blockhash) says nothing about the market.
-          const backedOff = this.now() < r.catchupBackoffUntilMs;
-          const wait = backedOff ? null : this.reserveCatchupStart();
-          if (wait !== null) {
+          let caughtUp = false;
+          for (let sent = 0; cur && sent < (fullRoute ? CATCHUP_TXS_PER_CYCLE : 1); sent++) {
+            // A market the program keeps refusing would hold a start every cycle forever (re-read + 2 simulations each, on the
+            // rate-limited RPC key); it backs off 60 s instead. A transport failure (429, blockhash) says nothing about the market.
+            if (this.now() < r.catchupBackoffUntilMs) break;
+            const wait = this.reserveCatchupStart();
+            if (wait === null) {
+              this.log(`[v22][catchup] ${cur.label}: ${BigInt(cur.readSlot) - cur.refresh.slotLast} slots behind, deferred to a later cycle (catch-up queue full this cycle)`);
+              break;
+            }
             if (wait > 0) {
               await (this.d.sleep ?? sleepMs)(wait);
               // Re-read: the chain moved while we waited, and a crank past the gap would settle the target alone.
               const again = await loadV22Market(conn, entry, this.d.programId);
               cur = again.ok ? again.ctx : null;
+              if (!cur) break;
             }
-            const m = cur ? catchupCrankCount(BigInt(cur.readSlot) - cur.refresh.slotLast, cur.refresh.maxAccrualDtSlots) : 0;
-            if (cur && m > 0 && (await this.multiAssetCatchup(cur, positioned.flatAnchor ?? positioned.lp.pubkey, m))) r.catchupBackoffUntilMs = this.now() + 60_000;
-          } else if (!backedOff) {
-            this.log(`[v22][catchup] ${ctx.label}: ${BigInt(ctx.readSlot) - ctx.refresh.slotLast} slots behind, deferred to a later cycle (catch-up queue full this cycle)`);
+            const m = behind(cur);
+            if (m === 0) {
+              caughtUp = true;
+              break;
+            }
+            if (await this.multiAssetCatchup(cur, positioned.flatAnchor ?? positioned.lp.pubkey, m)) {
+              r.catchupBackoffUntilMs = this.now() + 60_000;
+              break;
+            }
+            if (!fullRoute) break;
+            const after = await loadV22Market(conn, entry, this.d.programId);
+            cur = after.ok ? after.ctx : null;
+            if (cur && behind(cur) === 0) {
+              caughtUp = true;
+              break;
+            }
           }
-          // A9-1: no round this cycle, so publish this cycle's read as the crank-health record. Without it /health kept the
-          // last round's record for as long as the market stayed behind (a refused catch-up: for good).
-          await this.publishHealth(cur ?? ctx, r, positioned, null);
-          return true;
+          if (!caughtUp || !cur) {
+            // A9-1: no round this cycle, so publish this cycle's read as the crank-health record. Without it /health kept the
+            // last round's record for as long as the market stayed behind (a refused catch-up: for good).
+            await this.publishHealth(cur ?? ctx, r, positioned, null);
+            return true;
+          }
+          ctx = cur;
         }
       }
       const f = this.d.flags;
@@ -799,7 +837,7 @@ export class V22Loop {
     // v22price 2026-10-22: the per-crank cost depends on the market's config (v2.2 single-asset 36,350 CU; a band market
     // 42,538), so a fixed estimate either overflows the tx or wastes it. Measure THIS market with a one-crank simulation and
     // size the tx from it (+8%); the static estimate is the fallback when the measurement is unavailable.
-    let perCrank = catchupCrankCuFor(CATCHUP_CRANK_CU, hints);
+    let perCrank = catchupCrankCuFor(catchupCrankCuEstimate(), hints);
     if (wanted > 1) {
       try {
         const one = await simulateOnly(this.execCtx(), [crank()], { units: MAX_TX_CU });

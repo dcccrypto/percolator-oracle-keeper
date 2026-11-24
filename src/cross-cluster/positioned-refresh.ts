@@ -377,6 +377,16 @@ function buildPermissionlessCrankIx(
  * tx from a one-crank simulation of the market instead (loop.ts multiAssetCatchup); this is the static fallback.
  */
 export const CATCHUP_CRANK_CU = 45_000;
+/**
+ * Full crank routing: a bounded catch-up crank is a 32-step canonical path. Measured 108,574 CU (LiteSVM, wrapper
+ * agent/J-20261124-PROG-FULLROUTE, tests/v16_cu.rs fullroute catch-up, single asset with open interest); +10% margin.
+ * Static fallback only: the v2.2 loop sizes its catch-up tx from a one-crank simulation of the market.
+ */
+export const CATCHUP_PATH_CRANK_CU = 120_000;
+/** The static per-crank catch-up estimate for the configured wrapper (see `crankWindowSlots`). */
+export function catchupCrankCuEstimate(pathSteps: bigint = crankPathStepsFromEnv()): number {
+  return pathSteps > 0n ? CATCHUP_PATH_CRANK_CU : CATCHUP_CRANK_CU;
+}
 export const ACCRUE_CRANK_CU = 200_000;
 export const REFRESH_CRANK_CU = 145_000;
 export const MAX_TX_CU = 1_400_000;
@@ -542,17 +552,47 @@ export interface CrankPlan {
 }
 
 /**
+ * Full crank routing (wrapper agent/J-20261124-PROG-FULLROUTE): every crank commits the engine's canonical one-slot
+ * price path, and one path call covers at most `V16_MAX_ACCRUAL_PATH_STEPS` (32) slots per asset, whatever the market's
+ * `max_accrual_dt_slots` (100-500 on our markets). A crank that leaves an asset short returns early
+ * (`bounded_market_catchup_only`), exactly like the old window cap, only with a 32-slot window.
+ */
+export const V16_MAX_ACCRUAL_PATH_STEPS = 32n;
+
+/**
+ * Slots one crank commits per asset: `min(max_accrual_dt_slots, pathSteps)`. `pathSteps` comes from
+ * KEEPER_V22_CRANK_PATH_STEPS (default 32 = the full-routing program; 0 = the pre-routing program, window =
+ * `max_accrual_dt_slots`). Set it to 0 while the deployed wrapper is still the single-segment one: a 32-slot count
+ * against a 150-slot program sends catch-up cranks past the gap, and the extra one settles the LP alone.
+ */
+export function crankWindowSlots(maxDt: bigint, pathSteps: bigint = crankPathStepsFromEnv()): bigint {
+  if (maxDt <= 0n) return 0n;
+  return pathSteps > 0n && pathSteps < maxDt ? pathSteps : maxDt;
+}
+
+/** KEEPER_V22_CRANK_PATH_STEPS (see `crankWindowSlots`); a bad value falls back to the default 32. */
+export function crankPathStepsFromEnv(env: NodeJS.ProcessEnv = process.env): bigint {
+  const raw = env.KEEPER_V22_CRANK_PATH_STEPS;
+  if (raw === undefined || raw.trim() === "") return V16_MAX_ACCRUAL_PATH_STEPS;
+  if (!/^\d+$/.test(raw.trim())) return V16_MAX_ACCRUAL_PATH_STEPS;
+  return BigInt(raw.trim());
+}
+
+/**
  * Number of bounded catch-up cranks to put before the full accrual. Each one
- * advances `slot_last` by exactly `maxDt` and returns early; the crank after
- * them sees a gap below `maxDt`, accrues to `now`, and runs the engine
+ * advances `slot_last` by exactly one crank window (`crankWindowSlots`: 32 slots
+ * under full crank routing, `maxDt` before it) and returns early; the crank after
+ * them sees a gap below the window, accrues to `now`, and runs the engine
  * dispatch, so the refreshes behind it see `dt == 0`. The count is computed
  * from the slot the market was read at; if the chain crosses another
- * multiple of `maxDt` before the transaction lands, the pre-simulation or the
- * landing fails cleanly and the next cycle recomputes it.
+ * window boundary before the transaction lands, the pre-simulation or the
+ * landing fails cleanly and the caller re-reads and recounts (v22 loop:
+ * `CATCHUP_ROUNDS_PER_CYCLE`).
  */
-export function catchupCrankCount(gap: bigint, maxDt: bigint): number {
-  if (maxDt <= 0n || gap <= 0n) return 0;
-  const n = gap / maxDt;
+export function catchupCrankCount(gap: bigint, maxDt: bigint, pathSteps: bigint = crankPathStepsFromEnv()): number {
+  const window = crankWindowSlots(maxDt, pathSteps);
+  if (window <= 0n || gap <= 0n) return 0;
+  const n = gap / window;
   return Number(n > BigInt(MAX_CATCHUP_CRANKS) ? BigInt(MAX_CATCHUP_CRANKS) : n);
 }
 
@@ -607,9 +647,10 @@ export function planCrankTx(params: {
   // K-6: a multi-asset market's observation cranks carry one hint per asset and cost more; single-asset: hints = 1,
   // every figure below is the pre-K-6 one.
   const hints = observationAssetsFor(market.toBase58()).length;
-  const catchupCu = catchupCrankCuFor(CATCHUP_CRANK_CU, hints);
+  const catchupBase = catchupCrankCuEstimate();
+  const catchupCu = catchupCrankCuFor(catchupBase, hints);
   // CU-capped for every hint count (v22price 2026-10-22: the single-asset count used to be uncapped by compute).
-  const catchupN = Math.min(catchup, maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, hints, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM - repairCu));
+  const catchupN = Math.min(catchup, maxCatchupCranksFor(MAX_CATCHUP_CRANKS, catchupBase, hints, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM - repairCu));
   for (let i = 0; i < catchupN; i++) {
     cranks.push({ kind: "catchup", portfolio: lpPortfolio, ix: buildObservationCrankIx(owner, market, lpPortfolio) });
   }

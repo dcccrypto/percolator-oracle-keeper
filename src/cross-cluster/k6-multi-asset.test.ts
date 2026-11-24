@@ -59,6 +59,12 @@ import { fixedPushFor, landedPushes, multiAssetMarketHealth, newMarketStat, reco
 import { DEFAULT_THRESHOLDS } from "./alerting.ts";
 import { createWalletBalanceState } from "./wallet-balance-guard.ts";
 
+// Full crank routing (agent/J-20261124-KEEPER-FULLROUTE): this file models the single-segment wrapper, where one crank
+// covers max_accrual_dt_slots. Its gaps, counts and CU figures are in those windows, so it runs in the keeper's legacy mode
+// (KEEPER_V22_CRANK_PATH_STEPS=0), which stays supported until the full-routing wrapper deploys. The 32-slot window is
+// covered in v22/fullroute-catchup.test.ts.
+process.env.KEEPER_V22_CRANK_PATH_STEPS = "0";
+
 const here = dirname(fileURLToPath(import.meta.url));
 const fx = (n: string): Uint8Array => new Uint8Array(Buffer.from(readFileSync(join(here, "__fixtures__", `${n}.b64`), "utf8").trim(), "base64"));
 const ADDITIONS = JSON.parse(readFileSync(join(here, "..", "..", "registry-additions-v22-multiasset.json"), "utf8")) as { markets: MarketEntry[] };

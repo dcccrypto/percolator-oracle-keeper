@@ -38,7 +38,7 @@
  */
 import { PublicKey } from "@solana/web3.js";
 
-import { ACCRUE_CRANK_CU, CATCHUP_CRANK_CU, LIQUIDATE_CRANK_CU, MAX_TX_CU, REPAIR_CU, buildObservationCrankIx, buildRefreshCrankIx, catchupAllowsRefresh } from "./positioned-refresh.ts";
+import { ACCRUE_CRANK_CU, LIQUIDATE_CRANK_CU, catchupCrankCuEstimate, MAX_TX_CU, REPAIR_CU, buildObservationCrankIx, buildRefreshCrankIx, catchupAllowsRefresh } from "./positioned-refresh.ts";
 import type { LegCostModel } from "./positioned-refresh.ts";
 import type { CrankPlan, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
 import { KF_DRIFT_FIELDS, assetSlotsOff, detectLayout, engineSlotBase, layoutById } from "./market-layout.ts";
@@ -671,7 +671,7 @@ export function planSweepTx(params: {
   for (let i = 0; i < catchup; i++) {
     cranks.push({ kind: "catchup", portfolio: lpPortfolio, ix: buildObservationCrankIx(owner, market, lpPortfolio) });
   }
-  cu += catchup * CATCHUP_CRANK_CU;
+  cu += catchup * catchupCrankCuEstimate();
   if (accrue && !catchupAllowsRefresh(catchup)) {
     return { cranks, overflow: [], deferred: [...params.targets], computeUnits: Math.min(MAX_TX_CU, cu + cfg.headroomCu) };
   }
