@@ -479,6 +479,21 @@ export function planSweepPace(cov: SweepCoverage | null, positioned: number, cfg
  * visit is below it. A round ends when nothing is due; the next one starts at
  * the next sequence number, making every positioned portfolio due again.
  */
+/**
+ * base58 of a pubkey, cached per PublicKey object (web3.js re-encodes on every
+ * `toBase58()`, ~50us; the cursor keys every portfolio every cycle). PublicKey is
+ * immutable, so the cache is exact.
+ */
+const b58Cache = new WeakMap<PublicKey, string>();
+function keyOf(pk: PublicKey): string {
+  let k = b58Cache.get(pk);
+  if (k === undefined) {
+    k = pk.toBase58();
+    b58Cache.set(pk, k);
+  }
+  return k;
+}
+
 export interface SweepCursor {
   visits: Map<string, number>;
   roundStart: number;
@@ -547,7 +562,7 @@ export function selectSweepBatch(
 ): PositionedPortfolio[] {
   if (k <= 0) return [];
   const candidates = positioned
-    .map((p) => ({ p, key: p.pubkey.toBase58() }))
+    .map((p) => ({ p, key: keyOf(p.pubkey) }))
     .filter((x) => !exclude.has(x.key));
   if (candidates.length === 0) return [];
   const last = (key: string) => cursor.visits.get(key) ?? -1;
@@ -589,7 +604,7 @@ export function selectSweepBatch(
 export function markVisited(cursor: SweepCursor, pubkeys: ReadonlyArray<PublicKey>): void {
   if (pubkeys.length === 0) return;
   const seq = ++cursor.seq;
-  for (const pk of pubkeys) cursor.visits.set(pk.toBase58(), seq);
+  for (const pk of pubkeys) cursor.visits.set(keyOf(pk), seq);
   if (cursor.roundPending) {
     cursor.roundStart = seq + 1;
     cursor.roundPending = false;
@@ -598,7 +613,7 @@ export function markVisited(cursor: SweepCursor, pubkeys: ReadonlyArray<PublicKe
 
 /** Forget portfolios that are no longer positioned. */
 export function pruneVisits(cursor: SweepCursor, positioned: ReadonlyArray<PositionedPortfolio>): void {
-  const live = new Set(positioned.map((p) => p.pubkey.toBase58()));
+  const live = new Set(positioned.map((p) => keyOf(p.pubkey)));
   for (const k of [...cursor.visits.keys()]) if (!live.has(k)) cursor.visits.delete(k);
 }
 
@@ -611,9 +626,9 @@ export function refreshPositionedFrom(
   positioned: PositionedPortfolio[],
   fresh: ReadonlyArray<PositionedPortfolio>,
 ): void {
-  const byKey = new Map(fresh.map((p) => [p.pubkey.toBase58(), p]));
+  const byKey = new Map(fresh.map((p) => [keyOf(p.pubkey), p]));
   for (let i = 0; i < positioned.length; i++) {
-    const f = byKey.get(positioned[i].pubkey.toBase58());
+    const f = byKey.get(keyOf(positioned[i].pubkey));
     if (f) positioned[i] = f;
   }
 }
